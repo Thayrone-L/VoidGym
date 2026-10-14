@@ -55,7 +55,7 @@ hk-agent knowledge candidate-export `
   --worker-id maquina-1 `
   --artifact-uri https://github.com/owner/repo/releases/download/run-1/model.zip `
   --artifact-sha256 <sha256> --artifact-size-bytes <bytes> `
-  --trust-tier owned `
+  --trust-tier external-untrusted `
   --parent-generation <geracao> --parent-sha256 <sha-do-campeao>
 ```
 
@@ -63,9 +63,9 @@ O candidato sai em `knowledge/outbox/candidates/` como arquivo imutável. Cada w
 deve manter seu próprio checkout/outbox; não execute exportações concorrentes contra o
 mesmo `index.json`, pois a atualização local do índice não é um banco transacional.
 
-Somente um avaliador confiável deve promover candidatos. A promoção exige o resultado
-da avaliação, o commit completo do avaliador e compare-and-swap tanto da geração quanto
-do hash do campeão. Assim, duas promoções concorrentes não sobrescrevem uma à outra:
+Promoções estão temporariamente desabilitadas. O comando abaixo permanece reservado e
+falha fechado até existir um recibo verificável do avaliador; hashes fornecidos como
+argumentos e o tier autodeclarado pelo produtor não concedem autoridade:
 
 ```powershell
 hk-agent knowledge champion-promote `
@@ -75,16 +75,22 @@ hk-agent knowledge champion-promote `
   --evaluation-suite-sha256 <sha-da-suite> --evaluator-commit <commit-40-hex>
 ```
 
-A repetição exata de uma promoção já aplicada é idempotente. Um candidato baseado em
-outro campeão ou com fingerprint incompatível é rejeitado. O formato `sb3-zip` é apenas
+A futura promoção deverá ser idempotente, usar compare-and-swap e rejeitar candidato
+baseado em outro campeão ou com fingerprint incompatível. O formato `sb3-zip` é apenas
 catalogado: arquivos SB3 externos podem conter objetos serializados e nunca devem ser
 desserializados no processo ou na máquina confiável de promoção. Avalie contribuições
 de terceiros em ambiente descartável e isolado.
 
-O tier `external-untrusted` não pode ser promovido. Depois de validá-lo no ambiente
-isolado, gere um novo manifesto `quarantined`, com hash do artefato efetivamente
-avaliado. Relatório, suite de avaliação, candidato, política, pai e commit do avaliador
-ficam vinculados no registro promovido.
+Os tiers `external-untrusted` e `quarantined` não podem ser promovidos enquanto não
+existir uma attestation fechada e verificável do avaliador. Além disso, nenhum
+`sb3-zip` é promovível, inclusive quando foi produzido numa máquina própria: o ZIP
+pode conter pickle executável. O registro campeão aceita apenas uma policy
+`safetensors`; checkpoints SB3 continuam estritamente locais.
+
+Uma quarentena futura deverá converter o artefato dentro de uma VM descartável para
+`safetensors`, destruir a VM e produzir um recibo que vincule candidato, hashes,
+imagem da VM, suite, relatório e commit do avaliador. Até esse recibo existir, a
+classificação `quarantined` é apenas catálogo e não concede autoridade.
 
 ## Compatibilidade e limites
 

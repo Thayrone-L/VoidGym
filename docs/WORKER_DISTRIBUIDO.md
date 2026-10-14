@@ -30,11 +30,13 @@ externo diretamente para o cache não o torna confiável.
    .\.venv\Scripts\python.exe tools\worker_cycle.py sync
    ```
 
-3. Coloque o artefato promovido no cache local. Para o SHA-256 `<sha>`, o layout é:
+3. Um campeão distribuído nunca pode ser um checkpoint SB3. O único formato promovível
+   é uma policy `safetensors`, que não carrega objetos Python. Para o SHA-256 `<sha>`,
+   o layout futuro do cache é:
 
    ```text
    artifacts/distributed/cache/champions/<sha>/manifest.json
-   artifacts/distributed/cache/champions/<sha>/checkpoints/checkpoint.zip
+   artifacts/distributed/cache/champions/<sha>/policies/policy.safetensors
    ```
 
    O preflight confere tamanho, SHA-256, fingerprint de compatibilidade e inventário
@@ -47,9 +49,11 @@ externo diretamente para o cache não o torna confiável.
      --session-id campanha-001
    ```
 
-   O JSON retornado contém `resume_checkpoint`. Passe-o ao runner com
-   `--resume-checkpoint`. Se a geração for zero, o valor será `null` e a sessão
-   começará sem modelo-base. O campeão não muda durante o rollout.
+   Para geração zero, `resume_checkpoint` e `warm_start_policy` são `null`. Para um
+   campeão promovido, `resume_checkpoint` permanece sempre `null` e o recibo aponta
+   separadamente para `warm_start_policy`. Não passe esse arquivo para `PPO.load`:
+   o carregador tensor-a-tensor ainda será implementado e validado antes de habilitar
+   treino a partir de um campeão distribuído. O campeão não muda durante o rollout.
 
 5. Depois de o processo terminar, finalize usando o manifest exato daquela run:
 

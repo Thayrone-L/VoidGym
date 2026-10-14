@@ -138,6 +138,7 @@ def test_initial_preflight_freezes_canonical_parent_without_checkpoint(
 
     assert receipt["worker_id"] == "pc-um"
     assert receipt["resume_checkpoint"] is None
+    assert receipt["warm_start_policy"] is None
     assert receipt["parent_champion"] == {
         "generation": 0,
         "sha256": canonical_document_sha256(initial_champion()),
@@ -197,9 +198,9 @@ def test_sync_marks_only_the_configured_maintainer_ref(
         sync_worker_knowledge(config, repo=tmp_path, ref="origin/friend-candidate")
 
 
-def test_promoted_champion_is_selected_only_from_verified_cache(tmp_path: Path) -> None:
-    checkpoint_bytes = b"promoted owned checkpoint"
-    digest = hashlib.sha256(checkpoint_bytes).hexdigest()
+def test_promoted_champion_is_selected_only_as_safe_warm_start(tmp_path: Path) -> None:
+    policy_bytes = b"safe tensor fixture"
+    digest = hashlib.sha256(policy_bytes).hexdigest()
     compatibility = "a" * 64
     initial_hash = canonical_document_sha256(initial_champion())
     champion = {
@@ -209,10 +210,10 @@ def test_promoted_champion_is_selected_only_from_verified_cache(tmp_path: Path) 
         "contribution_id": "c" * 64,
         "compatibility_fingerprint": compatibility,
         "artifact": {
-            "uri": "https://github.com/example/releases/download/v1/checkpoint.zip",
+            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
             "sha256": digest,
-            "size_bytes": len(checkpoint_bytes),
-            "format": "sb3-zip",
+            "size_bytes": len(policy_bytes),
+            "format": "safetensors",
         },
         "parent_champion_sha256": initial_hash,
         "evaluation": {
@@ -227,22 +228,26 @@ def test_promoted_champion_is_selected_only_from_verified_cache(tmp_path: Path) 
     _knowledge(tmp_path, champion)
     _mark_trusted(tmp_path, champion)
     bundle = tmp_path / "cache" / "champions" / digest
-    checkpoint = bundle / "checkpoints" / "checkpoint.zip"
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_bytes(checkpoint_bytes)
+    policy = bundle / "policies" / "policy.safetensors"
+    policy.parent.mkdir(parents=True)
+    policy.write_bytes(policy_bytes)
     _write_json(
         bundle / "manifest.json",
         {
             "compatibility_fingerprint": compatibility,
-            "checkpoints": [{"step": 10, "sha256": digest}],
+            "portable_policies": [
+                {"step": 10, "sha256": digest, "format": "safetensors"}
+            ],
         },
     )
 
     receipt = preflight_worker(load_worker_config(_config(tmp_path)), "session-1")
-    assert receipt["resume_checkpoint"] == str(checkpoint)
+    assert receipt["resume_checkpoint"] is None
+    assert receipt["warm_start_policy"] == str(policy)
+    assert receipt["warm_start_policy_sha256"] == digest
 
-    checkpoint.write_bytes(b"tampered")
-    with pytest.raises(WorkerCycleError, match="size differs"):
+    policy.write_bytes(b"tampered")
+    with pytest.raises(WorkerCycleError, match="policy size differs"):
         preflight_worker(load_worker_config(_config(tmp_path)), "session-2")
 
 
@@ -283,6 +288,72 @@ def test_finalize_rejects_checkpoint_outside_run_directory(tmp_path: Path) -> No
         finalize_candidate(config, manifest_path, "session-1")
 
 
+def test_finalize_rejects_tampered_distributed_resume_receipt(tmp_path: Path) -> None:
+    _knowledge(tmp_path)
+    _mark_trusted(tmp_path)
+    config = load_worker_config(_config(tmp_path))
+    preflight_worker(config, "session-1")
+    receipt_path = tmp_path / "cache" / "preflights" / "session-1.json"
+    receipt = json.loads(receipt_path.read_text("utf-8"))
+    receipt["resume_checkpoint"] = str(tmp_path / "attacker.zip")
+    receipt["resume_checkpoint_sha256"] = "f" * 64
+    _write_json(receipt_path, receipt)
+
+    with pytest.raises(WorkerCycleError, match="cannot authorize an SB3 resume"):
+        finalize_candidate(config, _manifest(tmp_path), "session-1")
+
+
+def test_finalize_revalidates_warm_start_policy_after_preflight(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    policy_bytes = b"safe tensor fixture"
+    digest = hashlib.sha256(policy_bytes).hexdigest()
+    initial_hash = canonical_document_sha256(initial_champion())
+    champion = {
+        "schema_version": 1,
+        "generation": 1,
+        "candidate_id": "b" * 64,
+        "contribution_id": "c" * 64,
+        "compatibility_fingerprint": manifest["compatibility_fingerprint"],
+        "artifact": {
+            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
+            "sha256": digest,
+            "size_bytes": len(policy_bytes),
+            "format": "safetensors",
+        },
+        "parent_champion_sha256": initial_hash,
+        "evaluation": {
+            "report_sha256": "d" * 64,
+            "suite_sha256": "f" * 64,
+            "policy_sha256": digest,
+            "candidate_id": "b" * 64,
+            "parent_champion_sha256": initial_hash,
+            "evaluator_commit": "e" * 40,
+        },
+    }
+    _knowledge(tmp_path, champion)
+    _mark_trusted(tmp_path, champion)
+    bundle = tmp_path / "cache" / "champions" / digest
+    policy = bundle / "policies" / "policy.safetensors"
+    policy.parent.mkdir(parents=True)
+    policy.write_bytes(policy_bytes)
+    _write_json(
+        bundle / "manifest.json",
+        {
+            "compatibility_fingerprint": manifest["compatibility_fingerprint"],
+            "portable_policies": [
+                {"step": 10, "sha256": digest, "format": "safetensors"}
+            ],
+        },
+    )
+    config = load_worker_config(_config(tmp_path))
+    preflight_worker(config, "session-promoted")
+    policy.write_bytes(b"tampered after preflight")
+
+    with pytest.raises(WorkerCycleError, match="integrity revalidation"):
+        finalize_candidate(config, manifest_path, "session-promoted")
+
+
 def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text("utf-8"))
@@ -296,10 +367,10 @@ def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) 
         "contribution_id": "c" * 64,
         "compatibility_fingerprint": manifest["compatibility_fingerprint"],
         "artifact": {
-            "uri": "https://github.com/example/releases/download/v1/checkpoint.zip",
+            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
             "sha256": parent_digest,
             "size_bytes": len(parent_bytes),
-            "format": "sb3-zip",
+            "format": "safetensors",
         },
         "parent_champion_sha256": initial_hash,
         "evaluation": {
@@ -314,23 +385,28 @@ def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) 
     _knowledge(tmp_path, champion)
     _mark_trusted(tmp_path, champion)
     bundle = tmp_path / "cache" / "champions" / parent_digest
-    checkpoint = bundle / "checkpoints" / "checkpoint.zip"
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_bytes(parent_bytes)
+    policy = bundle / "policies" / "policy.safetensors"
+    policy.parent.mkdir(parents=True)
+    policy.write_bytes(parent_bytes)
     _write_json(
         bundle / "manifest.json",
         {
             "compatibility_fingerprint": manifest["compatibility_fingerprint"],
-            "checkpoints": [{"step": 10, "sha256": parent_digest}],
+            "portable_policies": [
+                {"step": 10, "sha256": parent_digest, "format": "safetensors"}
+            ],
         },
     )
     config = load_worker_config(_config(tmp_path))
     preflight_worker(config, "session-promoted")
 
-    with pytest.raises(WorkerCycleError, match="did not resume"):
+    with pytest.raises(WorkerCycleError, match="did not warm-start"):
         finalize_candidate(config, manifest_path, "session-promoted")
 
-    manifest["resumed_from"] = {"sha256": parent_digest}
+    manifest["warm_started_from"] = {
+        "sha256": parent_digest,
+        "format": "safetensors",
+    }
     _write_json(manifest_path, manifest)
     result = finalize_candidate(config, manifest_path, "session-promoted")
     assert result["parent_champion"]["generation"] == 1

@@ -934,7 +934,11 @@ def validate_champion(value: object) -> dict[str, Any]:
     else:
         if any(champion[key] is None for key in nullable_hashes) or champion["artifact"] is None:
             raise KnowledgeValidationError("promoted champion fields cannot be null")
-        _validate_artifact(champion["artifact"], "champion.artifact")
+        artifact = _validate_artifact(champion["artifact"], "champion.artifact")
+        if artifact["format"] != "safetensors":
+            raise KnowledgeValidationError(
+                "promoted champion artifact must use the non-executable safetensors format"
+            )
         evaluation = _expect_dict(champion["evaluation"], "champion.evaluation")
         _expect_exact_keys(
             evaluation,
@@ -981,56 +985,25 @@ def promote_candidate(
     evaluation_suite_sha256: str,
     evaluator_commit: str,
 ) -> dict[str, Any]:
-    """Promote locally using generation+digest CAS; never read candidate model bytes."""
+    """Reject promotion until evaluator attestations have a verifiable schema.
 
-    current = validate_champion(dict(champion))
-    clean_candidate = validate_candidate(dict(candidate))
-    current_sha256 = canonical_document_sha256(current)
-    parent = clean_candidate["parent_champion"]
-    if (
-        current["candidate_id"] == clean_candidate["candidate_id"]
-        and current["generation"] == parent["generation"] + 1
-        and current["parent_champion_sha256"] == parent["sha256"]
-    ):
-        evaluation = current.get("evaluation")
-        if not isinstance(evaluation, Mapping) or (
-            evaluation.get("report_sha256") != evaluation_report_sha256
-            or evaluation.get("suite_sha256") != evaluation_suite_sha256
-            or evaluation.get("evaluator_commit") != evaluator_commit
-        ):
-            raise KnowledgeValidationError(
-                "idempotent promotion evidence differs from the promoted champion"
-            )
-        return current
-    if expected_generation != current["generation"] or expected_champion_sha256 != current_sha256:
-        raise KnowledgeValidationError("champion compare-and-swap precondition failed")
-    if parent["generation"] != current["generation"] or parent["sha256"] != current_sha256:
-        raise KnowledgeValidationError("candidate was not trained from the current champion")
-    current_fingerprint = current["compatibility_fingerprint"]
-    if current_fingerprint is not None and (
-        clean_candidate["compatibility_fingerprint"] != current_fingerprint
-    ):
-        raise KnowledgeValidationError("candidate is incompatible with the current champion")
-    if clean_candidate["trust_tier"] == "external-untrusted":
-        raise KnowledgeValidationError("external-untrusted candidate must be quarantined first")
-    promoted = {
-        "schema_version": KNOWLEDGE_SCHEMA_VERSION,
-        "generation": current["generation"] + 1,
-        "candidate_id": clean_candidate["candidate_id"],
-        "contribution_id": clean_candidate["contribution_id"],
-        "compatibility_fingerprint": clean_candidate["compatibility_fingerprint"],
-        "artifact": dict(clean_candidate["artifact"]),
-        "parent_champion_sha256": current_sha256,
-        "evaluation": {
-            "report_sha256": evaluation_report_sha256,
-            "suite_sha256": evaluation_suite_sha256,
-            "policy_sha256": clean_candidate["artifact"]["sha256"],
-            "candidate_id": clean_candidate["candidate_id"],
-            "parent_champion_sha256": current_sha256,
-            "evaluator_commit": evaluator_commit,
-        },
-    }
-    return validate_champion(promoted)
+    Candidate trust tiers are supplied by the producer and therefore cannot authorize a
+    state transition. The arguments remain accepted so older callers fail closed with a
+    stable error instead of silently bypassing the missing authority boundary.
+    """
+
+    validate_champion(dict(champion))
+    validate_candidate(dict(candidate))
+    del (
+        expected_generation,
+        expected_champion_sha256,
+        evaluation_report_sha256,
+        evaluation_suite_sha256,
+        evaluator_commit,
+    )
+    raise KnowledgeValidationError(
+        "champion promotion is disabled until evaluator attestation is implemented"
+    )
 
 
 def _load_json(path: Path) -> object:
