@@ -35,6 +35,10 @@ jobs:
         run: python -m ruff check src tests tools
       - name: Type check
         run: python -m mypy src tools/worker_cycle.py tools/validate_knowledge_pr.py
+      - name: Create local-only readiness fixture
+        run: |
+          mkdir -p artifacts/interactive/kings-pass-1/bootstrap
+          touch artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png
       - name: Test
         run: python -m pytest -q
 
