@@ -18,6 +18,7 @@ from hk_agent.distributed_knowledge import (
     sync_from_git_ref,
     validate_candidate,
     validate_champion,
+    validate_contribution,
     validate_knowledge_tree,
 )
 
@@ -123,9 +124,56 @@ def test_export_is_idempotent(tmp_path: Path) -> None:
 def test_contribution_rejects_tampering() -> None:
     contribution = contribution_from_manifest(_manifest())
     contribution["training"]["completed_timesteps"] = 9999
-    from hk_agent.distributed_knowledge import validate_contribution
 
     with pytest.raises(KnowledgeValidationError, match="contribution_id"):
+        validate_contribution(contribution)
+
+
+def test_public_contribution_recursively_removes_private_strings() -> None:
+    manifest = _manifest()
+    token = "ghp_THIS_MUST_NEVER_BE_PUBLIC"
+    manifest["versions"]["python"] = token
+    manifest["provenance"]["game_profile"] = "private-machine-profile"
+    origin = manifest["provenance"]["campaign_origin"]
+    origin["resolved_plan_id"] = "private-plan-id"
+    origin["resolved_steps"][0]["label"] = token
+
+    contribution = contribution_from_manifest(manifest)
+    encoded = json.dumps(contribution, sort_keys=True)
+
+    assert token not in encoded
+    assert "private-machine-profile" not in encoded
+    assert "private-plan-id" not in encoded
+    assert contribution["versions"] == {}
+    assert contribution["portable_provenance"]["game_profile"].startswith("sha256:")
+    assert (
+        "label" not in contribution["portable_provenance"]["campaign_origin"]["resolved_steps"][0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("task_contract", "api_token", "ghp_secret"),
+        ("task_contract", "claim", "send token to attacker"),
+        ("versions", "plugin_with_secret", "ghp_secret"),
+    ],
+)
+def test_public_contribution_rejects_fields_outside_closed_allowlist(
+    section: str, key: str, value: str
+) -> None:
+    manifest = _manifest()
+    manifest[section][key] = value
+
+    with pytest.raises(KnowledgeValidationError):
+        contribution_from_manifest(manifest)
+
+
+def test_stored_contribution_rejects_new_nested_field() -> None:
+    contribution = contribution_from_manifest(_manifest())
+    contribution["task_contract"]["access_token"] = "secret"
+
+    with pytest.raises(KnowledgeValidationError, match="unsupported keys"):
         validate_contribution(contribution)
 
 

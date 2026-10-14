@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,7 @@ from hk_agent.worker_cycle import (
     finalize_candidate,
     load_worker_config,
     preflight_worker,
+    prepare_publication,
     sync_worker_knowledge,
 )
 
@@ -24,6 +28,21 @@ from hk_agent.worker_cycle import (
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _git(repo: Path, *arguments: str) -> str:
+    executable = "git"
+    if os.name == "nt":
+        installed = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/cmd/git.exe"
+        if installed.is_file():
+            executable = str(installed)
+    result = subprocess.run(
+        [executable, "-C", str(repo), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 
 def _config(tmp_path: Path, *, stage: bool = True) -> Path:
@@ -49,7 +68,12 @@ def _knowledge(tmp_path: Path, champion: dict[str, Any] | None = None) -> None:
     _write_json(root / "champion.json", champion or initial_champion())
 
 
-def _mark_trusted(tmp_path: Path, champion: dict[str, Any] | None = None) -> None:
+def _mark_trusted(
+    tmp_path: Path,
+    champion: dict[str, Any] | None = None,
+    *,
+    source_commit: str = "a" * 40,
+) -> None:
     selected = champion or initial_champion()
     _write_json(
         tmp_path / "cache" / "trusted-source.json",
@@ -57,6 +81,7 @@ def _mark_trusted(tmp_path: Path, champion: dict[str, Any] | None = None) -> Non
             "schema_version": 1,
             "trust_tier": "maintainer-promoted",
             "ref": "origin/knowledge",
+            "source_commit": source_commit,
             "generation": selected["generation"],
             "champion_sha256": canonical_document_sha256(selected),
         },
@@ -93,9 +118,7 @@ def _manifest(tmp_path: Path, checkpoint_bytes: bytes = b"owned checkpoint") -> 
         "resumable_checkpoint": True,
         "task_contract": task_contract,
         "provenance": provenance,
-        "compatibility_fingerprint": portable_compatibility_fingerprint(
-            task_contract, provenance
-        ),
+        "compatibility_fingerprint": portable_compatibility_fingerprint(task_contract, provenance),
         "versions": {"python": "3.12"},
         "checkpoints": [{"step": 128, "path": str(checkpoint), "sha256": digest}],
         "finished_unix_ns": 123456,
@@ -120,9 +143,7 @@ def test_initial_preflight_freezes_canonical_parent_without_checkpoint(
         "sha256": canonical_document_sha256(initial_champion()),
     }
     assert (
-        json.loads(
-            (tmp_path / "cache" / "preflights" / "session-1.json").read_text("utf-8")
-        )
+        json.loads((tmp_path / "cache" / "preflights" / "session-1.json").read_text("utf-8"))
         == receipt
     )
 
@@ -137,6 +158,16 @@ def test_preflight_rejects_locally_copied_champion_without_trusted_sync(
         preflight_worker(config, "session-1")
 
 
+def test_worker_config_accepts_only_the_maintainer_knowledge_ref(tmp_path: Path) -> None:
+    config_path = _config(tmp_path)
+    document = json.loads(config_path.read_text("utf-8"))
+    document["trusted_ref"] = "origin/friend-candidate"
+    _write_json(config_path, document)
+
+    with pytest.raises(WorkerCycleError, match="exactly origin/knowledge"):
+        load_worker_config(config_path)
+
+
 def test_sync_marks_only_the_configured_maintainer_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -145,7 +176,7 @@ def test_sync_marks_only_the_configured_maintainer_ref(
 
     def fake_sync(repo: Path, ref: str, knowledge_root: Path) -> dict[str, Any]:
         assert repo == tmp_path.resolve()
-        assert ref == "origin/knowledge"
+        assert ref == "1" * 40
         assert knowledge_root == (tmp_path / "knowledge").resolve()
         return {
             "imported": 0,
@@ -156,6 +187,7 @@ def test_sync_marks_only_the_configured_maintainer_ref(
         }
 
     monkeypatch.setattr("hk_agent.worker_cycle.sync_from_git_ref", fake_sync)
+    monkeypatch.setattr("hk_agent.worker_cycle._git", lambda *args, **kwargs: "1" * 40)
     report = sync_worker_knowledge(config, repo=tmp_path)
     assert report["champion_generation"] == 0
     trusted = json.loads((tmp_path / "cache" / "trusted-source.json").read_text("utf-8"))
@@ -302,3 +334,163 @@ def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) 
     _write_json(manifest_path, manifest)
     result = finalize_candidate(config, manifest_path, "session-promoted")
     assert result["parent_champion"]["generation"] == 1
+
+
+def test_prepare_publication_uses_isolated_immutable_branch(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _knowledge(repository)
+    _git(repository, "add", "knowledge")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "trusted knowledge",
+    )
+    trusted_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/remotes/origin/knowledge", trusted_commit)
+
+    config_path = tmp_path / "worker.json"
+    _write_json(
+        config_path,
+        {
+            "schema_version": 1,
+            "worker_id": "pc-um",
+            "trusted_ref": "origin/knowledge",
+            "knowledge_root": str(repository / "knowledge"),
+            "cache_root": str(tmp_path / "cache"),
+            "outbox_root": str(tmp_path / "outbox"),
+            "stage_checkpoint": False,
+        },
+    )
+    config = load_worker_config(config_path)
+    _mark_trusted(tmp_path, source_commit=trusted_commit)
+    preflight_worker(config, "session-1")
+    staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
+    main_before = _git(repository, "rev-parse", "HEAD")
+
+    prepared = prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+    repeated = prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+
+    assert prepared == repeated
+    assert prepared["source_commit"] == trusted_commit
+    assert prepared["branch"].startswith("codex/knowledge-pc-um-")
+    assert _git(repository, "rev-parse", "HEAD") == main_before
+    assert _git(repository, "branch", "--show-current") == "main"
+    worktree = Path(str(prepared["worktree"]))
+    assert set(_git(worktree, "diff", "--name-only", f"{trusted_commit}..HEAD").splitlines()) == {
+        "knowledge/index.json",
+        f"knowledge/contributions/{prepared['contribution_id']}.json",
+    }
+    assert not (worktree / "checkpoint.zip").exists()
+    assert not (worktree / "staging.json").exists()
+
+
+def test_prepare_publication_rolls_back_invalid_trusted_snapshot(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _knowledge(repository)
+    trusted_copy = tmp_path / "trusted-knowledge"
+    shutil.copytree(repository / "knowledge", trusted_copy)
+    _write_json(repository / "knowledge" / "champion.json", {"schema_version": 1})
+    _git(repository, "add", "knowledge")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "invalid remote snapshot",
+    )
+    source_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/remotes/origin/knowledge", source_commit)
+    config_path = tmp_path / "worker.json"
+    _write_json(
+        config_path,
+        {
+            "schema_version": 1,
+            "worker_id": "pc-um",
+            "trusted_ref": "origin/knowledge",
+            "knowledge_root": str(trusted_copy),
+            "cache_root": str(tmp_path / "cache"),
+            "outbox_root": str(tmp_path / "outbox"),
+            "stage_checkpoint": False,
+        },
+    )
+    config = load_worker_config(config_path)
+    _mark_trusted(tmp_path, source_commit=source_commit)
+    preflight_worker(config, "session-1")
+    staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
+    contribution_id = str(staging["contribution"]["contribution_id"])
+    branch = f"codex/knowledge-pc-um-{contribution_id[:12]}"
+
+    with pytest.raises(WorkerCycleError):
+        prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+
+    assert _git(repository, "branch", "--list", branch) == ""
+    assert not (tmp_path / "outbox" / "wt" / str(staging["bundle_id"])[:16]).exists()
+
+
+def test_prepare_publication_rejects_a_moved_trusted_ref(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _knowledge(repository)
+    _git(repository, "add", "knowledge")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "trusted knowledge",
+    )
+    trusted_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/remotes/origin/knowledge", trusted_commit)
+    config_path = tmp_path / "worker.json"
+    _write_json(
+        config_path,
+        {
+            "schema_version": 1,
+            "worker_id": "pc-um",
+            "trusted_ref": "origin/knowledge",
+            "knowledge_root": str(repository / "knowledge"),
+            "cache_root": str(tmp_path / "cache"),
+            "outbox_root": str(tmp_path / "outbox"),
+            "stage_checkpoint": False,
+        },
+    )
+    config = load_worker_config(config_path)
+    _mark_trusted(tmp_path, source_commit=trusted_commit)
+    preflight_worker(config, "session-1")
+    staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
+
+    (repository / "README.md").write_text("new trusted head", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-m",
+        "advance trusted ref",
+    )
+    advanced_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/remotes/origin/knowledge", advanced_commit)
+
+    with pytest.raises(WorkerCycleError, match="no longer matches"):
+        prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+
+    assert not (tmp_path / "outbox" / "publications").exists()

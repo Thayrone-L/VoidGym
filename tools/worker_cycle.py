@@ -14,15 +14,14 @@ from hk_agent.worker_cycle import (
     finalize_candidate,
     load_worker_config,
     preflight_worker,
+    prepare_publication,
     sync_worker_knowledge,
 )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Operate one local distributed-training worker")
-    parser.add_argument(
-        "--config", type=Path, default=PROJECT_ROOT / "config.worker.local.json"
-    )
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.worker.local.json")
     commands = parser.add_subparsers(dest="command", required=True)
     sync = commands.add_parser("sync", help="import an already-fetched knowledge Git ref")
     sync.add_argument("--repo", type=Path, default=PROJECT_ROOT)
@@ -34,6 +33,12 @@ def _parser() -> argparse.ArgumentParser:
     finalize = commands.add_parser("finalize", help="export a finished session candidate")
     finalize.add_argument("--manifest", type=Path, required=True)
     finalize.add_argument("--session-id", required=True)
+    prepare = commands.add_parser(
+        "prepare-publication",
+        help="create an isolated, local contribution branch without pushing it",
+    )
+    prepare.add_argument("--bundle-id", required=True)
+    prepare.add_argument("--repo", type=Path, default=PROJECT_ROOT)
     return parser
 
 
@@ -47,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
             report = preflight_worker(config, args.session_id)
         elif args.command == "finalize":
             report = finalize_candidate(config, args.manifest, args.session_id)
+        elif args.command == "prepare-publication":
+            report = prepare_publication(config, repo=args.repo, bundle_id=args.bundle_id)
         else:
             raise AssertionError(f"unhandled worker command: {args.command}")
     except (KnowledgeValidationError, WorkerCycleError, OSError, ValueError) as error:
