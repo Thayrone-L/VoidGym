@@ -106,3 +106,29 @@ enviar candidatos por forks/pull requests, sem acesso de escrita ao registro cam
 A comparação CAS local evita sobrescrita no arquivo, mas não substitui CAS remoto:
 promoções no GitHub ainda devem usar branch protegida, conferir novamente o HEAD e fazer
 push fast-forward, nunca force-push ou rebase automático do registro.
+
+## Validação no GitHub
+
+O workflow `Knowledge integrity / Data only` roda em todo pull request destinado a
+`knowledge`. Ele usa o código validador da branch base, nunca instala nem executa código
+do pull request e não baixa checkpoints. Somente estes caminhos são aceitos:
+
+- `knowledge/index.json`;
+- `knowledge/champion.json`;
+- `knowledge/contributions/<sha256>.json`.
+
+Contribuições publicadas são imutáveis. O check também rejeita arquivos órfãos, links,
+submódulos, exclusões, documentos acima de 2 MiB, mais de 50 contribuições ou mais de
+10 MiB alterados em um único pull request. Forks não podem alterar o campeão; uma
+promoção interna precisa avançar exatamente uma geração e apontar para o hash do campeão
+anterior.
+
+O rollout tem uma etapa deliberadamente manual: primeiro integre estes arquivos em
+`main`, depois abra e revise um pull request de sincronização de `main` para `knowledge`.
+Somente após o workflow existir na branch `knowledge`, marque
+`Knowledge integrity / Data only` como check obrigatório no ruleset dessa branch. Em
+`main`, os checks estáveis são `Code CI / Python` e `Code CI / Bridge contracts`.
+
+Por enquanto o CI público aceita contribuições, índice e promoções internas. O outbox de
+candidatos continua local até definirmos um caminho público canônico e sua política de
+revisão; não inclua `knowledge/outbox/` nos pull requests.
