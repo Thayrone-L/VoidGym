@@ -76,6 +76,26 @@ público. Depois do upload do checkpoint para uma URL HTTPS imutável, um public
 exportação do registro de conhecimento. Somente o avaliador confiável promove um
 candidato para `knowledge/champion.json`.
 
+Uma contribuição própria pode ser preparada para revisão sem alterar o checkout
+principal e sem acessar a rede:
+
+```powershell
+.\.venv\Scripts\python.exe tools\worker_cycle.py prepare-publication `
+  --bundle-id <bundle_id>
+```
+
+O comando fixa `origin/knowledge` em um commit imutável, cria um worktree isolado sob
+o outbox, desabilita hooks e produz uma branch `codex/knowledge-*` com exatamente um
+commit. Esse commit contém somente `knowledge/index.json` e o JSON sanitizado da
+contribuição; checkpoint, recibo de staging, saves e frames não entram nele. Repetir o
+comando valida e retorna o mesmo recibo. Uma falha remove o worktree e a branch parciais.
+
+Push e abertura automática de pull request permanecem deliberadamente desabilitados.
+O documento público usa uma allowlist recursiva: ações, sinais e claims são enumerações;
+configurações são apenas números/booleanos; identificadores locais e labels são omitidos;
+o perfil do jogo é publicado somente como SHA-256; valores livres de versões também são
+omitidos. Ainda assim, revise o diff preparado manualmente antes de qualquer publicação.
+
 O `session-id` deve ser único por campanha simultânea. Cada identificador cria um
 recibo de preflight imutável, impedindo que uma segunda campanha troque silenciosamente
 o campeão-pai congelado pela primeira.

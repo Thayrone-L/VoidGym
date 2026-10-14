@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -14,6 +15,129 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json$")
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+_VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "torch"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1"})
+_TASK_CONTRACT_KEYS = frozenset(
+    {
+        "reward_version",
+        "action_names",
+        "raw_action_indices",
+        "actions",
+        "config",
+        "information_boundary",
+        "reward_only_signals",
+        "detector_inputs",
+        "privileged_state",
+        "route_memory",
+        "diagnostic_training",
+        "claim",
+    }
+)
+_TASK_CONFIG_KEYS = frozenset(
+    {
+        "horizon_steps",
+        "pixel_delta_threshold",
+        "motion_target_fraction",
+        "target_window",
+        "required_target_hits",
+        "visual_change_scale",
+        "time_cost",
+        "diagnostic_target_bonus",
+        "enemy_kill_reward",
+        "enemy_kill_reward_budget",
+        "shade_recovery_reward",
+        "damage_penalty",
+        "geo_gain_reward",
+        "geo_spend_reward",
+        "geo_reward_budget",
+        "death_penalty",
+        "run_failed_penalty",
+        "crop_top_fraction",
+        "crop_bottom_fraction",
+        "crop_left_fraction",
+        "crop_right_fraction",
+        "warmup_frames",
+        "descriptor_rows",
+        "descriptor_columns",
+        "dark_luma_absolute",
+        "dark_luma_ratio",
+        "dark_pixel_fraction",
+        "white_luma_absolute",
+        "white_pixel_fraction",
+        "minimum_entropy_bits",
+        "baseline_stable_distance",
+        "transition_dark_frames",
+        "new_scene_distance",
+        "stable_frame_distance",
+        "stable_frames",
+        "novelty_shaping_budget",
+        "success_reward",
+        "terminate_on_scene_change",
+    }
+)
+_BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST"})
+_DURATIONS = frozenset({"base", "tap", "hold", "focus", "charge"})
+_ACTION_NAMES = frozenset(
+    {
+        "NOOP",
+        "LEFT",
+        "RIGHT",
+        "JUMP_TAP",
+        "JUMP_HOLD",
+        "LEFT+JUMP_TAP",
+        "LEFT+JUMP_HOLD",
+        "RIGHT+JUMP_TAP",
+        "RIGHT+JUMP_HOLD",
+        "ATTACK",
+        "LEFT+ATTACK",
+        "RIGHT+ATTACK",
+        "UP+ATTACK",
+        "DOWN+ATTACK",
+        "JUMP+ATTACK",
+        "LEFT+JUMP+ATTACK",
+        "RIGHT+JUMP+ATTACK",
+        "CAST",
+        "UP+CAST",
+        "DOWN+CAST",
+        "FOCUS_HOLD",
+        "NAIL_ART_CHARGE",
+        "LEFT+NAIL_ART_CHARGE",
+        "RIGHT+NAIL_ART_CHARGE",
+        "UP+NAIL_ART_CHARGE",
+        "DOWN+NAIL_ART_CHARGE",
+    }
+)
+_INFORMATION_BOUNDARY = frozenset({"pixels", "applied_action_history"})
+_REWARD_ONLY_SIGNALS = frozenset(
+    {
+        "enemy_kills_since_last_frame",
+        "hp_lost_since_last_frame",
+        "geo_gained_since_last_frame",
+        "geo_spent_since_last_frame",
+        "shade_recovered",
+    }
+)
+_DETECTOR_INPUTS = frozenset({"cropped_rgb_pixels", "temporal_pixel_descriptors"})
+_CLAIMS = frozenset(
+    {
+        "motor-signal diagnostic; not game progress or task success",
+        (
+            "pixel-only stable visual-regime-change diagnostic; room transition "
+            "not yet validated against a holdout corpus"
+        ),
+    }
+)
+_ROUTE_LITERAL_FIELDS = {
+    "node_identity": "nearest_visual_landmark_within_match_distance",
+    "edges": "directed_observed_traversals",
+    "revisits": "counted_and_allowed",
+    "policy_integration": "external_planner_only",
+    "reward_integration": "none",
+    "edge_payload": "shortest_observed_temporal_action_trace",
+    "confidence": "observed_traversal_count_capped_at_three",
+    "single_writer": "optimistic_revision_check",
+}
 _SEMANTIC_FILE_HASHES = frozenset(
     {
         "game_executable",
@@ -70,31 +194,320 @@ def _expect_exact_keys(value: Mapping[str, Any], keys: set[str], label: str) -> 
         )
 
 
-def _portable_origin(provenance: Mapping[str, Any]) -> dict[str, Any]:
+def _expect_allowed_keys(
+    value: Mapping[str, Any], allowed: frozenset[str] | set[str], label: str
+) -> None:
+    unexpected = set(value) - set(allowed)
+    if unexpected:
+        raise KnowledgeValidationError(f"{label} contains unsupported keys: {sorted(unexpected)}")
+
+
+def _public_identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _PUBLIC_ID_RE.fullmatch(value):
+        raise KnowledgeValidationError(f"{label} must be a safe public identifier")
+    return value
+
+
+def _public_game_profile(value: object, *, from_manifest: bool) -> str:
+    if from_manifest:
+        profile = _public_identifier(value, "provenance.game_profile")
+        return f"sha256:{hashlib.sha256(profile.encode('utf-8')).hexdigest()}"
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or not _SHA256_RE.fullmatch(value.removeprefix("sha256:"))
+    ):
+        raise KnowledgeValidationError("public game_profile must be a SHA-256 label")
+    return value
+
+
+def _finite_number(value: object, label: str) -> int | float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise KnowledgeValidationError(f"{label} must be a finite number")
+    return value
+
+
+def _public_dimensions(value: object) -> dict[str, Any]:
+    dimensions = _expect_dict(value, "observation_dimensions")
+    _expect_allowed_keys(dimensions, {"capture", "policy"}, "observation_dimensions")
+    result: dict[str, Any] = {}
+    allowed = {
+        "capture": {"height", "width", "frame_stack", "channels_per_frame"},
+        "policy": {"height", "width", "channels", "action_history_length"},
+    }
+    for section_name, section_value in dimensions.items():
+        if section_value is None and section_name == "policy":
+            result[section_name] = None
+            continue
+        section = _expect_dict(section_value, f"observation_dimensions.{section_name}")
+        _expect_allowed_keys(
+            section, allowed[section_name], f"observation_dimensions.{section_name}"
+        )
+        clean: dict[str, int] = {}
+        for name, raw in section.items():
+            if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+                raise KnowledgeValidationError(
+                    f"observation_dimensions.{section_name}.{name} must be non-negative integer"
+                )
+            clean[name] = raw
+        result[section_name] = clean
+    return result
+
+
+def _public_route_memory(value: object, *, from_manifest: bool) -> dict[str, Any]:
+    route = _expect_dict(value, "task_contract.route_memory")
+    allowed = {
+        "enabled",
+        "config",
+    }
+    _expect_allowed_keys(route, allowed, "task_contract.route_memory")
+    if not isinstance(route.get("enabled"), bool):
+        raise KnowledgeValidationError("task_contract.route_memory.enabled must be boolean")
+    config = _expect_dict(route.get("config"), "task_contract.route_memory.config")
+    config_keys = {
+        "schema_version",
+        "inputs",
+        *_ROUTE_LITERAL_FIELDS,
+        "privileged_state",
+        "match_distance",
+        "scope",
+    }
+    _expect_allowed_keys(config, config_keys, "task_contract.route_memory.config")
+    result_config: dict[str, Any] = {}
+    schema_version = config.get("schema_version")
+    if schema_version != 1:
+        raise KnowledgeValidationError("route memory schema_version must be 1")
+    result_config["schema_version"] = schema_version
+    inputs = config.get("inputs")
+    if inputs != ["pixel_scene_descriptor", "confirmed_stable_visual_regime_change"]:
+        raise KnowledgeValidationError("route memory inputs are not supported")
+    result_config["inputs"] = list(inputs)
+    for name, expected in _ROUTE_LITERAL_FIELDS.items():
+        if config.get(name) != expected:
+            raise KnowledgeValidationError(f"route memory {name} is not supported")
+        result_config[name] = expected
+    if config.get("privileged_state") != []:
+        raise KnowledgeValidationError("route memory privileged_state must be empty")
+    result_config["privileged_state"] = []
+    if "match_distance" in config:
+        result_config["match_distance"] = _finite_number(
+            config["match_distance"], "route memory match_distance"
+        )
+    if "scope" in config:
+        scope = _expect_dict(config["scope"], "route memory scope")
+        allowed_scope = {
+            "game_profile",
+            "save_source",
+            "save_slot",
+            "detector_signature",
+        }
+        # campaign_id is deliberately private: current runners use an absolute output path.
+        source_allowed = allowed_scope | ({"campaign_id"} if from_manifest else set())
+        _expect_allowed_keys(scope, source_allowed, "route memory scope")
+        clean_scope: dict[str, Any] = {}
+        for name in sorted(allowed_scope & set(scope)):
+            raw = scope[name]
+            if name == "save_slot":
+                if not isinstance(raw, int) or isinstance(raw, bool) or not 1 <= raw <= 4:
+                    raise KnowledgeValidationError("route memory save_slot must be in [1, 4]")
+                clean_scope[name] = raw
+            elif name == "save_source":
+                if raw not in {"new_game", "existing_save"}:
+                    raise KnowledgeValidationError("route memory save_source is not supported")
+                clean_scope[name] = raw
+            elif name == "game_profile":
+                clean_scope[name] = _public_game_profile(raw, from_manifest=from_manifest)
+            else:
+                if not isinstance(raw, str) or not _SHA256_RE.fullmatch(raw):
+                    raise KnowledgeValidationError(
+                        "route memory detector_signature must be a SHA-256"
+                    )
+                clean_scope[name] = raw
+        result_config["scope"] = clean_scope
+    return {"enabled": route["enabled"], "config": result_config}
+
+
+def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, Any]:
+    contract = _expect_dict(value, "task_contract")
+    _expect_allowed_keys(contract, _TASK_CONTRACT_KEYS, "task_contract")
+    required = {"reward_version", "action_names", "config"}
+    if not required <= set(contract):
+        raise KnowledgeValidationError("task_contract is missing required public fields")
+    result: dict[str, Any] = {}
+    if contract["reward_version"] not in _REWARD_VERSIONS:
+        raise KnowledgeValidationError("task_contract.reward_version is not supported")
+    result["reward_version"] = contract["reward_version"]
+    action_names = contract["action_names"]
+    if not isinstance(action_names, list) or not all(
+        name in _ACTION_NAMES for name in action_names
+    ):
+        raise KnowledgeValidationError("task_contract.action_names contains unsupported actions")
+    result["action_names"] = list(action_names)
+    if "raw_action_indices" in contract:
+        indices = contract["raw_action_indices"]
+        if not isinstance(indices, list) or not all(
+            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 127
+            for index in indices
+        ):
+            raise KnowledgeValidationError("task_contract.raw_action_indices is invalid")
+        result["raw_action_indices"] = list(indices)
+    if "actions" in contract:
+        actions = contract["actions"]
+        if not isinstance(actions, list) or len(actions) > len(_ACTION_NAMES):
+            raise KnowledgeValidationError("task_contract.actions must be a bounded list")
+        clean_actions: list[dict[str, Any]] = []
+        for index, raw in enumerate(actions):
+            action = _expect_dict(raw, f"task_contract.actions[{index}]")
+            _expect_exact_keys(
+                action,
+                {"name", "buttons", "raw_action_index", "duration", "lease_ms", "release_after"},
+                f"task_contract.actions[{index}]",
+            )
+            if action["name"] not in _ACTION_NAMES:
+                raise KnowledgeValidationError("task_contract action name is unsupported")
+            buttons = action["buttons"]
+            if not isinstance(buttons, list) or not all(button in _BUTTONS for button in buttons):
+                raise KnowledgeValidationError("task_contract action buttons are unsupported")
+            raw_index, lease_ms = action["raw_action_index"], action["lease_ms"]
+            if (
+                not isinstance(raw_index, int)
+                or isinstance(raw_index, bool)
+                or not 0 <= raw_index <= 127
+            ):
+                raise KnowledgeValidationError("task_contract action index is invalid")
+            if (
+                not isinstance(lease_ms, int)
+                or isinstance(lease_ms, bool)
+                or not 1 <= lease_ms <= 2_000
+            ):
+                raise KnowledgeValidationError("task_contract action lease is invalid")
+            if action["duration"] not in _DURATIONS or action["release_after"] is not True:
+                raise KnowledgeValidationError("task_contract action timing is unsupported")
+            clean_actions.append(dict(action))
+        result["actions"] = clean_actions
+    config = _expect_dict(contract["config"], "task_contract.config")
+    _expect_allowed_keys(config, _TASK_CONFIG_KEYS, "task_contract.config")
+    clean_config: dict[str, Any] = {}
+    for name, raw in config.items():
+        if raw is None and name == "horizon_steps":
+            clean_config[name] = None
+        elif isinstance(raw, bool):
+            clean_config[name] = raw
+        else:
+            clean_config[name] = _finite_number(raw, f"task_contract.config.{name}")
+    result["config"] = clean_config
+    list_fields = {
+        "information_boundary": _INFORMATION_BOUNDARY,
+        "reward_only_signals": _REWARD_ONLY_SIGNALS,
+        "detector_inputs": _DETECTOR_INPUTS,
+    }
+    for name, allowed_values in list_fields.items():
+        if name not in contract:
+            continue
+        raw = contract[name]
+        if not isinstance(raw, list) or not all(item in allowed_values for item in raw):
+            raise KnowledgeValidationError(f"task_contract.{name} contains unsupported values")
+        result[name] = list(raw)
+    if "privileged_state" in contract:
+        if contract["privileged_state"] != []:
+            raise KnowledgeValidationError("task_contract.privileged_state must be empty")
+        result["privileged_state"] = []
+    if "route_memory" in contract:
+        result["route_memory"] = _public_route_memory(
+            contract["route_memory"], from_manifest=from_manifest
+        )
+    if "diagnostic_training" in contract:
+        if not isinstance(contract["diagnostic_training"], bool):
+            raise KnowledgeValidationError("task_contract.diagnostic_training must be boolean")
+        result["diagnostic_training"] = contract["diagnostic_training"]
+    if "claim" in contract:
+        if contract["claim"] not in _CLAIMS:
+            raise KnowledgeValidationError("task_contract.claim is not an approved public claim")
+        result["claim"] = contract["claim"]
+    return result
+
+
+def _portable_origin(provenance: Mapping[str, Any], *, from_manifest: bool) -> dict[str, Any]:
     raw = provenance.get("campaign_origin", {})
     if not isinstance(raw, dict):
         return {}
+    allowed_source_keys = {
+        "schema_version",
+        "save_source",
+        "save_slot",
+        "save_file_name",
+        "base_plan_path",
+        "resolved_plan_id",
+        "resolved_plan_sha256",
+        "resolved_steps",
+        "subsequent_episode_bootstrap",
+    }
+    public_keys = allowed_source_keys - {"save_slot", "save_file_name", "base_plan_path"}
+    _expect_allowed_keys(
+        raw,
+        allowed_source_keys if from_manifest else public_keys,
+        "campaign_origin",
+    )
     result: dict[str, Any] = {}
-    for key in ("schema_version", "save_source", "resolved_plan_id", "resolved_plan_sha256"):
-        value = raw.get(key)
-        if isinstance(value, (str, int)) and not isinstance(value, bool):
-            result[key] = value
+    if "schema_version" in raw:
+        if raw["schema_version"] != 1:
+            raise KnowledgeValidationError("campaign_origin.schema_version must be 1")
+        result["schema_version"] = 1
+    if "save_source" in raw:
+        if raw["save_source"] not in {"new_game", "existing_save"}:
+            raise KnowledgeValidationError("campaign_origin.save_source is not supported")
+        result["save_source"] = raw["save_source"]
+    # Plan identifiers and step labels are local, human-authored strings. Their
+    # content is never public; the canonical plan hash carries the semantics.
+    if "resolved_plan_sha256" in raw:
+        digest = raw["resolved_plan_sha256"]
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise KnowledgeValidationError("campaign_origin.resolved_plan_sha256 is invalid")
+        result["resolved_plan_sha256"] = digest
     steps = raw.get("resolved_steps")
-    if isinstance(steps, list):
+    if steps is not None:
+        if not isinstance(steps, list) or len(steps) > 64:
+            raise KnowledgeValidationError("campaign_origin.resolved_steps must be a bounded list")
         clean_steps: list[dict[str, Any]] = []
-        for step in steps:
-            if not isinstance(step, dict):
-                continue
-            clean = {
-                key: step[key]
-                for key in ("button", "lease_ms", "settle_seconds", "label")
-                if key in step and isinstance(step[key], (str, int, float))
-            }
+        for index, step_value in enumerate(steps):
+            step = _expect_dict(step_value, f"campaign_origin.resolved_steps[{index}]")
+            allowed_step_keys = {"button", "lease_ms", "settle_seconds"}
+            _expect_allowed_keys(
+                step,
+                allowed_step_keys | ({"label"} if from_manifest else set()),
+                f"campaign_origin.resolved_steps[{index}]",
+            )
+            if "button" not in step:
+                raise KnowledgeValidationError("campaign origin step is missing its button")
+            button = step["button"]
+            if not isinstance(button, str) or button not in _BUTTONS | {"SUBMIT", "CANCEL"}:
+                raise KnowledgeValidationError("campaign origin step button is unsupported")
+            clean: dict[str, Any] = {"button": button}
+            if "lease_ms" in step:
+                lease_ms = step["lease_ms"]
+                if (
+                    not isinstance(lease_ms, int)
+                    or isinstance(lease_ms, bool)
+                    or not 1 <= lease_ms <= 2_000
+                ):
+                    raise KnowledgeValidationError("campaign origin step lease is invalid")
+                clean["lease_ms"] = lease_ms
+            if "settle_seconds" in step:
+                settle = _finite_number(step["settle_seconds"], "campaign origin settle_seconds")
+                if not 0 <= settle <= 120:
+                    raise KnowledgeValidationError(
+                        "campaign origin settle_seconds is outside safe range"
+                    )
+                clean["settle_seconds"] = settle
             clean_steps.append(clean)
         result["resolved_steps"] = clean_steps
     subsequent = raw.get("subsequent_episode_bootstrap")
-    if isinstance(subsequent, dict):
-        result["subsequent_episode_bootstrap"] = _portable_origin({"campaign_origin": subsequent})
+    if subsequent is not None:
+        if not isinstance(subsequent, dict):
+            raise KnowledgeValidationError("subsequent campaign bootstrap must be an object")
+        result["subsequent_episode_bootstrap"] = _portable_origin(
+            {"campaign_origin": subsequent}, from_manifest=from_manifest
+        )
     return result
 
 
@@ -134,16 +547,28 @@ def _fingerprint_from_portable_parts(
 def portable_compatibility_fingerprint(
     task_contract: Mapping[str, Any], provenance: Mapping[str, Any]
 ) -> str:
-    """Hash only cross-machine semantics, never absolute paths or save/screen data."""
+    """Hash cross-machine semantics without publishing the supplied contract.
 
-    dimensions = provenance.get("observation_dimensions", {})
-    if not isinstance(dimensions, dict):
-        dimensions = {}
+    Training tasks may use private or experimental contracts that are not eligible for
+    the public registry. They still need a stable local resume fingerprint. Publication
+    applies the closed schema separately in :func:`contribution_from_manifest`.
+    """
+
+    dimensions = _public_dimensions(provenance.get("observation_dimensions", {}))
     game_profile = provenance.get("game_profile")
+    clean_profile = (
+        _public_game_profile(game_profile, from_manifest=True) if game_profile is not None else None
+    )
+    try:
+        fingerprint_contract: Mapping[str, Any] = _public_task_contract(
+            task_contract, from_manifest=True
+        )
+    except KnowledgeValidationError:
+        fingerprint_contract = task_contract
     return _fingerprint_from_portable_parts(
-        task_contract,
-        game_profile=game_profile if isinstance(game_profile, str) else None,
-        campaign_origin=_portable_origin(provenance),
+        fingerprint_contract,
+        game_profile=clean_profile,
+        campaign_origin=_portable_origin(provenance, from_manifest=True),
         source_hashes=_portable_source_hashes(provenance),
         observation_dimensions=dimensions,
     )
@@ -152,7 +577,7 @@ def portable_compatibility_fingerprint(
 def contribution_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Create a public, allowlisted summary from a private training manifest."""
 
-    task_contract = _expect_dict(manifest.get("task_contract"), "manifest.task_contract")
+    task_contract = _public_task_contract(manifest.get("task_contract"), from_manifest=True)
     provenance = _expect_dict(manifest.get("provenance"), "manifest.provenance")
     checkpoints: list[dict[str, Any]] = []
     for checkpoint in manifest.get("checkpoints", []):
@@ -167,15 +592,27 @@ def contribution_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         ):
             checkpoints.append({"step": step, "sha256": digest})
 
-    versions = manifest.get("versions", {})
-    clean_versions = (
-        {str(key): value for key, value in versions.items() if isinstance(value, str)}
-        if isinstance(versions, dict)
-        else {}
+    versions = _expect_dict(manifest.get("versions", {}), "manifest.versions")
+    _expect_allowed_keys(versions, _VERSION_KEYS, "manifest.versions")
+    # Version values are intentionally not published. They are arbitrary strings
+    # supplied by the local runtime and are not part of compatibility semantics.
+    clean_versions: dict[str, str] = {}
+    game_profile = provenance.get("game_profile")
+    clean_profile = (
+        _public_game_profile(game_profile, from_manifest=True) if game_profile is not None else None
     )
+    dimensions = _public_dimensions(provenance.get("observation_dimensions", {}))
+    campaign_origin = _portable_origin(provenance, from_manifest=True)
+    source_hashes = _portable_source_hashes(provenance)
     body: dict[str, Any] = {
         "schema_version": KNOWLEDGE_SCHEMA_VERSION,
-        "compatibility_fingerprint": portable_compatibility_fingerprint(task_contract, provenance),
+        "compatibility_fingerprint": _fingerprint_from_portable_parts(
+            task_contract,
+            game_profile=clean_profile,
+            campaign_origin=campaign_origin,
+            source_hashes=source_hashes,
+            observation_dimensions=dimensions,
+        ),
         "training": {
             "algorithm": manifest.get("algorithm"),
             "seed": manifest.get("seed"),
@@ -188,10 +625,10 @@ def contribution_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         },
         "task_contract": task_contract,
         "portable_provenance": {
-            "game_profile": provenance.get("game_profile"),
-            "campaign_origin": _portable_origin(provenance),
-            "observation_dimensions": provenance.get("observation_dimensions", {}),
-            "source_hashes": _portable_source_hashes(provenance),
+            "game_profile": clean_profile,
+            "campaign_origin": campaign_origin,
+            "observation_dimensions": dimensions,
+            "source_hashes": source_hashes,
         },
         "versions": clean_versions,
         "checkpoint_fingerprints": sorted(checkpoints, key=lambda item: item["step"]),
@@ -225,9 +662,12 @@ def validate_contribution(value: object) -> dict[str, Any]:
             raise KnowledgeValidationError(f"contribution.{key} must be lowercase SHA-256")
     training = _expect_dict(contribution["training"], "contribution.training")
     _expect_exact_keys(training, _TRAINING_KEYS, "contribution.training")
-    for key in ("algorithm", "reward_version", "status"):
-        if not isinstance(training[key], str):
-            raise KnowledgeValidationError(f"training.{key} must be a string")
+    if training["algorithm"] != "PPO":
+        raise KnowledgeValidationError("training.algorithm is not supported")
+    if training["reward_version"] not in _REWARD_VERSIONS:
+        raise KnowledgeValidationError("training.reward_version is not supported")
+    if training["status"] not in {"RUNNING", "COMPLETED", "CANCELLED", "FAILED"}:
+        raise KnowledgeValidationError("training.status is not supported")
     for key in (
         "seed",
         "completed_timesteps",
@@ -238,6 +678,10 @@ def validate_contribution(value: object) -> dict[str, Any]:
         if not isinstance(training[key], int) or isinstance(training[key], bool):
             raise KnowledgeValidationError(f"training.{key} must be an integer")
     task_contract = _expect_dict(contribution["task_contract"], "contribution.task_contract")
+    if _public_task_contract(task_contract, from_manifest=False) != task_contract:
+        raise KnowledgeValidationError("task_contract is not in canonical public form")
+    if training["reward_version"] != task_contract["reward_version"]:
+        raise KnowledgeValidationError("training and task reward versions differ")
     portable = _expect_dict(contribution["portable_provenance"], "portable_provenance")
     _expect_exact_keys(
         portable,
@@ -245,12 +689,16 @@ def validate_contribution(value: object) -> dict[str, Any]:
         "portable_provenance",
     )
     game_profile = portable["game_profile"]
-    if game_profile is not None and not isinstance(game_profile, str):
-        raise KnowledgeValidationError("portable_provenance.game_profile must be a string or null")
+    if game_profile is not None:
+        _public_game_profile(game_profile, from_manifest=False)
     origin = _expect_dict(portable["campaign_origin"], "portable_provenance.campaign_origin")
+    if _portable_origin({"campaign_origin": origin}, from_manifest=False) != origin:
+        raise KnowledgeValidationError("campaign_origin is not in canonical public form")
     dimensions = _expect_dict(
         portable["observation_dimensions"], "portable_provenance.observation_dimensions"
     )
+    if _public_dimensions(dimensions) != dimensions:
+        raise KnowledgeValidationError("observation_dimensions is not in canonical public form")
     source_hashes = _expect_dict(portable["source_hashes"], "portable_provenance.source_hashes")
     for name, digest in source_hashes.items():
         if name not in _SEMANTIC_FILE_HASHES:
@@ -258,8 +706,8 @@ def validate_contribution(value: object) -> dict[str, Any]:
         if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
             raise KnowledgeValidationError("portable source hash is invalid")
     versions = _expect_dict(contribution["versions"], "contribution.versions")
-    if not all(isinstance(value, str) for value in versions.values()):
-        raise KnowledgeValidationError("contribution versions must be strings")
+    if versions:
+        raise KnowledgeValidationError("public contribution versions must be empty")
     expected_fingerprint = _fingerprint_from_portable_parts(
         task_contract,
         game_profile=game_profile,
@@ -277,8 +725,12 @@ def validate_contribution(value: object) -> dict[str, Any]:
     for item in fingerprints:
         record = _expect_dict(item, "checkpoint fingerprint")
         _expect_exact_keys(record, {"step", "sha256"}, "checkpoint fingerprint")
-        if not isinstance(record["step"], int) or isinstance(record["step"], bool):
-            raise KnowledgeValidationError("checkpoint step must be an integer")
+        if (
+            not isinstance(record["step"], int)
+            or isinstance(record["step"], bool)
+            or record["step"] < 0
+        ):
+            raise KnowledgeValidationError("checkpoint step must be a non-negative integer")
         if not isinstance(record["sha256"], str) or not _SHA256_RE.fullmatch(record["sha256"]):
             raise KnowledgeValidationError("checkpoint sha256 is invalid")
     body = dict(contribution)
