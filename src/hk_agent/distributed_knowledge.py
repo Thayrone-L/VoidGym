@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import subprocess
 from collections.abc import Mapping
@@ -726,7 +727,7 @@ def _git_show(repo: Path, ref: str, path: str) -> bytes:
         raise KnowledgeValidationError("unsafe knowledge path")
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo.resolve()), "show", f"{ref}:{path}"],
+            [_git_executable(), "-C", str(repo.resolve()), "show", f"{ref}:{path}"],
             check=False,
             capture_output=True,
             timeout=10,
@@ -739,6 +740,21 @@ def _git_show(repo: Path, ref: str, path: str) -> bytes:
     if len(result.stdout) > MAX_DOCUMENT_BYTES:
         raise KnowledgeValidationError(f"Git knowledge document exceeds size limit: {path}")
     return result.stdout
+
+
+def _git_executable() -> str:
+    override = os.environ.get("VOIDGYM_GIT_EXE")
+    if override:
+        candidate = Path(override).resolve(strict=False)
+        if not candidate.is_file():
+            raise KnowledgeValidationError("VOIDGYM_GIT_EXE is not a regular file")
+        return str(candidate)
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        git_for_windows = program_files / "Git" / "cmd" / "git.exe"
+        if git_for_windows.is_file():
+            return str(git_for_windows)
+    return "git"
 
 
 def sync_from_git_ref(repo: Path, ref: str, knowledge_root: Path) -> dict[str, Any]:
