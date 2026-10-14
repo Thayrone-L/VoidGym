@@ -8,10 +8,16 @@ import pytest
 
 from hk_agent.distributed_knowledge import (
     KnowledgeValidationError,
+    candidate_from_contribution,
+    canonical_document_sha256,
     contribution_from_manifest,
     export_contribution,
+    initial_champion,
     portable_compatibility_fingerprint,
+    promote_candidate,
     sync_from_git_ref,
+    validate_candidate,
+    validate_champion,
     validate_knowledge_tree,
 )
 
@@ -41,9 +47,7 @@ def _manifest(root: str = r"C:\Users\alice\project") -> dict[str, Any]:
                 "base_plan_path": f"{root}\\configs\\plan.json",
                 "resolved_plan_id": "continue-v1",
                 "resolved_plan_sha256": "a" * 64,
-                "resolved_steps": [
-                    {"button": "SUBMIT", "lease_ms": 50, "settle_seconds": 2.0}
-                ],
+                "resolved_steps": [{"button": "SUBMIT", "lease_ms": 50, "settle_seconds": 2.0}],
                 "subsequent_episode_bootstrap": {
                     "schema_version": 1,
                     "save_source": "existing_save",
@@ -125,6 +129,98 @@ def test_contribution_rejects_tampering() -> None:
         validate_contribution(contribution)
 
 
+def _candidate(champion: dict[str, Any] | None = None) -> dict[str, Any]:
+    parent = champion or initial_champion()
+    return candidate_from_contribution(
+        contribution_from_manifest(_manifest()),
+        worker_id="machine-1",
+        artifact_uri="https://github.com/example/VoidGym/releases/download/run-1/model.zip",
+        artifact_sha256="9" * 64,
+        artifact_size_bytes=123_456,
+        artifact_format="sb3-zip",
+        trust_tier="owned",
+        parent_generation=parent["generation"],
+        parent_sha256=canonical_document_sha256(parent),
+    )
+
+
+def test_candidate_is_closed_content_addressed_and_https_only() -> None:
+    candidate = _candidate()
+    assert validate_candidate(candidate) == candidate
+
+    tampered = dict(candidate)
+    tampered["worker_id"] = "other-machine"
+    with pytest.raises(KnowledgeValidationError, match="candidate_id"):
+        validate_candidate(tampered)
+
+    with pytest.raises(KnowledgeValidationError, match="HTTPS"):
+        candidate_from_contribution(
+            contribution_from_manifest(_manifest()),
+            worker_id="machine-1",
+            artifact_uri="https://example.test/model.zip?token=secret",
+            artifact_sha256="9" * 64,
+            artifact_size_bytes=123,
+            artifact_format="sb3-zip",
+            trust_tier="owned",
+            parent_generation=0,
+            parent_sha256=canonical_document_sha256(initial_champion()),
+        )
+
+
+def test_champion_promotion_uses_cas_lineage_and_is_idempotent() -> None:
+    champion = initial_champion()
+    candidate = _candidate(champion)
+    champion_sha = canonical_document_sha256(champion)
+    promoted = promote_candidate(
+        champion,
+        candidate,
+        expected_generation=0,
+        expected_champion_sha256=champion_sha,
+        evaluation_report_sha256="8" * 64,
+        evaluation_suite_sha256="6" * 64,
+        evaluator_commit="7" * 40,
+    )
+    assert validate_champion(promoted)["generation"] == 1
+    assert promoted["parent_champion_sha256"] == champion_sha
+    assert (
+        promote_candidate(
+            promoted,
+            candidate,
+            expected_generation=0,
+            expected_champion_sha256=champion_sha,
+            evaluation_report_sha256="8" * 64,
+            evaluation_suite_sha256="6" * 64,
+            evaluator_commit="7" * 40,
+        )
+        == promoted
+    )
+    with pytest.raises(KnowledgeValidationError, match="evidence differs"):
+        promote_candidate(
+            promoted,
+            candidate,
+            expected_generation=0,
+            expected_champion_sha256=champion_sha,
+            evaluation_report_sha256="5" * 64,
+            evaluation_suite_sha256="6" * 64,
+            evaluator_commit="7" * 40,
+        )
+
+
+def test_champion_promotion_rejects_stale_or_incompatible_candidate() -> None:
+    champion = initial_champion()
+    candidate = _candidate(champion)
+    with pytest.raises(KnowledgeValidationError, match="compare-and-swap"):
+        promote_candidate(
+            champion,
+            candidate,
+            expected_generation=1,
+            expected_champion_sha256=canonical_document_sha256(champion),
+            evaluation_report_sha256="8" * 64,
+            evaluation_suite_sha256="6" * 64,
+            evaluator_commit="7" * 40,
+        )
+
+
 def test_sync_reads_validated_git_ref_without_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -132,6 +228,7 @@ def test_sync_reads_validated_git_ref_without_checkout(
     _write_manifest(manifest_path)
     source = tmp_path / "source" / "knowledge"
     export_contribution(manifest_path, source)
+    (source / "champion.json").write_text(json.dumps(initial_champion()), encoding="utf-8")
     calls: list[str] = []
 
     def fake_git_show(repo: Path, ref: str, path: str) -> bytes:
@@ -146,9 +243,19 @@ def test_sync_reads_validated_git_ref_without_checkout(
     destination = tmp_path / "consumer" / "knowledge"
     report = sync_from_git_ref(tmp_path, "knowledge", destination)
 
-    assert report == {"imported": 1, "total": 1, "ref": "knowledge"}
+    assert report == {
+        "imported": 1,
+        "total": 1,
+        "ref": "knowledge",
+        "champion_generation": 0,
+        "champion_sha256": canonical_document_sha256(initial_champion()),
+    }
     assert calls[0] == "knowledge/index.json"
-    assert all(path == "knowledge/index.json" or path.startswith("knowledge/contributions/") for path in calls)
+    assert all(
+        path in {"knowledge/index.json", "knowledge/champion.json"}
+        or path.startswith("knowledge/contributions/")
+        for path in calls
+    )
     validate_knowledge_tree(destination)
 
 

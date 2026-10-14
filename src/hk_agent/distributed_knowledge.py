@@ -5,12 +5,14 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 KNOWLEDGE_SCHEMA_VERSION = 1
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json$")
+_WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SEMANTIC_FILE_HASHES = frozenset(
     {
         "game_executable",
@@ -36,6 +38,12 @@ _TRAINING_KEYS = {
 
 class KnowledgeValidationError(ValueError):
     """Raised when public knowledge does not satisfy the closed schema."""
+
+
+def canonical_document_sha256(value: object) -> str:
+    """Return the stable digest used for registry compare-and-swap operations."""
+
+    return _sha256_json(value)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -85,9 +93,7 @@ def _portable_origin(provenance: Mapping[str, Any]) -> dict[str, Any]:
         result["resolved_steps"] = clean_steps
     subsequent = raw.get("subsequent_episode_bootstrap")
     if isinstance(subsequent, dict):
-        result["subsequent_episode_bootstrap"] = _portable_origin(
-            {"campaign_origin": subsequent}
-        )
+        result["subsequent_episode_bootstrap"] = _portable_origin({"campaign_origin": subsequent})
     return result
 
 
@@ -168,9 +174,7 @@ def contribution_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     )
     body: dict[str, Any] = {
         "schema_version": KNOWLEDGE_SCHEMA_VERSION,
-        "compatibility_fingerprint": portable_compatibility_fingerprint(
-            task_contract, provenance
-        ),
+        "compatibility_fingerprint": portable_compatibility_fingerprint(task_contract, provenance),
         "training": {
             "algorithm": manifest.get("algorithm"),
             "seed": manifest.get("seed"),
@@ -263,7 +267,9 @@ def validate_contribution(value: object) -> dict[str, Any]:
         observation_dimensions=dimensions,
     )
     if contribution["compatibility_fingerprint"] != expected_fingerprint:
-        raise KnowledgeValidationError("compatibility_fingerprint does not match portable semantics")
+        raise KnowledgeValidationError(
+            "compatibility_fingerprint does not match portable semantics"
+        )
     fingerprints = contribution["checkpoint_fingerprints"]
     if not isinstance(fingerprints, list):
         raise KnowledgeValidationError("checkpoint_fingerprints must be a list")
@@ -280,7 +286,9 @@ def validate_contribution(value: object) -> dict[str, Any]:
         raise KnowledgeValidationError("contribution_id does not match canonical content")
     forbidden = re.compile(r'(?i)([a-z]:\\|/users/|\\users\\|\.png|\.dat(?:\b|\.)|"path"\s*:)')
     if forbidden.search(_canonical_bytes(contribution).decode("utf-8")):
-        raise KnowledgeValidationError("contribution contains a local path, save, or screen reference")
+        raise KnowledgeValidationError(
+            "contribution contains a local path, save, or screen reference"
+        )
     return contribution
 
 
@@ -317,6 +325,261 @@ def validate_index(value: object) -> dict[str, Any]:
     return index
 
 
+def _validate_artifact(value: object, label: str = "artifact") -> dict[str, Any]:
+    artifact = _expect_dict(value, label)
+    _expect_exact_keys(artifact, {"uri", "sha256", "size_bytes", "format"}, label)
+    uri = artifact["uri"]
+    if not isinstance(uri, str) or len(uri) > 2_048:
+        raise KnowledgeValidationError(f"{label}.uri must be an HTTPS URL")
+    parsed = urlsplit(uri)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise KnowledgeValidationError(
+            f"{label}.uri must be HTTPS without credentials, query, or fragment"
+        )
+    digest = artifact["sha256"]
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        raise KnowledgeValidationError(f"{label}.sha256 must be lowercase SHA-256")
+    size = artifact["size_bytes"]
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= 2 * 1024**3:
+        raise KnowledgeValidationError(f"{label}.size_bytes must be between 1 and 2 GiB")
+    if artifact["format"] not in {"sb3-zip", "safetensors"}:
+        raise KnowledgeValidationError(f"{label}.format is not supported")
+    return artifact
+
+
+def _validate_parent_champion(value: object) -> dict[str, Any]:
+    parent = _expect_dict(value, "candidate.parent_champion")
+    _expect_exact_keys(parent, {"generation", "sha256"}, "candidate.parent_champion")
+    generation = parent["generation"]
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise KnowledgeValidationError("candidate parent generation must be non-negative")
+    digest = parent["sha256"]
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        raise KnowledgeValidationError("candidate parent sha256 must be lowercase SHA-256")
+    return parent
+
+
+def candidate_from_contribution(
+    contribution: Mapping[str, Any],
+    *,
+    worker_id: str,
+    artifact_uri: str,
+    artifact_sha256: str,
+    artifact_size_bytes: int,
+    artifact_format: str,
+    trust_tier: str,
+    parent_generation: int,
+    parent_sha256: str,
+) -> dict[str, Any]:
+    """Build a content-addressed candidate without reading its model artifact."""
+
+    clean_contribution = validate_contribution(dict(contribution))
+    body: dict[str, Any] = {
+        "schema_version": KNOWLEDGE_SCHEMA_VERSION,
+        "worker_id": worker_id,
+        "trust_tier": trust_tier,
+        "contribution_id": clean_contribution["contribution_id"],
+        "compatibility_fingerprint": clean_contribution["compatibility_fingerprint"],
+        "parent_champion": {"generation": parent_generation, "sha256": parent_sha256},
+        "artifact": {
+            "uri": artifact_uri,
+            "sha256": artifact_sha256,
+            "size_bytes": artifact_size_bytes,
+            "format": artifact_format,
+        },
+    }
+    candidate = {"candidate_id": _sha256_json(body), **body}
+    return validate_candidate(candidate)
+
+
+def validate_candidate(value: object) -> dict[str, Any]:
+    candidate = _expect_dict(value, "candidate")
+    _expect_exact_keys(
+        candidate,
+        {
+            "candidate_id",
+            "schema_version",
+            "worker_id",
+            "trust_tier",
+            "contribution_id",
+            "compatibility_fingerprint",
+            "parent_champion",
+            "artifact",
+        },
+        "candidate",
+    )
+    if candidate["schema_version"] != KNOWLEDGE_SCHEMA_VERSION:
+        raise KnowledgeValidationError("unsupported candidate schema_version")
+    worker_id = candidate["worker_id"]
+    if not isinstance(worker_id, str) or not _WORKER_ID_RE.fullmatch(worker_id):
+        raise KnowledgeValidationError("candidate.worker_id is not a safe public identifier")
+    if candidate["trust_tier"] not in {"owned", "quarantined", "external-untrusted"}:
+        raise KnowledgeValidationError("candidate.trust_tier is not supported")
+    for key in ("candidate_id", "contribution_id", "compatibility_fingerprint"):
+        if not isinstance(candidate[key], str) or not _SHA256_RE.fullmatch(candidate[key]):
+            raise KnowledgeValidationError(f"candidate.{key} must be lowercase SHA-256")
+    _validate_parent_champion(candidate["parent_champion"])
+    _validate_artifact(candidate["artifact"], "candidate.artifact")
+    body = dict(candidate)
+    claimed_id = body.pop("candidate_id")
+    if _sha256_json(body) != claimed_id:
+        raise KnowledgeValidationError("candidate_id does not match canonical content")
+    return candidate
+
+
+def initial_champion() -> dict[str, Any]:
+    return {
+        "schema_version": KNOWLEDGE_SCHEMA_VERSION,
+        "generation": 0,
+        "candidate_id": None,
+        "contribution_id": None,
+        "compatibility_fingerprint": None,
+        "artifact": None,
+        "parent_champion_sha256": None,
+        "evaluation": None,
+    }
+
+
+def validate_champion(value: object) -> dict[str, Any]:
+    champion = _expect_dict(value, "champion")
+    keys = {
+        "schema_version",
+        "generation",
+        "candidate_id",
+        "contribution_id",
+        "compatibility_fingerprint",
+        "artifact",
+        "parent_champion_sha256",
+        "evaluation",
+    }
+    _expect_exact_keys(champion, keys, "champion")
+    if champion["schema_version"] != KNOWLEDGE_SCHEMA_VERSION:
+        raise KnowledgeValidationError("unsupported champion schema_version")
+    generation = champion["generation"]
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise KnowledgeValidationError("champion.generation must be non-negative")
+    nullable_hashes = (
+        "candidate_id",
+        "contribution_id",
+        "compatibility_fingerprint",
+        "parent_champion_sha256",
+    )
+    for key in nullable_hashes:
+        item = champion[key]
+        if item is not None and (not isinstance(item, str) or not _SHA256_RE.fullmatch(item)):
+            raise KnowledgeValidationError(f"champion.{key} must be null or lowercase SHA-256")
+    if generation == 0:
+        if champion != initial_champion():
+            raise KnowledgeValidationError("generation-zero champion must be canonical and empty")
+    else:
+        if any(champion[key] is None for key in nullable_hashes) or champion["artifact"] is None:
+            raise KnowledgeValidationError("promoted champion fields cannot be null")
+        _validate_artifact(champion["artifact"], "champion.artifact")
+        evaluation = _expect_dict(champion["evaluation"], "champion.evaluation")
+        _expect_exact_keys(
+            evaluation,
+            {
+                "report_sha256",
+                "suite_sha256",
+                "policy_sha256",
+                "candidate_id",
+                "parent_champion_sha256",
+                "evaluator_commit",
+            },
+            "champion.evaluation",
+        )
+        for key in (
+            "report_sha256",
+            "suite_sha256",
+            "policy_sha256",
+            "candidate_id",
+            "parent_champion_sha256",
+        ):
+            if not isinstance(evaluation[key], str) or not _SHA256_RE.fullmatch(evaluation[key]):
+                raise KnowledgeValidationError(f"champion evaluation {key} is invalid")
+        commit = evaluation["evaluator_commit"]
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise KnowledgeValidationError("champion evaluator_commit must be a full Git SHA-1")
+        if evaluation["policy_sha256"] != champion["artifact"]["sha256"]:
+            raise KnowledgeValidationError(
+                "champion evaluation policy hash does not match artifact"
+            )
+        if evaluation["candidate_id"] != champion["candidate_id"]:
+            raise KnowledgeValidationError("champion evaluation candidate binding differs")
+        if evaluation["parent_champion_sha256"] != champion["parent_champion_sha256"]:
+            raise KnowledgeValidationError("champion evaluation parent binding differs")
+    return champion
+
+
+def promote_candidate(
+    champion: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    expected_generation: int,
+    expected_champion_sha256: str,
+    evaluation_report_sha256: str,
+    evaluation_suite_sha256: str,
+    evaluator_commit: str,
+) -> dict[str, Any]:
+    """Promote locally using generation+digest CAS; never read candidate model bytes."""
+
+    current = validate_champion(dict(champion))
+    clean_candidate = validate_candidate(dict(candidate))
+    current_sha256 = canonical_document_sha256(current)
+    parent = clean_candidate["parent_champion"]
+    if (
+        current["candidate_id"] == clean_candidate["candidate_id"]
+        and current["generation"] == parent["generation"] + 1
+        and current["parent_champion_sha256"] == parent["sha256"]
+    ):
+        evaluation = current.get("evaluation")
+        if not isinstance(evaluation, Mapping) or (
+            evaluation.get("report_sha256") != evaluation_report_sha256
+            or evaluation.get("suite_sha256") != evaluation_suite_sha256
+            or evaluation.get("evaluator_commit") != evaluator_commit
+        ):
+            raise KnowledgeValidationError(
+                "idempotent promotion evidence differs from the promoted champion"
+            )
+        return current
+    if expected_generation != current["generation"] or expected_champion_sha256 != current_sha256:
+        raise KnowledgeValidationError("champion compare-and-swap precondition failed")
+    if parent["generation"] != current["generation"] or parent["sha256"] != current_sha256:
+        raise KnowledgeValidationError("candidate was not trained from the current champion")
+    current_fingerprint = current["compatibility_fingerprint"]
+    if current_fingerprint is not None and (
+        clean_candidate["compatibility_fingerprint"] != current_fingerprint
+    ):
+        raise KnowledgeValidationError("candidate is incompatible with the current champion")
+    if clean_candidate["trust_tier"] == "external-untrusted":
+        raise KnowledgeValidationError("external-untrusted candidate must be quarantined first")
+    promoted = {
+        "schema_version": KNOWLEDGE_SCHEMA_VERSION,
+        "generation": current["generation"] + 1,
+        "candidate_id": clean_candidate["candidate_id"],
+        "contribution_id": clean_candidate["contribution_id"],
+        "compatibility_fingerprint": clean_candidate["compatibility_fingerprint"],
+        "artifact": dict(clean_candidate["artifact"]),
+        "parent_champion_sha256": current_sha256,
+        "evaluation": {
+            "report_sha256": evaluation_report_sha256,
+            "suite_sha256": evaluation_suite_sha256,
+            "policy_sha256": clean_candidate["artifact"]["sha256"],
+            "candidate_id": clean_candidate["candidate_id"],
+            "parent_champion_sha256": current_sha256,
+            "evaluator_commit": evaluator_commit,
+        },
+    }
+    return validate_champion(promoted)
+
+
 def _load_json(path: Path) -> object:
     if not path.is_file() or path.is_symlink():
         raise KnowledgeValidationError(f"expected a regular JSON file: {path}")
@@ -341,6 +604,9 @@ def validate_knowledge_tree(root: Path) -> dict[str, Any]:
             raise KnowledgeValidationError("index and contribution fingerprints differ")
         if hashlib.sha256(_canonical_bytes(contribution)).hexdigest() != entry["sha256"]:
             raise KnowledgeValidationError("indexed contribution content hash differs")
+    champion_path = resolved / "champion.json"
+    if champion_path.exists():
+        validate_champion(_load_json(champion_path))
     return index
 
 
@@ -371,32 +637,102 @@ def export_contribution(manifest_path: Path, knowledge_root: Path) -> dict[str, 
         "sha256": hashlib.sha256(_canonical_bytes(contribution)).hexdigest(),
         "compatibility_fingerprint": contribution["compatibility_fingerprint"],
     }
-    retained = [item for item in index["contributions"] if item["contribution_id"] != contribution_id]
+    retained = [
+        item for item in index["contributions"] if item["contribution_id"] != contribution_id
+    ]
     index["contributions"] = sorted(retained + [entry], key=lambda item: item["contribution_id"])
     _atomic_json(index_path, index)
     validate_knowledge_tree(root)
     return entry
 
 
+def export_candidate(
+    contribution_path: Path,
+    output_root: Path,
+    *,
+    worker_id: str,
+    artifact_uri: str,
+    artifact_sha256: str,
+    artifact_size_bytes: int,
+    artifact_format: str,
+    trust_tier: str,
+    parent_generation: int,
+    parent_sha256: str,
+) -> dict[str, Any]:
+    contribution = _expect_dict(_load_json(contribution_path), "contribution")
+    candidate = candidate_from_contribution(
+        contribution,
+        worker_id=worker_id,
+        artifact_uri=artifact_uri,
+        artifact_sha256=artifact_sha256,
+        artifact_size_bytes=artifact_size_bytes,
+        artifact_format=artifact_format,
+        trust_tier=trust_tier,
+        parent_generation=parent_generation,
+        parent_sha256=parent_sha256,
+    )
+    output = output_root.resolve() / "outbox" / "candidates" / f"{candidate['candidate_id']}.json"
+    _atomic_json(output, candidate)
+    return {"candidate_id": candidate["candidate_id"], "path": str(output)}
+
+
+def validate_champion_file(path: Path) -> dict[str, Any]:
+    champion = validate_champion(_load_json(path))
+    return {
+        "generation": champion["generation"],
+        "sha256": canonical_document_sha256(champion),
+        "candidate_id": champion["candidate_id"],
+    }
+
+
+def promote_candidate_file(
+    champion_path: Path,
+    candidate_path: Path,
+    *,
+    expected_generation: int,
+    expected_champion_sha256: str,
+    evaluation_report_sha256: str,
+    evaluation_suite_sha256: str,
+    evaluator_commit: str,
+) -> dict[str, Any]:
+    current = _expect_dict(_load_json(champion_path), "champion")
+    candidate = _expect_dict(_load_json(candidate_path), "candidate")
+    promoted = promote_candidate(
+        current,
+        candidate,
+        expected_generation=expected_generation,
+        expected_champion_sha256=expected_champion_sha256,
+        evaluation_report_sha256=evaluation_report_sha256,
+        evaluation_suite_sha256=evaluation_suite_sha256,
+        evaluator_commit=evaluator_commit,
+    )
+    _atomic_json(champion_path, promoted)
+    return {
+        "generation": promoted["generation"],
+        "sha256": canonical_document_sha256(promoted),
+        "candidate_id": promoted["candidate_id"],
+    }
+
+
 def _validate_git_ref(ref: str) -> None:
-    if (
-        not _REF_RE.fullmatch(ref)
-        or ".." in ref
-        or "//" in ref
-        or ref.endswith("/")
-        or "@{" in ref
-    ):
+    if not _REF_RE.fullmatch(ref) or ".." in ref or "//" in ref or ref.endswith("/") or "@{" in ref:
         raise KnowledgeValidationError("unsafe Git ref")
 
 
 def _git_show(repo: Path, ref: str, path: str) -> bytes:
-    if path != "knowledge/index.json" and not _CONTRIBUTION_PATH_RE.fullmatch(path):
+    if path not in {"knowledge/index.json", "knowledge/champion.json"} and not (
+        _CONTRIBUTION_PATH_RE.fullmatch(path)
+    ):
         raise KnowledgeValidationError("unsafe knowledge path")
-    result = subprocess.run(
-        ["git", "-C", str(repo.resolve()), "show", f"{ref}:{path}"],
-        check=False,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo.resolve()), "show", f"{ref}:{path}"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise KnowledgeValidationError(f"git show timed out for {path}") from error
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise KnowledgeValidationError(f"git show failed for {path}: {message}")
@@ -412,6 +748,8 @@ def sync_from_git_ref(repo: Path, ref: str, knowledge_root: Path) -> dict[str, A
     try:
         remote_index_raw = _git_show(repo, ref, "knowledge/index.json")
         remote_index = validate_index(json.loads(remote_index_raw.decode("utf-8")))
+        remote_champion_raw = _git_show(repo, ref, "knowledge/champion.json")
+        remote_champion = validate_champion(json.loads(remote_champion_raw.decode("utf-8")))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise KnowledgeValidationError("remote knowledge index is invalid JSON") from error
 
@@ -434,6 +772,23 @@ def sync_from_git_ref(repo: Path, ref: str, knowledge_root: Path) -> dict[str, A
     root = knowledge_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     local_index_path = root / "index.json"
+    local_champion_path = root / "champion.json"
+    if local_champion_path.exists():
+        local_champion = validate_champion(_load_json(local_champion_path))
+        local_generation = local_champion["generation"]
+        remote_generation = remote_champion["generation"]
+        if remote_generation < local_generation:
+            raise KnowledgeValidationError("remote champion generation would roll back local state")
+        if remote_generation == local_generation and remote_champion != local_champion:
+            raise KnowledgeValidationError("champion fork detected at the same generation")
+        if remote_generation == local_generation + 1 and (
+            remote_champion["parent_champion_sha256"] != canonical_document_sha256(local_champion)
+        ):
+            raise KnowledgeValidationError("remote champion does not descend from local champion")
+        if remote_generation > local_generation + 1:
+            raise KnowledgeValidationError(
+                "remote champion skipped generations; verify the promotion chain explicitly"
+            )
     local_index: dict[str, Any]
     if local_index_path.exists():
         local_index = validate_index(_load_json(local_index_path))
@@ -450,6 +805,13 @@ def sync_from_git_ref(repo: Path, ref: str, knowledge_root: Path) -> dict[str, A
         "schema_version": KNOWLEDGE_SCHEMA_VERSION,
         "contributions": sorted(entries.values(), key=lambda item: item["contribution_id"]),
     }
+    _atomic_json(local_champion_path, remote_champion)
     _atomic_json(local_index_path, merged)
     validate_knowledge_tree(root)
-    return {"imported": len(staged), "total": len(entries), "ref": ref}
+    return {
+        "imported": len(staged),
+        "total": len(entries),
+        "ref": ref,
+        "champion_generation": remote_champion["generation"],
+        "champion_sha256": canonical_document_sha256(remote_champion),
+    }

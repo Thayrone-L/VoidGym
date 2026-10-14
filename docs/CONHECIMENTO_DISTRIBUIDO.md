@@ -36,6 +36,56 @@ exporte manifestos recebidos de terceiros e sempre revise o JSON sanitizado ante
 publicá-lo. A automação de push deve permanecer desabilitada até existir uma allowlist
 fechada para todas as versões de contrato aceitas.
 
+## Candidatos e campeão
+
+`knowledge/champion.json` é o ponteiro canônico para o melhor checkpoint já avaliado.
+Antes do treino, registre sua geração e SHA-256 canônico:
+
+```powershell
+hk-agent knowledge champion-validate
+```
+
+Depois de exportar a contribuição e publicar o checkpoint como um asset HTTPS imutável,
+crie o manifesto do candidato. A URI não pode conter credenciais, query string ou
+fragmento; o comando registra metadados, mas não baixa nem abre o checkpoint:
+
+```powershell
+hk-agent knowledge candidate-export `
+  --contribution knowledge/contributions/<id>.json `
+  --worker-id maquina-1 `
+  --artifact-uri https://github.com/owner/repo/releases/download/run-1/model.zip `
+  --artifact-sha256 <sha256> --artifact-size-bytes <bytes> `
+  --trust-tier owned `
+  --parent-generation <geracao> --parent-sha256 <sha-do-campeao>
+```
+
+O candidato sai em `knowledge/outbox/candidates/` como arquivo imutável. Cada worker
+deve manter seu próprio checkout/outbox; não execute exportações concorrentes contra o
+mesmo `index.json`, pois a atualização local do índice não é um banco transacional.
+
+Somente um avaliador confiável deve promover candidatos. A promoção exige o resultado
+da avaliação, o commit completo do avaliador e compare-and-swap tanto da geração quanto
+do hash do campeão. Assim, duas promoções concorrentes não sobrescrevem uma à outra:
+
+```powershell
+hk-agent knowledge champion-promote `
+  --candidate knowledge/outbox/candidates/<id>.json `
+  --expected-generation <geracao> --expected-sha256 <sha-do-campeao> `
+  --evaluation-report-sha256 <sha-do-relatorio> `
+  --evaluation-suite-sha256 <sha-da-suite> --evaluator-commit <commit-40-hex>
+```
+
+A repetição exata de uma promoção já aplicada é idempotente. Um candidato baseado em
+outro campeão ou com fingerprint incompatível é rejeitado. O formato `sb3-zip` é apenas
+catalogado: arquivos SB3 externos podem conter objetos serializados e nunca devem ser
+desserializados no processo ou na máquina confiável de promoção. Avalie contribuições
+de terceiros em ambiente descartável e isolado.
+
+O tier `external-untrusted` não pode ser promovido. Depois de validá-lo no ambiente
+isolado, gere um novo manifesto `quarantined`, com hash do artefato efetivamente
+avaliado. Relatório, suite de avaliação, candidato, política, pai e commit do avaliador
+ficam vinculados no registro promovido.
+
 ## Compatibilidade e limites
 
 O fingerprint considera contrato de ações/recompensas, perfil do jogo, origem lógica
@@ -50,3 +100,9 @@ evidência e catálogo; não são executados e não substituem pesos locais auto
 Para compartilhar pesos no futuro, prefira GitHub Releases ou Git LFS, com hash já
 registrado na contribuição, limite de tamanho, revisão e opt-in explícito. Não coloque
 checkpoints grandes no Git comum.
+
+Proteja `main` e `knowledge`, exija revisão e atualização fast-forward. Amigos devem
+enviar candidatos por forks/pull requests, sem acesso de escrita ao registro campeão.
+A comparação CAS local evita sobrescrita no arquivo, mas não substitui CAS remoto:
+promoções no GitHub ainda devem usar branch protegida, conferir novamente o HEAD e fazer
+push fast-forward, nunca force-push ou rebase automático do registro.

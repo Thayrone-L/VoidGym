@@ -22,6 +22,7 @@ artifacts/diagnostics/*.txt
 artifacts/diagnostics/*.png
 config.local.toml
 config.*.local.toml
+config.*.local.json
 .env
 checkpoints/
 *.ckpt
