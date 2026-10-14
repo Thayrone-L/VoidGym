@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hollow-knight-local-agent"
+version = "0.0.0"
+description = "Local, experience-driven Hollow Knight agent environment"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Thayrone-L/VoidGym"
+Repository = "https://github.com/Thayrone-L/VoidGym.git"
+Issues = "https://github.com/Thayrone-L/VoidGym/issues"
+
+[project.optional-dependencies]
+environment = [
+    "gymnasium>=1.2,<2",
+    "numpy>=2.2,<3",
+    "psutil>=7,<8",
+]
+training = [
+    "stable-baselines3>=2.7,<3",
+]
+development = [
+    "pytest>=8,<10",
+    "ruff>=0.12,<1",
+    "mypy>=1.17,<2",
+]
+
+[project.scripts]
+hk-agent = "hk_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

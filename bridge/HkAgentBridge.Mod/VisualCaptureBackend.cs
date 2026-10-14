@@ -1,0 +1,256 @@
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEngine;
+
+namespace HkAgentBridge;
+
+internal sealed class VisualCaptureBackend : IDisposable
+{
+    private const int MaximumWidth = 600;
+    private const int MaximumHeight = 338;
+    private const int MaximumPngBytes = 720_000;
+
+    private readonly ConcurrentQueue<CaptureRequest> _requests = new();
+    private readonly Action<string> _log;
+    private readonly GameObject _pumpObject;
+    private long _nextFrameId = -1;
+    private int _outstanding;
+    private bool _disposed;
+
+    public VisualCaptureBackend(Action<string> log)
+    {
+        _log = log;
+        _pumpObject = new GameObject("HK Agent Visual Capture");
+        UnityEngine.Object.DontDestroyOnLoad(_pumpObject);
+        CapturePump pump = _pumpObject.AddComponent<CapturePump>();
+        pump.Initialize(this);
+    }
+
+    public Task<CapturedFrame> CaptureOnceAsync(CancellationToken cancellationToken)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(VisualCaptureBackend));
+        }
+        if (Interlocked.CompareExchange(ref _outstanding, 1, 0) != 0)
+        {
+            throw new InvalidOperationException("A capture is already pending");
+        }
+
+        var request = new CaptureRequest(cancellationToken);
+        request.Completion.Task.ContinueWith(
+            _ => Interlocked.Exchange(ref _outstanding, 0),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
+        _requests.Enqueue(request);
+        return request.Completion.Task;
+    }
+
+    private bool TryTakeRequest(out CaptureRequest request) =>
+        _requests.TryDequeue(out request!);
+
+    private IEnumerator CaptureAtEndOfFrame(CaptureRequest request)
+    {
+        yield return new WaitForEndOfFrame();
+        if (request.IsCompleted)
+        {
+            yield break;
+        }
+
+        Texture2D? screenshot = null;
+        Texture2D? output = null;
+        RenderTexture? scaled = null;
+        RenderTexture? previousRenderTarget = null;
+        bool changedRenderTarget = false;
+        try
+        {
+            screenshot = ScreenCapture.CaptureScreenshotAsTexture();
+            if (screenshot == null || screenshot.width <= 0 || screenshot.height <= 0)
+            {
+                throw new InvalidOperationException("Unity returned an empty screenshot");
+            }
+
+            int width;
+            int height;
+            CalculateOutputSize(screenshot.width, screenshot.height, out width, out height);
+            scaled = RenderTexture.GetTemporary(
+                width,
+                height,
+                0,
+                RenderTextureFormat.ARGB32,
+                RenderTextureReadWrite.Default
+            );
+            Graphics.Blit(screenshot, scaled);
+            previousRenderTarget = RenderTexture.active;
+            RenderTexture.active = scaled;
+            changedRenderTarget = true;
+            output = new Texture2D(width, height, TextureFormat.RGB24, false);
+            output.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+            output.Apply(false, false);
+
+            byte[] png = output.EncodeToPNG();
+            if (png == null || png.Length == 0)
+            {
+                throw new InvalidOperationException("Unity returned an empty PNG");
+            }
+            if (png.Length > MaximumPngBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Captured PNG exceeds the {MaximumPngBytes}-byte safety limit"
+                );
+            }
+
+            long frameId = Interlocked.Increment(ref _nextFrameId);
+            request.TrySetResult(
+                new CapturedFrame(
+                    frameId,
+                    MonotonicNanoseconds(),
+                    output.width,
+                    output.height,
+                    png
+                )
+            );
+            _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {png.Length} bytes");
+        }
+        catch (Exception exception)
+        {
+            request.TrySetException(exception);
+        }
+        finally
+        {
+            if (changedRenderTarget)
+            {
+                RenderTexture.active = previousRenderTarget;
+            }
+            if (scaled != null)
+            {
+                RenderTexture.ReleaseTemporary(scaled);
+            }
+            if (output != null)
+            {
+                UnityEngine.Object.Destroy(output);
+            }
+            if (screenshot != null)
+            {
+                UnityEngine.Object.Destroy(screenshot);
+            }
+        }
+    }
+
+    private static void CalculateOutputSize(
+        int sourceWidth,
+        int sourceHeight,
+        out int width,
+        out int height
+    )
+    {
+        double scale = Math.Min(
+            1.0,
+            Math.Min((double)MaximumWidth / sourceWidth, (double)MaximumHeight / sourceHeight)
+        );
+        width = Math.Max(1, (int)Math.Round(sourceWidth * scale));
+        height = Math.Max(1, (int)Math.Round(sourceHeight * scale));
+    }
+
+    private static long MonotonicNanoseconds()
+    {
+        long timestamp = Stopwatch.GetTimestamp();
+        return checked((long)(timestamp * (1_000_000_000.0 / Stopwatch.Frequency)));
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        while (_requests.TryDequeue(out CaptureRequest request))
+        {
+            request.TrySetException(new ObjectDisposedException(nameof(VisualCaptureBackend)));
+        }
+        UnityEngine.Object.Destroy(_pumpObject);
+    }
+
+    private sealed class CapturePump : MonoBehaviour
+    {
+        private VisualCaptureBackend? _owner;
+        private bool _captureInProgress;
+
+        public void Initialize(VisualCaptureBackend owner) => _owner = owner;
+
+        private void Update()
+        {
+            if (_captureInProgress || _owner == null || !_owner.TryTakeRequest(out CaptureRequest request))
+            {
+                return;
+            }
+            if (request.IsCompleted)
+            {
+                return;
+            }
+            _captureInProgress = true;
+            StartCoroutine(RunCapture(request));
+        }
+
+        private IEnumerator RunCapture(CaptureRequest request)
+        {
+            yield return _owner!.CaptureAtEndOfFrame(request);
+            _captureInProgress = false;
+        }
+    }
+
+    private sealed class CaptureRequest
+    {
+        private readonly CancellationTokenRegistration _registration;
+
+        public CaptureRequest(CancellationToken cancellationToken)
+        {
+            Completion = new TaskCompletionSource<CapturedFrame>(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+            _registration = cancellationToken.Register(() => Completion.TrySetCanceled());
+            Completion.Task.ContinueWith(
+                _ => _registration.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            );
+        }
+
+        public TaskCompletionSource<CapturedFrame> Completion { get; }
+        public bool IsCompleted => Completion.Task.IsCompleted;
+        public void TrySetResult(CapturedFrame frame) => Completion.TrySetResult(frame);
+        public void TrySetException(Exception exception) => Completion.TrySetException(exception);
+    }
+}
+
+internal sealed class CapturedFrame
+{
+    public CapturedFrame(
+        long frameId,
+        long captureMonotonicNanoseconds,
+        int width,
+        int height,
+        byte[] pngBytes
+    )
+    {
+        FrameId = frameId;
+        CaptureMonotonicNanoseconds = captureMonotonicNanoseconds;
+        Width = width;
+        Height = height;
+        PngBytes = pngBytes;
+    }
+
+    public long FrameId { get; }
+    public long CaptureMonotonicNanoseconds { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public byte[] PngBytes { get; }
+}

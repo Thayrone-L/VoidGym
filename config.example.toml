@@ -1,0 +1,68 @@
+schema_version = 1
+
+[project]
+run_root = "runs"
+diagnostics_root = "artifacts/diagnostics"
+fail_closed = true
+
+[game]
+profile = "development"
+# Set only in config.local.toml after installing the selected game build.
+distribution = "standalone"
+install_path = ""
+executable = "hollow_knight.exe"
+expected_version = "1.5.78.11833"
+expected_sha256 = ""
+
+# Additional standalone builds are declared as separate profiles in local
+# configuration. Never point two profiles at the same writable directory.
+
+[modding]
+enabled = false
+api_version = "1.5.78.11833-77"
+api_sha256 = "bc9f0db3d0916b05cd5a2420bb602fb1b239ce3ff6c289fd84bffb682fb8f1d6"
+bridge_version = "0.0.0-dev"
+
+[ipc]
+bind_host = "127.0.0.1"
+port = 0
+connect_timeout_seconds = 15
+heartbeat_interval_ms = 500
+heartbeat_timeout_ms = 2000
+max_action_lease_ms = 250
+
+[capture]
+enabled = false
+width = 320
+height = 180
+channels = 3
+pixel_format = "RGB8"
+target_hz = 12
+backend = "probe"
+persist_all_frames = false
+
+[safety]
+emergency_stop_enabled = true
+release_all_on_disconnect = true
+release_all_on_timeout = true
+allow_personal_save_root = false
+minimum_free_disk_gb = 20
+max_run_disk_gb = 25
+max_episode_seconds = 900
+
+[saves]
+# Both paths remain empty until the save-isolation procedure is completed.
+personal_root = ""
+experimental_root = ""
+backup_root = ""
+
+[training]
+enabled = false
+reward_version = "zero-v1"
+algorithm = "none"
+pretrained_weights_allowed = false
+privileged_diagnostics_allowed = false
+
+[instances]
+count = 1
+parallel_enabled = false

@@ -1,0 +1,53 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-*/
+.test-tmp/
+.mypy_cache/
+.ruff_cache/
+
+# .NET
+bin/
+obj/
+*.user
+
+# Runtime data and local configuration
+artifacts/
+runs/
+artifacts/diagnostics/*.json
+artifacts/diagnostics/*.txt
+artifacts/diagnostics/*.png
+config.local.toml
+config.*.local.toml
+.env
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.zip
+*.log
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Game binaries, saves and third-party mods must never enter Git
+game/
+saves/
+third_party/
+*.dat
+*.dat.bak*
+*.dll
+*.exe
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

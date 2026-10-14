@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "plan_id": "continue-kings-pass-v1",
+  "initial_wait_seconds": 5.0,
+  "final_wait_seconds": 12.0,
+  "timeout_seconds": 45.0,
+  "minimum_distinct_captures": 2,
+  "steps": [
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "open-save-menu"
+    },
+    {
+      "button": "CANCEL",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "return-to-main-menu"
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "reopen-save-menu-at-slot-one"
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "select-slot-one"
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "confirm-or-skip"
+    }
+  ],
+  "readiness": {
+    "verifier_id": "reference-rgb-mae-v1",
+    "reference_image": "../../artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png",
+    "maximum_mean_absolute_error": 20.0
+  }
+}

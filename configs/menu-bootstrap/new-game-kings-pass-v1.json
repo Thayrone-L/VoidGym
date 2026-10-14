@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "plan_id": "new-game-kings-pass-v1",
+  "initial_wait_seconds": 8.0,
+  "final_wait_seconds": 120.0,
+  "timeout_seconds": 150.0,
+  "minimum_distinct_captures": 4,
+  "steps": [
+    {
+      "label": "open-profile-selection",
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0
+    },
+    {
+      "label": "return-to-main-menu",
+      "button": "CANCEL",
+      "lease_ms": 50,
+      "settle_seconds": 2.0
+    },
+    {
+      "label": "reopen-profile-selection-at-slot-one",
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0
+    },
+    {
+      "label": "select-new-game-slot-1",
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0
+    },
+    {
+      "label": "select-classic-mode",
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0
+    }
+  ],
+  "readiness": {
+    "verifier_id": "reference-rgb-mae-v1",
+    "reference_image": "../../artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png",
+    "maximum_mean_absolute_error": 20.0
+  }
+}
