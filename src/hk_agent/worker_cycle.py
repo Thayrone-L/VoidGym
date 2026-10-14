@@ -157,8 +157,12 @@ def load_worker_config(path: Path) -> WorkerConfig:
         raise WorkerCycleError("stage_checkpoint must be a boolean")
     upstream_repository = _repository(document["upstream_repository"], "upstream_repository")
     fork_repository = _repository(document["fork_repository"], "fork_repository")
-    if upstream_repository.casefold() == fork_repository.casefold():
-        raise WorkerCycleError("fork_repository must differ from upstream_repository")
+    upstream_owner, upstream_name = upstream_repository.split("/", 1)
+    fork_owner, fork_name = fork_repository.split("/", 1)
+    if upstream_owner.casefold() == fork_owner.casefold():
+        raise WorkerCycleError("fork_repository must belong to a different GitHub owner")
+    if upstream_name.casefold() != fork_name.casefold():
+        raise WorkerCycleError("fork_repository must retain the upstream repository name")
     upstream_remote = _remote_name(document["upstream_remote"], "upstream_remote")
     fork_remote = _remote_name(document["fork_remote"], "fork_remote")
     if upstream_remote == fork_remote:
@@ -391,6 +395,9 @@ def _native_io_path(path: Path) -> Path:
     absolute = str(path.resolve(strict=False))
     if absolute.startswith("\\\\?\\"):
         return Path(absolute)
+    if absolute.startswith("\\\\"):
+        unc_tail = absolute.lstrip("\\")
+        return Path(f"\\\\?\\UNC\\{unc_tail}")
     return Path(f"\\\\?\\{absolute}")
 
 
@@ -400,24 +407,39 @@ def _immutable_json(path: Path, value: Mapping[str, object]) -> None:
     path = _native_io_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    created = False
+    pending = path.with_name(f".receipt-{os.getpid()}-{secrets.token_hex(8)}.pending")
+    pending.write_text(payload, encoding="utf-8")
     try:
-        # Exclusive creation gives the receipt write-once semantics without
-        # requiring hard-link privileges, which are commonly unavailable in
-        # OneDrive workspaces on Windows. A crash may leave an unreadable receipt;
-        # readers fail closed and never overwrite it.
-        with path.open("x", encoding="utf-8") as stream:
-            created = True
-            stream.write(payload)
-    except FileExistsError as error:
-        raise WorkerCycleError(f"immutable receipt already exists: {path.name}") from error
-    except Exception:
-        if created:
+        # Publish only a complete file. Windows rename is create-if-absent and
+        # works in OneDrive where hard links are often denied; POSIX hard-linking
+        # supplies the same no-replace guarantee.
+        if os.name == "nt":
+            os.rename(pending, path)
+        else:
+            os.link(pending, path)
+    except OSError as error:
+        if path.exists():
+            raise WorkerCycleError(
+                f"immutable receipt already exists: {path.name}"
+            ) from error
+        raise
+    finally:
+        if pending.exists():
             try:
-                path.unlink()
+                pending.unlink()
             except OSError:
                 pass
-        raise
+
+
+def _acquire_publication_claim(path: Path) -> Path:
+    claim = _native_io_path(path)
+    claim.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with claim.open("x", encoding="ascii") as stream:
+            stream.write(f"pid={os.getpid()}\n")
+    except FileExistsError as error:
+        raise WorkerCycleError("this publication attempt is already being prepared") from error
+    return claim
 
 
 def _git_executable() -> str:
@@ -496,6 +518,17 @@ def _verify_remote(
     expected_push = expected if push_enabled else _DISABLED_UPSTREAM_PUSH_URL
     if fetch_url != expected or push_url != expected_push:
         raise WorkerCycleError(f"{name} remote does not match its configured GitHub repository")
+    if not push_enabled:
+        fetch_refspec = _git(
+            repo,
+            "config",
+            "--get-all",
+            f"remote.{name}.fetch",
+            safe_error="cannot inspect the upstream fetch refspec",
+        ).splitlines()
+        expected_refspec = f"+refs/heads/knowledge:refs/remotes/{name}/knowledge"
+        if fetch_refspec != [expected_refspec]:
+            raise WorkerCycleError("upstream remote must fetch only refs/heads/knowledge")
 
 
 def _remote_branch_commit(output: str, remote_ref: str) -> str | None:
@@ -540,6 +573,35 @@ def _git_ref_exists(repo: Path, ref: str) -> bool:
         raise WorkerCycleError("cannot inspect local publication branches") from error
     if result.returncode not in {0, 1}:
         raise WorkerCycleError("cannot inspect local publication branches")
+    return result.returncode == 0
+
+
+def _git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    environment = dict(os.environ)
+    environment.pop("GH_TOKEN", None)
+    environment.pop("GITHUB_TOKEN", None)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        result = subprocess.run(
+            [
+                _git_executable(),
+                "-C",
+                str(repo),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            cwd=repo,
+            env=environment,
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WorkerCycleError("cannot verify publication ancestry") from error
+    if result.returncode not in {0, 1}:
+        raise WorkerCycleError("cannot verify publication ancestry")
     return result.returncode == 0
 
 
@@ -1000,8 +1062,6 @@ def prepare_publication(
     # 128-bit attempt ID remains collision-resistant; receipts retain the full
     # bundle ID in their separate immutable directory hierarchy.
     worktree = (config.outbox_root / "wt" / selected_attempt).resolve(strict=False)
-    if worktree.exists():
-        raise WorkerCycleError("publication worktree already exists without a receipt")
     worktree.parent.mkdir(parents=True, exist_ok=True)
     hooks = (config.outbox_root / "empty-git-hooks").resolve(strict=False)
     hooks.mkdir(parents=True, exist_ok=True)
@@ -1018,13 +1078,18 @@ def prepare_publication(
         r"[0-9a-f]{40,64}", trained_source_commit
     ):
         raise WorkerCycleError("staging receipt has an invalid trained source commit")
+    if not _git_is_ancestor(repository, trained_source_commit, publication_base_commit):
+        raise WorkerCycleError("upstream knowledge is not a descendant of the training snapshot")
     if _git_ref_exists(repository, f"refs/heads/{branch}"):
         raise WorkerCycleError("immutable publication branch already exists")
 
+    claim = _acquire_publication_claim(attempt_root / "preparing.lock")
     worktree_created = False
     branch_created = False
     receipt_written = False
     try:
+        if worktree.exists():
+            raise WorkerCycleError("publication worktree already exists without a receipt")
         _git(
             repository,
             "-c",
@@ -1133,7 +1198,7 @@ def prepare_publication(
         _verify_prepared_publication(config, receipt)
         return dict(receipt_document)
     except Exception as error:
-        if worktree_created or worktree.exists():
+        if worktree_created:
             try:
                 _git(
                     repository,
@@ -1168,6 +1233,11 @@ def prepare_publication(
         if isinstance(error, KnowledgeValidationError):
             raise WorkerCycleError("trusted publication snapshot is invalid") from error
         raise
+    finally:
+        try:
+            claim.unlink()
+        except OSError:
+            pass
 
 
 def publish_fork(
@@ -1246,24 +1316,35 @@ def publish_fork(
         cwd=repository,
         safe_error="cannot check whether the fork branch is available",
     )
-    if _remote_branch_commit(existing, remote_ref) is not None:
-        raise WorkerCycleError("unique fork branch already exists; prepare a new attempt")
-    _run(
-        [
-            _git_executable(),
-            "-C",
-            str(worktree),
-            "-c",
-            f"core.hooksPath={(config.outbox_root / 'empty-git-hooks').resolve(strict=True)}",
-            "push",
-            "--porcelain",
-            fork_url,
-            f"{receipt.publication_commit}:{remote_ref}",
-        ],
-        cwd=worktree,
-        safe_error="cannot publish the immutable contribution to the configured fork",
-        timeout=120,
-    )
+    existing_commit = _remote_branch_commit(existing, remote_ref)
+    if existing_commit not in {None, receipt.publication_commit}:
+        raise WorkerCycleError("unique fork branch belongs to a different publication")
+    if existing_commit is None:
+        try:
+            _run(
+                [
+                    _git_executable(),
+                    "-C",
+                    str(worktree),
+                    "-c",
+                    f"core.hooksPath={(config.outbox_root / 'empty-git-hooks').resolve(strict=True)}",
+                    "push",
+                    "--porcelain",
+                    fork_url,
+                    f"{receipt.publication_commit}:{remote_ref}",
+                ],
+                cwd=worktree,
+                safe_error="cannot publish the immutable contribution to the configured fork",
+                timeout=120,
+            )
+        except WorkerCycleError:
+            recovered = _run(
+                [_git_executable(), "ls-remote", "--heads", fork_url, remote_ref],
+                cwd=repository,
+                safe_error="cannot recover the fork publication after a failed push",
+            )
+            if _remote_branch_commit(recovered, remote_ref) != receipt.publication_commit:
+                raise
     remote = _run(
         [_git_executable(), "ls-remote", "--heads", fork_url, remote_ref],
         cwd=repository,
@@ -1284,5 +1365,15 @@ def publish_fork(
         "target_branch": "knowledge",
         "compare_url": compare_url,
     }
-    _immutable_json(pushed_path, pushed_document)
+    try:
+        _immutable_json(pushed_path, pushed_document)
+    except WorkerCycleError:
+        if pushed_io_path.exists():
+            return publish_fork(
+                config,
+                repo=repository,
+                bundle_id=bundle_id,
+                attempt_id=attempt_id,
+            )
+        raise
     return pushed_document

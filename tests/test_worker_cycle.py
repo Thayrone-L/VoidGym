@@ -170,7 +170,7 @@ def test_worker_config_requires_distinct_upstream_and_fork(tmp_path: Path) -> No
     document["fork_repository"] = document["upstream_repository"]
     _write_json(config_path, document)
 
-    with pytest.raises(WorkerCycleError, match="must differ"):
+    with pytest.raises(WorkerCycleError, match="different GitHub owner"):
         load_worker_config(config_path)
 
 
@@ -431,6 +431,14 @@ def _publication_fixture(tmp_path: Path) -> tuple[Path, Path, object, dict[str, 
         "upstream",
         "disabled://voidgym-upstream-read-only",
     )
+    _git(repository, "config", "--unset-all", "remote.upstream.fetch")
+    _git(
+        repository,
+        "config",
+        "--add",
+        "remote.upstream.fetch",
+        "+refs/heads/knowledge:refs/remotes/upstream/knowledge",
+    )
     _git(repository, "remote", "add", "fork", "https://github.com/voidgym-worker/VoidGym.git")
     _knowledge(repository)
     _git(repository, "add", "knowledge")
@@ -549,6 +557,75 @@ def test_prepare_publication_rejects_mismatched_remote(tmp_path: Path) -> None:
         )
 
 
+def test_prepare_publication_rejects_noncanonical_upstream_refspec(tmp_path: Path) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    _git(
+        repository,
+        "config",
+        "--replace-all",
+        "remote.upstream.fetch",
+        "+refs/pull/1/head:refs/remotes/upstream/knowledge",
+    )
+
+    with pytest.raises(WorkerCycleError, match="fetch only refs/heads/knowledge"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id="5" * 32,
+        )
+
+
+def test_prepare_publication_rejects_divergent_upstream_history(tmp_path: Path) -> None:
+    repository, _, config, staging, trained_commit = _publication_fixture(tmp_path)
+    tree = _git(repository, "rev-parse", f"{trained_commit}^{{tree}}")
+    divergent = _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit-tree",
+        tree,
+        "-m",
+        "divergent knowledge",
+    )
+    _git(repository, "update-ref", "refs/remotes/upstream/knowledge", divergent)
+
+    with pytest.raises(WorkerCycleError, match="not a descendant"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id="6" * 32,
+        )
+
+
+def test_prepare_publication_claim_prevents_attempt_collision(tmp_path: Path) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    attempt = "7" * 32
+    claim = (
+        tmp_path
+        / "outbox"
+        / "publications"
+        / str(staging["bundle_id"])
+        / attempt
+        / "preparing.lock"
+    )
+    claim.parent.mkdir(parents=True)
+    claim.write_text("owned by another process", encoding="ascii")
+
+    with pytest.raises(WorkerCycleError, match="already being prepared"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id=attempt,
+        )
+    assert claim.read_text("ascii") == "owned by another process"
+    assert not (tmp_path / "outbox" / "wt" / attempt).exists()
+
+
 def test_publish_fork_pushes_exact_commit_without_force(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -589,6 +666,52 @@ def test_publish_fork_pushes_exact_commit_without_force(
     assert result["compare_url"].startswith(
         "https://github.com/Thayrone-L/VoidGym/compare/knowledge...voidgym-worker:"
     )
+
+
+def test_publish_fork_adopts_matching_remote_branch_after_lost_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    attempt = "8" * 32
+    prepared = prepare_publication(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id=attempt,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_: object) -> str:
+        calls.append(arguments)
+        if "ls-remote" in arguments:
+            return f"{prepared['publication_commit']}\trefs/heads/{prepared['remote_branch']}"
+        return "ok"
+
+    monkeypatch.setattr(worker_cycle_module, "_run", fake_run)
+    monkeypatch.setattr(worker_cycle_module, "_verify_remote", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        worker_cycle_module,
+        "_verify_prepared_publication",
+        lambda *_: Path(str(prepared["worktree"])),
+    )
+
+    result = publish_fork(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id=attempt,
+    )
+
+    assert result["publication_commit"] == prepared["publication_commit"]
+    assert not any("push" in arguments for arguments in calls)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended UNC path behavior")
+def test_native_io_path_uses_valid_extended_unc_prefix() -> None:
+    converted = worker_cycle_module._native_io_path(
+        Path(r"\\server\share\voidgym\receipt.json")
+    )
+    assert str(converted).startswith("\\\\?\\UNC\\server\\share\\")
 
 
 def test_subprocess_environment_drops_ambient_github_tokens(

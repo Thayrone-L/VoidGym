@@ -28,11 +28,16 @@ Configure os remotes sem colocar token na URL:
 ```powershell
 git remote add upstream https://github.com/Thayrone-L/VoidGym.git
 git remote set-url --push upstream disabled://voidgym-upstream-read-only
+git config --replace-all remote.upstream.fetch `
+  +refs/heads/knowledge:refs/remotes/upstream/knowledge
 git remote add fork https://github.com/SEU-USUARIO/VoidGym.git
 ```
 
 Use o Git Credential Manager do sistema para autenticar o fork. Não salve PAT em
 `config.worker.local.json`, argumentos, variáveis `GH_TOKEN`/`GITHUB_TOKEN` ou URLs.
+O arquivo de configuração exige outro proprietário e o mesmo nome de repositório;
+confirme no GitHub que ele é realmente um fork. A relação final também é validada
+pelo GitHub quando a URL de comparação abre o pull request.
 
 ## Ciclo de uma sessão
 
