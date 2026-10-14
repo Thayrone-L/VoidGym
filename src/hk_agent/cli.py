@@ -44,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     candidate.add_argument(
         "--trust-tier",
         choices=("owned", "quarantined", "external-untrusted"),
-        default="owned",
+        default="external-untrusted",
     )
     candidate.add_argument("--parent-generation", type=int, required=True)
     candidate.add_argument("--parent-sha256", required=True)
@@ -60,7 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     champion_validate.add_argument("--champion", type=Path, default=Path("knowledge/champion.json"))
     champion_promote = knowledge_commands.add_parser(
-        "champion-promote", help="Promote a candidate using local compare-and-swap"
+        "champion-promote",
+        help="Reserved for the future evaluator-attested promotion flow",
     )
     champion_promote.add_argument("--champion", type=Path, default=Path("knowledge/champion.json"))
     champion_promote.add_argument("--candidate", type=Path, required=True)

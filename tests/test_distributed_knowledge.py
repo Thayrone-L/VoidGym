@@ -182,10 +182,12 @@ def _candidate(champion: dict[str, Any] | None = None) -> dict[str, Any]:
     return candidate_from_contribution(
         contribution_from_manifest(_manifest()),
         worker_id="machine-1",
-        artifact_uri="https://github.com/example/VoidGym/releases/download/run-1/model.zip",
+        artifact_uri=(
+            "https://github.com/example/VoidGym/releases/download/run-1/policy.safetensors"
+        ),
         artifact_sha256="9" * 64,
         artifact_size_bytes=123_456,
-        artifact_format="sb3-zip",
+        artifact_format="safetensors",
         trust_tier="owned",
         parent_generation=parent["generation"],
         parent_sha256=canonical_document_sha256(parent),
@@ -215,24 +217,13 @@ def test_candidate_is_closed_content_addressed_and_https_only() -> None:
         )
 
 
-def test_champion_promotion_uses_cas_lineage_and_is_idempotent() -> None:
+def test_champion_promotion_is_disabled_until_attestation_exists() -> None:
     champion = initial_champion()
     candidate = _candidate(champion)
     champion_sha = canonical_document_sha256(champion)
-    promoted = promote_candidate(
-        champion,
-        candidate,
-        expected_generation=0,
-        expected_champion_sha256=champion_sha,
-        evaluation_report_sha256="8" * 64,
-        evaluation_suite_sha256="6" * 64,
-        evaluator_commit="7" * 40,
-    )
-    assert validate_champion(promoted)["generation"] == 1
-    assert promoted["parent_champion_sha256"] == champion_sha
-    assert (
+    with pytest.raises(KnowledgeValidationError, match="promotion is disabled"):
         promote_candidate(
-            promoted,
+            champion,
             candidate,
             expected_generation=0,
             expected_champion_sha256=champion_sha,
@@ -240,29 +231,85 @@ def test_champion_promotion_uses_cas_lineage_and_is_idempotent() -> None:
             evaluation_suite_sha256="6" * 64,
             evaluator_commit="7" * 40,
         )
-        == promoted
+
+
+def test_promotion_rejects_executable_sb3_artifact_without_opening_it() -> None:
+    champion = initial_champion()
+    contribution = contribution_from_manifest(_manifest())
+    parent_sha = canonical_document_sha256(champion)
+    candidate = candidate_from_contribution(
+        contribution,
+        worker_id="machine-1",
+        artifact_uri="https://github.com/example/VoidGym/releases/download/run-1/model.zip",
+        artifact_sha256="9" * 64,
+        artifact_size_bytes=123,
+        artifact_format="sb3-zip",
+        trust_tier="owned",
+        parent_generation=0,
+        parent_sha256=parent_sha,
     )
-    with pytest.raises(KnowledgeValidationError, match="evidence differs"):
+    with pytest.raises(KnowledgeValidationError, match="promotion is disabled"):
         promote_candidate(
-            promoted,
+            champion,
             candidate,
             expected_generation=0,
-            expected_champion_sha256=champion_sha,
-            evaluation_report_sha256="5" * 64,
+            expected_champion_sha256=parent_sha,
+            evaluation_report_sha256="8" * 64,
             evaluation_suite_sha256="6" * 64,
             evaluator_commit="7" * 40,
         )
 
 
-def test_champion_promotion_rejects_stale_or_incompatible_candidate() -> None:
+def test_promoted_champion_rejects_sb3_even_with_valid_hash_bindings() -> None:
     champion = initial_champion()
     candidate = _candidate(champion)
-    with pytest.raises(KnowledgeValidationError, match="compare-and-swap"):
+    parent_sha = canonical_document_sha256(champion)
+    promoted = {
+        "schema_version": 1,
+        "generation": 1,
+        "candidate_id": candidate["candidate_id"],
+        "contribution_id": candidate["contribution_id"],
+        "compatibility_fingerprint": candidate["compatibility_fingerprint"],
+        "artifact": {**candidate["artifact"], "format": "sb3-zip"},
+        "parent_champion_sha256": parent_sha,
+        "evaluation": {
+            "report_sha256": "8" * 64,
+            "suite_sha256": "6" * 64,
+            "policy_sha256": candidate["artifact"]["sha256"],
+            "candidate_id": candidate["candidate_id"],
+            "parent_champion_sha256": parent_sha,
+            "evaluator_commit": "7" * 40,
+        },
+    }
+
+    with pytest.raises(KnowledgeValidationError, match="safetensors"):
+        validate_champion(promoted)
+
+
+def test_quarantined_safetensors_cannot_self_authorize_promotion() -> None:
+    champion = initial_champion()
+    contribution = contribution_from_manifest(_manifest())
+    parent_sha = canonical_document_sha256(champion)
+    candidate = candidate_from_contribution(
+        contribution,
+        worker_id="friend-machine",
+        artifact_uri=(
+            "https://github.com/example/VoidGym/releases/download/run-1/policy.safetensors"
+        ),
+        artifact_sha256="9" * 64,
+        artifact_size_bytes=123,
+        artifact_format="safetensors",
+        trust_tier="quarantined",
+        parent_generation=0,
+        parent_sha256=parent_sha,
+    )
+
+    with pytest.raises(KnowledgeValidationError, match="promotion is disabled"):
         promote_candidate(
             champion,
             candidate,
-            expected_generation=1,
-            expected_champion_sha256=canonical_document_sha256(champion),
+            expected_generation=0,
+            expected_champion_sha256=parent_sha,
             evaluation_report_sha256="8" * 64,
             evaluation_suite_sha256="6" * 64,
             evaluator_commit="7" * 40,
