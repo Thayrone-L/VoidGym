@@ -1,9 +1,9 @@
 # Worker distribuído local
 
-Este fluxo prepara uma máquina para treinar a partir de um campeão promovido e
-empacota o resultado localmente. Ele não executa `git fetch`, `git push`, login,
-download nem upload. Essas operações continuam explícitas e fora do processo de
-treino.
+Este fluxo prepara uma máquina para treinar a partir de um campeão promovido,
+empacota o resultado localmente e, em uma etapa separada, pode publicar somente os
+JSONs sanitizados em um fork. O processo de treino não recebe credenciais, não faz
+`git fetch`, `git push`, download nem upload.
 
 ## Configuração local
 
@@ -16,10 +16,28 @@ Use `true` nas máquinas próprias. Para contribuições externas, mantenha o
 checkpoint em quarentena: um SB3 ZIP usa serialização Python e não deve ser
 carregado em uma máquina confiável antes da revisão.
 
-`trusted_ref` identifica a única branch de promoção mantida pelo responsável. O
-worker rejeita override para outro ref. O preflight também exige o recibo criado
+`upstream_repository` e `upstream_remote` identificam o repositório canônico. O ref
+confiável é sempre `<upstream_remote>/knowledge`; o worker rejeita override para
+outro ref. `fork_repository` precisa ser um fork em outra conta e `fork_remote`
+precisa ser um remote diferente. O preflight também exige o recibo criado
 pelo sync e vincula exatamente geração e hash do campeão; copiar um candidato
 externo diretamente para o cache não o torna confiável.
+
+Configure os remotes sem colocar token na URL:
+
+```powershell
+git remote add upstream https://github.com/Thayrone-L/VoidGym.git
+git remote set-url --push upstream disabled://voidgym-upstream-read-only
+git config --replace-all remote.upstream.fetch `
+  +refs/heads/knowledge:refs/remotes/upstream/knowledge
+git remote add fork https://github.com/SEU-USUARIO/VoidGym.git
+```
+
+Use o Git Credential Manager do sistema para autenticar o fork. Não salve PAT em
+`config.worker.local.json`, argumentos, variáveis `GH_TOKEN`/`GITHUB_TOKEN` ou URLs.
+O arquivo de configuração exige outro proprietário e o mesmo nome de repositório;
+confirme no GitHub que ele é realmente um fork. A relação final também é validada
+pelo GitHub quando a URL de comparação abre o pull request.
 
 ## Ciclo de uma sessão
 
@@ -88,13 +106,29 @@ principal e sem acessar a rede:
   --bundle-id <bundle_id>
 ```
 
-O comando fixa `origin/knowledge` em um commit imutável, cria um worktree isolado sob
-o outbox, desabilita hooks e produz uma branch `codex/knowledge-*` com exatamente um
-commit. Esse commit contém somente `knowledge/index.json` e o JSON sanitizado da
-contribuição; checkpoint, recibo de staging, saves e frames não entram nele. Repetir o
-comando valida e retorna o mesmo recibo. Uma falha remove o worktree e a branch parciais.
+O comando usa o `upstream/knowledge` disponível localmente mais recente, cria um
+worktree isolado e uma branch inédita com um identificador aleatório de 128 bits. O
+commit contém somente `knowledge/index.json` e o JSON sanitizado da contribuição;
+checkpoint, recibo de staging, saves e frames não entram nele. O recibo preserva
+separadamente o commit usado no treino e o commit usado como base de publicação. Se
+outra máquina avançou a branch `knowledge`, uma nova tentativa recompõe a contribuição
+sobre a base nova, sem rebase nem force-push.
 
-Push e abertura automática de pull request permanecem deliberadamente desabilitados.
+Depois de revisar o diff local, publique a tentativa apenas no fork:
+
+```powershell
+.\.venv\Scripts\python.exe tools\worker_cycle.py publish-fork `
+  --bundle-id <bundle_id> `
+  --attempt-id <attempt_id>
+```
+
+O remote `upstream` tem uma URL de push deliberadamente inválida. O publicador deriva
+a URL HTTPS exclusivamente de `fork_repository`, exige que a branch remota ainda não
+exista, envia o commit exato sem `--force` e confirma o SHA
+remoto. A resposta fornece uma URL de comparação para abrir o pull request
+manualmente contra `Thayrone-L/VoidGym:knowledge`. Ele nunca envia para o upstream,
+não abre nem mescla PR automaticamente e não promove campeão.
+
 O documento público usa uma allowlist recursiva: ações, sinais e claims são enumerações;
 configurações são apenas números/booleanos; identificadores locais e labels são omitidos;
 o perfil do jogo é publicado somente como SHA-256; valores livres de versões também são
@@ -109,6 +143,7 @@ o campeão-pai congelado pela primeira.
 - GitHub não é um barramento de rollout e não combina pesos PPO.
 - Cada sessão usa um snapshot fixo do campeão.
 - O worker nunca executa código recebido da branch `knowledge`.
+- Cada tentativa usa branch remota nova; não há force-push, rebase ou branch reutilizada.
 - Nenhum caminho local, save, frame ou credencial entra na contribuição pública.
 - Um cache ausente ou adulterado interrompe o preflight; não há fallback silencioso.
 - Candidatos de amigos são dados não confiáveis e devem ser avaliados em ambiente

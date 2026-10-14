@@ -15,6 +15,7 @@ from hk_agent.worker_cycle import (
     load_worker_config,
     preflight_worker,
     prepare_publication,
+    publish_fork,
     sync_worker_knowledge,
 )
 
@@ -38,7 +39,18 @@ def _parser() -> argparse.ArgumentParser:
         help="create an isolated, local contribution branch without pushing it",
     )
     prepare.add_argument("--bundle-id", required=True)
+    prepare.add_argument(
+        "--attempt-id",
+        help="optional 128-bit lowercase hex ID; generated securely when omitted",
+    )
     prepare.add_argument("--repo", type=Path, default=PROJECT_ROOT)
+    publish = commands.add_parser(
+        "publish-fork",
+        help="push one prepared attempt only to its configured fork",
+    )
+    publish.add_argument("--bundle-id", required=True)
+    publish.add_argument("--attempt-id", required=True)
+    publish.add_argument("--repo", type=Path, default=PROJECT_ROOT)
     return parser
 
 
@@ -53,7 +65,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finalize":
             report = finalize_candidate(config, args.manifest, args.session_id)
         elif args.command == "prepare-publication":
-            report = prepare_publication(config, repo=args.repo, bundle_id=args.bundle_id)
+            report = prepare_publication(
+                config,
+                repo=args.repo,
+                bundle_id=args.bundle_id,
+                attempt_id=args.attempt_id,
+            )
+        elif args.command == "publish-fork":
+            report = publish_fork(
+                config,
+                repo=args.repo,
+                bundle_id=args.bundle_id,
+                attempt_id=args.attempt_id,
+            )
         else:
             raise AssertionError(f"unhandled worker command: {args.command}")
     except (KnowledgeValidationError, WorkerCycleError, OSError, ValueError) as error:

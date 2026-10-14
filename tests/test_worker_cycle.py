@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.distributed_knowledge import (
     canonical_document_sha256,
     initial_champion,
@@ -21,6 +21,7 @@ from hk_agent.worker_cycle import (
     load_worker_config,
     preflight_worker,
     prepare_publication,
+    publish_fork,
     sync_worker_knowledge,
 )
 
@@ -50,9 +51,13 @@ def _config(tmp_path: Path, *, stage: bool = True) -> Path:
     _write_json(
         path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "worker_id": "pc-um",
-            "trusted_ref": "origin/knowledge",
+            "upstream_repository": "Thayrone-L/VoidGym",
+            "upstream_remote": "upstream",
+            "fork_repository": "voidgym-worker/VoidGym",
+            "fork_remote": "fork",
+            "branch_prefix": "voidgym/knowledge",
             "knowledge_root": "knowledge",
             "cache_root": "cache",
             "outbox_root": "outbox",
@@ -80,7 +85,7 @@ def _mark_trusted(
         {
             "schema_version": 1,
             "trust_tier": "maintainer-promoted",
-            "ref": "origin/knowledge",
+            "ref": "upstream/knowledge",
             "source_commit": source_commit,
             "generation": selected["generation"],
             "champion_sha256": canonical_document_sha256(selected),
@@ -159,13 +164,13 @@ def test_preflight_rejects_locally_copied_champion_without_trusted_sync(
         preflight_worker(config, "session-1")
 
 
-def test_worker_config_accepts_only_the_maintainer_knowledge_ref(tmp_path: Path) -> None:
+def test_worker_config_requires_distinct_upstream_and_fork(tmp_path: Path) -> None:
     config_path = _config(tmp_path)
     document = json.loads(config_path.read_text("utf-8"))
-    document["trusted_ref"] = "origin/friend-candidate"
+    document["fork_repository"] = document["upstream_repository"]
     _write_json(config_path, document)
 
-    with pytest.raises(WorkerCycleError, match="exactly origin/knowledge"):
+    with pytest.raises(WorkerCycleError, match="different GitHub owner"):
         load_worker_config(config_path)
 
 
@@ -188,6 +193,7 @@ def test_sync_marks_only_the_configured_maintainer_ref(
         }
 
     monkeypatch.setattr("hk_agent.worker_cycle.sync_from_git_ref", fake_sync)
+    monkeypatch.setattr("hk_agent.worker_cycle._verify_remote", lambda *args, **kwargs: None)
     monkeypatch.setattr("hk_agent.worker_cycle._git", lambda *args, **kwargs: "1" * 40)
     report = sync_worker_knowledge(config, repo=tmp_path)
     assert report["champion_generation"] == 0
@@ -412,10 +418,28 @@ def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) 
     assert result["parent_champion"]["generation"] == 1
 
 
-def test_prepare_publication_uses_isolated_immutable_branch(tmp_path: Path) -> None:
+def _publication_fixture(tmp_path: Path) -> tuple[Path, Path, object, dict[str, Any], str]:
     repository = tmp_path / "repository"
     repository.mkdir()
     _git(repository, "init", "-b", "main")
+    _git(repository, "remote", "add", "upstream", "https://github.com/Thayrone-L/VoidGym.git")
+    _git(
+        repository,
+        "remote",
+        "set-url",
+        "--push",
+        "upstream",
+        "disabled://voidgym-upstream-read-only",
+    )
+    _git(repository, "config", "--unset-all", "remote.upstream.fetch")
+    _git(
+        repository,
+        "config",
+        "--add",
+        "remote.upstream.fetch",
+        "+refs/heads/knowledge:refs/remotes/upstream/knowledge",
+    )
+    _git(repository, "remote", "add", "fork", "https://github.com/voidgym-worker/VoidGym.git")
     _knowledge(repository)
     _git(repository, "add", "knowledge")
     _git(
@@ -429,15 +453,19 @@ def test_prepare_publication_uses_isolated_immutable_branch(tmp_path: Path) -> N
         "trusted knowledge",
     )
     trusted_commit = _git(repository, "rev-parse", "HEAD")
-    _git(repository, "update-ref", "refs/remotes/origin/knowledge", trusted_commit)
+    _git(repository, "update-ref", "refs/remotes/upstream/knowledge", trusted_commit)
 
     config_path = tmp_path / "worker.json"
     _write_json(
         config_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "worker_id": "pc-um",
-            "trusted_ref": "origin/knowledge",
+            "upstream_repository": "Thayrone-L/VoidGym",
+            "upstream_remote": "upstream",
+            "fork_repository": "voidgym-worker/VoidGym",
+            "fork_remote": "fork",
+            "branch_prefix": "voidgym/knowledge",
             "knowledge_root": str(repository / "knowledge"),
             "cache_root": str(tmp_path / "cache"),
             "outbox_root": str(tmp_path / "outbox"),
@@ -448,18 +476,31 @@ def test_prepare_publication_uses_isolated_immutable_branch(tmp_path: Path) -> N
     _mark_trusted(tmp_path, source_commit=trusted_commit)
     preflight_worker(config, "session-1")
     staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
-    main_before = _git(repository, "rev-parse", "HEAD")
+    return repository, config_path, config, staging, trusted_commit
 
-    prepared = prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
-    repeated = prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+
+def test_prepare_publication_uses_unique_isolated_attempt(tmp_path: Path) -> None:
+    repository, _, config, staging, trusted_commit = _publication_fixture(tmp_path)
+    main_before = _git(repository, "rev-parse", "HEAD")
+    attempt = "1" * 32
+
+    prepared = prepare_publication(
+        config, repo=repository, bundle_id=str(staging["bundle_id"]), attempt_id=attempt
+    )
+    repeated = prepare_publication(
+        config, repo=repository, bundle_id=str(staging["bundle_id"]), attempt_id=attempt
+    )
 
     assert prepared == repeated
-    assert prepared["source_commit"] == trusted_commit
-    assert prepared["branch"].startswith("codex/knowledge-pc-um-")
+    assert prepared["trained_source_commit"] == trusted_commit
+    assert prepared["publication_base_commit"] == trusted_commit
+    assert prepared["remote_branch"] == f"voidgym/knowledge/pc-um/{attempt}"
     assert _git(repository, "rev-parse", "HEAD") == main_before
     assert _git(repository, "branch", "--show-current") == "main"
     worktree = Path(str(prepared["worktree"]))
-    assert set(_git(worktree, "diff", "--name-only", f"{trusted_commit}..HEAD").splitlines()) == {
+    assert set(
+        _git(worktree, "diff", "--name-only", f"{trusted_commit}..HEAD").splitlines()
+    ) == {
         "knowledge/index.json",
         f"knowledge/contributions/{prepared['contribution_id']}.json",
     }
@@ -467,91 +508,9 @@ def test_prepare_publication_uses_isolated_immutable_branch(tmp_path: Path) -> N
     assert not (worktree / "staging.json").exists()
 
 
-def test_prepare_publication_rolls_back_invalid_trusted_snapshot(tmp_path: Path) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    _git(repository, "init", "-b", "main")
-    _knowledge(repository)
-    trusted_copy = tmp_path / "trusted-knowledge"
-    shutil.copytree(repository / "knowledge", trusted_copy)
-    _write_json(repository / "knowledge" / "champion.json", {"schema_version": 1})
-    _git(repository, "add", "knowledge")
-    _git(
-        repository,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-m",
-        "invalid remote snapshot",
-    )
-    source_commit = _git(repository, "rev-parse", "HEAD")
-    _git(repository, "update-ref", "refs/remotes/origin/knowledge", source_commit)
-    config_path = tmp_path / "worker.json"
-    _write_json(
-        config_path,
-        {
-            "schema_version": 1,
-            "worker_id": "pc-um",
-            "trusted_ref": "origin/knowledge",
-            "knowledge_root": str(trusted_copy),
-            "cache_root": str(tmp_path / "cache"),
-            "outbox_root": str(tmp_path / "outbox"),
-            "stage_checkpoint": False,
-        },
-    )
-    config = load_worker_config(config_path)
-    _mark_trusted(tmp_path, source_commit=source_commit)
-    preflight_worker(config, "session-1")
-    staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
-    contribution_id = str(staging["contribution"]["contribution_id"])
-    branch = f"codex/knowledge-pc-um-{contribution_id[:12]}"
-
-    with pytest.raises(WorkerCycleError):
-        prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
-
-    assert _git(repository, "branch", "--list", branch) == ""
-    assert not (tmp_path / "outbox" / "wt" / str(staging["bundle_id"])[:16]).exists()
-
-
-def test_prepare_publication_rejects_a_moved_trusted_ref(tmp_path: Path) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    _git(repository, "init", "-b", "main")
-    _knowledge(repository)
-    _git(repository, "add", "knowledge")
-    _git(
-        repository,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-m",
-        "trusted knowledge",
-    )
-    trusted_commit = _git(repository, "rev-parse", "HEAD")
-    _git(repository, "update-ref", "refs/remotes/origin/knowledge", trusted_commit)
-    config_path = tmp_path / "worker.json"
-    _write_json(
-        config_path,
-        {
-            "schema_version": 1,
-            "worker_id": "pc-um",
-            "trusted_ref": "origin/knowledge",
-            "knowledge_root": str(repository / "knowledge"),
-            "cache_root": str(tmp_path / "cache"),
-            "outbox_root": str(tmp_path / "outbox"),
-            "stage_checkpoint": False,
-        },
-    )
-    config = load_worker_config(config_path)
-    _mark_trusted(tmp_path, source_commit=trusted_commit)
-    preflight_worker(config, "session-1")
-    staging = finalize_candidate(config, _manifest(tmp_path), "session-1")
-
-    (repository / "README.md").write_text("new trusted head", encoding="utf-8")
+def test_prepare_publication_rebuilds_on_latest_upstream_snapshot(tmp_path: Path) -> None:
+    repository, _, config, staging, trained_commit = _publication_fixture(tmp_path)
+    (repository / "README.md").write_text("new upstream head", encoding="utf-8")
     _git(repository, "add", "README.md")
     _git(
         repository,
@@ -561,12 +520,223 @@ def test_prepare_publication_rejects_a_moved_trusted_ref(tmp_path: Path) -> None
         "user.email=test@example.invalid",
         "commit",
         "-m",
-        "advance trusted ref",
+        "advance upstream knowledge",
     )
-    advanced_commit = _git(repository, "rev-parse", "HEAD")
-    _git(repository, "update-ref", "refs/remotes/origin/knowledge", advanced_commit)
+    latest_commit = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", "refs/remotes/upstream/knowledge", latest_commit)
 
-    with pytest.raises(WorkerCycleError, match="no longer matches"):
-        prepare_publication(config, repo=repository, bundle_id=str(staging["bundle_id"]))
+    prepared = prepare_publication(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id="2" * 32,
+    )
 
-    assert not (tmp_path / "outbox" / "publications").exists()
+    assert prepared["trained_source_commit"] == trained_commit
+    assert prepared["publication_base_commit"] == latest_commit
+    assert _git(Path(prepared["worktree"]), "show", "HEAD^:README.md") == "new upstream head"
+
+
+def test_prepare_publication_rejects_mismatched_remote(tmp_path: Path) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    _git(
+        repository,
+        "remote",
+        "set-url",
+        "--push",
+        "fork",
+        "https://github.com/attacker/VoidGym.git",
+    )
+
+    with pytest.raises(WorkerCycleError, match="does not match"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id="3" * 32,
+        )
+
+
+def test_prepare_publication_rejects_noncanonical_upstream_refspec(tmp_path: Path) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    _git(
+        repository,
+        "config",
+        "--replace-all",
+        "remote.upstream.fetch",
+        "+refs/pull/1/head:refs/remotes/upstream/knowledge",
+    )
+
+    with pytest.raises(WorkerCycleError, match="fetch only refs/heads/knowledge"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id="5" * 32,
+        )
+
+
+def test_prepare_publication_rejects_divergent_upstream_history(tmp_path: Path) -> None:
+    repository, _, config, staging, trained_commit = _publication_fixture(tmp_path)
+    tree = _git(repository, "rev-parse", f"{trained_commit}^{{tree}}")
+    divergent = _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit-tree",
+        tree,
+        "-m",
+        "divergent knowledge",
+    )
+    _git(repository, "update-ref", "refs/remotes/upstream/knowledge", divergent)
+
+    with pytest.raises(WorkerCycleError, match="not a descendant"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id="6" * 32,
+        )
+
+
+def test_prepare_publication_claim_prevents_attempt_collision(tmp_path: Path) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    attempt = "7" * 32
+    claim = (
+        tmp_path
+        / "outbox"
+        / "publications"
+        / str(staging["bundle_id"])
+        / attempt
+        / "preparing.lock"
+    )
+    claim.parent.mkdir(parents=True)
+    claim.write_text("owned by another process", encoding="ascii")
+
+    with pytest.raises(WorkerCycleError, match="already being prepared"):
+        prepare_publication(
+            config,
+            repo=repository,
+            bundle_id=str(staging["bundle_id"]),
+            attempt_id=attempt,
+        )
+    assert claim.read_text("ascii") == "owned by another process"
+    assert not (tmp_path / "outbox" / "wt" / attempt).exists()
+
+
+def test_publish_fork_pushes_exact_commit_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    prepared = prepare_publication(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id="4" * 32,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_: object) -> str:
+        calls.append(arguments)
+        if "ls-remote" in arguments and len([call for call in calls if "ls-remote" in call]) == 1:
+            return ""
+        if "ls-remote" in arguments:
+            return f"{prepared['publication_commit']}\trefs/heads/{prepared['remote_branch']}"
+        return "ok"
+
+    monkeypatch.setattr("hk_agent.worker_cycle._run", fake_run)
+    monkeypatch.setattr("hk_agent.worker_cycle._verify_remote", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "hk_agent.worker_cycle._verify_prepared_publication",
+        lambda *_: Path(str(prepared["worktree"])),
+    )
+    result = publish_fork(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id="4" * 32,
+    )
+
+    push = next(arguments for arguments in calls if "push" in arguments)
+    assert not any(argument.startswith(("--force", "+")) for argument in push)
+    assert "https://github.com/voidgym-worker/VoidGym.git" in push
+    assert all("Thayrone-L/VoidGym.git" not in argument for argument in push)
+    assert result["compare_url"].startswith(
+        "https://github.com/Thayrone-L/VoidGym/compare/knowledge...voidgym-worker:"
+    )
+
+
+def test_publish_fork_adopts_matching_remote_branch_after_lost_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, _, config, staging, _ = _publication_fixture(tmp_path)
+    attempt = "8" * 32
+    prepared = prepare_publication(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id=attempt,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_: object) -> str:
+        calls.append(arguments)
+        if "ls-remote" in arguments:
+            return f"{prepared['publication_commit']}\trefs/heads/{prepared['remote_branch']}"
+        return "ok"
+
+    monkeypatch.setattr(worker_cycle_module, "_run", fake_run)
+    monkeypatch.setattr(worker_cycle_module, "_verify_remote", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        worker_cycle_module,
+        "_verify_prepared_publication",
+        lambda *_: Path(str(prepared["worktree"])),
+    )
+
+    result = publish_fork(
+        config,
+        repo=repository,
+        bundle_id=str(staging["bundle_id"]),
+        attempt_id=attempt,
+    )
+
+    assert result["publication_commit"] == prepared["publication_commit"]
+    assert not any("push" in arguments for arguments in calls)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended UNC path behavior")
+def test_native_io_path_uses_valid_extended_unc_prefix() -> None:
+    converted = worker_cycle_module._native_io_path(
+        Path(r"\\server\share\voidgym\receipt.json")
+    )
+    assert str(converted).startswith("\\\\?\\UNC\\server\\share\\")
+
+
+def test_subprocess_environment_drops_ambient_github_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_subprocess_run(*_: object, **kwargs: object) -> object:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        captured.update(environment)
+
+        class Result:
+            returncode = 0
+            stdout = "ok"
+
+        return Result()
+
+    monkeypatch.setenv("GH_TOKEN", "must-not-leak")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-leak")
+    monkeypatch.setattr(worker_cycle_module.subprocess, "run", fake_subprocess_run)
+
+    assert worker_cycle_module._run(
+        ["git", "version"], cwd=tmp_path, safe_error="failed"
+    ) == "ok"
+    assert "GH_TOKEN" not in captured
+    assert "GITHUB_TOKEN" not in captured
+    assert captured["GIT_TERMINAL_PROMPT"] == "0"
