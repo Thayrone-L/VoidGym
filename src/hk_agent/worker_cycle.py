@@ -4,12 +4,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from hk_agent.distributed_knowledge import (
     KnowledgeValidationError,
@@ -25,7 +27,14 @@ from hk_agent.first_training import sha256_file
 
 _WORKER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ATTEMPT_ID = re.compile(r"^[0-9a-f]{32}$")
+_GITHUB_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$"
+)
+_REMOTE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+_BRANCH_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _MAX_POLICY_BYTES = 512 * 1024 * 1024
+_DISABLED_UPSTREAM_PUSH_URL = "disabled://voidgym-upstream-read-only"
 
 
 class WorkerCycleError(ValueError):
@@ -35,20 +44,30 @@ class WorkerCycleError(ValueError):
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
     worker_id: str
-    trusted_ref: str
+    upstream_repository: str
+    upstream_remote: str
+    fork_repository: str
+    fork_remote: str
+    branch_prefix: str
     knowledge_root: Path
     cache_root: Path
     outbox_root: Path
     stage_checkpoint: bool = True
 
+    @property
+    def trusted_ref(self) -> str:
+        return f"{self.upstream_remote}/knowledge"
+
 
 @dataclass(frozen=True, slots=True)
 class PublicationReceipt:
     bundle_id: str
-    branch: str
-    commit: str
+    attempt_id: str
+    remote_branch: str
+    publication_commit: str
     contribution_id: str
-    source_commit: str
+    trained_source_commit: str
+    publication_base_commit: str
     worktree: str
 
 
@@ -72,6 +91,38 @@ def _resolve_config_path(config_path: Path, value: object, label: str) -> Path:
     return candidate.resolve(strict=False)
 
 
+def _repository(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _GITHUB_REPOSITORY.fullmatch(value):
+        raise WorkerCycleError(f"{label} must be an owner/repository GitHub identifier")
+    owner, repository = value.split("/", 1)
+    if (
+        repository in {".", ".."}
+        or repository.casefold().endswith((".git", ".lock"))
+        or owner.endswith("-")
+    ):
+        raise WorkerCycleError(f"{label} is not a safe GitHub repository identifier")
+    return value
+
+
+def _remote_name(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _REMOTE_NAME.fullmatch(value):
+        raise WorkerCycleError(f"{label} must be a lowercase Git remote name")
+    return value
+
+
+def _branch_prefix(value: object) -> str:
+    if not isinstance(value, str):
+        raise WorkerCycleError("branch_prefix must be a slash-separated lowercase name")
+    components = value.split("/")
+    if (
+        not 1 <= len(components) <= 4
+        or any(not _BRANCH_COMPONENT.fullmatch(component) for component in components)
+        or any(component.endswith(".lock") or ".." in component for component in components)
+    ):
+        raise WorkerCycleError("branch_prefix must be a slash-separated lowercase name")
+    return value
+
+
 def load_worker_config(path: Path) -> WorkerConfig:
     config_path = path.resolve(strict=True)
     try:
@@ -84,7 +135,11 @@ def load_worker_config(path: Path) -> WorkerConfig:
         {
             "schema_version",
             "worker_id",
-            "trusted_ref",
+            "upstream_repository",
+            "upstream_remote",
+            "fork_repository",
+            "fork_remote",
+            "branch_prefix",
             "knowledge_root",
             "cache_root",
             "outbox_root",
@@ -92,7 +147,7 @@ def load_worker_config(path: Path) -> WorkerConfig:
         },
         "worker config",
     )
-    if document["schema_version"] != 1:
+    if document["schema_version"] != 2:
         raise WorkerCycleError("unsupported worker config schema_version")
     worker_id = document["worker_id"]
     if not isinstance(worker_id, str) or not _WORKER_ID.fullmatch(worker_id):
@@ -100,12 +155,21 @@ def load_worker_config(path: Path) -> WorkerConfig:
     stage_checkpoint = document["stage_checkpoint"]
     if not isinstance(stage_checkpoint, bool):
         raise WorkerCycleError("stage_checkpoint must be a boolean")
-    trusted_ref = document["trusted_ref"]
-    if trusted_ref != "origin/knowledge":
-        raise WorkerCycleError("trusted_ref must be exactly origin/knowledge")
+    upstream_repository = _repository(document["upstream_repository"], "upstream_repository")
+    fork_repository = _repository(document["fork_repository"], "fork_repository")
+    if upstream_repository.casefold() == fork_repository.casefold():
+        raise WorkerCycleError("fork_repository must differ from upstream_repository")
+    upstream_remote = _remote_name(document["upstream_remote"], "upstream_remote")
+    fork_remote = _remote_name(document["fork_remote"], "fork_remote")
+    if upstream_remote == fork_remote:
+        raise WorkerCycleError("fork_remote must differ from upstream_remote")
     return WorkerConfig(
         worker_id=worker_id,
-        trusted_ref=trusted_ref,
+        upstream_repository=upstream_repository,
+        upstream_remote=upstream_remote,
+        fork_repository=fork_repository,
+        fork_remote=fork_remote,
+        branch_prefix=_branch_prefix(document["branch_prefix"]),
         knowledge_root=_resolve_config_path(
             config_path, document["knowledge_root"], "knowledge_root"
         ),
@@ -124,6 +188,12 @@ def sync_worker_knowledge(
     if selected_ref != config.trusted_ref:
         raise WorkerCycleError("sync ref differs from the configured trusted maintainer ref")
     repository = repo.resolve(strict=True)
+    _verify_remote(
+        repository,
+        config.upstream_remote,
+        config.upstream_repository,
+        push_enabled=False,
+    )
     source_commit = _git(
         repository,
         "rev-parse",
@@ -303,12 +373,51 @@ def preflight_worker(config: WorkerConfig, session_id: str) -> dict[str, Any]:
 
 def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pending = path.with_name(f".{path.name}.{os.getpid()}.pending")
+    # Do not repeat a possibly 64-character content ID in the temporary name;
+    # that can cross MAX_PATH inside Git worktrees on Windows.
+    pending = path.with_name(f".voidgym-{os.getpid()}-{secrets.token_hex(8)}.pending")
     pending.write_text(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
     os.replace(pending, path)
+
+
+def _native_io_path(path: Path) -> Path:
+    """Use the Win32 extended path form for immutable full-ID receipt paths."""
+
+    if os.name != "nt":
+        return path
+    absolute = str(path.resolve(strict=False))
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    return Path(f"\\\\?\\{absolute}")
+
+
+def _immutable_json(path: Path, value: Mapping[str, object]) -> None:
+    """Publish a JSON receipt once without replacing an existing path."""
+
+    path = _native_io_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    created = False
+    try:
+        # Exclusive creation gives the receipt write-once semantics without
+        # requiring hard-link privileges, which are commonly unavailable in
+        # OneDrive workspaces on Windows. A crash may leave an unreadable receipt;
+        # readers fail closed and never overwrite it.
+        with path.open("x", encoding="utf-8") as stream:
+            created = True
+            stream.write(payload)
+    except FileExistsError as error:
+        raise WorkerCycleError(f"immutable receipt already exists: {path.name}") from error
+    except Exception:
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _git_executable() -> str:
@@ -333,6 +442,8 @@ def _run(
     timeout: int = 60,
 ) -> str:
     environment = dict(os.environ)
+    environment.pop("GH_TOKEN", None)
+    environment.pop("GITHUB_TOKEN", None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     try:
         result = subprocess.run(
@@ -357,6 +468,79 @@ def _git(repo: Path, *arguments: str, safe_error: str) -> str:
         cwd=repo,
         safe_error=safe_error,
     )
+
+
+def _github_https(repository: str) -> str:
+    return f"https://github.com/{repository}.git"
+
+
+def _verify_remote(
+    repo: Path, name: str, repository: str, *, push_enabled: bool
+) -> None:
+    expected = _github_https(repository)
+    fetch_url = _git(
+        repo,
+        "remote",
+        "get-url",
+        name,
+        safe_error=f"cannot inspect the configured {name} remote",
+    )
+    push_url = _git(
+        repo,
+        "remote",
+        "get-url",
+        "--push",
+        name,
+        safe_error=f"cannot inspect the configured {name} push URL",
+    )
+    expected_push = expected if push_enabled else _DISABLED_UPSTREAM_PUSH_URL
+    if fetch_url != expected or push_url != expected_push:
+        raise WorkerCycleError(f"{name} remote does not match its configured GitHub repository")
+
+
+def _remote_branch_commit(output: str, remote_ref: str) -> str | None:
+    if not output:
+        return None
+    lines = output.splitlines()
+    if len(lines) != 1:
+        raise WorkerCycleError("fork branch lookup returned an ambiguous result")
+    fields = lines[0].split("\t")
+    if len(fields) != 2 or fields[1] != remote_ref or not re.fullmatch(
+        r"[0-9a-f]{40,64}", fields[0]
+    ):
+        raise WorkerCycleError("fork branch lookup returned an invalid result")
+    return fields[0]
+
+
+def _git_ref_exists(repo: Path, ref: str) -> bool:
+    environment = dict(os.environ)
+    environment.pop("GH_TOKEN", None)
+    environment.pop("GITHUB_TOKEN", None)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        result = subprocess.run(
+            [
+                _git_executable(),
+                "-C",
+                str(repo),
+                "-c",
+                "core.longpaths=true",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                ref,
+            ],
+            cwd=repo,
+            env=environment,
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WorkerCycleError("cannot inspect local publication branches") from error
+    if result.returncode not in {0, 1}:
+        raise WorkerCycleError("cannot inspect local publication branches")
+    return result.returncode == 0
 
 
 def _latest_checkpoint(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[Path, str, int]:
@@ -602,14 +786,34 @@ def _load_staged_contribution(
     return staging, contribution
 
 
-def _publication_receipt(config: WorkerConfig, bundle_id: str) -> Path:
-    return config.outbox_root / "publications" / f"{bundle_id}.json"
+def _publication_attempt_root(
+    config: WorkerConfig, bundle_id: str, attempt_id: str
+) -> Path:
+    if not _SHA256.fullmatch(bundle_id):
+        raise WorkerCycleError("bundle_id must be a lowercase SHA-256")
+    if not _ATTEMPT_ID.fullmatch(attempt_id):
+        raise WorkerCycleError("attempt_id must be 128 bits encoded as lowercase hexadecimal")
+    root = config.outbox_root / "publications" / bundle_id / attempt_id
+    for candidate in (
+        config.outbox_root,
+        config.outbox_root / "publications",
+        config.outbox_root / "publications" / bundle_id,
+        root,
+    ):
+        if candidate.exists() and _is_link_or_junction(candidate):
+            raise WorkerCycleError("publication receipt path cannot contain links or junctions")
+    return root
 
 
-def _read_publication_receipt(config: WorkerConfig, bundle_id: str) -> PublicationReceipt:
-    path = _publication_receipt(config, bundle_id)
+def _read_publication_receipt(
+    config: WorkerConfig, bundle_id: str, attempt_id: str
+) -> PublicationReceipt:
+    path = _publication_attempt_root(config, bundle_id, attempt_id) / "prepared.json"
+    io_path = _native_io_path(path)
+    if io_path.is_symlink():
+        raise WorkerCycleError("publication receipt cannot be a symlink")
     try:
-        document = _object(json.loads(path.read_text("utf-8")), "publication receipt")
+        document = _object(json.loads(io_path.read_text("utf-8")), "publication receipt")
     except (OSError, json.JSONDecodeError) as error:
         raise WorkerCycleError("prepare this bundle before publishing it") from error
     _exact_keys(
@@ -617,42 +821,73 @@ def _read_publication_receipt(config: WorkerConfig, bundle_id: str) -> Publicati
         {
             "schema_version",
             "bundle_id",
-            "branch",
-            "commit",
+            "attempt_id",
+            "remote_branch",
+            "publication_commit",
             "contribution_id",
-            "source_commit",
+            "trained_source_commit",
+            "publication_base_commit",
+            "upstream_repository",
+            "fork_repository",
             "worktree",
         },
         "publication receipt",
     )
-    if document["schema_version"] != 1 or document["bundle_id"] != bundle_id:
+    if (
+        document["schema_version"] != 1
+        or document["bundle_id"] != bundle_id
+        or document["attempt_id"] != attempt_id
+    ):
         raise WorkerCycleError("publication receipt belongs to another bundle or schema")
-    for key in ("branch", "commit", "contribution_id", "source_commit", "worktree"):
+    for key in (
+        "remote_branch",
+        "publication_commit",
+        "contribution_id",
+        "trained_source_commit",
+        "publication_base_commit",
+        "upstream_repository",
+        "fork_repository",
+        "worktree",
+    ):
         if not isinstance(document[key], str):
             raise WorkerCycleError(f"publication receipt {key} must be a string")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", document["commit"]):
+    if not re.fullmatch(r"[0-9a-f]{40,64}", document["publication_commit"]):
         raise WorkerCycleError("publication receipt has an invalid commit")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", document["source_commit"]):
-        raise WorkerCycleError("publication receipt has an invalid source_commit")
+    for key in ("trained_source_commit", "publication_base_commit"):
+        if not re.fullmatch(r"[0-9a-f]{40,64}", document[key]):
+            raise WorkerCycleError(f"publication receipt has an invalid {key}")
     if not _SHA256.fullmatch(document["contribution_id"]):
         raise WorkerCycleError("publication receipt has an invalid contribution_id")
+    if (
+        document["upstream_repository"] != config.upstream_repository
+        or document["fork_repository"] != config.fork_repository
+    ):
+        raise WorkerCycleError("publication receipt belongs to different repositories")
     return PublicationReceipt(
         bundle_id=bundle_id,
-        branch=document["branch"],
-        commit=document["commit"],
+        attempt_id=attempt_id,
+        remote_branch=document["remote_branch"],
+        publication_commit=document["publication_commit"],
         contribution_id=document["contribution_id"],
-        source_commit=document["source_commit"],
+        trained_source_commit=document["trained_source_commit"],
+        publication_base_commit=document["publication_base_commit"],
         worktree=document["worktree"],
     )
 
 
 def _verify_prepared_publication(config: WorkerConfig, receipt: PublicationReceipt) -> Path:
-    expected_branch = f"codex/knowledge-{config.worker_id}-{receipt.contribution_id[:12]}"
-    if receipt.branch != expected_branch:
+    staging, contribution = _load_staged_contribution(config, receipt.bundle_id)
+    if (
+        receipt.trained_source_commit != staging.get("source_commit")
+        or receipt.contribution_id != contribution["contribution_id"]
+    ):
+        raise WorkerCycleError("publication receipt differs from its immutable training bundle")
+    expected_branch = f"{config.branch_prefix}/{config.worker_id}/{receipt.attempt_id}"
+    if receipt.remote_branch != expected_branch:
         raise WorkerCycleError("publication branch does not match the immutable bundle")
     worktree = Path(receipt.worktree).resolve(strict=True)
-    expected_worktree = (config.outbox_root / "wt" / receipt.bundle_id[:16]).resolve(strict=False)
-    if worktree != expected_worktree or worktree.is_symlink():
+    expected_worktree = (config.outbox_root / "wt" / receipt.attempt_id).resolve(strict=False)
+    if worktree != expected_worktree or _is_link_or_junction(worktree):
         raise WorkerCycleError("publication worktree escaped the configured outbox")
     branch = _git(
         worktree,
@@ -673,7 +908,7 @@ def _verify_prepared_publication(config: WorkerConfig, receipt: PublicationRecei
         "--untracked-files=all",
         safe_error="cannot inspect the prepared publication worktree",
     )
-    if branch != receipt.branch or commit != receipt.commit or status:
+    if branch != receipt.remote_branch or commit != receipt.publication_commit or status:
         raise WorkerCycleError("prepared publication changed after its receipt was created")
     parents = _git(
         worktree,
@@ -681,17 +916,17 @@ def _verify_prepared_publication(config: WorkerConfig, receipt: PublicationRecei
         "--parents",
         "-n",
         "1",
-        receipt.commit,
+        receipt.publication_commit,
         safe_error="cannot inspect the prepared publication lineage",
     ).split()
-    if parents != [receipt.commit, receipt.source_commit]:
+    if parents != [receipt.publication_commit, receipt.publication_base_commit]:
         raise WorkerCycleError("prepared publication is not one commit above its trusted snapshot")
     changed = set(
         _git(
             worktree,
             "diff",
             "--name-only",
-            f"{receipt.source_commit}..{receipt.commit}",
+            f"{receipt.publication_base_commit}..{receipt.publication_commit}",
             safe_error="cannot inspect prepared publication paths",
         ).splitlines()
     )
@@ -705,7 +940,21 @@ def _verify_prepared_publication(config: WorkerConfig, receipt: PublicationRecei
     return worktree
 
 
-def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> dict[str, Any]:
+def _publication_compare_url(config: WorkerConfig, remote_branch: str) -> str:
+    fork_owner = config.fork_repository.split("/", 1)[0]
+    return (
+        f"https://github.com/{config.upstream_repository}/compare/knowledge..."
+        f"{fork_owner}:{quote(remote_branch, safe='')}?expand=1"
+    )
+
+
+def prepare_publication(
+    config: WorkerConfig,
+    *,
+    repo: Path,
+    bundle_id: str,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
     """Create an immutable contribution commit in an isolated Git worktree.
 
     This does not fetch, push, open a pull request, upload the checkpoint, or modify
@@ -713,66 +962,64 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
     """
 
     staging, contribution = _load_staged_contribution(config, bundle_id)
-    receipt_path = _publication_receipt(config, bundle_id)
-    if receipt_path.exists():
-        receipt = _read_publication_receipt(config, bundle_id)
+    selected_attempt = attempt_id or secrets.token_hex(16)
+    attempt_root = _publication_attempt_root(config, bundle_id, selected_attempt)
+    receipt_path = attempt_root / "prepared.json"
+    if _native_io_path(receipt_path).exists():
+        receipt = _read_publication_receipt(config, bundle_id, selected_attempt)
         _verify_prepared_publication(config, receipt)
         return {
             "schema_version": 1,
             "bundle_id": receipt.bundle_id,
-            "branch": receipt.branch,
-            "commit": receipt.commit,
+            "attempt_id": receipt.attempt_id,
+            "remote_branch": receipt.remote_branch,
+            "publication_commit": receipt.publication_commit,
             "contribution_id": receipt.contribution_id,
-            "source_commit": receipt.source_commit,
+            "trained_source_commit": receipt.trained_source_commit,
+            "publication_base_commit": receipt.publication_base_commit,
+            "upstream_repository": config.upstream_repository,
+            "fork_repository": config.fork_repository,
             "worktree": receipt.worktree,
         }
 
     repository = repo.resolve(strict=True)
+    _verify_remote(
+        repository,
+        config.upstream_remote,
+        config.upstream_repository,
+        push_enabled=False,
+    )
+    _verify_remote(
+        repository, config.fork_remote, config.fork_repository, push_enabled=True
+    )
     contribution_id = contribution["contribution_id"]
-    branch = f"codex/knowledge-{config.worker_id}-{contribution_id[:12]}"
-    worktree = (config.outbox_root / "wt" / bundle_id[:16]).resolve(strict=False)
+    # The complete 128-bit attempt ID makes the branch unique without embedding
+    # another 64 hex characters that can exceed Git-for-Windows ref path limits.
+    branch = f"{config.branch_prefix}/{config.worker_id}/{selected_attempt}"
+    # Keep the checkout path below Windows' common path-length limit. The full
+    # 128-bit attempt ID remains collision-resistant; receipts retain the full
+    # bundle ID in their separate immutable directory hierarchy.
+    worktree = (config.outbox_root / "wt" / selected_attempt).resolve(strict=False)
     if worktree.exists():
         raise WorkerCycleError("publication worktree already exists without a receipt")
     worktree.parent.mkdir(parents=True, exist_ok=True)
     hooks = (config.outbox_root / "empty-git-hooks").resolve(strict=False)
     hooks.mkdir(parents=True, exist_ok=True)
-    source_commit = _git(
+    publication_base_commit = _git(
         repository,
         "rev-parse",
         f"{config.trusted_ref}^{{commit}}",
         safe_error="cannot resolve the trusted ref to an immutable commit",
     )
-    if not re.fullmatch(r"[0-9a-f]{40,64}", source_commit):
+    if not re.fullmatch(r"[0-9a-f]{40,64}", publication_base_commit):
         raise WorkerCycleError("trusted ref did not resolve to a full commit hash")
-    if staging.get("source_commit") != source_commit:
-        raise WorkerCycleError(
-            "trusted ref no longer matches the commit frozen for this training session"
-        )
-
-    # `show-ref` exit 1 means absent. Any other output/error is intentionally hidden.
-    try:
-        branch_probe = subprocess.run(
-            [
-                _git_executable(),
-                "-C",
-                str(repository),
-                "show-ref",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{branch}",
-            ],
-            cwd=repository,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise WorkerCycleError("cannot inspect local publication branches") from error
-    if branch_probe.returncode == 0:
+    trained_source_commit = staging.get("source_commit")
+    if not isinstance(trained_source_commit, str) or not re.fullmatch(
+        r"[0-9a-f]{40,64}", trained_source_commit
+    ):
+        raise WorkerCycleError("staging receipt has an invalid trained source commit")
+    if _git_ref_exists(repository, f"refs/heads/{branch}"):
         raise WorkerCycleError("immutable publication branch already exists")
-    if branch_probe.returncode != 1:
-        raise WorkerCycleError("cannot inspect local publication branches")
 
     worktree_created = False
     branch_created = False
@@ -786,7 +1033,7 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
             "add",
             "--detach",
             str(worktree),
-            source_commit,
+            publication_base_commit,
             safe_error="cannot create the isolated publication worktree",
         )
         worktree_created = True
@@ -794,6 +1041,8 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
             worktree,
             "-c",
             f"core.hooksPath={hooks}",
+            "-c",
+            "core.longpaths=true",
             "checkout",
             "-b",
             branch,
@@ -801,18 +1050,9 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
         )
         branch_created = True
 
-        # The checked-out tree must be exactly the validated maintainer snapshot used by
-        # the worker. This catches a fetch without a matching worker sync.
-        checked_index = validate_knowledge_tree(worktree / "knowledge")
-        trusted_index = validate_knowledge_tree(config.knowledge_root)
-        checked_champion, checked_hash = _load_champion(worktree / "knowledge")
-        trusted_champion, trusted_hash = _load_champion(config.knowledge_root)
-        if (
-            checked_index != trusted_index
-            or checked_champion != trusted_champion
-            or checked_hash != trusted_hash
-        ):
-            raise WorkerCycleError("trusted ref changed; sync the worker again before preparing")
+        # Validate the current upstream snapshot using only trusted local code. The
+        # training source remains in the receipt as provenance and may be older.
+        validate_knowledge_tree(worktree / "knowledge")
 
         destination = worktree / "knowledge" / "contributions" / f"{contribution_id}.json"
         if destination.exists():
@@ -877,15 +1117,19 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
         receipt_document: dict[str, object] = {
             "schema_version": 1,
             "bundle_id": bundle_id,
-            "branch": branch,
-            "commit": commit,
+            "attempt_id": selected_attempt,
+            "remote_branch": branch,
+            "publication_commit": commit,
             "contribution_id": contribution_id,
-            "source_commit": source_commit,
+            "trained_source_commit": trained_source_commit,
+            "publication_base_commit": publication_base_commit,
+            "upstream_repository": config.upstream_repository,
+            "fork_repository": config.fork_repository,
             "worktree": str(worktree),
         }
-        _atomic_json(receipt_path, receipt_document)
+        _immutable_json(receipt_path, receipt_document)
         receipt_written = True
-        receipt = _read_publication_receipt(config, bundle_id)
+        receipt = _read_publication_receipt(config, bundle_id, selected_attempt)
         _verify_prepared_publication(config, receipt)
         return dict(receipt_document)
     except Exception as error:
@@ -907,6 +1151,8 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
             try:
                 _git(
                     repository,
+                    "-c",
+                    "core.longpaths=true",
                     "branch",
                     "-D",
                     branch,
@@ -916,9 +1162,127 @@ def prepare_publication(config: WorkerConfig, *, repo: Path, bundle_id: str) -> 
                 pass
         if receipt_written:
             try:
-                receipt_path.unlink()
+                _native_io_path(receipt_path).unlink()
             except OSError:
                 pass
         if isinstance(error, KnowledgeValidationError):
             raise WorkerCycleError("trusted publication snapshot is invalid") from error
         raise
+
+
+def publish_fork(
+    config: WorkerConfig,
+    *,
+    repo: Path,
+    bundle_id: str,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Push one immutable prepared commit to a new branch in the configured fork."""
+
+    repository = repo.resolve(strict=True)
+    _verify_remote(
+        repository,
+        config.upstream_remote,
+        config.upstream_repository,
+        push_enabled=False,
+    )
+    _verify_remote(
+        repository, config.fork_remote, config.fork_repository, push_enabled=True
+    )
+    receipt = _read_publication_receipt(config, bundle_id, attempt_id)
+    worktree = _verify_prepared_publication(config, receipt)
+    attempt_root = _publication_attempt_root(config, bundle_id, attempt_id)
+    pushed_path = attempt_root / "pushed.json"
+    pushed_io_path = _native_io_path(pushed_path)
+    if pushed_io_path.is_symlink():
+        raise WorkerCycleError("pushed receipt cannot be a symlink")
+    fork_url = _github_https(config.fork_repository)
+    remote_ref = f"refs/heads/{receipt.remote_branch}"
+
+    if pushed_io_path.exists():
+        try:
+            pushed = _object(json.loads(pushed_io_path.read_text("utf-8")), "pushed receipt")
+        except (OSError, json.JSONDecodeError) as error:
+            raise WorkerCycleError("immutable pushed receipt is unreadable") from error
+        _exact_keys(
+            pushed,
+            {
+                "schema_version",
+                "bundle_id",
+                "attempt_id",
+                "publication_commit",
+                "remote_branch",
+                "fork_repository",
+                "target_repository",
+                "target_branch",
+                "compare_url",
+            },
+            "pushed receipt",
+        )
+        if (
+            pushed["schema_version"] != 1
+            or pushed["bundle_id"] != bundle_id
+            or pushed["attempt_id"] != attempt_id
+            or pushed["publication_commit"] != receipt.publication_commit
+            or pushed["remote_branch"] != receipt.remote_branch
+            or pushed["fork_repository"] != config.fork_repository
+            or pushed["target_repository"] != config.upstream_repository
+            or pushed["target_branch"] != "knowledge"
+            or pushed["compare_url"]
+            != _publication_compare_url(config, receipt.remote_branch)
+        ):
+            raise WorkerCycleError("pushed receipt differs from its prepared publication")
+        remote = _run(
+            [_git_executable(), "ls-remote", "--heads", fork_url, remote_ref],
+            cwd=repository,
+            safe_error="cannot verify the published fork branch",
+        )
+        if _remote_branch_commit(remote, remote_ref) != receipt.publication_commit:
+            raise WorkerCycleError("published fork branch no longer matches its receipt")
+        return pushed
+
+    existing = _run(
+        [_git_executable(), "ls-remote", "--heads", fork_url, remote_ref],
+        cwd=repository,
+        safe_error="cannot check whether the fork branch is available",
+    )
+    if _remote_branch_commit(existing, remote_ref) is not None:
+        raise WorkerCycleError("unique fork branch already exists; prepare a new attempt")
+    _run(
+        [
+            _git_executable(),
+            "-C",
+            str(worktree),
+            "-c",
+            f"core.hooksPath={(config.outbox_root / 'empty-git-hooks').resolve(strict=True)}",
+            "push",
+            "--porcelain",
+            fork_url,
+            f"{receipt.publication_commit}:{remote_ref}",
+        ],
+        cwd=worktree,
+        safe_error="cannot publish the immutable contribution to the configured fork",
+        timeout=120,
+    )
+    remote = _run(
+        [_git_executable(), "ls-remote", "--heads", fork_url, remote_ref],
+        cwd=repository,
+        safe_error="cannot verify the published fork branch",
+    )
+    if _remote_branch_commit(remote, remote_ref) != receipt.publication_commit:
+        raise WorkerCycleError("fork branch does not point to the prepared publication commit")
+
+    compare_url = _publication_compare_url(config, receipt.remote_branch)
+    pushed_document: dict[str, Any] = {
+        "schema_version": 1,
+        "bundle_id": bundle_id,
+        "attempt_id": attempt_id,
+        "publication_commit": receipt.publication_commit,
+        "remote_branch": receipt.remote_branch,
+        "fork_repository": config.fork_repository,
+        "target_repository": config.upstream_repository,
+        "target_branch": "knowledge",
+        "compare_url": compare_url,
+    }
+    _immutable_json(pushed_path, pushed_document)
+    return pushed_document

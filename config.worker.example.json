@@ -1,7 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "worker_id": "pc-principal",
-  "trusted_ref": "origin/knowledge",
+  "upstream_repository": "Thayrone-L/VoidGym",
+  "upstream_remote": "upstream",
+  "fork_repository": "seu-usuario/VoidGym",
+  "fork_remote": "fork",
+  "branch_prefix": "voidgym/knowledge",
   "knowledge_root": "artifacts/distributed/knowledge",
   "cache_root": "artifacts/distributed/cache",
   "outbox_root": "artifacts/distributed/outbox",
