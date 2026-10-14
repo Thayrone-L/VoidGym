@@ -1,0 +1,55 @@
+name: Knowledge integrity
+
+on:
+  pull_request:
+    branches: [knowledge]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledge-integrity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Data only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted validator from base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Check out candidate merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Validate data without loading candidate code
+        working-directory: trusted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_REPOSITORY: ${{ github.workspace }}/candidate
+          ALLOW_CHAMPION_UPDATE: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          arguments=(
+            --candidate-repository "$CANDIDATE_REPOSITORY"
+            --trusted-knowledge "${{ github.workspace }}/trusted/knowledge"
+            --base-sha "$BASE_SHA"
+            --candidate-sha "$CANDIDATE_SHA"
+          )
+          if [[ "$ALLOW_CHAMPION_UPDATE" == "true" ]]; then
+            arguments+=(--allow-champion-update)
+          fi
+          PYTHONPATH="${{ github.workspace }}/trusted/src" \
+            python tools/validate_knowledge_pr.py "${arguments[@]}"

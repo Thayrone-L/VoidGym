@@ -1,0 +1,63 @@
+name: Code CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-dev.lock
+          python -m pip install --disable-pip-version-check --no-deps -e .
+      - name: Lint
+        run: python -m ruff check src tests tools
+      - name: Type check
+        run: python -m mypy src tools/worker_cycle.py tools/validate_knowledge_pr.py
+      - name: Test
+        run: python -m pytest -q
+
+  bridge-contracts:
+    name: Bridge contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "8.0.x"
+      - name: Test correlation contract
+        run: >-
+          dotnet run --project
+          bridge/HkAgentBridge.CorrelationTests/HkAgentBridge.CorrelationTests.csproj
+          --configuration Release
+      - name: Test menu policy contract
+        run: >-
+          dotnet run --project
+          bridge/HkAgentBridge.MenuPolicyTests/HkAgentBridge.MenuPolicyTests.csproj
+          --configuration Release
