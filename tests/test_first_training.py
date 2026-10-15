@@ -7,6 +7,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
+from hk_agent import first_training
 from hk_agent.first_training import FirstTrainingConfig, train_ppo
 from hk_agent.training_task import InvalidTrainingTransition
 
@@ -14,6 +17,7 @@ from hk_agent.training_task import InvalidTrainingTransition
 class FakeModel:
     def __init__(self, *_: object, **__: object) -> None:
         self.num_timesteps = 0
+        self.policy = object()
 
     def learn(
         self,
@@ -58,9 +62,65 @@ class FakeTask:
         }
 
 
+@pytest.fixture(autouse=True)
+def fake_portable_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_export(
+        policy: object,
+        artifact_path: Path,
+        *,
+        compatibility_fingerprint: str,
+        manifest_path: Path | None = None,
+    ) -> dict[str, Any]:
+        del policy
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(b"portable policy")
+        sidecar = manifest_path or artifact_path.with_suffix(".manifest.json")
+        sidecar.write_text("{}", encoding="utf-8")
+        return {
+            "manifest_id": "b" * 64,
+            "compatibility_fingerprint": compatibility_fingerprint,
+            "artifact": {
+                "sha256": first_training.sha256_file(artifact_path),
+                "size_bytes": artifact_path.stat().st_size,
+            },
+        }
+
+    def fake_import(
+        policy: object,
+        artifact_path: Path,
+        *,
+        expected_compatibility_fingerprint: str,
+        manifest_path: Path | None = None,
+        expected_artifact_sha256: str | None = None,
+        expected_manifest_sha256: str | None = None,
+        expected_manifest_id: str | None = None,
+    ) -> dict[str, Any]:
+        del policy, expected_artifact_sha256, expected_manifest_sha256, expected_manifest_id
+        assert artifact_path.is_file()
+        assert manifest_path is not None and manifest_path.is_file()
+        return {
+            "manifest_id": "c" * 64,
+            "compatibility_fingerprint": expected_compatibility_fingerprint,
+            "artifact": {
+                "sha256": first_training.sha256_file(artifact_path),
+                "size_bytes": artifact_path.stat().st_size,
+            },
+        }
+
+    monkeypatch.setattr(first_training, "export_policy_artifact", fake_export)
+    monkeypatch.setattr(first_training, "import_policy_artifact", fake_import)
+
+
 class FailingConstructorModel:
     def __init__(self, *_: object, **__: object) -> None:
         raise RuntimeError("constructor exploded")
+
+
+class FreshOnlyModel(FakeModel):
+    @classmethod
+    def load(cls, path: str, *, env: object, device: str) -> FakeModel:
+        del path, env, device
+        raise AssertionError("portable policy must never use PPO.load")
 
 
 class InvalidTransitionModel(FakeModel):
@@ -137,6 +197,30 @@ def test_training_budget_requires_exact_rollouts() -> None:
         raise AssertionError("invalid rollout budget was accepted")
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        FirstTrainingConfig(warm_start_policy=Path("policy.safetensors")),
+        FirstTrainingConfig(warm_start_policy_manifest=Path("policy.manifest.json")),
+        FirstTrainingConfig(
+            resume_checkpoint=Path("checkpoint.zip"),
+            warm_start_policy=Path("policy.safetensors"),
+            warm_start_policy_manifest=Path("policy.manifest.json"),
+        ),
+        FirstTrainingConfig(
+            warm_start_policy=Path("policy.safetensors"),
+            warm_start_policy_manifest=Path("policy.manifest.json"),
+            warm_start_policy_sha256="a" * 64,
+        ),
+    ],
+)
+def test_training_rejects_incomplete_or_ambiguous_warm_start(
+    config: FirstTrainingConfig,
+) -> None:
+    with pytest.raises(ValueError):
+        config.validate()
+
+
 def test_training_writes_atomic_checkpoints_and_honest_manifest(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -168,7 +252,74 @@ def test_training_writes_atomic_checkpoints_and_honest_manifest(
     assert manifest["provenance"]["game_profile"] == "test-profile"
     assert [entry["step"] for entry in manifest["checkpoints"]] == [128, 256]
     assert all(len(entry["sha256"]) == 64 for entry in manifest["checkpoints"])
+    assert [entry["step"] for entry in manifest["portable_policies"]] == [128, 256]
+    assert all(
+        Path(entry["path"]).is_file()
+        and Path(entry["manifest_path"]).is_file()
+        and entry["format"] == "safetensors"
+        for entry in manifest["portable_policies"]
+    )
     assert environment.closed
+
+
+def test_portable_policy_warm_starts_a_fresh_model_without_loading_zip(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    sb3 = ModuleType("stable_baselines3")
+    sb3.__version__ = "test"  # type: ignore[attr-defined]
+    sb3.PPO = FreshOnlyModel  # type: ignore[attr-defined]
+    torch = ModuleType("torch")
+    torch.__version__ = "test"  # type: ignore[attr-defined]
+    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    artifact = tmp_path / "source" / "policy.safetensors"
+    sidecar = tmp_path / "source" / "policy.policy.manifest.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"received tensors")
+    sidecar.write_text("{}", encoding="utf-8")
+    imported: list[tuple[Path, Path]] = []
+
+    def record_import(
+        policy: object,
+        artifact_path: Path,
+        *,
+        expected_compatibility_fingerprint: str,
+        manifest_path: Path | None = None,
+        expected_artifact_sha256: str | None = None,
+        expected_manifest_sha256: str | None = None,
+        expected_manifest_id: str | None = None,
+    ) -> dict[str, Any]:
+        del policy, expected_artifact_sha256, expected_manifest_sha256, expected_manifest_id
+        assert len(expected_compatibility_fingerprint) == 64
+        assert manifest_path is not None
+        imported.append((artifact_path, manifest_path))
+        return {
+            "manifest_id": "c" * 64,
+            "compatibility_fingerprint": expected_compatibility_fingerprint,
+            "artifact": {
+                "sha256": first_training.sha256_file(artifact_path),
+                "size_bytes": artifact_path.stat().st_size,
+            },
+        }
+
+    monkeypatch.setattr(first_training, "import_policy_artifact", record_import)
+    result = train_ppo(
+        FakeEnvironment(),  # type: ignore[arg-type]
+        task=FakeTask(),
+        config=FirstTrainingConfig(
+            total_timesteps=128,
+            checkpoint_interval=128,
+            warm_start_policy=artifact,
+            warm_start_policy_manifest=sidecar,
+        ),
+        output_root=tmp_path / "run",
+    )
+
+    assert imported == [(artifact.resolve(), sidecar.resolve())]
+    assert result["completed_timesteps"] == 128
+    assert result["warm_started_from"]["manifest_id"] == "c" * 64
+    assert "path" not in result["warm_started_from"]
 
 
 def test_constructor_failure_marks_manifest_failed_and_closes_environment(
@@ -359,6 +510,11 @@ def test_continuous_training_runs_until_stop_and_rotates_checkpoints(
     assert [entry["step"] for entry in result["checkpoints"]] == [384, 512]
     assert [entry["step"] for entry in result["pruned_checkpoints"]] == [128, 256]
     assert not (tmp_path / "run" / "checkpoints" / "step-128.zip").exists()
+    assert [entry["step"] for entry in result["portable_policies"]] == [384, 512]
+    assert not (tmp_path / "run" / "policies" / "step-128.safetensors").exists()
+    assert not (
+        tmp_path / "run" / "policies" / "step-128.policy.manifest.json"
+    ).exists()
 
 
 def test_environment_run_failed_does_not_abort_continuous_campaign(

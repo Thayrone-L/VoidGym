@@ -1,9 +1,17 @@
 # Worker distribuído local
 
+> A configuração do fork está registrada em `docs/PENDENCIAS.md`. Ela bloqueia apenas
+> a publicação remota, não o treino nem a preparação local de conhecimento.
+
 Este fluxo prepara uma máquina para treinar a partir de um campeão promovido,
 empacota o resultado localmente e, em uma etapa separada, pode publicar somente os
 JSONs sanitizados em um fork. O processo de treino não recebe credenciais, não faz
-`git fetch`, `git push`, download nem upload.
+upload e não carrega checkpoints SB3 recebidos de outras máquinas. Políticas promovidas
+usam somente o par validado `policy.safetensors` + `policy.manifest.json`.
+
+Depois do `preflight`, use o valor de `session_id` no campo opcional **Sessão do
+worker** do painel. A campanha começa do zero quando o campo fica vazio; quando
+preenchido, o painel resolve exclusivamente o par congelado no cache do worker.
 
 ## Configuração local
 
@@ -11,10 +19,9 @@ Copie `config.worker.example.json` para `config.worker.local.json` e escolha um
 `worker_id` estável, por exemplo `pc-sala`. O arquivo local é ignorado pelo Git.
 Os diretórios padrão ficam sob `artifacts/`, que também não é publicado.
 
-`stage_checkpoint` controla se o checkpoint final será copiado para o outbox.
-Use `true` nas máquinas próprias. Para contribuições externas, mantenha o
-checkpoint em quarentena: um SB3 ZIP usa serialização Python e não deve ser
-carregado em uma máquina confiável antes da revisão.
+`stage_checkpoint` é o nome legado da opção que controla se o par portátil final
+será copiado para o outbox. Mesmo quando está `true`, nenhum checkpoint SB3 ZIP é
+copiado. O ZIP usa serialização Python e permanece local à sessão que o produziu.
 
 `upstream_repository` e `upstream_remote` identificam o repositório canônico. O ref
 confiável é sempre `<upstream_remote>/knowledge`; o worker rejeita override para

@@ -21,6 +21,9 @@ VoidGym é um projeto comunitário não oficial, sem afiliação, endosso ou pat
 - [Painel local de treinamento](docs/PAINEL_DE_TREINAMENTO.md): acompanhamento de runs, campanhas versionadas e lançamentos protegidos.
 - [Capacidades avançadas](docs/CAPACIDADES_AVANCADAS.md): magia, cura, ataques carregados, memória de rotas e planejamento empírico de builds.
 - [Conhecimento distribuído](docs/CONHECIMENTO_DISTRIBUIDO.md): protocolo para compartilhar métricas e linhagem entre máquinas sem publicar dados locais.
+- [Política portátil](docs/POLITICA_PORTATIL.md): formato seguro de pesos para compartilhar aprendizado sem executar checkpoints externos.
+- [Worker distribuído](docs/WORKER_DISTRIBUIDO.md): ciclo seguro de sync, preflight, finalização e publicação por fork.
+- [Pendências operacionais](docs/PENDENCIAS.md): bloqueios externos registrados sem interromper o desenvolvimento local.
 
 ## Estado atual
 

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import numpy as np
+
 from hk_agent.distributed_knowledge import (
     KnowledgeValidationError,
     canonical_document_sha256,
@@ -24,6 +26,7 @@ from hk_agent.distributed_knowledge import (
     validate_knowledge_tree,
 )
 from hk_agent.first_training import sha256_file
+from hk_agent.policy_artifact import PolicyArtifactError, validate_policy_manifest
 
 _WORKER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -57,6 +60,15 @@ class WorkerConfig:
     @property
     def trusted_ref(self) -> str:
         return f"{self.upstream_remote}/knowledge"
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenWarmStart:
+    policy: Path
+    manifest: Path
+    policy_sha256: str
+    manifest_sha256: str
+    manifest_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +277,87 @@ def _cached_policy_path(config: WorkerConfig, digest: str) -> Path:
     return policy
 
 
-def _policy_from_cache(config: WorkerConfig, champion: Mapping[str, Any]) -> Path:
+def _cached_policy_manifest_path(config: WorkerConfig, digest: str) -> Path:
+    return (
+        config.cache_root
+        / "champions"
+        / digest
+        / "policies"
+        / "policy.manifest.json"
+    )
+
+
+def _validated_portable_policy(
+    policy_path: Path,
+    sidecar_path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_compatibility: str | None = None,
+) -> dict[str, Any]:
+    """Validate a safetensors file and its closed sidecar without loading tensors."""
+
+    try:
+        if policy_path.is_symlink() or sidecar_path.is_symlink():
+            raise WorkerCycleError("portable policy files cannot be symlinks")
+        policy = policy_path.resolve(strict=True)
+        sidecar = sidecar_path.resolve(strict=True)
+        if not 0 < policy.stat().st_size <= _MAX_POLICY_BYTES:
+            raise WorkerCycleError("portable policy size is outside the safe range")
+        if not 0 < sidecar.stat().st_size <= 2 * 1024 * 1024:
+            raise WorkerCycleError("portable policy sidecar size is outside the safe range")
+        policy_manifest = validate_policy_manifest(
+            json.loads(sidecar.read_text("utf-8"))
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, PolicyArtifactError) as error:
+        raise WorkerCycleError("portable policy sidecar failed validation") from error
+    artifact = policy_manifest["artifact"]
+    digest = sha256_file(policy)
+    if digest != artifact["sha256"] or policy.stat().st_size != artifact["size_bytes"]:
+        raise WorkerCycleError("portable policy differs from its canonical sidecar")
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise WorkerCycleError("portable policy hash differs from its expected identity")
+    if (
+        expected_compatibility is not None
+        and policy_manifest["compatibility_fingerprint"] != expected_compatibility
+    ):
+        raise WorkerCycleError("portable policy compatibility differs")
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(policy), framework="np") as reader:
+            expected_metadata = {
+                "format": "voidgym-policy-v1",
+                "compatibility_fingerprint": policy_manifest[
+                    "compatibility_fingerprint"
+                ],
+                "tensor_schema_sha256": policy_manifest["tensor_schema_sha256"],
+            }
+            if reader.metadata() != expected_metadata:
+                raise WorkerCycleError("safetensors metadata differs from its sidecar")
+            tensors = policy_manifest["tensors"]
+            if sorted(reader.keys()) != [entry["name"] for entry in tensors]:
+                raise WorkerCycleError("safetensors keys differ from its sidecar")
+            for entry in tensors:
+                view = reader.get_slice(entry["name"])
+                if (
+                    view.get_dtype() != entry["dtype"]
+                    or list(view.get_shape()) != entry["shape"]
+                ):
+                    raise WorkerCycleError("safetensors schema differs from its sidecar")
+                if not bool(np.isfinite(reader.get_tensor(entry["name"])).all()):
+                    raise WorkerCycleError("portable policy contains NaN or infinity")
+    except ImportError as error:
+        raise WorkerCycleError("safetensors is required to validate portable policies") from error
+    except WorkerCycleError:
+        raise
+    except Exception as error:  # safetensors exposes format-specific exception types
+        raise WorkerCycleError("portable safetensors payload is invalid") from error
+    return policy_manifest
+
+
+def _policy_from_cache(
+    config: WorkerConfig, champion: Mapping[str, Any]
+) -> tuple[Path, Path, dict[str, Any]]:
     artifact = champion.get("artifact")
     if not isinstance(artifact, Mapping):
         raise WorkerCycleError("non-canonical champion has no artifact")
@@ -284,9 +376,10 @@ def _policy_from_cache(config: WorkerConfig, champion: Mapping[str, Any]) -> Pat
         raise WorkerCycleError("distributed champions must use safetensors")
     bundle = config.cache_root / "champions" / digest
     policy = _cached_policy_path(config, digest)
+    sidecar = _cached_policy_manifest_path(config, digest)
     manifest_path = bundle / "manifest.json"
     try:
-        if policy.is_symlink() or manifest_path.is_symlink():
+        if policy.is_symlink() or sidecar.is_symlink() or manifest_path.is_symlink():
             raise WorkerCycleError("champion cache bundle cannot contain symlinks")
         if policy.stat().st_size != size:
             raise WorkerCycleError("cached policy size differs from champion.json")
@@ -298,15 +391,26 @@ def _policy_from_cache(config: WorkerConfig, champion: Mapping[str, Any]) -> Pat
     compatibility = champion.get("compatibility_fingerprint")
     if manifest.get("compatibility_fingerprint") != compatibility:
         raise WorkerCycleError("cached champion manifest compatibility differs")
+    policy_manifest = _validated_portable_policy(
+        policy,
+        sidecar,
+        expected_sha256=digest,
+        expected_compatibility=(compatibility if isinstance(compatibility, str) else None),
+    )
+    sidecar_digest = sha256_file(sidecar)
     inventory = manifest.get("portable_policies")
     if not isinstance(inventory, list) or not any(
         isinstance(entry, Mapping)
         and entry.get("sha256") == digest
         and entry.get("format") == "safetensors"
+        and entry.get("manifest_id") == policy_manifest["manifest_id"]
+        and entry.get("manifest_sha256") == sidecar_digest
         for entry in inventory
     ):
-        raise WorkerCycleError("cached policy hash is absent from its manifest")
-    return policy
+        raise WorkerCycleError(
+            "cached policy and canonical sidecar are absent from its manifest"
+        )
+    return policy, sidecar, policy_manifest
 
 
 def preflight_worker(config: WorkerConfig, session_id: str) -> dict[str, Any]:
@@ -344,10 +448,12 @@ def preflight_worker(config: WorkerConfig, session_id: str) -> dict[str, Any]:
     ):
         raise WorkerCycleError("champion is not the exact trusted maintainer-promoted snapshot")
     policy: Path | None = None
+    policy_sidecar: Path | None = None
+    policy_manifest: dict[str, Any] | None = None
     if generation != 0:
-        policy = _policy_from_cache(config, champion)
+        policy, policy_sidecar, policy_manifest = _policy_from_cache(config, champion)
     receipt: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "worker_id": config.worker_id,
         "session_id": session_id,
         "parent_champion": {"generation": generation, "sha256": champion_hash},
@@ -361,6 +467,15 @@ def preflight_worker(config: WorkerConfig, session_id: str) -> dict[str, Any]:
             champion["artifact"]["sha256"] if generation != 0 else None
         ),
         "warm_start_policy_format": "safetensors" if generation != 0 else None,
+        "warm_start_policy_manifest": (
+            str(policy_sidecar) if policy_sidecar is not None else None
+        ),
+        "warm_start_policy_manifest_sha256": (
+            sha256_file(policy_sidecar) if policy_sidecar is not None else None
+        ),
+        "warm_start_policy_manifest_id": (
+            policy_manifest["manifest_id"] if policy_manifest is not None else None
+        ),
     }
     receipt_path = config.cache_root / "preflights" / f"{session_id}.json"
     if receipt_path.exists():
@@ -646,6 +761,91 @@ def _latest_checkpoint(manifest_path: Path, manifest: Mapping[str, Any]) -> tupl
     return checkpoint, digest, step
 
 
+def _latest_portable_policy(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    checkpoint_step: int,
+    compatibility: str,
+) -> tuple[Path, Path, dict[str, Any]]:
+    inventory = manifest.get("portable_policies")
+    if not isinstance(inventory, list):
+        raise WorkerCycleError("training manifest has no portable policy inventory")
+    matches = [
+        entry
+        for entry in inventory
+        if isinstance(entry, Mapping) and entry.get("step") == checkpoint_step
+    ]
+    if len(matches) != 1:
+        raise WorkerCycleError("latest checkpoint has no unique portable policy")
+    entry = matches[0]
+    required = {
+        "step",
+        "path",
+        "manifest_path",
+        "sha256",
+        "size_bytes",
+        "format",
+        "manifest_id",
+        "manifest_sha256",
+    }
+    if set(entry) != required or entry.get("format") != "safetensors":
+        raise WorkerCycleError("portable policy inventory entry is invalid")
+    digest = entry.get("sha256")
+    sidecar_digest = entry.get("manifest_sha256")
+    manifest_id = entry.get("manifest_id")
+    size = entry.get("size_bytes")
+    if (
+        not isinstance(digest, str)
+        or not _SHA256.fullmatch(digest)
+        or not isinstance(sidecar_digest, str)
+        or not _SHA256.fullmatch(sidecar_digest)
+        or not isinstance(manifest_id, str)
+        or not _SHA256.fullmatch(manifest_id)
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= _MAX_POLICY_BYTES
+    ):
+        raise WorkerCycleError("portable policy inventory identity is invalid")
+
+    def resolve_inventory_path(value: object, label: str) -> Path:
+        if not isinstance(value, str):
+            raise WorkerCycleError(f"portable policy {label} path is invalid")
+        unresolved = Path(value)
+        if not unresolved.is_absolute():
+            unresolved = manifest_path.parent / unresolved
+        if unresolved.is_symlink():
+            raise WorkerCycleError(f"portable policy {label} cannot be a symlink")
+        resolved = unresolved.resolve(strict=True)
+        expected_parent = (manifest_path.parent / "policies").resolve(strict=True)
+        try:
+            resolved.relative_to(expected_parent)
+        except ValueError as error:
+            raise WorkerCycleError(
+                f"portable policy {label} escaped the run policy directory"
+            ) from error
+        if resolved.parent != expected_parent:
+            raise WorkerCycleError(
+                f"portable policy {label} must be directly inside the run policy directory"
+            )
+        return resolved
+
+    policy = resolve_inventory_path(entry.get("path"), "artifact")
+    sidecar = resolve_inventory_path(entry.get("manifest_path"), "manifest")
+    validated = _validated_portable_policy(
+        policy,
+        sidecar,
+        expected_sha256=digest,
+        expected_compatibility=compatibility,
+    )
+    if (
+        policy.stat().st_size != size
+        or validated["manifest_id"] != manifest_id
+        or sha256_file(sidecar) != sidecar_digest
+    ):
+        raise WorkerCycleError("portable policy inventory differs from its files")
+    return policy, sidecar, validated
+
+
 def _load_preflight(config: WorkerConfig, session_id: str) -> dict[str, Any]:
     if not _WORKER_ID.fullmatch(session_id):
         raise WorkerCycleError("session_id must be a lowercase slug")
@@ -669,11 +869,14 @@ def _load_preflight(config: WorkerConfig, session_id: str) -> dict[str, Any]:
             "warm_start_policy",
             "warm_start_policy_sha256",
             "warm_start_policy_format",
+            "warm_start_policy_manifest",
+            "warm_start_policy_manifest_sha256",
+            "warm_start_policy_manifest_id",
         },
         "preflight receipt",
     )
     if (
-        receipt["schema_version"] != 1
+        receipt["schema_version"] != 2
         or receipt["worker_id"] != config.worker_id
         or receipt["session_id"] != session_id
         or receipt["trust_tier"] != "maintainer-promoted"
@@ -698,8 +901,19 @@ def _load_preflight(config: WorkerConfig, session_id: str) -> dict[str, Any]:
     warm_path = receipt["warm_start_policy"]
     warm_digest = receipt["warm_start_policy_sha256"]
     warm_format = receipt["warm_start_policy_format"]
-    if warm_path is None or warm_digest is None or warm_format is None:
-        if (warm_path, warm_digest, warm_format) != (None, None, None):
+    warm_sidecar = receipt["warm_start_policy_manifest"]
+    warm_sidecar_digest = receipt["warm_start_policy_manifest_sha256"]
+    warm_manifest_id = receipt["warm_start_policy_manifest_id"]
+    warm_fields = (
+        warm_path,
+        warm_digest,
+        warm_format,
+        warm_sidecar,
+        warm_sidecar_digest,
+        warm_manifest_id,
+    )
+    if any(value is None for value in warm_fields):
+        if warm_fields != (None, None, None, None, None, None):
             raise WorkerCycleError("preflight warm-start policy fields are incomplete")
         if parent_generation != 0:
             raise WorkerCycleError("promoted champion preflight has no safe warm-start policy")
@@ -708,22 +922,63 @@ def _load_preflight(config: WorkerConfig, session_id: str) -> dict[str, Any]:
         or not isinstance(warm_digest, str)
         or not _SHA256.fullmatch(warm_digest)
         or warm_format != "safetensors"
+        or not isinstance(warm_sidecar, str)
+        or not isinstance(warm_sidecar_digest, str)
+        or not _SHA256.fullmatch(warm_sidecar_digest)
+        or not isinstance(warm_manifest_id, str)
+        or not _SHA256.fullmatch(warm_manifest_id)
     ):
         raise WorkerCycleError("preflight warm-start policy is invalid")
     elif parent_generation == 0:
         raise WorkerCycleError("generation-zero preflight cannot contain a warm-start policy")
     else:
         expected_policy = _cached_policy_path(config, warm_digest)
+        expected_sidecar = _cached_policy_manifest_path(config, warm_digest)
         supplied_policy = Path(warm_path)
-        if supplied_policy != expected_policy:
+        supplied_sidecar = Path(warm_sidecar)
+        if supplied_policy != expected_policy or supplied_sidecar != expected_sidecar:
             raise WorkerCycleError("preflight warm-start policy escaped the canonical cache path")
-        try:
-            size = expected_policy.stat().st_size
-        except OSError as error:
-            raise WorkerCycleError("preflight warm-start policy is unavailable") from error
-        if not 0 < size <= _MAX_POLICY_BYTES or sha256_file(expected_policy) != warm_digest:
-            raise WorkerCycleError("preflight warm-start policy failed integrity revalidation")
+        validated = _validated_portable_policy(
+            expected_policy,
+            expected_sidecar,
+            expected_sha256=warm_digest,
+            expected_compatibility=receipt["compatibility_fingerprint"],
+        )
+        if (
+            sha256_file(expected_sidecar) != warm_sidecar_digest
+            or validated["manifest_id"] != warm_manifest_id
+        ):
+            raise WorkerCycleError("preflight warm-start sidecar failed integrity revalidation")
     return receipt
+
+
+def warm_start_from_preflight(
+    config: WorkerConfig, session_id: str
+) -> FrozenWarmStart | None:
+    """Return only the validated canonical warm-start pair frozen for a session."""
+
+    receipt = _load_preflight(config, session_id)
+    policy = receipt["warm_start_policy"]
+    sidecar = receipt["warm_start_policy_manifest"]
+    if policy is None and sidecar is None:
+        return None
+    if not isinstance(policy, str) or not isinstance(sidecar, str):
+        raise WorkerCycleError("preflight warm-start pair is invalid")
+    policy_sha256 = receipt["warm_start_policy_sha256"]
+    manifest_sha256 = receipt["warm_start_policy_manifest_sha256"]
+    manifest_id = receipt["warm_start_policy_manifest_id"]
+    if not all(
+        isinstance(value, str)
+        for value in (policy_sha256, manifest_sha256, manifest_id)
+    ):
+        raise WorkerCycleError("preflight warm-start identity is invalid")
+    return FrozenWarmStart(
+        policy=Path(policy),
+        manifest=Path(sidecar),
+        policy_sha256=policy_sha256,
+        manifest_sha256=manifest_sha256,
+        manifest_id=manifest_id,
+    )
 
 
 def finalize_candidate(
@@ -759,9 +1014,18 @@ def finalize_candidate(
         not isinstance(warm_started_from, Mapping)
         or warm_started_from.get("sha256") != warm_start_digest
         or warm_started_from.get("format") != "safetensors"
+        or warm_started_from.get("manifest_id")
+        != receipt["warm_start_policy_manifest_id"]
+        or warm_started_from.get("manifest_sha256")
+        != receipt["warm_start_policy_manifest_sha256"]
     ):
         raise WorkerCycleError("training session did not warm-start its frozen champion policy")
-    checkpoint, checkpoint_hash, checkpoint_step = _latest_checkpoint(resolved_manifest, manifest)
+    _, _, checkpoint_step = _latest_checkpoint(resolved_manifest, manifest)
+    policy, policy_sidecar, policy_manifest = _latest_portable_policy(
+        resolved_manifest, manifest, checkpoint_step, compatibility
+    )
+    policy_hash = policy_manifest["artifact"]["sha256"]
+    policy_sidecar_hash = sha256_file(policy_sidecar)
     contribution = contribution_from_manifest(manifest)
     if contribution["compatibility_fingerprint"] != compatibility:
         raise WorkerCycleError("training manifest compatibility fingerprint is not canonical")
@@ -775,7 +1039,7 @@ def finalize_candidate(
     if not isinstance(parent, Mapping):
         raise WorkerCycleError("preflight parent champion is invalid")
     body: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "worker_id": config.worker_id,
         "session_id": session_id,
         "parent_champion": dict(parent),
@@ -783,10 +1047,16 @@ def finalize_candidate(
         "compatibility_fingerprint": compatibility,
         "contribution": contribution_summary,
         "artifact": {
-            "sha256": checkpoint_hash,
-            "size_bytes": checkpoint.stat().st_size,
+            "sha256": policy_hash,
+            "size_bytes": policy.stat().st_size,
             "step": checkpoint_step,
-            "filename": "checkpoint.zip" if config.stage_checkpoint else None,
+            "format": "safetensors",
+            "filename": "policy.safetensors" if config.stage_checkpoint else None,
+            "manifest_filename": (
+                "policy.manifest.json" if config.stage_checkpoint else None
+            ),
+            "manifest_sha256": policy_sidecar_hash,
+            "manifest_id": policy_manifest["manifest_id"],
         },
         "finished_unix_ns": manifest.get("finished_unix_ns"),
     }
@@ -801,16 +1071,20 @@ def finalize_candidate(
     candidate_root.mkdir(parents=True, exist_ok=True)
     _atomic_json(candidate_root / "contribution.json", contribution)
     if config.stage_checkpoint:
-        destination = candidate_root / "checkpoint.zip"
-        if destination.exists():
-            if sha256_file(destination) != checkpoint_hash:
-                raise WorkerCycleError("existing staged candidate checkpoint has wrong hash")
-        else:
-            pending = candidate_root / f".checkpoint.{os.getpid()}.pending"
+        for source, filename, digest in (
+            (policy, "policy.safetensors", policy_hash),
+            (policy_sidecar, "policy.manifest.json", policy_sidecar_hash),
+        ):
+            destination = candidate_root / filename
+            if destination.exists():
+                if sha256_file(destination) != digest:
+                    raise WorkerCycleError("existing staged portable policy has wrong hash")
+                continue
+            pending = candidate_root / f".{filename}.{os.getpid()}.pending"
             try:
-                shutil.copyfile(checkpoint, pending)
-                if sha256_file(pending) != checkpoint_hash:
-                    raise WorkerCycleError("staged candidate checkpoint failed hash verification")
+                shutil.copyfile(source, pending)
+                if sha256_file(pending) != digest:
+                    raise WorkerCycleError("staged portable policy failed hash verification")
                 os.replace(pending, destination)
             finally:
                 if pending.exists():

@@ -70,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path)
+    parser.add_argument("--warm-start-policy", type=Path)
+    parser.add_argument("--warm-start-policy-manifest", type=Path)
+    parser.add_argument("--warm-start-policy-sha256")
+    parser.add_argument("--warm-start-policy-manifest-sha256")
+    parser.add_argument("--warm-start-policy-manifest-id")
     parser.add_argument("--horizon", type=int, default=512)
     parser.add_argument("--rollout-steps", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -140,6 +145,13 @@ def _provenance(
     gym_env_source = (PROJECT_ROOT / "src" / "hk_agent" / "gym_env.py").resolve(
         strict=True
     )
+    policy_runtime_source = (
+        PROJECT_ROOT / "src" / "hk_agent" / "first_training.py"
+    ).resolve(strict=True)
+    policy_artifact_source = (
+        PROJECT_ROOT / "src" / "hk_agent" / "policy_artifact.py"
+    ).resolve(strict=True)
+    training_lock = (PROJECT_ROOT / "requirements-training.lock").resolve(strict=True)
     files = {
         "config": config_path,
         "bootstrap_plan": bootstrap_path,
@@ -150,6 +162,9 @@ def _provenance(
         "route_memory_source": route_memory_source,
         "temporal_actions_source": temporal_actions_source,
         "environment_source": gym_env_source,
+        "policy_runtime_source": policy_runtime_source,
+        "policy_artifact_source": policy_artifact_source,
+        "training_lock": training_lock,
     }
     return {
         "game_profile": project_config.game_profile,
@@ -276,6 +291,11 @@ def main() -> int:
         continuous=args.continuous,
         max_checkpoints=args.max_checkpoints,
         resume_checkpoint=args.resume_checkpoint,
+        warm_start_policy=args.warm_start_policy,
+        warm_start_policy_manifest=args.warm_start_policy_manifest,
+        warm_start_policy_sha256=args.warm_start_policy_sha256,
+        warm_start_policy_manifest_sha256=args.warm_start_policy_manifest_sha256,
+        warm_start_policy_manifest_id=args.warm_start_policy_manifest_id,
     )
     training_config.validate()
     task_config = SceneChangeTaskConfig(
@@ -317,6 +337,14 @@ def main() -> int:
         "checkpoint_interval": args.checkpoint_interval,
         "max_checkpoints": args.max_checkpoints,
         "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
+        "warm_start_policy": (
+            str(args.warm_start_policy) if args.warm_start_policy else None
+        ),
+        "warm_start_policy_manifest": (
+            str(args.warm_start_policy_manifest)
+            if args.warm_start_policy_manifest
+            else None
+        ),
         "dependencies": dependencies,
         "bootstrap_plan": str(resolved_bootstrap.base_path),
         "campaign_origin": origin_provenance,
