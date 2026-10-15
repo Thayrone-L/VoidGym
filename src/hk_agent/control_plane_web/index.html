@@ -39,6 +39,7 @@
             <label>Partida<select name="save_source" id="save-source"><option value="existing_save">Usar save existente</option><option value="new_game">Iniciar novo jogo</option></select></label>
             <label>Slot<select name="save_slot"><option value="1">Slot 1</option><option value="2">Slot 2</option><option value="3">Slot 3</option><option value="4">Slot 4</option></select></label>
           </div><small id="save-source-help">O slot precisa existir no save experimental.</small></fieldset>
+          <label>Sessão do worker (opcional)<input name="worker_session_id" placeholder="ex.: pc-sala-run-01" pattern="[a-z0-9][a-z0-9-]{0,62}"><small>Para treinos, usa somente a política portátil já congelada pelo preflight; vazio começa do zero.</small></label>
           <div class="field-grid">
             <label>Seed<input name="seed" type="number" value="23" min="0" max="2147483647"></label>
             <label>Lease (ms)<input name="lease_ms" type="number" value="80" min="20" max="5000"></label>

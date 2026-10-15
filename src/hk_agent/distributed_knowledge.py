@@ -147,6 +147,9 @@ _SEMANTIC_FILE_HASHES = frozenset(
         "curriculum_source",
         "temporal_actions_source",
         "environment_source",
+        "policy_runtime_source",
+        "policy_artifact_source",
+        "training_lock",
     }
 )
 _TRAINING_KEYS = {

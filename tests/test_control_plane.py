@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.control_plane import CampaignSpec, ControlPlane
 from hk_agent.control_plane_server import ControlPlaneHTTPServer
 
@@ -53,7 +54,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 4
+    assert first["schema_version"] == 5
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 
@@ -181,6 +182,45 @@ def test_command_is_allowlisted_argument_vector_with_no_shell_text(tmp_path: Pat
     stop_file = tmp_path / "artifacts" / "control-plane" / "launches" / "x" / "stop.request"
     command = control.build_command(spec, execute=False, stop_file=stop_file)
     assert command[-2:] == ["--stop-file", str(stop_file)]
+
+
+def test_training_worker_session_resolves_only_validated_preflight_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _payload("visual_motion_training")
+    payload["worker_session_id"] = "pc-sala-run-01"
+    payload["weights"] = {
+        "time_cost": -0.001,
+        "visual_change_scale": 0.1,
+        "success_reward": 1.0,
+    }
+    spec = CampaignSpec.from_payload(payload)
+    policy = tmp_path / "cache" / "policy.safetensors"
+    sidecar = tmp_path / "cache" / "policy.manifest.json"
+    monkeypatch.setattr("hk_agent.worker_cycle.load_worker_config", lambda _: object())
+    monkeypatch.setattr(
+        "hk_agent.worker_cycle.warm_start_from_preflight",
+        lambda config, session: worker_cycle_module.FrozenWarmStart(
+            policy=policy,
+            manifest=sidecar,
+            policy_sha256="a" * 64,
+            manifest_sha256="b" * 64,
+            manifest_id="c" * 64,
+        ),
+    )
+
+    command = ControlPlane(_project(tmp_path)).build_command(spec, execute=False)
+
+    assert command[command.index("--warm-start-policy") + 1] == str(policy)
+    assert command[command.index("--warm-start-policy-manifest") + 1] == str(sidecar)
+    assert command[command.index("--warm-start-policy-sha256") + 1] == "a" * 64
+
+
+def test_probe_rejects_worker_session() -> None:
+    payload = _payload()
+    payload["worker_session_id"] = "pc-sala-run-01"
+    with pytest.raises(ValueError, match="cannot consume"):
+        CampaignSpec.from_payload(payload)
 
 
 def test_geo_weights_are_validated_and_forwarded_to_runner(tmp_path: Path) -> None:

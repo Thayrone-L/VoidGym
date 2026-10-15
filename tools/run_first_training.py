@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path)
+    parser.add_argument("--warm-start-policy", type=Path)
+    parser.add_argument("--warm-start-policy-manifest", type=Path)
+    parser.add_argument("--warm-start-policy-sha256")
+    parser.add_argument("--warm-start-policy-manifest-sha256")
+    parser.add_argument("--warm-start-policy-manifest-id")
     parser.add_argument("--calibration-samples", type=int, default=5)
     parser.add_argument("--lease-ms", type=int, default=80)
     parser.add_argument("--window-width", type=int, default=960)
@@ -237,6 +242,11 @@ def main() -> int:
         continuous=args.continuous,
         max_checkpoints=args.max_checkpoints,
         resume_checkpoint=args.resume_checkpoint,
+        warm_start_policy=args.warm_start_policy,
+        warm_start_policy_manifest=args.warm_start_policy_manifest,
+        warm_start_policy_sha256=args.warm_start_policy_sha256,
+        warm_start_policy_manifest_sha256=args.warm_start_policy_manifest_sha256,
+        warm_start_policy_manifest_id=args.warm_start_policy_manifest_id,
     )
     training_config.validate()
     dependency_state = {
@@ -254,6 +264,14 @@ def main() -> int:
         "checkpoint_interval": args.checkpoint_interval,
         "max_checkpoints": args.max_checkpoints,
         "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
+        "warm_start_policy": (
+            str(args.warm_start_policy) if args.warm_start_policy else None
+        ),
+        "warm_start_policy_manifest": (
+            str(args.warm_start_policy_manifest)
+            if args.warm_start_policy_manifest
+            else None
+        ),
         "calibration_samples_per_group": args.calibration_samples,
         "dependencies": dependency_state,
         "bootstrap_plan": str(resolved_bootstrap.base_path),
@@ -298,6 +316,15 @@ def main() -> int:
     gym_env_path = (PROJECT_ROOT / "src" / "hk_agent" / "gym_env.py").resolve(
         strict=True
     )
+    policy_runtime_path = (
+        PROJECT_ROOT / "src" / "hk_agent" / "first_training.py"
+    ).resolve(strict=True)
+    policy_artifact_path = (
+        PROJECT_ROOT / "src" / "hk_agent" / "policy_artifact.py"
+    ).resolve(strict=True)
+    training_lock_path = (PROJECT_ROOT / "requirements-training.lock").resolve(
+        strict=True
+    )
     provenance: dict[str, Any] = {
         "game_profile": project_config.game_profile,
         "campaign_origin": origin_provenance,
@@ -327,6 +354,18 @@ def main() -> int:
             "environment_source": {
                 "path": str(gym_env_path),
                 "sha256": sha256_file(gym_env_path),
+            },
+            "policy_runtime_source": {
+                "path": str(policy_runtime_path),
+                "sha256": sha256_file(policy_runtime_path),
+            },
+            "policy_artifact_source": {
+                "path": str(policy_artifact_path),
+                "sha256": sha256_file(policy_artifact_path),
+            },
+            "training_lock": {
+                "path": str(training_lock_path),
+                "sha256": sha256_file(training_lock_path),
             },
         },
         "observation_dimensions": {

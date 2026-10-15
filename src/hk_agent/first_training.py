@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import random
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import gymnasium as gym
 import numpy as np
 
 from hk_agent.distributed_knowledge import portable_compatibility_fingerprint
+from hk_agent.policy_artifact import export_policy_artifact, import_policy_artifact
 from hk_agent.training_task import VISUAL_MOTION_REWARD_VERSION
 
 
@@ -37,6 +39,11 @@ class FirstTrainingConfig:
     continuous: bool = False
     max_checkpoints: int = 5
     resume_checkpoint: Path | None = None
+    warm_start_policy: Path | None = None
+    warm_start_policy_manifest: Path | None = None
+    warm_start_policy_sha256: str | None = None
+    warm_start_policy_manifest_sha256: str | None = None
+    warm_start_policy_manifest_id: str | None = None
 
     def validate(self) -> None:
         if not 1 <= self.total_timesteps <= 10_000_000:
@@ -55,6 +62,36 @@ class FirstTrainingConfig:
             raise ValueError("max_checkpoints must be in [2, 100]")
         if self.resume_checkpoint is not None and self.resume_checkpoint.suffix != ".zip":
             raise ValueError("resume_checkpoint must be a .zip archive")
+        if (self.warm_start_policy is None) != (self.warm_start_policy_manifest is None):
+            raise ValueError("warm-start policy and manifest must be provided together")
+        frozen_identity = (
+            self.warm_start_policy_sha256,
+            self.warm_start_policy_manifest_sha256,
+            self.warm_start_policy_manifest_id,
+        )
+        if any(value is not None for value in frozen_identity) and (
+            self.warm_start_policy is None
+            or any(value is None for value in frozen_identity)
+        ):
+            raise ValueError("warm-start frozen identity must be provided as a complete set")
+        if any(
+            value is not None
+            and (not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None)
+            for value in frozen_identity
+        ):
+            raise ValueError("warm-start frozen identity must use lowercase SHA-256")
+        if self.resume_checkpoint is not None and self.warm_start_policy is not None:
+            raise ValueError("resume checkpoint and warm-start policy are mutually exclusive")
+        if (
+            self.warm_start_policy is not None
+            and self.warm_start_policy.suffix != ".safetensors"
+        ):
+            raise ValueError("warm_start_policy must be a .safetensors file")
+        if (
+            self.warm_start_policy_manifest is not None
+            and not self.warm_start_policy_manifest.name.endswith(".manifest.json")
+        ):
+            raise ValueError("warm_start_policy_manifest must be a .manifest.json file")
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -157,6 +194,7 @@ def train_ppo(
             task_contract, dict(provenance or {})
         ),
         "checkpoints": [],
+        "portable_policies": [],
         "pruned_checkpoints": [],
         "gameplay_run_index": 1,
         "gameplay_run_failures": 0,
@@ -209,6 +247,35 @@ def train_ppo(
                 verbose=1,
                 device="auto",
             )
+            if (
+                config.warm_start_policy is not None
+                and config.warm_start_policy_manifest is not None
+            ):
+                policy_path = config.warm_start_policy.resolve(strict=True)
+                policy_manifest_path = config.warm_start_policy_manifest.resolve(strict=True)
+                imported = import_policy_artifact(
+                    model.policy,
+                    policy_path,
+                    expected_compatibility_fingerprint=manifest[
+                        "compatibility_fingerprint"
+                    ],
+                    manifest_path=policy_manifest_path,
+                    expected_artifact_sha256=config.warm_start_policy_sha256,
+                    expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
+                    expected_manifest_id=config.warm_start_policy_manifest_id,
+                )
+                model.num_timesteps = 0
+                manifest["warm_started_from"] = {
+                    "sha256": imported["artifact"]["sha256"],
+                    "size_bytes": imported["artifact"]["size_bytes"],
+                    "format": "safetensors",
+                    "manifest_id": imported["manifest_id"],
+                    "manifest_sha256": sha256_file(policy_manifest_path),
+                    "compatibility_fingerprint": imported[
+                        "compatibility_fingerprint"
+                    ],
+                }
+                atomic_json(manifest_path, manifest)
 
         run_failures = 0
         episode_count = 0
@@ -270,6 +337,36 @@ def train_ppo(
                     "sha256": sha256_file(final_archive),
                 }
             )
+            policy_root = output_root / "policies"
+            policy_root.mkdir(parents=True, exist_ok=True)
+            policy_path = policy_root / f"step-{completed}.safetensors"
+            policy_manifest_path = policy_root / f"step-{completed}.policy.manifest.json"
+            portable = export_policy_artifact(
+                model.policy,
+                policy_path,
+                compatibility_fingerprint=manifest["compatibility_fingerprint"],
+                manifest_path=policy_manifest_path,
+            )
+            portable_policies = manifest["portable_policies"]
+            if not isinstance(portable_policies, list):
+                raise TypeError("portable policy manifest state is invalid")
+            portable_policies[:] = [
+                item
+                for item in portable_policies
+                if not isinstance(item, Mapping) or item.get("step") != completed
+            ]
+            portable_policies.append(
+                {
+                    "step": completed,
+                    "path": str(policy_path),
+                    "manifest_path": str(policy_manifest_path),
+                    "sha256": portable["artifact"]["sha256"],
+                    "size_bytes": portable["artifact"]["size_bytes"],
+                    "format": "safetensors",
+                    "manifest_id": portable["manifest_id"],
+                    "manifest_sha256": sha256_file(policy_manifest_path),
+                }
+            )
             manifest["resumable_checkpoint"] = True
             manifest["completed_timesteps"] = completed
             manifest["gameplay_run_failures"] = run_failures
@@ -290,6 +387,22 @@ def train_ppo(
                             }
                         )
                         del pruned[:-1000]
+            retained_steps = {
+                item.get("step") for item in checkpoints if isinstance(item, Mapping)
+            }
+            expired_policies: list[Path] = []
+            retained_policies: list[object] = []
+            for item in portable_policies:
+                if isinstance(item, Mapping) and item.get("step") not in retained_steps:
+                    expired_policies.extend(
+                        (
+                            Path(str(item.get("path", ""))),
+                            Path(str(item.get("manifest_path", ""))),
+                        )
+                    )
+                else:
+                    retained_policies.append(item)
+            portable_policies[:] = retained_policies
             atomic_json(manifest_path, manifest)
             # Persist the new inventory before deleting expired archives. A
             # crash may leave an unreferenced old zip, never a manifest that
@@ -297,6 +410,9 @@ def train_ppo(
             for expired_path in expired_paths:
                 if expired_path.is_file():
                     expired_path.unlink()
+            for expired_policy in expired_policies:
+                if expired_policy.is_file():
+                    expired_policy.unlink()
 
         while config.continuous or completed < config.total_timesteps:
             if stop_file is not None and stop_file.is_file():

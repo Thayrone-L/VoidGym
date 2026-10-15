@@ -59,8 +59,9 @@ class CampaignSpec:
     max_checkpoints: int = 5
     save_source: str = "existing_save"
     save_slot: int = 1
+    worker_session_id: str | None = None
     weights: Mapping[str, float] = field(default_factory=dict)
-    schema_version: int = 4
+    schema_version: int = 5
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -165,6 +166,16 @@ class CampaignSpec:
             raise ValueError("duration_mode must be limited or continuous")
         if campaign_type == "scene_change_probe" and duration_mode != "limited":
             raise ValueError("scene-change probes do not support continuous duration")
+        raw_worker_session = payload.get("worker_session_id")
+        worker_session_id: str | None = None
+        if raw_worker_session is not None and raw_worker_session != "":
+            if not isinstance(raw_worker_session, str) or not _IDENTIFIER.fullmatch(
+                raw_worker_session
+            ):
+                raise ValueError("worker_session_id must be a lowercase slug")
+            if campaign_type == "scene_change_probe":
+                raise ValueError("scene-change probes cannot consume a worker policy")
+            worker_session_id = raw_worker_session
         spec = cls(
             campaign_id=identifier,
             name=name,
@@ -190,6 +201,7 @@ class CampaignSpec:
             ),
             save_source=save_source,
             save_slot=_bounded_int(payload.get("save_slot", 1), "save_slot", 1, 4),
+            worker_session_id=worker_session_id,
             weights=weights,
         )
         if spec.campaign_type == "visual_motion_training" and spec.horizon < 16:
@@ -474,6 +486,31 @@ class ControlPlane:
             ]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
+            if spec.worker_session_id is not None:
+                from hk_agent.worker_cycle import (
+                    load_worker_config,
+                    warm_start_from_preflight,
+                )
+
+                worker_config = load_worker_config(
+                    self.project_root / "config.worker.local.json"
+                )
+                warm_start = warm_start_from_preflight(
+                    worker_config, spec.worker_session_id
+                )
+                if warm_start is not None:
+                    command += [
+                        "--warm-start-policy",
+                        str(warm_start.policy),
+                        "--warm-start-policy-manifest",
+                        str(warm_start.manifest),
+                        "--warm-start-policy-sha256",
+                        warm_start.policy_sha256,
+                        "--warm-start-policy-manifest-sha256",
+                        warm_start.manifest_sha256,
+                        "--warm-start-policy-manifest-id",
+                        warm_start.manifest_id,
+                    ]
         for key, value in sorted(spec.weights.items()):
             command += ["--" + key.replace("_", "-"), str(value)]
         if stop_file is not None:

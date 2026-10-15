@@ -7,7 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
 from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.distributed_knowledge import (
@@ -93,6 +95,105 @@ def _mark_trusted(
     )
 
 
+def _write_portable_policy(
+    policy: Path, compatibility: str
+) -> tuple[dict[str, Any], Path]:
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    inventory = [{"name": "weight", "dtype": "F32", "shape": [1], "numel": 1}]
+    canonical_inventory = json.dumps(
+        inventory, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    schema_hash = hashlib.sha256(canonical_inventory).hexdigest()
+    save_file(
+        {"weight": np.asarray([0.25], dtype=np.float32)},
+        str(policy),
+        metadata={
+            "format": "voidgym-policy-v1",
+            "compatibility_fingerprint": compatibility,
+            "tensor_schema_sha256": schema_hash,
+        },
+    )
+    artifact = {
+        "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        "size_bytes": policy.stat().st_size,
+    }
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "format": "safetensors",
+        "compatibility_fingerprint": compatibility,
+        "policy_class": "stable_baselines3.common.policies.MultiInputActorCriticPolicy",
+        "tensor_schema_sha256": schema_hash,
+        "tensors": inventory,
+        "artifact": artifact,
+    }
+    manifest_id = hashlib.sha256(
+        json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    manifest = {"manifest_id": manifest_id, **body}
+    sidecar = policy.with_suffix(".manifest.json")
+    _write_json(sidecar, manifest)
+    return manifest, sidecar
+
+
+def _install_promoted_policy(
+    tmp_path: Path, compatibility: str
+) -> tuple[dict[str, Any], Path, Path]:
+    provisional = tmp_path / "cache" / "provisional" / "policy.safetensors"
+    policy_manifest, provisional_sidecar = _write_portable_policy(
+        provisional, compatibility
+    )
+    digest = str(policy_manifest["artifact"]["sha256"])
+    bundle = tmp_path / "cache" / "champions" / digest
+    policy = bundle / "policies" / "policy.safetensors"
+    sidecar = bundle / "policies" / "policy.manifest.json"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    provisional.replace(policy)
+    provisional_sidecar.replace(sidecar)
+    initial_hash = canonical_document_sha256(initial_champion())
+    champion = {
+        "schema_version": 1,
+        "generation": 1,
+        "candidate_id": "b" * 64,
+        "contribution_id": "c" * 64,
+        "compatibility_fingerprint": compatibility,
+        "artifact": {
+            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
+            "sha256": digest,
+            "size_bytes": policy.stat().st_size,
+            "format": "safetensors",
+        },
+        "parent_champion_sha256": initial_hash,
+        "evaluation": {
+            "report_sha256": "d" * 64,
+            "suite_sha256": "f" * 64,
+            "policy_sha256": digest,
+            "candidate_id": "b" * 64,
+            "parent_champion_sha256": initial_hash,
+            "evaluator_commit": "e" * 40,
+        },
+    }
+    _knowledge(tmp_path, champion)
+    _mark_trusted(tmp_path, champion)
+    _write_json(
+        bundle / "manifest.json",
+        {
+            "compatibility_fingerprint": compatibility,
+            "portable_policies": [
+                {
+                    "step": 10,
+                    "sha256": digest,
+                    "format": "safetensors",
+                    "manifest_id": policy_manifest["manifest_id"],
+                    "manifest_sha256": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+                }
+            ],
+        },
+    )
+    return champion, policy, sidecar
+
+
 def _manifest(tmp_path: Path, checkpoint_bytes: bytes = b"owned checkpoint") -> Path:
     training = tmp_path / "run" / "training"
     checkpoint = training / "checkpoints" / "step-128.zip"
@@ -109,6 +210,9 @@ def _manifest(tmp_path: Path, checkpoint_bytes: bytes = b"owned checkpoint") -> 
         "files": {},
         "observation_dimensions": {"policy": {"height": 90, "width": 160}},
     }
+    compatibility = portable_compatibility_fingerprint(task_contract, provenance)
+    policy = training / "policies" / "step-128.safetensors"
+    policy_manifest, sidecar = _write_portable_policy(policy, compatibility)
     digest = hashlib.sha256(checkpoint_bytes).hexdigest()
     manifest = {
         "schema_version": 3,
@@ -123,9 +227,21 @@ def _manifest(tmp_path: Path, checkpoint_bytes: bytes = b"owned checkpoint") -> 
         "resumable_checkpoint": True,
         "task_contract": task_contract,
         "provenance": provenance,
-        "compatibility_fingerprint": portable_compatibility_fingerprint(task_contract, provenance),
+        "compatibility_fingerprint": compatibility,
         "versions": {"python": "3.12"},
         "checkpoints": [{"step": 128, "path": str(checkpoint), "sha256": digest}],
+        "portable_policies": [
+            {
+                "step": 128,
+                "path": str(policy),
+                "manifest_path": str(sidecar),
+                "sha256": policy_manifest["artifact"]["sha256"],
+                "size_bytes": policy_manifest["artifact"]["size_bytes"],
+                "format": "safetensors",
+                "manifest_id": policy_manifest["manifest_id"],
+                "manifest_sha256": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+            }
+        ],
         "finished_unix_ns": 123456,
     }
     path = training / "manifest.json"
@@ -144,6 +260,7 @@ def test_initial_preflight_freezes_canonical_parent_without_checkpoint(
     assert receipt["worker_id"] == "pc-um"
     assert receipt["resume_checkpoint"] is None
     assert receipt["warm_start_policy"] is None
+    assert receipt["warm_start_policy_manifest"] is None
     assert receipt["parent_champion"] == {
         "generation": 0,
         "sha256": canonical_document_sha256(initial_champion()),
@@ -205,55 +322,19 @@ def test_sync_marks_only_the_configured_maintainer_ref(
 
 
 def test_promoted_champion_is_selected_only_as_safe_warm_start(tmp_path: Path) -> None:
-    policy_bytes = b"safe tensor fixture"
-    digest = hashlib.sha256(policy_bytes).hexdigest()
     compatibility = "a" * 64
-    initial_hash = canonical_document_sha256(initial_champion())
-    champion = {
-        "schema_version": 1,
-        "generation": 1,
-        "candidate_id": "b" * 64,
-        "contribution_id": "c" * 64,
-        "compatibility_fingerprint": compatibility,
-        "artifact": {
-            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
-            "sha256": digest,
-            "size_bytes": len(policy_bytes),
-            "format": "safetensors",
-        },
-        "parent_champion_sha256": initial_hash,
-        "evaluation": {
-            "report_sha256": "d" * 64,
-            "suite_sha256": "f" * 64,
-            "policy_sha256": digest,
-            "candidate_id": "b" * 64,
-            "parent_champion_sha256": initial_hash,
-            "evaluator_commit": "e" * 40,
-        },
-    }
-    _knowledge(tmp_path, champion)
-    _mark_trusted(tmp_path, champion)
-    bundle = tmp_path / "cache" / "champions" / digest
-    policy = bundle / "policies" / "policy.safetensors"
-    policy.parent.mkdir(parents=True)
-    policy.write_bytes(policy_bytes)
-    _write_json(
-        bundle / "manifest.json",
-        {
-            "compatibility_fingerprint": compatibility,
-            "portable_policies": [
-                {"step": 10, "sha256": digest, "format": "safetensors"}
-            ],
-        },
-    )
+    champion, policy, sidecar = _install_promoted_policy(tmp_path, compatibility)
+    digest = champion["artifact"]["sha256"]
 
     receipt = preflight_worker(load_worker_config(_config(tmp_path)), "session-1")
     assert receipt["resume_checkpoint"] is None
     assert receipt["warm_start_policy"] == str(policy)
     assert receipt["warm_start_policy_sha256"] == digest
+    assert receipt["warm_start_policy_manifest"] == str(sidecar)
+    assert receipt["warm_start_policy_manifest_id"]
 
     policy.write_bytes(b"tampered")
-    with pytest.raises(WorkerCycleError, match="policy size differs"):
+    with pytest.raises(WorkerCycleError, match="policy size differs|canonical sidecar"):
         preflight_worker(load_worker_config(_config(tmp_path)), "session-2")
 
 
@@ -269,10 +350,13 @@ def test_finalize_is_sanitized_staged_and_idempotent(tmp_path: Path) -> None:
 
     assert first == second
     bundle = tmp_path / "outbox" / "candidates" / str(first["bundle_id"])
-    assert (bundle / "checkpoint.zip").read_bytes() == b"owned checkpoint"
+    assert (bundle / "policy.safetensors").is_file()
+    assert (bundle / "policy.manifest.json").is_file()
+    assert not (bundle / "checkpoint.zip").exists()
+    assert first["artifact"]["format"] == "safetensors"
     text = (bundle / "staging.json").read_text("utf-8")
     assert str(tmp_path) not in text
-    assert "manifest.json" not in text
+    assert "training/manifest.json" not in text
     assert "checkpoint_fingerprints" not in text
     contribution = json.loads((bundle / "contribution.json").read_text("utf-8"))
     assert contribution["contribution_id"] == first["contribution"]["contribution_id"]
@@ -312,106 +396,36 @@ def test_finalize_rejects_tampered_distributed_resume_receipt(tmp_path: Path) ->
 def test_finalize_revalidates_warm_start_policy_after_preflight(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text("utf-8"))
-    policy_bytes = b"safe tensor fixture"
-    digest = hashlib.sha256(policy_bytes).hexdigest()
-    initial_hash = canonical_document_sha256(initial_champion())
-    champion = {
-        "schema_version": 1,
-        "generation": 1,
-        "candidate_id": "b" * 64,
-        "contribution_id": "c" * 64,
-        "compatibility_fingerprint": manifest["compatibility_fingerprint"],
-        "artifact": {
-            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
-            "sha256": digest,
-            "size_bytes": len(policy_bytes),
-            "format": "safetensors",
-        },
-        "parent_champion_sha256": initial_hash,
-        "evaluation": {
-            "report_sha256": "d" * 64,
-            "suite_sha256": "f" * 64,
-            "policy_sha256": digest,
-            "candidate_id": "b" * 64,
-            "parent_champion_sha256": initial_hash,
-            "evaluator_commit": "e" * 40,
-        },
-    }
-    _knowledge(tmp_path, champion)
-    _mark_trusted(tmp_path, champion)
-    bundle = tmp_path / "cache" / "champions" / digest
-    policy = bundle / "policies" / "policy.safetensors"
-    policy.parent.mkdir(parents=True)
-    policy.write_bytes(policy_bytes)
-    _write_json(
-        bundle / "manifest.json",
-        {
-            "compatibility_fingerprint": manifest["compatibility_fingerprint"],
-            "portable_policies": [
-                {"step": 10, "sha256": digest, "format": "safetensors"}
-            ],
-        },
+    _, policy, _ = _install_promoted_policy(
+        tmp_path, manifest["compatibility_fingerprint"]
     )
     config = load_worker_config(_config(tmp_path))
     preflight_worker(config, "session-promoted")
     policy.write_bytes(b"tampered after preflight")
 
-    with pytest.raises(WorkerCycleError, match="integrity revalidation"):
+    with pytest.raises(WorkerCycleError, match="canonical sidecar|integrity revalidation"):
         finalize_candidate(config, manifest_path, "session-promoted")
 
 
 def test_finalize_requires_the_exact_frozen_promoted_checkpoint(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text("utf-8"))
-    parent_bytes = b"promoted parent"
-    parent_digest = hashlib.sha256(parent_bytes).hexdigest()
-    initial_hash = canonical_document_sha256(initial_champion())
-    champion = {
-        "schema_version": 1,
-        "generation": 1,
-        "candidate_id": "b" * 64,
-        "contribution_id": "c" * 64,
-        "compatibility_fingerprint": manifest["compatibility_fingerprint"],
-        "artifact": {
-            "uri": "https://github.com/example/releases/download/v1/policy.safetensors",
-            "sha256": parent_digest,
-            "size_bytes": len(parent_bytes),
-            "format": "safetensors",
-        },
-        "parent_champion_sha256": initial_hash,
-        "evaluation": {
-            "report_sha256": "d" * 64,
-            "suite_sha256": "f" * 64,
-            "policy_sha256": parent_digest,
-            "candidate_id": "b" * 64,
-            "parent_champion_sha256": initial_hash,
-            "evaluator_commit": "e" * 40,
-        },
-    }
-    _knowledge(tmp_path, champion)
-    _mark_trusted(tmp_path, champion)
-    bundle = tmp_path / "cache" / "champions" / parent_digest
-    policy = bundle / "policies" / "policy.safetensors"
-    policy.parent.mkdir(parents=True)
-    policy.write_bytes(parent_bytes)
-    _write_json(
-        bundle / "manifest.json",
-        {
-            "compatibility_fingerprint": manifest["compatibility_fingerprint"],
-            "portable_policies": [
-                {"step": 10, "sha256": parent_digest, "format": "safetensors"}
-            ],
-        },
+    champion, _, _ = _install_promoted_policy(
+        tmp_path, manifest["compatibility_fingerprint"]
     )
+    parent_digest = champion["artifact"]["sha256"]
     config = load_worker_config(_config(tmp_path))
     preflight_worker(config, "session-promoted")
 
     with pytest.raises(WorkerCycleError, match="did not warm-start"):
         finalize_candidate(config, manifest_path, "session-promoted")
 
+    frozen = preflight_worker(config, "session-promoted")
     manifest["warm_started_from"] = {
         "sha256": parent_digest,
         "format": "safetensors",
+        "manifest_id": frozen["warm_start_policy_manifest_id"],
+        "manifest_sha256": frozen["warm_start_policy_manifest_sha256"],
     }
     _write_json(manifest_path, manifest)
     result = finalize_candidate(config, manifest_path, "session-promoted")
