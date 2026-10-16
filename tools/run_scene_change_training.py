@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import secrets
 import sys
 import time
@@ -10,6 +11,15 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+# Native math runtimes read these variables while NumPy/Torch are imported.
+# Pre-parse the manual runner's thread budget before importing project modules.
+_thread_parser = argparse.ArgumentParser(add_help=False)
+_thread_parser.add_argument("--torch-threads", type=int, choices=range(1, 9), default=3)
+_thread_args, _ = _thread_parser.parse_known_args()
+for _thread_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, str(_thread_args.torch_threads))
+del _thread_args, _thread_env, _thread_parser
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -43,16 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train the pixel-only reach_scene_change_v1 curriculum"
     )
-    parser.add_argument(
-        "--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml"
-    )
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
     parser.add_argument(
         "--bootstrap-plan",
         type=Path,
-        default=PROJECT_ROOT
-        / "configs"
-        / "menu-bootstrap"
-        / "continue-kings-pass-v1.json",
+        default=PROJECT_ROOT / "configs" / "menu-bootstrap" / "continue-kings-pass-v1.json",
     )
     parser.add_argument(
         "--new-game-bootstrap-plan",
@@ -64,6 +69,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-slot", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--experimental-save-root", type=Path)
+    parser.add_argument("--game-install", type=Path)
+    parser.add_argument("--instance-data-root", type=Path)
+    parser.add_argument("--log-file", type=Path)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--timesteps", type=int, default=4096)
     parser.add_argument("--checkpoint-interval", type=int, default=1024)
@@ -84,6 +92,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=338)
     parser.add_argument("--width", type=int, default=600)
     parser.add_argument("--frame-stack", type=int, default=4)
+    parser.add_argument("--training-device", choices=("cpu", "cuda", "auto"), default="cpu")
+    parser.add_argument("--torch-threads", type=int, choices=range(1, 9), default=3)
+    parser.add_argument("--torch-interop-threads", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--time-cost", type=float, default=-0.002)
     parser.add_argument("--novelty-shaping-budget", type=float, default=0.0)
     parser.add_argument("--success-reward", type=float, default=10.0)
@@ -119,7 +130,7 @@ def _provenance(
     origin_provenance: dict[str, object],
 ) -> dict[str, Any]:
     bootstrap_plan = resolved_bootstrap.plan
-    game_executable = project_config.game_executable.resolve(strict=True)
+    game_executable = ((args.game_install / project_config.game_executable.name) if args.game_install else project_config.game_executable).resolve(strict=True)
     mod_dll = (
         game_executable.parent
         / "Hollow Knight_Data"
@@ -133,24 +144,20 @@ def _provenance(
     if bootstrap_plan.readiness is None:
         raise RuntimeError("the bootstrap plan has no readiness reference")
     reference_path = bootstrap_plan.readiness.reference_image.resolve(strict=True)
-    source_path = (PROJECT_ROOT / "src" / "hk_agent" / "scene_change_task.py").resolve(
-        strict=True
-    )
+    source_path = (PROJECT_ROOT / "src" / "hk_agent" / "scene_change_task.py").resolve(strict=True)
     route_memory_source = (PROJECT_ROOT / "src" / "hk_agent" / "route_memory.py").resolve(
         strict=True
     )
-    temporal_actions_source = (
-        PROJECT_ROOT / "src" / "hk_agent" / "temporal_actions.py"
-    ).resolve(strict=True)
-    gym_env_source = (PROJECT_ROOT / "src" / "hk_agent" / "gym_env.py").resolve(
+    temporal_actions_source = (PROJECT_ROOT / "src" / "hk_agent" / "temporal_actions.py").resolve(
         strict=True
     )
-    policy_runtime_source = (
-        PROJECT_ROOT / "src" / "hk_agent" / "first_training.py"
-    ).resolve(strict=True)
-    policy_artifact_source = (
-        PROJECT_ROOT / "src" / "hk_agent" / "policy_artifact.py"
-    ).resolve(strict=True)
+    gym_env_source = (PROJECT_ROOT / "src" / "hk_agent" / "gym_env.py").resolve(strict=True)
+    policy_runtime_source = (PROJECT_ROOT / "src" / "hk_agent" / "first_training.py").resolve(
+        strict=True
+    )
+    policy_artifact_source = (PROJECT_ROOT / "src" / "hk_agent" / "policy_artifact.py").resolve(
+        strict=True
+    )
     training_lock = (PROJECT_ROOT / "requirements-training.lock").resolve(strict=True)
     files = {
         "config": config_path,
@@ -167,14 +174,17 @@ def _provenance(
         "training_lock": training_lock,
     }
     return {
+        "launch_id": os.environ.get("HK_AGENT_LAUNCH_ID"),
+        "slot_id": os.environ.get("HK_AGENT_SLOT_ID"),
+        "game_install": str(args.game_install) if args.game_install else str(game_executable.parent),
+        "instance_data_root": str(args.instance_data_root) if args.instance_data_root else None,
+        "product_name": os.environ.get("HK_AGENT_PRODUCT_NAME"),
+        "log_file": str(args.log_file) if args.log_file else None,
         "game_profile": project_config.game_profile,
         "campaign_origin": origin_provenance,
-        "experimental_save_snapshot": fingerprint_directory(
-            project_config.experimental_save_root
-        ),
+        "experimental_save_snapshot": fingerprint_directory(project_config.experimental_save_root),
         "files": {
-            name: {"path": str(path), "sha256": sha256_file(path)}
-            for name, path in files.items()
+            name: {"path": str(path), "sha256": sha256_file(path)} for name, path in files.items()
         },
         "observation_dimensions": {
             "capture": {
@@ -204,15 +214,18 @@ def build_task(
 ) -> tuple[ReachSceneChangeTask, IsolatedEpisodeProcessOwner]:
     owner = IsolatedEpisodeProcessOwner(
         ProcessOwnerConfig(
-            game_executable=project_config.game_executable,
+            game_executable=(args.game_install / project_config.game_executable.name) if args.game_install else project_config.game_executable,
             personal_root=project_config.personal_save_root,
             experimental_root=project_config.experimental_save_root,
             backup_root=project_config.backup_root,
-            redirected_save_mode=args.experimental_save_root is not None,
+            redirected_save_mode=args.experimental_save_root is not None or args.instance_data_root is not None,
             transactional_launcher=PROJECT_ROOT / "tools" / "start-isolated-hollow-knight.ps1",
-            game_arguments=windowed_game_arguments(args.window_width, args.window_height),
+            game_arguments=windowed_game_arguments(args.window_width, args.window_height, log_file=str(args.log_file) if args.log_file else None),
             state_root=output_root / "episodes",
             maximum_episode_seconds=None if args.continuous else 3600.0,
+            instance_data_root=args.instance_data_root,
+            expected_product_name=(project_config.instance_product_names[int(os.environ["HK_AGENT_SLOT_ID"])] if args.instance_data_root is not None and os.environ.get("HK_AGENT_SLOT_ID") is not None else None),
+            other_instance_data_roots=tuple(root for root in project_config.instance_data_roots if root.resolve(strict=False) != args.instance_data_root.resolve(strict=False)) if args.instance_data_root else (),
         )
     )
     try:
@@ -296,6 +309,9 @@ def main() -> int:
         warm_start_policy_sha256=args.warm_start_policy_sha256,
         warm_start_policy_manifest_sha256=args.warm_start_policy_manifest_sha256,
         warm_start_policy_manifest_id=args.warm_start_policy_manifest_id,
+        training_device=args.training_device,
+        torch_threads=args.torch_threads,
+        torch_interop_threads=args.torch_interop_threads,
     )
     training_config.validate()
     task_config = SceneChangeTaskConfig(
@@ -314,6 +330,10 @@ def main() -> int:
         terminate_on_scene_change=not args.continuous,
     )
     task_config.validate()
+    if args.route_memory is None and args.instance_data_root is not None:
+        # Two instances must never share the default route-memory file; the
+        # panel always passes an exclusive per-slot --route-memory.
+        raise ValueError("instance launches require an exclusive --route-memory path")
     if args.route_memory is None:
         args.route_memory = (
             args.output_root.resolve(strict=False)
@@ -336,14 +356,15 @@ def main() -> int:
         "timesteps": None if args.continuous else args.timesteps,
         "checkpoint_interval": args.checkpoint_interval,
         "max_checkpoints": args.max_checkpoints,
+        "runtime_resources": {
+            "training_device": args.training_device,
+            "torch_threads": args.torch_threads,
+            "torch_interop_threads": args.torch_interop_threads,
+        },
         "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
-        "warm_start_policy": (
-            str(args.warm_start_policy) if args.warm_start_policy else None
-        ),
+        "warm_start_policy": (str(args.warm_start_policy) if args.warm_start_policy else None),
         "warm_start_policy_manifest": (
-            str(args.warm_start_policy_manifest)
-            if args.warm_start_policy_manifest
-            else None
+            str(args.warm_start_policy_manifest) if args.warm_start_policy_manifest else None
         ),
         "dependencies": dependencies,
         "bootstrap_plan": str(resolved_bootstrap.base_path),
@@ -359,6 +380,14 @@ def main() -> int:
         raise SystemExit("training dependencies are absent; install .[training] first")
 
     project_config = load_config(args.config.resolve(strict=True), allow_training=True)
+    if args.game_install is not None or args.instance_data_root is not None:
+        slot = int(os.environ.get("HK_AGENT_SLOT_ID", "-1"))
+        if slot < 0 or slot >= len(project_config.install_roots) or args.game_install is None or args.instance_data_root is None:
+            raise ValueError("managed instance arguments require a valid reserved slot")
+        if args.game_install.resolve(strict=True) != project_config.install_roots[slot] or args.instance_data_root.resolve(strict=False) != project_config.instance_data_roots[slot]:
+            raise ValueError("managed instance arguments do not match the validated slot")
+    elif os.environ.get("HK_AGENT_SLOT_ID") is not None:
+        raise ValueError("execute slot requires validated managed instance arguments")
     if args.experimental_save_root is not None:
         project_config = replace(
             project_config,
@@ -367,9 +396,7 @@ def main() -> int:
     if not project_config.training_enabled:
         raise SystemExit("the selected configuration does not enable training")
     validate_save_precondition(project_config.experimental_save_root, origin)
-    provenance = _provenance(
-        args, project_config, resolved_bootstrap, origin_provenance
-    )
+    provenance = _provenance(args, project_config, resolved_bootstrap, origin_provenance)
     run_root = args.output_root.resolve(strict=False) / (
         time.strftime("run-%Y%m%dT%H%M%S") + f"-{secrets.token_hex(3)}"
     )

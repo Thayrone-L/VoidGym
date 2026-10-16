@@ -23,6 +23,8 @@ class AcceptedBridge:
     game_version: str
     effective_save_root: str | None
     writer: asyncio.StreamWriter = field(repr=False)
+    persistent_data_path: str | None = None
+    product_name: str | None = None
     heartbeats_received: int = 0
     last_heartbeat_ns: int | None = None
     machine: SessionMachine = field(default_factory=SessionMachine)
@@ -64,6 +66,10 @@ class SupervisorServer:
         game_profile: str = "development",
         heartbeat_timeout_seconds: float = 2.0,
         expected_save_root: Path | None = None,
+        expected_persistent_data_path: Path | None = None,
+        forbidden_personal_root: Path | None = None,
+        expected_product_name: str | None = None,
+        forbidden_instance_data_roots: tuple[Path, ...] = (),
     ) -> None:
         if heartbeat_timeout_seconds <= 0:
             raise ValueError("heartbeat_timeout_seconds must be positive")
@@ -72,6 +78,17 @@ class SupervisorServer:
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.expected_save_root = (
             _canonical_path(expected_save_root) if expected_save_root is not None else None
+        )
+        self.expected_persistent_data_path = (
+            _canonical_path(expected_persistent_data_path or Path(os.environ["HK_AGENT_INSTANCE_DATA_ROOT"]))
+            if expected_persistent_data_path is not None or os.environ.get("HK_AGENT_INSTANCE_DATA_ROOT") else None
+        )
+        self.forbidden_personal_root = _canonical_path(forbidden_personal_root or Path(os.environ["HK_AGENT_PERSONAL_ROOT"])) if forbidden_personal_root is not None or os.environ.get("HK_AGENT_PERSONAL_ROOT") else None
+        self.expected_product_name = expected_product_name or os.environ.get("HK_AGENT_PRODUCT_NAME")
+        raw_forbidden = os.environ.get("HK_AGENT_OTHER_INSTANCE_DATA_ROOTS", "")
+        self.forbidden_instance_data_roots = tuple(_canonical_path(path) for path in forbidden_instance_data_roots) or tuple(_canonical_path(Path(path)) for path in raw_forbidden.split(os.pathsep) if path)
+        self.forbidden_personal_root = (
+            _canonical_path(forbidden_personal_root) if forbidden_personal_root is not None else None
         )
         self.run_id = str(uuid.uuid4())
         self.port: int | None = None
@@ -361,6 +378,19 @@ class SupervisorServer:
                     raise ProtocolError("HELLO requires effective_save_root")
                 if _canonical_path(Path(effective_save_root)) != self.expected_save_root:
                     raise ProtocolError("Effective save root mismatch")
+            if self.expected_persistent_data_path is not None:
+                persistent = hello.payload.get("persistent_data_path")
+                if not isinstance(persistent, str):
+                    raise ProtocolError("HELLO requires persistent_data_path")
+                canonical_persistent = _canonical_path(Path(persistent))
+                if canonical_persistent != self.expected_persistent_data_path:
+                    raise ProtocolError("Persistent data path mismatch")
+                if self.forbidden_personal_root is not None and canonical_persistent == self.forbidden_personal_root:
+                    raise ProtocolError("Persistent data path resolves to personal saves")
+                if canonical_persistent in self.forbidden_instance_data_roots:
+                    raise ProtocolError("Persistent data path resolves to another instance")
+            if self.expected_product_name is not None and hello.payload.get("product_name") != self.expected_product_name:
+                raise ProtocolError("Product name mismatch")
 
             accepted = AcceptedBridge(
                 instance_id=hello.instance_id,
@@ -369,6 +399,16 @@ class SupervisorServer:
                 game_version=game_version,
                 effective_save_root=effective_save_root,
                 writer=writer,
+                persistent_data_path=(
+                    hello.payload.get("persistent_data_path")
+                    if isinstance(hello.payload.get("persistent_data_path"), str)
+                    else None
+                ),
+                product_name=(
+                    hello.payload.get("product_name")
+                    if isinstance(hello.payload.get("product_name"), str)
+                    else None
+                ),
                 machine=machine,
             )
             machine.transition(SessionState.READY)

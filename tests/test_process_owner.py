@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import hk_agent.process_owner as process_owner_module
+from hk_agent.bridge_environment import BRIDGE_VARIABLES
 from hk_agent.process_owner import (
     EPISODE_REQUEST_ENV,
     IsolatedEpisodeProcessOwner,
@@ -154,6 +155,121 @@ def test_owner_launches_transaction_worker_with_endpoint_environment(tmp_path: P
     assert owner.active_episode_id is None
     owner.shutdown()
     owner.close()
+
+
+def test_instance_owner_uses_copy_and_player_log_without_save_redirect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "hk-ai-1" / "Hollow Knight.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    data_root = tmp_path / "LocalLow" / "Hollow Knight AI 1"
+    data_root.mkdir(parents=True)
+    seed_root = tmp_path / "seed"
+    seed_root.mkdir()
+    process = FakeProcess()
+    factory = CaptureFactory(process)
+    owner = IsolatedEpisodeProcessOwner(
+        ProcessOwnerConfig(
+            game_executable=executable,
+            personal_root=tmp_path / "personal",
+            experimental_root=seed_root,
+            backup_root=tmp_path / "backup",
+            transactional_launcher=tmp_path / "unused.ps1",
+            python_executable=tmp_path / "python.exe",
+            redirected_save_mode=True,
+            game_arguments=("-logFile", str(tmp_path / "runtime" / "launches" / "x" / "Player.log")),
+            state_root=tmp_path / "episodes",
+            instance_data_root=data_root,
+            expected_product_name="Hollow Knight AI 1",
+            other_instance_data_roots=(tmp_path / "LocalLow" / "Hollow Knight AI 2",),
+        ),
+        process_factory=factory,
+        validate_files=False,
+    )
+    owner.start_episode(endpoint(), "episode-instance")
+
+    command, environment = factory.calls[0]
+    request = decode_request(environment[EPISODE_REQUEST_ENV])
+    assert command[0].endswith("python.exe")
+    assert request["game_executable"] == str(executable)
+    assert request["game_arguments"][-2:] == ["-logFile", str(tmp_path / "runtime" / "launches" / "x" / "Player.log")]
+    assert request["bridge_mode"] == "instance"
+    assert request["instance_product_name"] == "Hollow Knight AI 1"
+    assert request["instance_data_root"] == str(data_root.resolve(strict=False))
+    # The owner hands the worker an explicit contract; no bridge variable is
+    # forwarded through the inherited environment.
+    assert not BRIDGE_VARIABLES & environment.keys()
+
+    from hk_agent.episode_worker import WorkerRequest, _game_environment
+
+    # Real handoff: the worker parses exactly what the owner emitted, while
+    # stale values from either bridge mode exist in the worker's environment.
+    monkeypatch.setenv(EPISODE_REQUEST_ENV, environment[EPISODE_REQUEST_ENV])
+    monkeypatch.setenv("HK_AGENT_SAVE_ROOT", "stale-save")
+    monkeypatch.setenv("HK_AGENT_PRODUCT_NAME", "stale-product")
+    monkeypatch.delenv("HK_AGENT_INSTANCE_MODE", raising=False)
+    worker_request = WorkerRequest.from_environment()
+    game_environment = _game_environment(worker_request)
+    assert game_environment["HK_AGENT_INSTANCE_MODE"] == "1"
+    assert game_environment["HK_AGENT_PRODUCT_NAME"] == "Hollow Knight AI 1"
+    assert game_environment["HK_AGENT_INSTANCE_DATA_ROOT"] == str(data_root.resolve(strict=False))
+    assert "HK_AGENT_SAVE_ROOT" not in game_environment
+    owner.shutdown()
+
+
+def test_legacy_owner_handoff_ignores_inherited_instance_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "game" / "Hollow Knight.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    seed_root = tmp_path / "seed"
+    seed_root.mkdir()
+    monkeypatch.setenv("HK_AGENT_INSTANCE_MODE", "1")
+    monkeypatch.setenv("HK_AGENT_PRODUCT_NAME", "stale-product")
+    monkeypatch.setenv("HK_AGENT_INSTANCE_DATA_ROOT", "stale-data")
+    factory = CaptureFactory(FakeProcess())
+    owner = IsolatedEpisodeProcessOwner(
+        ProcessOwnerConfig(
+            game_executable=executable,
+            personal_root=tmp_path / "personal",
+            experimental_root=seed_root,
+            backup_root=tmp_path / "backup",
+            transactional_launcher=tmp_path / "unused.ps1",
+            python_executable=tmp_path / "python.exe",
+            redirected_save_mode=True,
+            state_root=tmp_path / "episodes",
+        ),
+        process_factory=factory,
+        validate_files=False,
+    )
+    owner.start_episode(endpoint(), "episode-legacy")
+    _, environment = factory.calls[0]
+    request = decode_request(environment[EPISODE_REQUEST_ENV])
+    assert request["bridge_mode"] == "legacy"
+    assert request["instance_product_name"] is None
+    assert not BRIDGE_VARIABLES & environment.keys()
+
+    from hk_agent.episode_worker import WorkerRequest, _game_environment
+
+    monkeypatch.setenv(EPISODE_REQUEST_ENV, environment[EPISODE_REQUEST_ENV])
+    game_environment = _game_environment(WorkerRequest.from_environment())
+    assert game_environment["HK_AGENT_SAVE_ROOT"] == str(seed_root.resolve(strict=False))
+    assert "HK_AGENT_INSTANCE_MODE" not in game_environment
+    owner.shutdown()
+
+
+def test_instance_owner_requires_redirected_save_mode(tmp_path: Path) -> None:
+    config = ProcessOwnerConfig(
+        game_executable=tmp_path / "Hollow Knight.exe",
+        personal_root=tmp_path / "personal",
+        experimental_root=tmp_path / "seed",
+        backup_root=tmp_path / "backup",
+        transactional_launcher=tmp_path / "launcher.ps1",
+        instance_data_root=tmp_path / "LocalLow" / "Hollow Knight AI 1",
+        expected_product_name="Hollow Knight AI 1",
+    )
+    with pytest.raises(ValueError, match="redirected save mode"):
+        config.validate(require_files=False)
 
 
 def test_redirected_owner_launches_worker_directly_with_isolated_root(

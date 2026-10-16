@@ -14,19 +14,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hk_agent.bridge_environment import BRIDGE_VARIABLES, build_bridge_environment
 from hk_agent.gameplay_control import GameplayControlServer
 from hk_agent.protocol import ProtocolError
 from hk_agent.supervisor import AcceptedBridge, SupervisorServer
 
 REQUEST_ENVIRONMENT_VARIABLE = "HK_ISOLATED_SESSION_REQUEST"
-BRIDGE_ENVIRONMENT_VARIABLES = {
-    "HK_AGENT_HOST",
-    "HK_AGENT_PORT",
-    "HK_AGENT_RUN_ID",
-    "HK_AGENT_INSTANCE_ID",
-    "HK_AGENT_TOKEN",
-    "HK_AGENT_GAME_PROFILE",
-}
+BRIDGE_ENVIRONMENT_VARIABLES = BRIDGE_VARIABLES
 MENU_BUTTONS = frozenset({"UP", "DOWN", "LEFT", "RIGHT", "SUBMIT", "CANCEL"})
 MAXIMUM_MENU_LEASE_MILLISECONDS = 100
 
@@ -83,6 +77,8 @@ class SessionRequest:
     control_output_dir: Path | None = None
     control_idle_timeout_seconds: float = 300.0
     control_settle_seconds: float = 0.15
+    instance_data_root: Path | None = None
+    expected_product_name: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Any) -> SessionRequest:
@@ -179,6 +175,12 @@ class SessionRequest:
         executable = Path(value["game_executable"]).resolve(strict=True)
         if not executable.is_file():
             raise SessionRequestError(f"Game executable is not a file: {executable}")
+        data_value = value.get("instance_data_root")
+        product_value = value.get("expected_product_name")
+        if data_value is not None and (not isinstance(data_value, str) or not data_value.strip()):
+            raise SessionRequestError("instance_data_root must be null or a non-empty path")
+        if data_value is not None and (not isinstance(product_value, str) or not product_value.strip()):
+            raise SessionRequestError("expected_product_name is required for instance mode")
 
         return cls(
             mode=mode,
@@ -223,6 +225,8 @@ class SessionRequest:
             ),
             control_idle_timeout_seconds=control_idle_timeout,
             control_settle_seconds=control_settle,
+            instance_data_root=Path(os.path.abspath(data_value)) if isinstance(data_value, str) else None,
+            expected_product_name=product_value if isinstance(product_value, str) else None,
         )
 
 
@@ -289,6 +293,15 @@ def _bounded_positive_number(value: Any, name: str, maximum: float) -> float:
 
 
 def assert_save_isolation(request: SessionRequest) -> None:
+    if request.instance_data_root is not None:
+        if not request.instance_data_root.is_dir():
+            raise SessionRequestError("Instance data root must exist before the game starts")
+        try:
+            if os.path.samefile(request.instance_data_root, request.personal_root):
+                raise SessionRequestError("Instance data root resolves to personal saves")
+        except FileNotFoundError:
+            raise SessionRequestError("Instance and personal save roots must exist") from None
+        return
     if not request.personal_root.is_dir() or not request.experimental_root.is_dir():
         raise SessionRequestError("Save-isolation roots must exist before the game starts")
     if not os.path.samefile(request.personal_root, request.experimental_root):
@@ -313,23 +326,31 @@ def load_request_from_environment() -> SessionRequest:
 
 
 def _game_environment(supervisor: SupervisorServer, request: SessionRequest) -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in BRIDGE_ENVIRONMENT_VARIABLES and key != REQUEST_ENVIRONMENT_VARIABLE
-    }
     if supervisor.port is None:
         raise RuntimeError("Supervisor did not bind a port")
-    environment.update(
-        {
-            "HK_AGENT_HOST": "127.0.0.1",
-            "HK_AGENT_PORT": str(supervisor.port),
-            "HK_AGENT_RUN_ID": supervisor.run_id,
-            "HK_AGENT_INSTANCE_ID": request.instance_id,
-            "HK_AGENT_TOKEN": supervisor.token,
-            "HK_AGENT_GAME_PROFILE": request.game_profile,
-        }
+    if request.instance_data_root is None:
+        mode = "legacy"
+        save_root = str(request.experimental_root.resolve(strict=False))
+        product_name = instance_data_root = None
+    else:
+        mode = "instance"
+        save_root = None
+        product_name = request.expected_product_name
+        instance_data_root = str(request.instance_data_root)
+    environment = build_bridge_environment(
+        os.environ,
+        mode=mode,
+        host="127.0.0.1",
+        port=str(supervisor.port),
+        run_id=supervisor.run_id,
+        instance_id=request.instance_id,
+        token=supervisor.token,
+        game_profile=request.game_profile,
+        save_root=save_root,
+        product_name=product_name,
+        instance_data_root=instance_data_root,
     )
+    environment.pop(REQUEST_ENVIRONMENT_VARIABLE, None)
     return environment
 
 
@@ -507,7 +528,12 @@ async def run_session(request: SessionRequest) -> SessionResult:
             str(request.control_output_dir) if request.control_output_dir is not None else None
         ),
     )
-    supervisor = SupervisorServer(game_profile=request.game_profile)
+    supervisor = SupervisorServer(
+        game_profile=request.game_profile,
+        expected_persistent_data_path=request.instance_data_root,
+        forbidden_personal_root=request.personal_root if request.instance_data_root else None,
+        expected_product_name=request.expected_product_name,
+    )
     process: asyncio.subprocess.Process | None = None
     bridge: AcceptedBridge | None = None
     control: GameplayControlServer | None = None

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from hk_agent.protocol import ProtocolError
 from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
 
 MENU_BUTTONS = frozenset({"UP", "DOWN", "LEFT", "RIGHT", "SUBMIT", "CANCEL"})
@@ -173,6 +174,12 @@ def build_readiness_verifier(plan: MenuBootstrapPlan) -> ReadinessVerifier:
         from hk_agent.supervisor_backend import decode_rgb8_png
 
         reference = decode_rgb8_png(reference_bytes)
+        if (frame.width, frame.height) != (reference.shape[1], reference.shape[0]):
+            raise ProtocolError(
+                f"menu frame is {frame.width}x{frame.height} but the readiness reference is "
+                f"{reference.shape[1]}x{reference.shape[0]}; the game window client area "
+                "changed size (check window placement and -screen-width/-height)"
+            )
         candidate = decode_rgb8_png(
             frame.data,
             expected_width=reference.shape[1],

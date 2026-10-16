@@ -82,7 +82,10 @@ internal sealed class BridgeClient : IDisposable
                         ["token"] = _configuration.Token,
                         ["game_profile"] = _configuration.GameProfile,
                         ["game_version"] = Constants.GAME_VERSION,
-                        ["effective_save_root"] = _configuration.SaveRoot,
+                        ["effective_save_root"] = _configuration.SaveRoot!,
+                        ["instance_mode"] = _configuration.InstanceMode,
+                        ["persistent_data_path"] = UnityEngine.Application.persistentDataPath,
+                        ["product_name"] = UnityEngine.Application.productName,
                         ["bridge_version"] = "0.0.0-dev",
                         ["capabilities"] = new[]
                         {

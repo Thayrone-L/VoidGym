@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from hk_agent.config import ConfigError, load_config
 from hk_agent.control_plane import ControlPlane, parse_json_body, require_keys
 
 
@@ -25,9 +26,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         elif path == "/api/runs":
             self._json(HTTPStatus.OK, {"runs": self.server.control_plane.list_runs()})
         elif path == "/api/campaigns":
-            self._json(
-                HTTPStatus.OK, {"campaigns": self.server.control_plane.list_campaigns()}
-            )
+            self._json(HTTPStatus.OK, {"campaigns": self.server.control_plane.list_campaigns()})
         elif path == "/api/log":
             query = parse_qs(urlsplit(self.path).query)
             try:
@@ -152,7 +151,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'",
+        )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
@@ -197,13 +199,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_control_plane(project_root: Path, *, allow_execute: bool) -> ControlPlane:
+    if not allow_execute:
+        return ControlPlane(
+            project_root,
+            allow_execute=False,
+            max_active_launches=1,
+            parallel_enabled=False,
+            runtime_root=project_root / "artifacts" / "runtime",
+            training_device="cpu",
+            torch_threads=3,
+            torch_interop_threads=1,
+        )
+    project_config = load_config(
+        project_root / "config.training.local.toml", allow_training=True
+    )
+    return ControlPlane(
+        project_root,
+        allow_execute=True,
+        max_active_launches=project_config.instance_count,
+        parallel_enabled=project_config.parallel_enabled,
+        runtime_root=project_config.runtime_root,
+        training_device=project_config.training_device,
+        torch_threads=project_config.torch_threads,
+        torch_interop_threads=project_config.torch_interop_threads,
+    )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if not 1 <= args.port <= 65_535:
         raise SystemExit("port must be in [1, 65535]")
     project_root = Path(__file__).resolve().parents[2]
     static_root = Path(__file__).resolve().parent / "control_plane_web"
-    control_plane = ControlPlane(project_root, allow_execute=args.allow_execute)
+    try:
+        control_plane = build_control_plane(project_root, allow_execute=args.allow_execute)
+    except ConfigError as error:
+        raise SystemExit(str(error)) from error
     server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root)
     print(
         f"HK Training Control Plane: http://127.0.0.1:{args.port} "
