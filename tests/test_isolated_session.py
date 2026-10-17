@@ -7,11 +7,46 @@ import sys
 import textwrap
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from hk_agent.isolated_session import SessionRequest, _game_environment
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "tools" / "run_isolated_session.py"
+
+
+def test_instance_game_environment_uses_bridge_instance_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "game.exe"
+    executable.touch()
+    data_root = tmp_path / "instance-data"
+    data_root.mkdir()
+    request = SessionRequest.from_mapping(
+        {
+            "game_executable": str(executable),
+            "game_profile": "development",
+            "instance_id": "instance-1",
+            "result_path": str(tmp_path / "result.json"),
+            "personal_root": str(tmp_path / "personal"),
+            "experimental_root": str(tmp_path / "experimental"),
+            "instance_data_root": str(data_root),
+            "expected_product_name": "Hollow Knight AI 1",
+        }
+    )
+    monkeypatch.setenv("HK_AGENT_SAVE_ROOT", "stale-save")
+    monkeypatch.setenv("HK_AGENT_INSTANCE_MODE", "stale-mode")
+    monkeypatch.setenv("HK_AGENT_PRODUCT_NAME", "stale-product")
+    monkeypatch.setenv("HK_AGENT_INSTANCE_DATA_ROOT", "stale-data")
+    environment = _game_environment(
+        SimpleNamespace(port=43123, run_id="run-1", token="token-1"), request
+    )
+    assert environment["HK_AGENT_INSTANCE_MODE"] == "1"
+    assert environment["HK_AGENT_PRODUCT_NAME"] == "Hollow Knight AI 1"
+    assert environment["HK_AGENT_INSTANCE_DATA_ROOT"] == str(data_root)
+    assert "HK_AGENT_SAVE_ROOT" not in environment
 
 
 def _inventory(root: Path) -> list[tuple[str, str]]:

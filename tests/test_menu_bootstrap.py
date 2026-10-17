@@ -161,3 +161,49 @@ def test_animated_distinct_menu_is_rejected_by_explicit_readiness_verifier(
     )
     assert saved["status"] == "FAILED"
     assert saved["readiness"]["ready"] is False
+
+
+def _rgb_png(width: int, height: int) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    rows = b"".join(b"\x00" + b"\x10\x20\x30" * width for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_readiness_verifier_explains_window_size_change(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from hk_agent.menu_bootstrap import ReferenceReadinessSpec, build_readiness_verifier
+    from hk_agent.protocol import ProtocolError
+
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(_rgb_png(4, 2))
+    plan = replace(
+        _plan(),
+        readiness=ReferenceReadinessSpec(
+            verifier_id="reference-rgb-mae-v1",
+            reference_image=reference,
+            maximum_mean_absolute_error=1.0,
+        ),
+    )
+    verifier = build_readiness_verifier(plan)
+    same_size = SimpleNamespace(data=_rgb_png(4, 2), width=4, height=2)
+    assert verifier(same_size).ready is True  # type: ignore[arg-type]
+    resized = SimpleNamespace(data=_rgb_png(4, 3), width=4, height=3)
+    with pytest.raises(ProtocolError, match="client area changed size"):
+        verifier(resized)  # type: ignore[arg-type]

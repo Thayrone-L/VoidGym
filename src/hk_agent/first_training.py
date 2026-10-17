@@ -44,6 +44,9 @@ class FirstTrainingConfig:
     warm_start_policy_sha256: str | None = None
     warm_start_policy_manifest_sha256: str | None = None
     warm_start_policy_manifest_id: str | None = None
+    training_device: str = "cpu"
+    torch_threads: int = 3
+    torch_interop_threads: int = 1
 
     def validate(self) -> None:
         if not 1 <= self.total_timesteps <= 10_000_000:
@@ -70,8 +73,7 @@ class FirstTrainingConfig:
             self.warm_start_policy_manifest_id,
         )
         if any(value is not None for value in frozen_identity) and (
-            self.warm_start_policy is None
-            or any(value is None for value in frozen_identity)
+            self.warm_start_policy is None or any(value is None for value in frozen_identity)
         ):
             raise ValueError("warm-start frozen identity must be provided as a complete set")
         if any(
@@ -82,16 +84,19 @@ class FirstTrainingConfig:
             raise ValueError("warm-start frozen identity must use lowercase SHA-256")
         if self.resume_checkpoint is not None and self.warm_start_policy is not None:
             raise ValueError("resume checkpoint and warm-start policy are mutually exclusive")
-        if (
-            self.warm_start_policy is not None
-            and self.warm_start_policy.suffix != ".safetensors"
-        ):
+        if self.warm_start_policy is not None and self.warm_start_policy.suffix != ".safetensors":
             raise ValueError("warm_start_policy must be a .safetensors file")
         if (
             self.warm_start_policy_manifest is not None
             and not self.warm_start_policy_manifest.name.endswith(".manifest.json")
         ):
             raise ValueError("warm_start_policy_manifest must be a .manifest.json file")
+        if self.training_device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("training_device must be cpu, cuda, or auto")
+        if not 1 <= self.torch_threads <= 8:
+            raise ValueError("torch_threads must be in [1, 8]")
+        if not 1 <= self.torch_interop_threads <= 4:
+            raise ValueError("torch_interop_threads must be in [1, 4]")
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -130,24 +135,16 @@ def _validated_resume_manifest(
     if not isinstance(source_fingerprint, str):
         source_contract = manifest.get("task_contract")
         source_provenance = manifest.get("provenance")
-        if not isinstance(source_contract, Mapping) or not isinstance(
-            source_provenance, Mapping
-        ):
+        if not isinstance(source_contract, Mapping) or not isinstance(source_provenance, Mapping):
             raise TypeError("resume checkpoint has no compatible provenance")
-        source_fingerprint = portable_compatibility_fingerprint(
-            source_contract, source_provenance
-        )
+        source_fingerprint = portable_compatibility_fingerprint(source_contract, source_provenance)
     if source_fingerprint != expected_fingerprint:
         raise ValueError("resume checkpoint provenance differs from this campaign")
     entries = manifest.get("checkpoints")
     if not isinstance(entries, list):
         raise TypeError("resume manifest has no checkpoint inventory")
     digest = sha256_file(resolved)
-    matched = any(
-        isinstance(entry, Mapping)
-        and entry.get("sha256") == digest
-        for entry in entries
-    )
+    matched = any(isinstance(entry, Mapping) and entry.get("sha256") == digest for entry in entries)
     if not matched:
         raise ValueError("resume checkpoint hash is absent from its manifest")
     return manifest
@@ -171,9 +168,7 @@ def train_ppo(
     reward_version = str(task_contract.get("reward_version", VISUAL_MOTION_REWARD_VERSION))
     diagnostic_training = bool(task_contract.get("diagnostic_training", True))
     claim = str(
-        task_contract.get(
-            "claim", "motor-signal diagnostic; not game progress or task success"
-        )
+        task_contract.get("claim", "motor-signal diagnostic; not game progress or task success")
     )
     manifest: dict[str, Any] = {
         "schema_version": 3,
@@ -215,6 +210,22 @@ def train_ppo(
             ) from error
         random.seed(config.seed)
         np.random.seed(config.seed)
+        try:
+            torch.set_num_threads(config.torch_threads)
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError("Torch intra-op thread budget could not be applied") from error
+        try:
+            torch.set_num_interop_threads(config.torch_interop_threads)
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError(
+                "Torch inter-op threads were initialized before the campaign resource budget"
+            ) from error
+        if (
+            config.training_device == "cuda"
+            and hasattr(torch, "cuda")
+            and not torch.cuda.is_available()
+        ):
+            raise RuntimeError("CUDA training was requested but this Torch build has no CUDA")
         torch.manual_seed(config.seed)
         manifest["versions"] = {
             "python": platform.python_version(),
@@ -230,7 +241,7 @@ def train_ppo(
                 task_contract=task_contract,
                 provenance=dict(provenance or {}),
             )
-            model = PPO.load(str(resume_path), env=environment, device="auto")
+            model = PPO.load(str(resume_path), env=environment, device=config.training_device)
             completed = int(model.num_timesteps)
             manifest["resumed_from"] = {
                 "path": str(resume_path),
@@ -245,7 +256,7 @@ def train_ppo(
                 n_steps=config.rollout_steps,
                 batch_size=config.batch_size,
                 verbose=1,
-                device="auto",
+                device=config.training_device,
             )
             if (
                 config.warm_start_policy is not None
@@ -256,9 +267,7 @@ def train_ppo(
                 imported = import_policy_artifact(
                     model.policy,
                     policy_path,
-                    expected_compatibility_fingerprint=manifest[
-                        "compatibility_fingerprint"
-                    ],
+                    expected_compatibility_fingerprint=manifest["compatibility_fingerprint"],
                     manifest_path=policy_manifest_path,
                     expected_artifact_sha256=config.warm_start_policy_sha256,
                     expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
@@ -271,11 +280,20 @@ def train_ppo(
                     "format": "safetensors",
                     "manifest_id": imported["manifest_id"],
                     "manifest_sha256": sha256_file(policy_manifest_path),
-                    "compatibility_fingerprint": imported[
-                        "compatibility_fingerprint"
-                    ],
+                    "compatibility_fingerprint": imported["compatibility_fingerprint"],
                 }
                 atomic_json(manifest_path, manifest)
+
+        manifest["runtime_resources"] = {
+            "training_device_requested": config.training_device,
+            "training_device_effective": str(model.device),
+            "torch_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
+            "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+            "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
+        }
+        atomic_json(manifest_path, manifest)
 
         run_failures = 0
         episode_count = 0
@@ -387,9 +405,7 @@ def train_ppo(
                             }
                         )
                         del pruned[:-1000]
-            retained_steps = {
-                item.get("step") for item in checkpoints if isinstance(item, Mapping)
-            }
+            retained_steps = {item.get("step") for item in checkpoints if isinstance(item, Mapping)}
             expired_policies: list[Path] = []
             retained_policies: list[object] = []
             for item in portable_policies:

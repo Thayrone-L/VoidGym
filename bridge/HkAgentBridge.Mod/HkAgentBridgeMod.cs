@@ -39,7 +39,25 @@ public sealed class HkAgentBridgeMod : Mod
 
         try
         {
-            ApplySaveRoot(configuration.SaveRoot);
+            if (configuration.InstanceMode)
+            {
+                BridgeConfiguration.ValidateInstanceRuntime(
+                    configuration.ExpectedProductName!,
+                    configuration.ExpectedDataRoot!,
+                    Application.productName,
+                    Application.persistentDataPath,
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "Low",
+                        "Team Cherry",
+                        "Hollow Knight"
+                    )
+                );
+            }
+            else
+            {
+                ApplySaveRoot(configuration.SaveRoot!);
+            }
             Application.runInBackground = true;
         }
         catch (Exception exception)

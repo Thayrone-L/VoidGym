@@ -71,6 +71,8 @@ class PixelFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    decode_ms: float = 0.0
+    bridge_timing: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +121,24 @@ class EnvironmentBackend(Protocol):
     def close(self) -> None: ...
 
 
+def extended_length_path(path: str, *, os_name: str = os.name) -> str:
+    """Return a Windows extended-length path (\\\\?\\...) for deep experience trees.
+
+    Per-launch runtime roots plus instance/episode identifiers exceed MAX_PATH
+    (260 for files, 248 for directories), which made the experience writer fail
+    with WinError 206. Extended-length paths lift that limit without requiring the
+    system-wide LongPathsEnabled setting. Other platforms are returned unchanged.
+    """
+    if os_name != "nt":
+        return path
+    if path.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(path)
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
 class AtomicJsonlWriter:
     """Append complete JSON records durably, without a partially buffered line."""
 
@@ -126,12 +146,12 @@ class AtomicJsonlWriter:
         self.path = path
 
     def append(self, record: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(extended_length_path(str(self.path.parent)), exist_ok=True)
         payload = (
             json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
         ).encode("utf-8")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        descriptor = os.open(self.path, flags, 0o600)
+        descriptor = os.open(extended_length_path(str(self.path)), flags, 0o600)
         try:
             written = os.write(descriptor, payload)
             if written != len(payload):
@@ -457,6 +477,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
             geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
             geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+            decode_ms=frame.decode_ms,
+            bridge_timing=frame.bridge_timing,
         )
 
     def _validate_applied_action(

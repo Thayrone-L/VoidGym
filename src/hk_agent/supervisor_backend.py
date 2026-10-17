@@ -318,8 +318,10 @@ class SupervisorEnvironmentBackend:
             self._ensure_open()
             bridge, episode_id = self._require_episode()
             started = time.monotonic_ns()
+            timings: dict[str, float] = {}
             response = None
             try:
+                apply_started = time.monotonic_ns()
                 response = self._submit(
                     self._supervisor.send_command(
                         "APPLY_ACTION",
@@ -343,17 +345,28 @@ class SupervisorEnvironmentBackend:
                 self._validate_action_ack(
                     response.payload, episode_id, action_id, buttons, lease_ms
                 )
+                timings["apply_rtt"] = (time.monotonic_ns() - apply_started) / 1_000_000
+                sleep_started = time.monotonic_ns()
                 time.sleep((lease_ms / 1000.0) + self._settle_seconds)
+                timings["lease_sleep"] = (time.monotonic_ns() - sleep_started) / 1_000_000
             finally:
+                release_started = time.monotonic_ns()
                 self._release_locked(best_effort=response is None)
+                timings["release_rtt"] = (time.monotonic_ns() - release_started) / 1_000_000
 
+            capture_started = time.monotonic_ns()
             frame = self._capture_locked(expected_action_id=action_id)
+            timings["capture_rtt"] = (time.monotonic_ns() - capture_started) / 1_000_000
+            timings["decode"] = frame.decode_ms
+            for name, value in frame.bridge_timing:
+                timings[f"bridge_{name}"] = value
+            timings["backend"] = (time.monotonic_ns() - started) / 1_000_000
             return BackendStep(
                 frame=frame,
                 applied_action=AppliedAction(action_id, buttons, buttons, lease_ms),
                 terminated=frame.player_dead,
                 termination_reason="player_death" if frame.player_dead else None,
-                timing_ms={"backend": (time.monotonic_ns() - started) / 1_000_000},
+                timing_ms=timings,
             )
 
     def release_all(self) -> None:
@@ -509,6 +522,7 @@ class SupervisorEnvironmentBackend:
 def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
     if frame.episode_id != episode_id:
         raise ProtocolError("FRAME belongs to another episode")
+    decode_started = time.monotonic_ns()
     pixels = decode_rgb8_png(
         frame.data, expected_width=frame.width, expected_height=frame.height
     )
@@ -531,6 +545,8 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
         geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
         geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+        decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
+        bridge_timing=frame.bridge_timing,
     )
 
 

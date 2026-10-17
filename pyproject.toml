@@ -32,6 +32,9 @@ development = [
     "safetensors>=0.8,<1",
     "mypy>=1.17,<2",
 ]
+instances = [
+    "UnityPy>=1.20,<2",
+]
 
 [project.scripts]
 hk-agent = "hk_agent.cli:main"

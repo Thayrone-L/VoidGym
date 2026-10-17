@@ -3,8 +3,14 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
+import shutil
+import subprocess
 import threading
+import time
+from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -13,6 +19,7 @@ import pytest
 from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.control_plane import CampaignSpec, ControlPlane
 from hk_agent.control_plane_server import ControlPlaneHTTPServer
+from hk_agent.runtime_paths import prepare_instance_saves
 
 
 def _project(tmp_path: Path) -> Path:
@@ -168,6 +175,13 @@ def test_real_launch_requires_explicit_server_flag(tmp_path: Path) -> None:
         control.launch(str(campaign["campaign_id"]), version=1, execute=True)
 
 
+def test_execute_command_refuses_missing_managed_copy(tmp_path: Path) -> None:
+    spec = CampaignSpec.from_payload(_real_campaign_payload())
+    control = ControlPlane(_project(tmp_path), allow_execute=True)
+    with pytest.raises(ValueError, match="validated managed installation"):
+        control.build_command(spec, execute=True)
+
+
 def test_command_is_allowlisted_argument_vector_with_no_shell_text(tmp_path: Path) -> None:
     control = ControlPlane(_project(tmp_path))
     spec = CampaignSpec.from_payload(_payload())
@@ -182,6 +196,23 @@ def test_command_is_allowlisted_argument_vector_with_no_shell_text(tmp_path: Pat
     stop_file = tmp_path / "artifacts" / "control-plane" / "launches" / "x" / "stop.request"
     command = control.build_command(spec, execute=False, stop_file=stop_file)
     assert command[-2:] == ["--stop-file", str(stop_file)]
+
+
+def test_parallel_smoke_campaign_uses_controlled_probe_without_training(
+    tmp_path: Path,
+) -> None:
+    payload = _payload("parallel_smoke")
+    payload["weights"] = {}
+    payload["horizon"] = 10_000
+    spec = CampaignSpec.from_payload(payload)
+    command = ControlPlane(_project(tmp_path)).build_command(spec, execute=False)
+
+    assert command[1].endswith("run_scene_change_probe.py")
+    assert command[command.index("--bridge-smoke-seconds") + 1] == "90"
+    assert command[command.index("--horizon") + 1] == "10000"
+    assert command[command.index("--action-repeat") + 1] == "1"
+    assert "--training-device" not in command
+    assert "--execute" not in command
 
 
 def test_training_worker_session_resolves_only_validated_preflight_pair(
@@ -270,6 +301,8 @@ def test_restart_reattaches_live_launch_and_stop_remains_cooperative(
         "launch_id": "launch-1",
         "campaign_id": "continuous-test",
         "pid": 31337,
+        "runner_process": {"pid": 31337, "creation_time": 100, "executable": "runner.exe"},
+        "launch_nonce": "launch-1",
         "status": "RUNNING",
         "stop_file": (
             "artifacts/control-plane/launches/launch-1/stop.request"
@@ -278,6 +311,7 @@ def test_restart_reattaches_live_launch_and_stop_remains_cooperative(
     }
     (launch_root / "launch.json").write_text(json.dumps(launch), encoding="utf-8")
     monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: pid == 31337))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {"pid": pid, "creation_time": 100, "executable": "runner.exe"})
 
     control = ControlPlane(root)
     active = control.status()["active"]
@@ -286,6 +320,155 @@ def test_restart_reattaches_live_launch_and_stop_remains_cooperative(
     stopped = control.stop()
     assert stopped == {"status": "STOP_REQUESTED", "pid": 31337}
     assert (launch_root / "stop.request").is_file()
+
+
+def test_windows_launch_is_suspended_assigned_then_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    campaign = control.create_campaign(_payload())
+    events: list[object] = []
+
+    class FakeJob:
+        @classmethod
+        def create(cls):
+            events.append("create-job")
+            return cls()
+
+        def assign_pid(self, pid: int) -> None:
+            events.append(("assign", pid))
+
+        def close(self) -> None:
+            events.append("close")
+
+        def process_ids(self) -> list[int]:
+            return []
+
+    class RecordingProcess(_FakeProcess):
+        def __init__(self, command, **kwargs):
+            events.append(("popen", kwargs["creationflags"]))
+            super().__init__(command, **kwargs)
+
+    monkeypatch.setattr("hk_agent.control_plane._windows_job_enabled", lambda: True)
+    monkeypatch.setattr("hk_agent.control_plane.WindowsJob", FakeJob)
+    monkeypatch.setattr("hk_agent.control_plane._REAL_POPEN", RecordingProcess)
+    monkeypatch.setattr("hk_agent.control_plane.resume_process", lambda pid: events.append(("resume", pid)))
+    monkeypatch.setattr(ControlPlane, "_discover_runner_process", staticmethod(lambda *_args: None))
+    with patch("hk_agent.control_plane.subprocess.Popen", RecordingProcess):
+        launched = control.launch(str(campaign["campaign_id"]), version=1, execute=False)
+    assert [event if isinstance(event, str) else event[0] for event in events[:4]] == [
+        "create-job", "popen", "assign", "resume"
+    ]
+    popen_flags = events[1][1]  # type: ignore[index]
+    assert popen_flags & getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+    _finish_launch(control, str(launched["launch_id"]))
+
+
+def test_recovery_reattaches_runner_sidecar_when_redirector_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "child-runner"
+    launch_root.mkdir(parents=True)
+    record = {
+        "launch_id": "child-runner", "mode": "dry-run", "pid": 4240,
+        "runner_process": {"pid": 4240, "creation_time": 10, "executable": "redirector.exe"},
+        "launch_nonce": "child-runner", "status": "RUNNING",
+        "resources": {"slot_id": None},
+    }
+    (launch_root / "launch.json").write_text(json.dumps(record), encoding="utf-8")
+    (launch_root / "runner-process.json").write_text(json.dumps({
+        "pid": 4241, "creation_time": 20, "executable": "base-python.exe",
+        "parent_pid": 4240, "launch_nonce": "child-runner",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: pid == 4241))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {
+        "pid": pid, "creation_time": 20, "executable": "base-python.exe",
+    })
+    control = ControlPlane(root)
+    active = control.status()["active_launches"]
+    assert isinstance(active, list) and active[0]["reattached"] is True
+    assert active[0]["runner_process"]["pid"] == 4241  # type: ignore[index]
+
+
+def test_job_descendants_keep_slot_reserved_until_job_is_empty(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    launch_id = "draining-job"
+    launch_root = control.control_root / "launches" / launch_id
+    launch_root.mkdir(parents=True)
+    record: dict[str, object] = {
+        "launch_id": launch_id,
+        "mode": "execute",
+        "status": "RUNNING",
+        "resources": {"slot_id": 0},
+    }
+    process = _FakeProcess([])
+    process._return_code = 0
+    process._done.set()
+    release = threading.Event()
+    terminated = threading.Event()
+
+    class DrainingJob:
+        def process_ids(self) -> list[int]:
+            if not terminated.is_set() or not release.is_set():
+                return [999]
+            return []
+
+        def terminate(self) -> None:
+            terminated.set()
+
+        def close(self) -> None:
+            return None
+
+    control._launches[launch_id] = record
+    control._processes[launch_id] = process
+    control._jobs[launch_id] = DrainingJob()  # type: ignore[assignment]
+    control._slot_owners[0] = launch_id
+    control._slot_fences[0] = "fence"
+    log_handle = (launch_root / "process.log").open("wb")
+    waiter = threading.Thread(
+        target=control._wait_for_process,
+        args=(launch_id, process, log_handle, launch_root),
+        daemon=True,
+    )
+    waiter.start()
+    assert terminated.wait(2)
+    assert control._slot_owners[0] == launch_id
+    assert control.status()["active_count"] == 1
+    release.set()
+    waiter.join(2)
+    assert not waiter.is_alive()
+    assert launch_id not in control._slot_owners.values()
+    assert record["status"] == "FAILED"
+    assert record["draining_pids"] == []
+
+
+def test_runner_sidecar_with_reused_pid_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "runner-pid-reuse"
+    launch_root.mkdir(parents=True)
+    (launch_root / "launch.json").write_text(json.dumps({
+        "launch_id": "runner-pid-reuse", "mode": "dry-run", "pid": 4240,
+        "runner_process": {"pid": 4240, "creation_time": 10, "executable": "redirector.exe"},
+        "launch_nonce": "runner-pid-reuse", "status": "RUNNING",
+        "resources": {"slot_id": None},
+    }), encoding="utf-8")
+    (launch_root / "runner-process.json").write_text(json.dumps({
+        "pid": 4241, "creation_time": 20, "executable": "base-python.exe",
+        "parent_pid": 4240, "launch_nonce": "runner-pid-reuse",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: pid == 4241))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {
+        "pid": pid, "creation_time": 21, "executable": "base-python.exe",
+    })
+    control = ControlPlane(root)
+    assert control.status()["active_count"] == 0
+    saved = json.loads((launch_root / "launch.json").read_text("utf-8"))
+    assert saved["status"] == "FAILED"
 
 
 def test_default_reward_values_are_valid_in_the_browser_form() -> None:
@@ -310,10 +493,13 @@ def test_default_reward_values_are_valid_in_the_browser_form() -> None:
 
 
 class _FakeProcess:
+    next_pid = 31337
+
     def __init__(self, command: list[str], **kwargs: Any) -> None:
         self.command = command
         self.kwargs = kwargs
-        self.pid = 31337
+        self.pid = self.next_pid
+        type(self).next_pid += 1
         self._done = threading.Event()
         self._return_code: int | None = None
 
@@ -333,6 +519,811 @@ class _FakeProcess:
 
     def kill(self) -> None:
         self.send_signal(0)
+
+
+def _real_campaign_payload() -> dict[str, object]:
+    payload = _payload("visual_motion_training")
+    payload["weights"] = {
+        "time_cost": -0.001,
+        "visual_change_scale": 0.1,
+        "success_reward": 1.0,
+    }
+    return payload
+
+
+def _patch_execution_config(
+    monkeypatch: pytest.MonkeyPatch, root: Path, runtime_root: Path
+) -> Path:
+    baseline = root / "baseline"
+    baseline.mkdir(parents=True, exist_ok=True)
+    (baseline / "user1.dat").write_bytes(b"baseline-save")
+    personal = root / "personal"
+    backup = root / "backup"
+    install = root / "game"
+    for directory in (personal, backup, install):
+        directory.mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(
+        personal_save_root=personal.resolve(),
+        experimental_save_root=baseline.resolve(),
+        backup_root=backup.resolve(),
+        game_executable=(install / "hollow_knight.exe").resolve(),
+        runtime_root=runtime_root.resolve(),
+        install_roots=(root / "hk-ai-1", root / "hk-ai-2"),
+        instance_data_roots=(root / "data-1", root / "data-2"),
+        instance_product_names=("Hollow Knight AI 1", "Hollow Knight AI 2"),
+    )
+    for index, install_root in enumerate(config.install_roots, start=1):
+        install_root.mkdir(parents=True, exist_ok=True)
+        config.instance_data_roots[index - 1].mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "hk_agent.instance_marker.load_instance_marker",
+        lambda install_root, *, expected_index: SimpleNamespace(
+            persistent_data_path_expected=str(config.instance_data_roots[expected_index - 1]),
+            product_name=f"Hollow Knight AI {expected_index}",
+        ),
+    )
+    monkeypatch.setattr("hk_agent.config.load_config", lambda *args, **kwargs: config)
+    return baseline
+
+
+def _finish_launch(control: ControlPlane, launch_id: str, return_code: int = 0) -> None:
+    process = control._processes[launch_id]
+    assert isinstance(process, _FakeProcess)
+    process._return_code = return_code
+    process._done.set()
+    deadline = time.monotonic() + 2
+    while launch_id in control._processes and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert launch_id not in control._processes
+
+
+def test_real_slots_capacity_and_dry_runs_are_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(
+        root,
+        allow_execute=True,
+        max_active_launches=2,
+        parallel_enabled=True,
+        runtime_root=runtime,
+    )
+    campaign = control.create_campaign(_real_campaign_payload())
+    campaign_id = str(campaign["campaign_id"])
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        first = control.launch(campaign_id, version=1, execute=True)
+        dry_run = control.launch(campaign_id, version=1, execute=False)
+        second = control.launch(campaign_id, version=1, execute=True)
+        assert first["resources"]["slot_id"] == 0  # type: ignore[index]
+        assert dry_run["resources"]["slot_id"] is None  # type: ignore[index]
+        assert second["resources"]["slot_id"] == 1  # type: ignore[index]
+        for launch, index in ((first, 1), (second, 2)):
+            resources = launch["resources"]
+            assert resources["game_install"] == str(root / f"hk-ai-{index}")  # type: ignore[index]
+            assert resources["instance_data_root"] == str(root / f"data-{index}")  # type: ignore[index]
+            assert resources["product_name"] == f"Hollow Knight AI {index}"  # type: ignore[index]
+            assert "--game-install" in launch["command"]  # type: ignore[operator]
+            assert str(root / f"hk-ai-{index}") in launch["command"]  # type: ignore[operator]
+            assert "--instance-data-root" in launch["command"]  # type: ignore[operator]
+            assert str(resources["log_file"]).endswith("Player.log")  # type: ignore[index]
+        with pytest.raises(RuntimeError, match="capacity reached"):
+            control.launch(campaign_id, version=1, execute=True)
+        for launch in (first, dry_run, second):
+            _finish_launch(control, str(launch["launch_id"]))
+        for launch in (first, second):
+            runtime_launch = runtime / "launches" / str(launch["launch_id"])
+            assert (runtime_launch / "previous-instance-state").is_dir()
+            assert (runtime_launch / "final-save" / "user1.dat").read_bytes() == b"baseline-save"
+
+
+def test_parallel_disabled_blocks_second_real_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, max_active_launches=2, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        first = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        with pytest.raises(RuntimeError, match="parallel execution is disabled"):
+            control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        _finish_launch(control, str(first["launch_id"]))
+
+
+@pytest.mark.parametrize(
+    ("stop_first", "return_code", "expected_status"),
+    [(False, 1, "FAILED"), (True, 0, "CANCELLED")],
+)
+def test_final_instance_saves_are_captured_on_failure_and_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_first: bool,
+    return_code: int,
+    expected_status: str,
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        resources = launch["resources"]
+        data_root = Path(str(resources["instance_data_root"]))  # type: ignore[index]
+        (data_root / "user1.dat").write_bytes(b"final-instance-save")
+        if stop_first:
+            assert control.stop(str(launch["launch_id"]))["status"] == "STOP_REQUESTED"
+        _finish_launch(control, str(launch["launch_id"]), return_code=return_code)
+
+    launch_root = runtime / "launches" / str(launch["launch_id"])
+    record_path = (
+        root
+        / "artifacts"
+        / "control-plane"
+        / "launches"
+        / str(launch["launch_id"])
+        / "launch.json"
+    )
+    record = json.loads(record_path.read_text("utf-8"))
+    assert record["status"] == expected_status
+    assert (launch_root / "final-save" / "user1.dat").read_bytes() == b"final-instance-save"
+
+
+def test_slots_and_seeds_are_reproducible_after_finish_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    campaign_id = str(campaign["campaign_id"])
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        first = control.launch(campaign_id, version=1, execute=True)
+        assert first["resources"]["effective_seed"] == 23  # type: ignore[index]
+        _finish_launch(control, str(first["launch_id"]))
+        second = control.launch(campaign_id, version=1, execute=True)
+        control.stop(str(second["launch_id"]))
+        _finish_launch(control, str(second["launch_id"]))
+        third = control.launch(campaign_id, version=1, execute=True)
+        assert third["resources"]["slot_id"] == 0  # type: ignore[index]
+        assert third["resources"]["effective_seed"] == 23  # type: ignore[index]
+        _finish_launch(control, str(third["launch_id"]))
+
+
+def test_reattached_slot_is_reserved_without_seed_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "reattached"
+    launch_root.mkdir(parents=True)
+    (launch_root / "launch.json").write_text(
+        json.dumps(
+            {
+                "launch_id": "reattached",
+                "mode": "execute",
+                "pid": 4242,
+                "runner_process": {"pid": 4242, "creation_time": 100, "executable": "runner.exe"},
+                "launch_nonce": "reattached",
+                "status": "RUNNING",
+                "started_unix_ns": 1,
+                "stop_file": "artifacts/control-plane/launches/reattached/stop.request",
+                "log_path": "artifacts/control-plane/launches/reattached/process.log",
+                "campaign_origin": {"isolated_save_root": "relative-save-root"},
+                "resources": {"slot_id": 1, "effective_seed": 24},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: pid == 4242))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {"pid": pid, "creation_time": 100, "executable": "runner.exe"})
+    control = ControlPlane(
+        root,
+        allow_execute=True,
+        max_active_launches=2,
+        parallel_enabled=True,
+        runtime_root=runtime,
+    )
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert launch["resources"]["slot_id"] == 0  # type: ignore[index]
+        assert launch["resources"]["effective_seed"] == 23  # type: ignore[index]
+        _finish_launch(control, str(launch["launch_id"]))
+
+
+def test_child_environment_contains_launch_slot_and_thread_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(
+        root, allow_execute=True, runtime_root=runtime, torch_threads=4, torch_interop_threads=2
+    )
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        process = control._processes[str(launch["launch_id"])]
+        environment = process.kwargs["env"]  # type: ignore[attr-defined]
+        assert environment["HK_AGENT_LAUNCH_ID"] == launch["launch_id"]
+        assert environment["HK_AGENT_SLOT_ID"] == "0"
+        assert environment["OMP_NUM_THREADS"] == "4"
+        assert environment["MKL_NUM_THREADS"] == "4"
+        assert environment["OPENBLAS_NUM_THREADS"] == "4"
+        _finish_launch(control, str(launch["launch_id"]))
+
+
+def test_scene_training_uses_per_slot_route_memory_and_legacy_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    legacy = (
+        root
+        / "artifacts"
+        / "training"
+        / "reach-scene-change-v1"
+        / "route-memory-existing_save-slot-1.json"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('{"legacy": true}', encoding="utf-8")
+    control = ControlPlane(
+        root,
+        allow_execute=True,
+        runtime_root=runtime,
+        training_device="cpu",
+        torch_threads=3,
+        torch_interop_threads=1,
+    )
+    monkeypatch.setattr(control, "scene_change_gate", lambda: {"passed": True})
+    campaign = control.create_campaign(_payload("scene_change_training"))
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        command = launch["command"]
+        assert isinstance(command, list)
+        route_memory = Path(command[command.index("--route-memory") + 1])
+        assert route_memory == (
+            runtime / "route-memory" / "existing_save-slot-1" / "instance-0.json"
+        ).resolve()
+        assert route_memory.read_text("utf-8") == '{"legacy": true}'
+        assert command[command.index("--training-device") + 1] == "cpu"
+        assert command[command.index("--torch-threads") + 1] == "3"
+        assert command[command.index("--torch-interop-threads") + 1] == "1"
+        _finish_launch(control, str(launch["launch_id"]))
+
+
+def test_execute_clones_save_inside_runtime_without_mutating_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    baseline = _patch_execution_config(monkeypatch, root, runtime)
+    before = hashlib.sha256((baseline / "user1.dat").read_bytes()).hexdigest()
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        clone = Path(str(launch["campaign_origin"]["isolated_save_root"]))  # type: ignore[index]
+        clone.relative_to(runtime.resolve())
+        assert (clone / "user1.dat").read_bytes() == b"baseline-save"
+        after = hashlib.sha256((baseline / "user1.dat").read_bytes()).hexdigest()
+        assert after == before
+        _finish_launch(control, str(launch["launch_id"]))
+
+
+def test_copy_failure_releases_slot_and_removes_only_launch_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    baseline = _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    original_copytree = shutil.copytree
+
+    def fail_copytree(*args: Any, **kwargs: Any) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", fail_copytree)
+    with pytest.raises(OSError, match="copy failed"):
+        control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+    assert control.status()["active_count"] == 0
+    assert (baseline / "user1.dat").is_file()
+    assert any((runtime / "launches").glob("*/previous-instance-state"))
+    failed = json.loads((root / "artifacts" / "control-plane" / "launches" / next(
+        path.name for path in (root / "artifacts" / "control-plane" / "launches").iterdir()
+    ) / "launch.json").read_text("utf-8"))
+    assert failed["status"] == "FAILED"
+    assert failed["failure"] == "copy failed"
+    failed_runtime = runtime / "launches" / str(failed["launch_id"])
+    assert (failed_runtime / "final-save" / "user1.dat").read_bytes() == b"baseline-save"
+
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", original_copytree)
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launch = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert launch["resources"]["slot_id"] == 0  # type: ignore[index]
+        _finish_launch(control, str(launch["launch_id"]))
+
+
+def test_runtime_inside_baseline_is_rejected_at_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "baseline" / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with pytest.raises(ValueError, match="experimental saves"):
+        control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+    assert control.status()["active_count"] == 0
+
+
+def test_status_does_not_wait_for_save_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    original_copytree = shutil.copytree
+
+    def blocking_copytree(*args: Any, **kwargs: Any) -> Any:
+        copy_started.set()
+        assert release_copy.wait(timeout=2)
+        return original_copytree(*args, **kwargs)
+
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", blocking_copytree)
+    result: dict[str, object] = {}
+
+    def run_launch() -> None:
+        result.update(control.launch(str(campaign["campaign_id"]), version=1, execute=True))
+
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        thread = threading.Thread(target=run_launch)
+        thread.start()
+        assert copy_started.wait(timeout=2)
+        started = time.monotonic()
+        status = control.status()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.5
+        assert status["active_launches"][0]["status"] == "PREPARING"  # type: ignore[index]
+        release_copy.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        _finish_launch(control, str(result["launch_id"]))
+
+
+def test_legacy_running_without_identity_is_failed_and_does_not_block_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    legacy_root = root / "artifacts" / "control-plane" / "launches" / "old-launch"
+    legacy_root.mkdir(parents=True)
+    (legacy_root / "launch.json").write_text(json.dumps({
+        "launch_id": "old-launch", "pid": 8001, "status": "RUNNING",
+        "stop_file": "artifacts/control-plane/launches/old-launch/stop.request",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda _pid: True))
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    failed_record = json.loads((legacy_root / "launch.json").read_text("utf-8"))
+    assert failed_record["status"] == "FAILED"
+    assert failed_record["failure"] == "processo não pertence mais a este launch"
+    campaign = control.create_campaign(_real_campaign_payload())
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launched = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert launched["resources"]["slot_id"] == 0  # type: ignore[index]
+        _finish_launch(control, str(launched["launch_id"]))
+
+
+def test_preparing_record_is_persisted_and_stop_cancels_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    entered, release = threading.Event(), threading.Event()
+    original_copytree = shutil.copytree
+    def blocked_copy(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(3)
+        return original_copytree(*args, **kwargs)
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", blocked_copy)
+    errors: list[InterruptedError] = []
+    def launch() -> None:
+        try:
+            control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        except InterruptedError as error:
+            errors.append(error)
+    thread = threading.Thread(target=launch)
+    thread.start()
+    assert entered.wait(2)
+    launch_id = next(iter(control._preparing_ids))
+    launch_json = root / "artifacts" / "control-plane" / "launches" / launch_id / "launch.json"
+    assert json.loads(launch_json.read_text("utf-8"))["status"] == "PREPARING"
+    assert control.stop(launch_id) == {"status": "CANCEL_REQUESTED"}
+    release.set()
+    thread.join(3)
+    assert not thread.is_alive()
+    record = json.loads(launch_json.read_text("utf-8"))
+    assert record["status"] == "CANCELLED"
+    assert control.status()["active_count"] == 0
+    assert (runtime / "launches" / launch_id / "previous-instance-state").is_dir()
+    assert errors and isinstance(errors[0], InterruptedError)
+
+
+def test_preparation_timeout_fails_and_releases_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime, preparation_timeout_seconds=0)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with pytest.raises(TimeoutError, match="timed out"):
+        control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+    record_path = next((root / "artifacts" / "control-plane" / "launches").glob("*/launch.json"))
+    assert json.loads(record_path.read_text("utf-8"))["status"] == "FAILED"
+    assert control.status()["active_count"] == 0
+
+
+def test_blocked_copy_timeout_releases_slot_and_cleans_after_copy_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime, preparation_timeout_seconds=0.5)
+    campaign = control.create_campaign(_real_campaign_payload())
+    entered, release = threading.Event(), threading.Event()
+    original_copy = shutil.copytree
+
+    def blocked_copy(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(3)
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", blocked_copy)
+    errors: list[Exception] = []
+    thread = threading.Thread(target=lambda: _capture_launch_error(control, campaign, errors))
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        thread.start()
+        assert entered.wait(2)
+        launch_json = next((root / "artifacts" / "control-plane" / "launches").glob("*/launch.json"))
+        for _ in range(100):
+            saved = json.loads(launch_json.read_text("utf-8"))
+            if saved["status"] == "FAILED":
+                break
+            threading.Event().wait(0.01)
+        assert saved["status"] == "FAILED"
+        draining = control.status()
+        assert draining["active_count"] == 1
+        assert draining["active"]["slot_state"] == "draining"  # type: ignore[index]
+        assert thread.is_alive()
+        release.set()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert errors and isinstance(errors[0], TimeoutError)
+        assert (runtime / "launches" / launch_json.parent.name / "previous-instance-state").is_dir()
+        assert control._processes == {}
+
+
+def _capture_launch_error(control: ControlPlane, campaign: Mapping[str, object], errors: list[Exception]) -> None:
+    try:
+        control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+    except Exception as error:  # noqa: BLE001
+        errors.append(error)
+
+
+def test_stop_during_blocked_copy_cancels_immediately_and_releases_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    entered, release = threading.Event(), threading.Event()
+    original_copy = shutil.copytree
+
+    def blocked_copy(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(3)
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr("hk_agent.control_plane.shutil.copytree", blocked_copy)
+    errors: list[Exception] = []
+    thread = threading.Thread(target=lambda: _capture_launch_error(control, campaign, errors))
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        thread.start()
+        assert entered.wait(2)
+        launch_id = next(iter(control._preparing_ids))
+        assert control.stop(launch_id) == {"status": "CANCEL_REQUESTED"}
+        draining = control.status()
+        assert draining["active_count"] == 1
+        assert draining["active"]["slot_state"] == "draining"  # type: ignore[index]
+        assert thread.is_alive()
+        release.set()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert errors and isinstance(errors[0], InterruptedError)
+        assert (runtime / "launches" / launch_id / "previous-instance-state").is_dir()
+        assert control._processes == {}
+
+
+def test_restart_reattaches_live_dry_run_without_blocking_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "live-dry-run"
+    launch_root.mkdir(parents=True)
+    (launch_root / "launch.json").write_text(json.dumps({
+        "launch_id": "live-dry-run", "mode": "dry-run", "pid": 4243,
+        "runner_process": {"pid": 4243, "creation_time": 100, "executable": "runner.exe"},
+        "launch_nonce": "live-dry-run",
+        "status": "RUNNING", "resources": {"slot_id": None},
+        "campaign_origin": {"isolated_save_root": None},
+        "stop_file": "artifacts/control-plane/launches/live-dry-run/stop.request",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: pid == 4243))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {"pid": pid, "creation_time": 100, "executable": "runner.exe"})
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    active = control.status()["active_launches"]
+    assert isinstance(active, list)
+    assert active[0]["mode"] == "dry-run"
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        launched = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert launched["resources"]["slot_id"] == 0  # type: ignore[index]
+
+
+def test_recovery_rejects_reused_pid_with_different_creation_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    record = {
+        "launch_id": "reused-pid", "mode": "dry-run", "pid": 4246,
+        "runner_process": {"pid": 4246, "creation_time": 100, "executable": "runner.exe"},
+        "launch_nonce": "reused-pid", "status": "RUNNING", "resources": {"slot_id": None},
+    }
+    launch = root / "artifacts" / "control-plane" / "launches" / "reused-pid"
+    launch.mkdir(parents=True)
+    (launch / "launch.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", lambda pid: {"pid": pid, "creation_time": 200, "executable": "runner.exe"})
+    control = ControlPlane(root)
+    assert control.status()["active_count"] == 0
+    saved = json.loads((launch / "launch.json").read_text("utf-8"))
+    assert saved["status"] == "FAILED"
+    assert saved["failure"] == "processo não pertence mais a este launch"
+
+
+@pytest.mark.parametrize("cancel_with_stop", [False, True])
+def test_blocked_save_preparation_drains_slot_and_stale_worker_cannot_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_with_stop: bool
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    instance = root / "data-1"
+    instance.mkdir(parents=True, exist_ok=True)
+    (instance / "user1.dat").write_bytes(b"original")
+    control = ControlPlane(
+        root, allow_execute=True, runtime_root=runtime, parallel_enabled=True,
+        preparation_timeout_seconds=0.5,
+    )
+    campaign = control.create_campaign(_real_campaign_payload())
+    entered, release = threading.Event(), threading.Event()
+    failed = threading.Event()
+    from hk_agent.control_plane import atomic_json as original_atomic_json
+
+    def observe_terminal(path: Path, payload: Mapping[str, object]) -> None:
+        original_atomic_json(path, payload)
+        if payload.get("status") == "FAILED":
+            failed.set()
+
+    monkeypatch.setattr("hk_agent.control_plane.atomic_json", observe_terminal)
+    original_prepare = prepare_instance_saves
+    first_call = True
+
+    def blocked_prepare(*args: Any, **kwargs: Any) -> Any:
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            entered.set()
+            assert release.wait(3)
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr("hk_agent.control_plane.prepare_instance_saves", blocked_prepare)
+    errors: list[Exception] = []
+    thread = threading.Thread(target=lambda: _capture_launch_error(control, campaign, errors))
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        thread.start()
+        assert entered.wait(2)
+        launch_id = next(iter(control._preparing_ids))
+        launch_json = root / "artifacts" / "control-plane" / "launches" / launch_id / "launch.json"
+        if cancel_with_stop:
+            assert control.stop(launch_id) == {"status": "CANCEL_REQUESTED"}
+            expected_status = "CANCELLED"
+        else:
+            assert failed.wait(2)
+            expected_status = "FAILED"
+        record = json.loads(launch_json.read_text("utf-8"))
+        assert record["status"] == expected_status
+        assert record["slot_state"] == "draining"
+        control.preparation_timeout_seconds = 5
+        other_slot = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert other_slot["resources"]["slot_id"] == 1  # type: ignore[index]
+        with pytest.raises(RuntimeError, match="slot 0 is draining"):
+            control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        release.set()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert errors
+        assert (instance / "user1.dat").read_bytes() == b"original"
+        assert control.status()["active_count"] == 1
+        launched = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        assert launched["resources"]["slot_id"] == 0  # type: ignore[index]
+        _finish_launch(control, str(launched["launch_id"]))
+        _finish_launch(control, str(other_slot["launch_id"]))
+
+
+def test_dead_reattached_execute_captures_before_releasing_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    instance = root / "instance-0"
+    instance.mkdir(parents=True)
+    (instance / "user1.dat").write_bytes(b"final")
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "reattached-execute"
+    launch_root.mkdir(parents=True)
+    (runtime / "launches" / "reattached-execute").mkdir(parents=True)
+    (launch_root / "launch.json").write_text(json.dumps({
+        "launch_id": "reattached-execute", "mode": "execute", "pid": 4244,
+        "status": "RUNNING", "resources": {
+            "slot_id": 0, "instance_data_root": str(instance),
+        }, "campaign_origin": {"isolated_save_root": "runtime/save-root"},
+        "stop_file": "artifacts/control-plane/launches/reattached-execute/stop.request",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: False))
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    result = control.status()
+    saved = json.loads((launch_root / "launch.json").read_text("utf-8"))
+    assert saved["final_save_status"] == "captured"
+    assert (runtime / "launches" / "reattached-execute" / "final-save" / "user1.dat").read_bytes() == b"final"
+    assert saved["status"] == "FAILED"
+    assert result["active_count"] == 0
+
+
+def test_reattached_capture_failure_is_persisted_before_slot_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    launch_root = root / "artifacts" / "control-plane" / "launches" / "reattached-failure"
+    launch_root.mkdir(parents=True)
+    (runtime / "launches" / "reattached-failure").mkdir(parents=True)
+    (launch_root / "launch.json").write_text(json.dumps({
+        "launch_id": "reattached-failure", "mode": "execute", "pid": 4245,
+        "status": "RUNNING", "resources": {
+            "slot_id": 0, "instance_data_root": str(root / "instance-0"),
+        }, "campaign_origin": {"isolated_save_root": "runtime/save-root"},
+        "stop_file": "artifacts/control-plane/launches/reattached-failure/stop.request",
+    }), encoding="utf-8")
+    monkeypatch.setattr(ControlPlane, "_pid_is_alive", staticmethod(lambda pid: False))
+    monkeypatch.setattr("hk_agent.control_plane.capture_instance_saves", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failure")))
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    control.status()
+    saved = json.loads((launch_root / "launch.json").read_text("utf-8"))
+    assert saved["final_save_status"] == "failed"
+    assert "disk failure" in saved["final_save_error"]
+    assert saved["status"] == "FAILED"
+    assert control._slot_owners == {}
+
+
+def test_stop_after_preparation_before_popen_prevents_process_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    opening_log, release_log = threading.Event(), threading.Event()
+    original_open = Path.open
+
+    def gated_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path.name == "process.log":
+            opening_log.set()
+            assert release_log.wait(3)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", gated_open)
+    errors: list[Exception] = []
+    thread = threading.Thread(target=lambda: _capture_launch_error(control, campaign, errors))
+    popen_calls: list[object] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> _FakeProcess:
+        popen_calls.append((args, kwargs))
+        return _FakeProcess(*args, **kwargs)
+
+    with patch("hk_agent.control_plane.subprocess.Popen", recording_popen):
+        thread.start()
+        assert opening_log.wait(2)
+        launch_id = next(iter(control._preparing_ids))
+        assert control.stop(launch_id) == {"status": "CANCEL_REQUESTED"}
+        release_log.set()
+        thread.join(3)
+        assert not thread.is_alive()
+        assert not popen_calls
+        assert errors and isinstance(errors[0], InterruptedError)
+        assert json.loads((root / "artifacts" / "control-plane" / "launches" / launch_id / "launch.json").read_text("utf-8"))["status"] == "CANCELLED"
+
+
+def test_restart_quarantines_orphaned_preparing_clone(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    launch_id = "orphan"
+    control_launch = root / "artifacts" / "control-plane" / "launches" / launch_id
+    control_launch.mkdir(parents=True)
+    (control_launch / "launch.json").write_text(json.dumps({"launch_id": launch_id, "status": "PREPARING"}), encoding="utf-8")
+    clone = runtime / "launches" / launch_id
+    clone.mkdir(parents=True)
+    (clone / "partial").write_text("keep", encoding="utf-8")
+    ControlPlane(root, runtime_root=runtime)
+    saved = json.loads((control_launch / "launch.json").read_text("utf-8"))
+    assert saved["status"] == "FAILED"
+    assert (runtime / "quarantine" / launch_id / "partial").read_text("utf-8") == "keep"
+    assert not clone.exists()
+
+
+def test_baseline_link_is_rejected_before_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    baseline = _patch_execution_config(monkeypatch, root, runtime)
+    target = root / "outside-target"
+    target.mkdir()
+    link = baseline / "linked-directory"
+    created = False
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        created = True
+    except OSError:
+        pass
+    if not created and os.name == "nt":
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        created = result.returncode == 0
+    if not created:
+        pytest.skip("SO não permitiu criar symlink nem junction")
+    control = ControlPlane(root, allow_execute=True, runtime_root=runtime)
+    campaign = control.create_campaign(_real_campaign_payload())
+    with pytest.raises(ValueError, match="baseline contains a link/reparse point"):
+        control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+    launch_json = next((root / "artifacts" / "control-plane" / "launches").glob("*/launch.json"))
+    assert json.loads(launch_json.read_text("utf-8"))["status"] == "FAILED"
 
 
 def test_two_campaign_processes_can_be_controlled_independently(tmp_path: Path) -> None:
@@ -428,3 +1419,214 @@ def test_http_api_is_local_and_requires_token_for_mutations(tmp_path: Path) -> N
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_panel_adopts_game_identity_sidecar_only_for_its_own_launch(tmp_path: Path) -> None:
+    control = ControlPlane(_project(tmp_path))
+    launch_root = control.control_root / "launches" / "L1"
+    launch_root.mkdir(parents=True)
+    control._launches["L1"] = {"launch_id": "L1", "status": "STOP_REQUESTED"}
+    sidecar = launch_root / "game-process.json"
+
+    sidecar.write_text(json.dumps({"pid": 5, "launch_nonce": "OTHER"}), "utf-8")
+    control._merge_game_identity_locked("L1")
+    assert "game_process" not in control._launches["L1"]
+
+    sidecar.write_text(json.dumps({"pid": 5, "launch_nonce": "L1"}), "utf-8")
+    control._merge_game_identity_locked("L1")
+    assert control._launches["L1"]["game_process"] == {"pid": 5, "launch_nonce": "L1"}
+    # The panel's own STOP_REQUESTED state is preserved.
+    assert control._launches["L1"]["status"] == "STOP_REQUESTED"
+
+
+@pytest.mark.parametrize("campaign_type", ["scene_change_probe", "parallel_smoke"])
+def test_probe_runner_campaigns_reject_horizon_the_runner_would_reject(campaign_type: str) -> None:
+    from hk_agent.control_plane import PROBE_MAX_HORIZON
+    from hk_agent.scene_change_probe import SceneChangeProbeConfig
+
+    payload = _payload(campaign_type)
+    if campaign_type == "parallel_smoke":
+        payload["weights"] = {}
+    payload["horizon"] = PROBE_MAX_HORIZON + 1
+    with pytest.raises(ValueError, match="horizon must be at most"):
+        CampaignSpec.from_payload(payload)
+    payload["horizon"] = PROBE_MAX_HORIZON
+    assert CampaignSpec.from_payload(payload).horizon == PROBE_MAX_HORIZON
+    # The panel limit is exactly the runner's own limit.
+    SceneChangeProbeConfig(horizon_steps=PROBE_MAX_HORIZON).validate()
+    with pytest.raises(ValueError):
+        SceneChangeProbeConfig(horizon_steps=PROBE_MAX_HORIZON + 1).validate()
+
+
+@pytest.mark.parametrize("campaign_type", ["scene_change_probe", "parallel_smoke"])
+def test_concurrent_probe_launches_never_share_route_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, campaign_type: str
+) -> None:
+    """Regression: two probe/smoke instances used the same default route-memory
+    file, and the second writer was (correctly) rejected mid-run."""
+    root = _project(tmp_path)
+    runtime = root / "runtime"
+    _patch_execution_config(monkeypatch, root, runtime)
+    legacy = (
+        root / "artifacts" / "training" / "reach-scene-change-v1"
+        / "route-memory-existing_save-slot-1.json"
+    )
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text('{"legacy": true}', encoding="utf-8")
+    control = ControlPlane(
+        root, allow_execute=True, parallel_enabled=True, runtime_root=runtime,
+        training_device="cpu", torch_threads=3, torch_interop_threads=1,
+    )
+    payload = _payload(campaign_type)
+    if campaign_type == "parallel_smoke":
+        payload["weights"] = {}
+        payload["horizon"] = 10_000
+    campaign = control.create_campaign(payload)
+    with patch("hk_agent.control_plane.subprocess.Popen", _FakeProcess):
+        first = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        second = control.launch(str(campaign["campaign_id"]), version=1, execute=True)
+        paths = []
+        for launch in (first, second):
+            command = launch["command"]
+            assert isinstance(command, list)
+            paths.append(Path(command[command.index("--route-memory") + 1]))
+        assert paths[0] != paths[1]
+        training_root = (runtime / "route-memory").resolve()
+        for path in paths:
+            # Diagnostics never write into, or get seeded from, training memory.
+            assert training_root not in path.resolve().parents
+            assert not path.exists() or path.read_text("utf-8") != '{"legacy": true}'
+        if campaign_type == "parallel_smoke":
+            for launch, path in zip((first, second), paths, strict=True):
+                assert path.parent == (runtime / "launches" / str(launch["launch_id"])).resolve()
+        _finish_launch(control, str(first["launch_id"]))
+        _finish_launch(control, str(second["launch_id"]))
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "return_code", "expected"),
+    [("STOP_REQUESTED", 0, "CANCELLED"), ("STOP_REQUESTED", 1, "CANCELLED"), ("RUNNING", 0, "FAILED")],
+)
+def test_requested_stop_with_job_draining_stays_cancelled(
+    tmp_path: Path, initial_status: str, return_code: int, expected: str
+) -> None:
+    """Regression (review P2): draining the job after a requested stop must not
+    turn a cooperative stop into FAILED; an unrequested drain still fails."""
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    launch_id = "drain-after-stop"
+    launch_root = control.control_root / "launches" / launch_id
+    launch_root.mkdir(parents=True)
+    record: dict[str, object] = {
+        "launch_id": launch_id,
+        "mode": "execute",
+        "status": initial_status,
+        "resources": {"slot_id": 0},
+    }
+    process = _FakeProcess([])
+    process._return_code = return_code
+    process._done.set()
+    calls = {"n": 0}
+
+    class DrainOnceJob:
+        def process_ids(self) -> list[int]:
+            calls["n"] += 1
+            return [777] if calls["n"] == 1 else []
+
+        def terminate(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    control._launches[launch_id] = record
+    control._processes[launch_id] = process
+    control._jobs[launch_id] = DrainOnceJob()  # type: ignore[assignment]
+    control._slot_owners[0] = launch_id
+    control._slot_fences[0] = "fence"
+    log_handle = (launch_root / "process.log").open("wb")
+    control._wait_for_process(launch_id, process, log_handle, launch_root)  # type: ignore[arg-type]
+    assert record["status"] == expected
+    assert record["drain_reason"] == "launcher exited while job processes remained"
+    assert record["draining_pids"] == []
+    assert launch_id not in control._slot_owners.values()
+    persisted = json.loads((launch_root / "launch.json").read_text("utf-8"))
+    assert persisted["status"] == expected
+    if expected == "CANCELLED":
+        assert "failure" not in persisted
+
+
+def _foreign_owner(control_root: Path, pid: int = 424242, creation_time: object = 99) -> Path:
+    control_root.mkdir(parents=True, exist_ok=True)
+    lock = control_root / ".control-plane.owner.json"
+    lock.write_text(json.dumps({"pid": pid, "creation_time": creation_time}), encoding="utf-8")
+    return lock
+
+
+def test_second_process_cannot_take_over_a_live_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (soak): a status query from another process built a full
+    ControlPlane, ran restart recovery on live launches and marked them FAILED."""
+    from hk_agent.control_plane import ControlPlaneBusyError
+
+    root = _project(tmp_path)
+    control_root = root / "artifacts" / "control-plane"
+    _foreign_owner(control_root)
+    live = control_root / "launches" / "L-live" / "launch.json"
+    live.parent.mkdir(parents=True)
+    record = {"launch_id": "L-live", "mode": "execute", "status": "RUNNING", "pid": 5151,
+              "resources": {"slot_id": 0}}
+    live.write_text(json.dumps(record), encoding="utf-8")
+    before = live.read_bytes()
+
+    def identity(pid: int) -> dict[str, object]:
+        if pid == 424242:
+            return {"pid": pid, "creation_time": 99, "executable": "python.exe"}
+        return {"pid": pid, "creation_time": 1, "executable": "python.exe"}
+
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", identity)
+    with pytest.raises(ControlPlaneBusyError, match="observer=True"):
+        ControlPlane(root)
+    assert live.read_bytes() == before  # nothing recovered or rewritten
+
+    observer = ControlPlane(root, observer=True)
+    status = observer.status()
+    assert status["observer"] is True
+    assert status["active_count"] == 1
+    assert live.read_bytes() == before
+    with pytest.raises(PermissionError, match="observer"):
+        observer.stop("L-live")
+    with pytest.raises(PermissionError, match="observer"):
+        observer.create_campaign(_payload())
+    assert live.read_bytes() == before
+
+
+def test_stale_owner_lock_from_dead_process_is_taken_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    lock = _foreign_owner(root / "artifacts" / "control-plane")
+
+    def identity(pid: int) -> dict[str, object]:
+        if pid == 424242:
+            raise OSError("no such process")
+        return {"pid": pid, "creation_time": 7, "executable": "python.exe"}
+
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", identity)
+    control = ControlPlane(root)
+    assert json.loads(lock.read_text("utf-8"))["pid"] == os.getpid()
+    control.close()
+    assert not lock.exists()
+
+
+def test_reused_owner_pid_with_different_creation_time_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    _foreign_owner(root / "artifacts" / "control-plane", creation_time=99)
+    monkeypatch.setattr(
+        "hk_agent.control_plane.process_identity",
+        lambda pid: {"pid": pid, "creation_time": 12345, "executable": "python.exe"},
+    )
+    ControlPlane(root)  # PID reused by an unrelated process: not a live owner

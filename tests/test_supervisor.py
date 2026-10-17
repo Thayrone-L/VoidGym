@@ -13,6 +13,52 @@ from hk_agent.supervisor import SupervisorServer
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_rejects_instance_hello_for_personal_other_slot_and_wrong_product(self) -> None:
+        async def scenario(persistent: Path, product: str) -> None:
+            expected = Path.cwd() / "slot-1"
+            personal = Path.cwd() / "personal"
+            other = Path.cwd() / "slot-2"
+            supervisor = SupervisorServer(
+                token="test-token",
+                expected_persistent_data_path=expected,
+                forbidden_personal_root=personal,
+                expected_product_name="Hollow Knight AI 1",
+                forbidden_instance_data_roots=(other,),
+            )
+            await supervisor.start()
+            assert supervisor.port is not None
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", supervisor.port)
+                hello = Envelope(
+                    protocol_version=PROTOCOL_VERSION,
+                    message_type="HELLO",
+                    run_id=supervisor.run_id,
+                    instance_id="hk-invalid",
+                    session_id=str(uuid.uuid4()),
+                    seq=0,
+                    trace_id=str(uuid.uuid4()),
+                    sent_monotonic_ns=time.monotonic_ns(),
+                    payload={
+                        "token": "test-token",
+                        "game_profile": "development",
+                        "game_version": "bridge-harness",
+                        "persistent_data_path": str(persistent),
+                        "product_name": product,
+                    },
+                )
+                await write_message(writer, hello)
+                with self.assertRaises(asyncio.IncompleteReadError):
+                    await read_message(reader)
+                self.assertEqual(supervisor.accepted, [])
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                await supervisor.close()
+
+        asyncio.run(scenario(Path.cwd() / "personal", "Hollow Knight AI 1"))
+        asyncio.run(scenario(Path.cwd() / "slot-2", "Hollow Knight AI 1"))
+        asyncio.run(scenario(Path.cwd() / "slot-1", "Hollow Knight AI 2"))
+
     def test_rejects_bridge_with_wrong_effective_save_root(self) -> None:
         async def scenario() -> None:
             expected = Path.cwd() / "expected-save-root"
