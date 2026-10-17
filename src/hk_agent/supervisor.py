@@ -32,6 +32,7 @@ class AcceptedBridge:
     outbound_seq: int = 1
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     pending: dict[str, asyncio.Future[Envelope]] = field(default_factory=dict, repr=False)
+    capabilities: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,12 +62,19 @@ class CapturedFrame:
     bridge_timing: tuple[tuple[str, float], ...] = ()
 
 
+def require_png_frame(frame: CapturedFrame) -> None:
+    """Reject raw observations at code paths that persist .png artifacts."""
+    if frame.encoding != "png":
+        raise ProtocolError("PNG artifact writer requires FRAME encoding=png")
+
+
 # Optional, diagnostic-only FRAME fields emitted by the bridge's capture backend.
 BRIDGE_TIMING_FIELDS = (
     "queued_to_start_ms",
     "capture_ms",
     "encode_ms",
     "png_bytes",
+    "payload_bytes",
     "log_ms",
     "unity_fps",
     "target_frame_rate",
@@ -247,10 +255,20 @@ class SupervisorServer:
         timeout: float = 5.0,
         bridge: AcceptedBridge | None = None,
         episode_id: str | None = None,
+        encoding: str = "png",
     ) -> CapturedFrame:
+        if encoding not in {"png", "raw_rgb8"}:
+            raise ValueError("encoding must be png or raw_rgb8")
+        effective_encoding = encoding
+        if effective_encoding == "raw_rgb8" and (
+            bridge is None or "frame_raw_rgb8" not in bridge.capabilities
+        ):
+            effective_encoding = "png"
         payload: dict[str, object] = {}
         if episode_id is not None:
             payload["episode_id"] = episode_id
+        if effective_encoding == "raw_rgb8":
+            payload["encoding"] = effective_encoding
         response = await self.send_command(
             "CAPTURE_ONCE", payload, timeout=timeout, bridge=bridge
         )
@@ -282,11 +300,11 @@ class SupervisorServer:
         if width == 0 or height == 0:
             raise ProtocolError("FRAME dimensions must be positive")
         pixel_format = payload.get("pixel_format")
-        encoding = payload.get("encoding")
+        frame_encoding = payload.get("encoding")
         if channels != 3 or pixel_format != "RGB8":
             raise ProtocolError("FRAME must contain RGB8 pixels")
-        if encoding != "png":
-            raise ProtocolError("FRAME encoding must be png")
+        if not isinstance(frame_encoding, str) or frame_encoding not in {"png", "raw_rgb8"}:
+            raise ProtocolError("FRAME encoding must be png or raw_rgb8")
         scene_transition = payload.get("scene_transition")
         if not isinstance(scene_transition, bool):
             raise ProtocolError("Invalid FRAME field: scene_transition")
@@ -341,8 +359,27 @@ class SupervisorServer:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as error:
             raise ProtocolError("FRAME data_base64 is invalid") from error
-        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ProtocolError("FRAME payload is not a PNG")
+        payload_bytes = payload.get("payload_bytes")
+        if frame_encoding == "png":
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ProtocolError("FRAME payload is not a PNG")
+            if payload_bytes is not None and (
+                not isinstance(payload_bytes, int)
+                or isinstance(payload_bytes, bool)
+                or payload_bytes != len(data)
+            ):
+                raise ProtocolError("FRAME payload_bytes does not match PNG data")
+        else:
+            if width > 600 or height > 338:
+                raise ProtocolError("raw RGB8 FRAME dimensions exceed 600x338")
+            expected_bytes = width * height * 3
+            if (
+                not isinstance(payload_bytes, int)
+                or isinstance(payload_bytes, bool)
+                or payload_bytes != expected_bytes
+                or len(data) != expected_bytes
+            ):
+                raise ProtocolError("raw RGB8 FRAME payload size is invalid")
 
         duplicate_of = payload.get("duplicate_of")
         last_action = payload.get("last_applied_action_id")
@@ -370,7 +407,7 @@ class SupervisorServer:
             height=height,
             channels=channels,
             pixel_format=pixel_format,
-            encoding=encoding,
+            encoding=frame_encoding,
             data=data,
             scene_transition=scene_transition,
             duplicate_of=duplicate_of,
@@ -430,6 +467,11 @@ class SupervisorServer:
                     raise ProtocolError("Persistent data path resolves to another instance")
             if self.expected_product_name is not None and hello.payload.get("product_name") != self.expected_product_name:
                 raise ProtocolError("Product name mismatch")
+            raw_capabilities = hello.payload.get("capabilities", [])
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(item, str) for item in raw_capabilities
+            ):
+                raise ProtocolError("HELLO capabilities must be an array of strings")
 
             accepted = AcceptedBridge(
                 instance_id=hello.instance_id,
@@ -448,6 +490,7 @@ class SupervisorServer:
                     if isinstance(hello.payload.get("product_name"), str)
                     else None
                 ),
+                capabilities=frozenset(raw_capabilities),
                 machine=machine,
             )
             machine.transition(SessionState.READY)

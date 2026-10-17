@@ -12,7 +12,12 @@ from pathlib import Path
 import numpy as np
 
 from hk_agent.protocol import ProtocolError
-from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
+from hk_agent.supervisor import (
+    AcceptedBridge,
+    CapturedFrame,
+    SupervisorServer,
+    require_png_frame,
+)
 
 MENU_BUTTONS = frozenset({"UP", "DOWN", "LEFT", "RIGHT", "SUBMIT", "CANCEL"})
 
@@ -238,6 +243,7 @@ async def run_menu_bootstrap(
 
     async def capture(index: int, label: str) -> CapturedFrame:
         frame = await supervisor.capture_once(timeout=command_timeout_seconds, bridge=bridge)
+        require_png_frame(frame)
         safe_label = "".join(char if char.isalnum() or char in "-_" else "-" for char in label)
         path = output_root / f"{index:03d}-{safe_label}.png"
         _write_bytes_atomic(path, frame.data)

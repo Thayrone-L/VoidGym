@@ -285,6 +285,7 @@ class SupervisorEnvironmentBackend:
                         timeout=self._command_timeout,
                         bridge=bridge,
                         episode_id=episode_id,
+                        encoding="raw_rgb8",
                     ),
                     timeout=self._command_timeout + 0.5,
                 )
@@ -399,6 +400,7 @@ class SupervisorEnvironmentBackend:
                 timeout=self._command_timeout,
                 bridge=bridge,
                 episode_id=episode_id,
+                encoding="raw_rgb8",
             ),
             timeout=self._command_timeout + 0.5,
         )
@@ -523,9 +525,24 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
     if frame.episode_id != episode_id:
         raise ProtocolError("FRAME belongs to another episode")
     decode_started = time.monotonic_ns()
-    pixels = decode_rgb8_png(
-        frame.data, expected_width=frame.width, expected_height=frame.height
-    )
+    if frame.encoding == "raw_rgb8":
+        expected_bytes = frame.width * frame.height * 3
+        if (
+            frame.channels != 3
+            or frame.width > 600
+            or frame.height > 338
+            or len(frame.data) != expected_bytes
+        ):
+            raise ProtocolError("raw RGB8 FRAME dimensions or payload are invalid")
+        pixels = np.frombuffer(frame.data, dtype=np.uint8).reshape(
+            frame.height, frame.width, 3
+        ).copy()
+    elif frame.encoding == "png":
+        pixels = decode_rgb8_png(
+            frame.data, expected_width=frame.width, expected_height=frame.height
+        )
+    else:
+        raise ProtocolError(f"unsupported FRAME encoding: {frame.encoding}")
     if pixels.shape != (frame.height, frame.width, 3):
         raise ProtocolError("decoded PNG dimensions differ from FRAME metadata")
     return PixelFrame(

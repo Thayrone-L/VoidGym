@@ -6,7 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from hk_agent.gameplay_control import GameplayControlServer
+import pytest
+
+from hk_agent.gameplay_control import GameplayControlServer, _write_frame_atomic
+from hk_agent.protocol import ProtocolError
+from tools.smoke_game_bridge import _write_png_capture
 
 
 class FakeSupervisor:
@@ -27,6 +31,7 @@ class FakeSupervisor:
     async def capture_once(self, **_: Any) -> Any:
         self.events.append("capture")
         return SimpleNamespace(
+            encoding="png",
             data=b"\x89PNG\r\n\x1a\nframe",
             frame_id=7,
             capture_monotonic_ns=11,
@@ -81,6 +86,18 @@ def test_action_is_bounded_released_and_captured(tmp_path: Path) -> None:
             await server.close()
 
     asyncio.run(scenario())
+
+
+def test_gameplay_control_png_writer_refuses_raw_frame(tmp_path: Path) -> None:
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        _write_frame_atomic(tmp_path / "raw.png", SimpleNamespace(encoding="raw_rgb8"))  # type: ignore[arg-type]
+    assert not (tmp_path / "raw.png").exists()
+
+
+def test_smoke_capture_writer_refuses_raw_frame(tmp_path: Path) -> None:
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        _write_png_capture(tmp_path / "raw.png", SimpleNamespace(encoding="raw_rgb8"))  # type: ignore[arg-type]
+    assert not (tmp_path / "raw.png").exists()
 
 
 def test_rejects_wrong_token_and_unsafe_action(tmp_path: Path) -> None:

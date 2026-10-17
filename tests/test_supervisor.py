@@ -7,7 +7,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from hk_agent.protocol import PROTOCOL_VERSION, Envelope, read_message, write_message
+from hk_agent.protocol import PROTOCOL_VERSION, Envelope, ProtocolError, read_message, write_message
 from hk_agent.session import SessionState
 from hk_agent.supervisor import SupervisorServer
 
@@ -168,6 +168,7 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(welcome.message_type, "WELCOME")
                 self.assertEqual(accepted.session_id, session_id)
                 self.assertEqual(accepted.machine.state, SessionState.READY)
+                self.assertEqual(accepted.capabilities, frozenset())
 
                 heartbeat = Envelope(
                     protocol_version=PROTOCOL_VERSION,
@@ -208,6 +209,7 @@ class SupervisorTests(unittest.TestCase):
                 capture_task = asyncio.create_task(supervisor.capture_once(bridge=accepted))
                 capture = await read_message(reader)
                 self.assertEqual(capture.message_type, "CAPTURE_ONCE")
+                self.assertNotIn("encoding", capture.payload)
                 frame = Envelope(
                     protocol_version=PROTOCOL_VERSION,
                     message_type="FRAME",
@@ -253,12 +255,132 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(captured.hp_lost_since_last_frame, 1)
                 self.assertEqual(captured.geo_gained_since_last_frame, 17)
                 self.assertEqual(captured.geo_spent_since_last_frame, 4)
+
+                fallback_task = asyncio.create_task(
+                    supervisor.capture_once(bridge=accepted, encoding="raw_rgb8")
+                )
+                fallback_command = await read_message(reader)
+                self.assertEqual(fallback_command.message_type, "CAPTURE_ONCE")
+                self.assertNotIn("encoding", fallback_command.payload)
+                fallback_data = b"\x89PNG\r\n\x1a\n"
+                await write_message(
+                    writer,
+                    Envelope(
+                        protocol_version=PROTOCOL_VERSION,
+                        message_type="FRAME",
+                        run_id=supervisor.run_id,
+                        instance_id="hk-00",
+                        session_id=session_id,
+                        seq=4,
+                        trace_id=fallback_command.trace_id,
+                        sent_monotonic_ns=time.monotonic_ns(),
+                        payload={
+                            "frame_id": 2,
+                            "capture_monotonic_ns": time.monotonic_ns(),
+                            "width": 1,
+                            "height": 1,
+                            "channels": 3,
+                            "pixel_format": "RGB8",
+                            "encoding": "png",
+                            "payload_bytes": len(fallback_data),
+                            "data_base64": base64.b64encode(fallback_data).decode(),
+                            "scene_transition": False,
+                        },
+                    ),
+                )
+                self.assertEqual((await fallback_task).encoding, "png")
                 writer.close()
                 await writer.wait_closed()
             finally:
                 await supervisor.close()
 
         asyncio.run(scenario())
+
+    def test_raw_frame_validation(self) -> None:
+        async def scenario(frame_encoding: str, encoded: str, size: int, width: int = 2) -> None:
+            supervisor = SupervisorServer(token="raw-test-token")
+            await supervisor.start()
+            assert supervisor.port is not None
+            writer: asyncio.StreamWriter | None = None
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", supervisor.port)
+                session_id = str(uuid.uuid4())
+                await write_message(
+                    writer,
+                    Envelope(
+                        protocol_version=PROTOCOL_VERSION,
+                        message_type="HELLO",
+                        run_id=supervisor.run_id,
+                        instance_id="hk-raw",
+                        session_id=session_id,
+                        seq=0,
+                        trace_id=str(uuid.uuid4()),
+                        sent_monotonic_ns=time.monotonic_ns(),
+                        payload={
+                            "token": "raw-test-token",
+                            "game_profile": "development",
+                            "game_version": "fake",
+                            "capabilities": ["frame_png_rgb8", "frame_raw_rgb8"],
+                        },
+                    ),
+                )
+                await read_message(reader)
+                accepted = await supervisor.wait_for_bridge(1.0)
+                self.assertEqual(accepted.capabilities, frozenset({"frame_png_rgb8", "frame_raw_rgb8"}))
+                capture_task = asyncio.create_task(
+                    supervisor.capture_once(bridge=accepted, encoding="raw_rgb8")
+                )
+                command = await read_message(reader)
+                self.assertEqual(command.payload.get("encoding"), "raw_rgb8")
+                raw_data = b"\x01\x02\x03" * size
+                await write_message(
+                    writer,
+                    Envelope(
+                        protocol_version=PROTOCOL_VERSION,
+                        message_type="FRAME",
+                        run_id=supervisor.run_id,
+                        instance_id="hk-raw",
+                        session_id=session_id,
+                        seq=1,
+                        trace_id=command.trace_id,
+                        sent_monotonic_ns=time.monotonic_ns(),
+                        payload={
+                            "frame_id": 1,
+                            "capture_monotonic_ns": time.monotonic_ns(),
+                            "width": width,
+                            "height": 1,
+                            "channels": 3,
+                            "pixel_format": "RGB8",
+                            "encoding": frame_encoding,
+                            "payload_bytes": len(raw_data),
+                            "data_base64": encoded if encoded != "__VALID__" else base64.b64encode(raw_data).decode(),
+                            "scene_transition": False,
+                        },
+                    ),
+                )
+                captured = await capture_task
+                self.assertEqual(captured.encoding, "raw_rgb8")
+                self.assertEqual(captured.data, raw_data)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
+                await supervisor.close()
+
+        asyncio.run(scenario("raw_rgb8", "__VALID__", 2))
+        for encoding, encoded, size, width in (
+            ("raw_rgb8", "__VALID__", 1, 2),
+            ("raw_rgb8", "%%%", 2, 2),
+            ("bitmap", "__VALID__", 2, 2),
+        ):
+            with self.assertRaises(ProtocolError):
+                asyncio.run(scenario(encoding, encoded, size, width))
+        with self.assertRaises(ProtocolError):
+            asyncio.run(scenario("raw_rgb8", "__VALID__", 601, 601))
+
+    def test_unknown_capture_request_encoding_is_rejected_locally(self) -> None:
+        with self.assertRaisesRegex(ValueError, "encoding must be png or raw_rgb8"):
+            asyncio.run(SupervisorServer().capture_once(encoding="jpeg"))
 
     def test_rejects_wrong_token(self) -> None:
         async def scenario() -> None:

@@ -17,7 +17,7 @@ from typing import Any
 from hk_agent.bridge_environment import BRIDGE_VARIABLES, build_bridge_environment
 from hk_agent.gameplay_control import GameplayControlServer
 from hk_agent.protocol import ProtocolError
-from hk_agent.supervisor import AcceptedBridge, SupervisorServer
+from hk_agent.supervisor import AcceptedBridge, SupervisorServer, require_png_frame
 
 REQUEST_ENVIRONMENT_VARIABLE = "HK_ISOLATED_SESSION_REQUEST"
 BRIDGE_ENVIRONMENT_VARIABLES = BRIDGE_VARIABLES
@@ -432,6 +432,7 @@ async def _capture_menu_frame(
     if request.menu_output_dir is None:
         raise RuntimeError("Menu output directory is unavailable")
     frame = await supervisor.capture_once(timeout=request.timeout_seconds, bridge=bridge)
+    require_png_frame(frame)
     output = request.menu_output_dir / f"{index:03d}-{label}.png"
     _write_bytes_atomic(output, frame.data)
     result.menu_captures.append(
@@ -629,6 +630,7 @@ async def run_session(request: SessionRequest) -> SessionResult:
             result.captured_height = frame.height
             result.captured_bytes = len(frame.data)
             if request.capture_output is not None:
+                require_png_frame(frame)
                 _write_bytes_atomic(request.capture_output, frame.data)
 
             result.release_all_ok = await _release_all(supervisor, bridge)

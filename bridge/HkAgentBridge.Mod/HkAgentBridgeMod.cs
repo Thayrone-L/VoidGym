@@ -80,7 +80,7 @@ public sealed class HkAgentBridgeMod : Mod
                 input.ApplyAction(buttons, leaseMilliseconds),
             (buttons, leaseMilliseconds) =>
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
-            cancellationToken => capture.CaptureOnceAsync(cancellationToken),
+            (encoding, cancellationToken) => capture.CaptureOnceAsync(encoding, cancellationToken),
             _lifecycle.Snapshot,
             BeginEpisodeLifecycle
         );

@@ -15,19 +15,22 @@ from hk_agent.menu_bootstrap import (
     ReadinessVerdict,
     run_menu_bootstrap,
 )
+from hk_agent.protocol import ProtocolError
 
 
 class FakeSupervisor:
-    def __init__(self, *, distinct: bool = True) -> None:
+    def __init__(self, *, distinct: bool = True, encoding: str = "png") -> None:
         self.events: list[str] = []
         self.capture_index = 0
         self.distinct = distinct
+        self.encoding = encoding
 
     async def capture_once(self, **_: Any) -> Any:
         self.events.append("capture")
         self.capture_index += 1
         suffix = bytes([self.capture_index]) if self.distinct else b"same"
         return SimpleNamespace(
+            encoding=self.encoding,
             data=b"\x89PNG\r\n\x1a\n" + suffix,
             frame_id=self.capture_index,
             capture_monotonic_ns=self.capture_index,
@@ -110,6 +113,19 @@ def test_bootstrap_is_pre_episode_menu_only_and_persists_evidence(tmp_path: Path
     )
     assert saved["status"] == "READY"
     assert len(saved["captures"]) == 3
+
+
+def test_bootstrap_refuses_raw_frame_for_png_artifacts(tmp_path: Path) -> None:
+    supervisor = FakeSupervisor(encoding="raw_rgb8")
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        asyncio.run(
+            run_menu_bootstrap(
+                _plan(), supervisor=supervisor, bridge=object(), episode_id="raw-menu",
+                artifact_root=tmp_path, command_timeout_seconds=0.5,
+                readiness_verifier=lambda _: _verdict(True),
+            )
+        )
+    assert not list((tmp_path / "raw-menu" / "menu-bootstrap").glob("*.png"))
 
 
 def test_bootstrap_fails_closed_when_readiness_evidence_is_not_distinct(tmp_path: Path) -> None:

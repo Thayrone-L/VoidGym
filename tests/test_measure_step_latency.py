@@ -22,6 +22,7 @@ def test_aggregate_reads_a_run_directory_and_bridge_prefixed_metrics(tmp_path):
     episode.mkdir(parents=True)
     rows = [
         {"timing_ms": {"backend": 300, "bridge_capture_ms": 40, "bridge_encode_ms": 60,
+                       "bridge_payload_bytes": 90,
                        "bridge_unity_fps": 30, "bridge_target_frame_rate_default": 1},
          "requested_action": {"lease_ms": 80}},
         {"timing_ms": {"backend": 100, "bridge_capture_ms": 20, "bridge_encode_ms": 20,
@@ -35,6 +36,7 @@ def test_aggregate_reads_a_run_directory_and_bridge_prefixed_metrics(tmp_path):
     assert result["backend"]["mean"] == 200
     assert result["bridge_capture_ms"]["mean"] == 30
     assert result["bridge_encode_ms"]["total_fraction"] == 0.2
+    assert result["gauges"]["bridge_payload_bytes"]["mean"] == 90
     # FPS is a gauge, never part of the time budget.
     assert "bridge_unity_fps" not in result
     assert result["gauges"]["bridge_unity_fps"]["min"] == 30

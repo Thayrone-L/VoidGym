@@ -23,7 +23,7 @@ internal sealed class BridgeClient : IDisposable
     private readonly Action _releaseAll;
     private readonly Func<IEnumerable<string>, int, string[]> _applyAction;
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
-    private readonly Func<CancellationToken, Task<CapturedFrame>> _captureOnce;
+    private readonly Func<string, CancellationToken, Task<CapturedFrame>> _captureOnce;
     private readonly Func<EpisodeLifecycleSnapshot> _lifecycleSnapshot;
     private readonly Action _beginEpisodeLifecycle;
     private readonly CancellationTokenSource _cancellation = new();
@@ -42,7 +42,7 @@ internal sealed class BridgeClient : IDisposable
         Action releaseAll,
         Func<IEnumerable<string>, int, string[]> applyAction,
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
-        Func<CancellationToken, Task<CapturedFrame>> captureOnce,
+        Func<string, CancellationToken, Task<CapturedFrame>> captureOnce,
         Func<EpisodeLifecycleSnapshot> lifecycleSnapshot,
         Action beginEpisodeLifecycle
     )
@@ -91,6 +91,7 @@ internal sealed class BridgeClient : IDisposable
                         {
                             "capture_once",
                             "frame_png_rgb8",
+                            "frame_raw_rgb8",
                             "begin_episode",
                             "apply_action",
                             "apply_menu_action",
@@ -348,6 +349,24 @@ internal sealed class BridgeClient : IDisposable
                 case "CAPTURE_ONCE":
                     try
                     {
+                        JToken? encodingToken = command["payload"]?["encoding"];
+                        string requestedEncoding = encodingToken == null
+                            ? "png"
+                            : encodingToken.Type == JTokenType.String
+                                ? encodingToken.Value<string>() ?? string.Empty
+                                : string.Empty;
+                        if (requestedEncoding != "png" && requestedEncoding != "raw_rgb8")
+                        {
+                            responseType = "ERROR";
+                            payload = new
+                            {
+                                command_type = messageType,
+                                error_code = "invalid_capture_encoding",
+                                recoverable = true,
+                                detail = "encoding must be png or raw_rgb8",
+                            };
+                            break;
+                        }
                         string? requestedEpisodeId =
                             (string?)command["payload"]?["episode_id"];
                         CorrelationSnapshot correlation =
@@ -356,42 +375,49 @@ internal sealed class BridgeClient : IDisposable
                             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                         {
                             captureCancellation.CancelAfter(CaptureTimeoutMilliseconds);
-                            CapturedFrame frame = await _captureOnce(captureCancellation.Token)
-                                .ConfigureAwait(false);
+                            CapturedFrame frame = await _captureOnce(
+                                requestedEncoding,
+                                captureCancellation.Token
+                            ).ConfigureAwait(false);
                             EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot();
                             responseType = "FRAME";
-                            payload = new
+                            var framePayload = new Dictionary<string, object?>
                             {
-                                frame_id = frame.FrameId,
-                                episode_id = correlation.EpisodeId,
-                                capture_monotonic_ns = frame.CaptureMonotonicNanoseconds,
-                                width = frame.Width,
-                                height = frame.Height,
-                                channels = 3,
-                                pixel_format = "RGB8",
-                                encoding = "png",
-                                data_base64 = Convert.ToBase64String(frame.PngBytes),
-                                queued_to_start_ms = frame.QueuedToStartMs,
-                                capture_ms = frame.CaptureMs,
-                                encode_ms = frame.EncodeMs,
-                                png_bytes = frame.PngByteCount,
-                                log_ms = frame.LogMs,
-                                unity_fps = frame.UnityFps,
-                                target_frame_rate = frame.TargetFrameRate,
-                                vsync_count = frame.VSyncCount,
-                                scene_transition = false,
-                                player_dead = lifecycle.PlayerDead,
-                                death_persisted = lifecycle.PlayerDead,
-                                shade_pending = lifecycle.ShadePending,
-                                shade_recovered = lifecycle.ShadeRecovered,
-                                run_failed = lifecycle.RunFailed,
-                                enemy_kills_since_last_frame = lifecycle.EnemyKillsSinceLastFrame,
-                                hp_lost_since_last_frame = lifecycle.HealthLostSinceLastFrame,
-                                geo_gained_since_last_frame = lifecycle.GeoGainedSinceLastFrame,
-                                geo_spent_since_last_frame = lifecycle.GeoSpentSinceLastFrame,
-                                duplicate_of = (long?)null,
-                                last_applied_action_id = correlation.LastAppliedActionId,
+                                ["frame_id"] = frame.FrameId,
+                                ["episode_id"] = correlation.EpisodeId,
+                                ["capture_monotonic_ns"] = frame.CaptureMonotonicNanoseconds,
+                                ["width"] = frame.Width,
+                                ["height"] = frame.Height,
+                                ["channels"] = 3,
+                                ["pixel_format"] = "RGB8",
+                                ["encoding"] = frame.Encoding,
+                                ["data_base64"] = Convert.ToBase64String(frame.Data),
+                                ["payload_bytes"] = frame.PayloadByteCount,
+                                ["queued_to_start_ms"] = frame.QueuedToStartMs,
+                                ["capture_ms"] = frame.CaptureMs,
+                                ["encode_ms"] = frame.EncodeMs,
+                                ["log_ms"] = frame.LogMs,
+                                ["unity_fps"] = frame.UnityFps,
+                                ["target_frame_rate"] = frame.TargetFrameRate,
+                                ["vsync_count"] = frame.VSyncCount,
+                                ["scene_transition"] = false,
+                                ["player_dead"] = lifecycle.PlayerDead,
+                                ["death_persisted"] = lifecycle.PlayerDead,
+                                ["shade_pending"] = lifecycle.ShadePending,
+                                ["shade_recovered"] = lifecycle.ShadeRecovered,
+                                ["run_failed"] = lifecycle.RunFailed,
+                                ["enemy_kills_since_last_frame"] = lifecycle.EnemyKillsSinceLastFrame,
+                                ["hp_lost_since_last_frame"] = lifecycle.HealthLostSinceLastFrame,
+                                ["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame,
+                                ["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame,
+                                ["duplicate_of"] = (long?)null,
+                                ["last_applied_action_id"] = correlation.LastAppliedActionId,
                             };
+                            if (frame.PngByteCount is int pngBytes)
+                            {
+                                framePayload["png_bytes"] = pngBytes;
+                            }
+                            payload = framePayload;
                         }
                     }
                     catch (OperationCanceledException)

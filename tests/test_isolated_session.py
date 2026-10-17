@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -11,7 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from hk_agent.isolated_session import SessionRequest, _game_environment
+from hk_agent.isolated_session import SessionRequest, _capture_menu_frame, _game_environment
+from hk_agent.protocol import ProtocolError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "tools" / "run_isolated_session.py"
@@ -47,6 +49,20 @@ def test_instance_game_environment_uses_bridge_instance_contract(
     assert environment["HK_AGENT_PRODUCT_NAME"] == "Hollow Knight AI 1"
     assert environment["HK_AGENT_INSTANCE_DATA_ROOT"] == str(data_root)
     assert "HK_AGENT_SAVE_ROOT" not in environment
+
+
+def test_isolated_session_menu_writer_refuses_raw_frame(tmp_path: Path) -> None:
+    class RawSupervisor:
+        async def capture_once(self, **_: object) -> object:
+            return SimpleNamespace(encoding="raw_rgb8")
+
+    request = SimpleNamespace(menu_output_dir=tmp_path, timeout_seconds=1.0)
+    result = SimpleNamespace(menu_captures=[])
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        asyncio.run(
+            _capture_menu_frame(request, result, RawSupervisor(), object(), 0, "before")  # type: ignore[arg-type]
+        )
+    assert not list(tmp_path.glob("*.png"))
 
 
 def _inventory(root: Path) -> list[tuple[str, str]]:

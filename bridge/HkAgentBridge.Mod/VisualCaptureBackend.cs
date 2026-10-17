@@ -14,6 +14,7 @@ internal sealed class VisualCaptureBackend : IDisposable
     private const int MaximumWidth = 600;
     private const int MaximumHeight = 338;
     private const int MaximumPngBytes = 720_000;
+    private const int MaximumRawRgb8Bytes = MaximumWidth * MaximumHeight * 3;
 
     private readonly ConcurrentQueue<CaptureRequest> _requests = new();
     private readonly Action<string> _log;
@@ -33,8 +34,15 @@ internal sealed class VisualCaptureBackend : IDisposable
         pump.Initialize(this);
     }
 
-    public Task<CapturedFrame> CaptureOnceAsync(CancellationToken cancellationToken)
+    public Task<CapturedFrame> CaptureOnceAsync(
+        string encoding,
+        CancellationToken cancellationToken
+    )
     {
+        if (encoding != "png" && encoding != "raw_rgb8")
+        {
+            throw new ArgumentException("encoding must be png or raw_rgb8", nameof(encoding));
+        }
         if (_disposed)
         {
             throw new ObjectDisposedException(nameof(VisualCaptureBackend));
@@ -44,7 +52,7 @@ internal sealed class VisualCaptureBackend : IDisposable
             throw new InvalidOperationException("A capture is already pending");
         }
 
-        var request = new CaptureRequest(cancellationToken);
+        var request = new CaptureRequest(encoding, cancellationToken);
         request.Completion.Task.ContinueWith(
             _ => Interlocked.Exchange(ref _outstanding, 0),
             CancellationToken.None,
@@ -73,7 +81,8 @@ internal sealed class VisualCaptureBackend : IDisposable
         bool changedRenderTarget = false;
         double captureMs = 0;
         double encodeMs = 0;
-        int pngBytes = 0;
+        byte[]? frameBytes = null;
+        int? pngBytes = null;
         try
         {
             long captureStarted = Stopwatch.GetTimestamp();
@@ -103,28 +112,50 @@ internal sealed class VisualCaptureBackend : IDisposable
             captureMs = ElapsedMilliseconds(captureStarted);
 
             long encodeStarted = Stopwatch.GetTimestamp();
-            byte[] png = output.EncodeToPNG();
-            encodeMs = ElapsedMilliseconds(encodeStarted);
-            pngBytes = png.Length;
-            if (png == null || png.Length == 0)
+            if (request.Encoding == "png")
             {
-                throw new InvalidOperationException("Unity returned an empty PNG");
+                byte[] png = output.EncodeToPNG();
+                if (png == null || png.Length == 0)
+                {
+                    throw new InvalidOperationException("Unity returned an empty PNG");
+                }
+                if (png.Length > MaximumPngBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Captured PNG exceeds the {MaximumPngBytes}-byte safety limit"
+                    );
+                }
+                frameBytes = png;
+                pngBytes = png.Length;
             }
-            if (png.Length > MaximumPngBytes)
+            else
             {
-                throw new InvalidOperationException(
-                    $"Captured PNG exceeds the {MaximumPngBytes}-byte safety limit"
+                byte[] bottomUp = output.GetRawTextureData();
+                frameBytes = FrameEncoding.FlipVerticalRgb24(
+                    bottomUp,
+                    output.width,
+                    output.height
                 );
+                if (frameBytes.Length > MaximumRawRgb8Bytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Captured RGB8 frame exceeds the {MaximumRawRgb8Bytes}-byte safety limit"
+                    );
+                }
             }
+            encodeMs = ElapsedMilliseconds(encodeStarted);
+            if (frameBytes == null || frameBytes.Length == 0)
+                throw new InvalidOperationException("Unity returned an empty frame");
 
             long frameId = Interlocked.Increment(ref _nextFrameId);
             long logStarted = Stopwatch.GetTimestamp();
-            _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {png.Length} bytes");
+            _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {frameBytes.Length} bytes ({request.Encoding})");
             double logMs = ElapsedMilliseconds(logStarted);
             request.TrySetResult(
                 new CapturedFrame(
-                    frameId, MonotonicNanoseconds(), output.width, output.height, png,
-                    queuedToStartMs, captureMs, encodeMs, png.Length, logMs,
+                    frameId, MonotonicNanoseconds(), output.width, output.height,
+                    request.Encoding, frameBytes, frameBytes.Length, pngBytes,
+                    queuedToStartMs, captureMs, encodeMs, logMs,
                     AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount
                 )
             );
@@ -239,8 +270,9 @@ internal sealed class VisualCaptureBackend : IDisposable
     {
         private readonly CancellationTokenRegistration _registration;
 
-        public CaptureRequest(CancellationToken cancellationToken)
+        public CaptureRequest(string encoding, CancellationToken cancellationToken)
         {
+            Encoding = encoding;
             Completion = new TaskCompletionSource<CapturedFrame>(
                 TaskCreationOptions.RunContinuationsAsynchronously
             );
@@ -254,6 +286,7 @@ internal sealed class VisualCaptureBackend : IDisposable
         }
 
         public TaskCompletionSource<CapturedFrame> Completion { get; }
+        public string Encoding { get; }
         public long QueuedTimestamp { get; } = Stopwatch.GetTimestamp();
         public bool IsCompleted => Completion.Task.IsCompleted;
         public void TrySetResult(CapturedFrame frame) => Completion.TrySetResult(frame);
@@ -268,11 +301,13 @@ internal sealed class CapturedFrame
         long captureMonotonicNanoseconds,
         int width,
         int height,
-        byte[] pngBytes,
+        string encoding,
+        byte[] data,
+        int payloadByteCount,
+        int? pngByteCount,
         double queuedToStartMs,
         double captureMs,
         double encodeMs,
-        int pngByteCount,
         double logMs,
         float unityFps,
         int targetFrameRate,
@@ -283,7 +318,9 @@ internal sealed class CapturedFrame
         CaptureMonotonicNanoseconds = captureMonotonicNanoseconds;
         Width = width;
         Height = height;
-        PngBytes = pngBytes;
+        Encoding = encoding;
+        Data = data;
+        PayloadByteCount = payloadByteCount;
         QueuedToStartMs = queuedToStartMs;
         CaptureMs = captureMs;
         EncodeMs = encodeMs;
@@ -298,11 +335,13 @@ internal sealed class CapturedFrame
     public long CaptureMonotonicNanoseconds { get; }
     public int Width { get; }
     public int Height { get; }
-    public byte[] PngBytes { get; }
+    public string Encoding { get; }
+    public byte[] Data { get; }
+    public int PayloadByteCount { get; }
     public double QueuedToStartMs { get; }
     public double CaptureMs { get; }
     public double EncodeMs { get; }
-    public int PngByteCount { get; }
+    public int? PngByteCount { get; }
     public double LogMs { get; }
     public float UnityFps { get; }
     public int TargetFrameRate { get; }

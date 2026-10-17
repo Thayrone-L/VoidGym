@@ -15,7 +15,7 @@ COMPONENTS = (
 )
 # Not durations: summarized separately so they never count toward the time budget.
 GAUGES = ("bridge_unity_fps", "bridge_png_bytes", "bridge_target_frame_rate",
-          "bridge_target_frame_rate_default", "bridge_vsync_count")
+          "bridge_payload_bytes", "bridge_target_frame_rate_default", "bridge_vsync_count")
 
 
 def _transition_files(path: Path) -> list[Path]:

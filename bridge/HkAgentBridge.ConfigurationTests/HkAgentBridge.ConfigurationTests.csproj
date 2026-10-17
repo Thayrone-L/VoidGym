@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\HkAgentBridge.Mod\BridgeConfiguration.cs" Link="BridgeConfiguration.cs" />
+    <Compile Include="..\HkAgentBridge.Mod\FrameEncoding.cs" Link="FrameEncoding.cs" />
   </ItemGroup>
 </Project>

@@ -62,7 +62,22 @@ try
         "Hollow Knight AI 1", personalRoot, "Hollow Knight AI 1", personalRoot, personalRoot
     ), "personal save path rejected");
 
-    Console.WriteLine("PASS: 8 bridge configuration/runtime assertions");
+    byte[] bottomUp = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 12, 13, 14, 15, 16, 17, 18,
+    };
+    byte[] expectedTopDown = {
+        10, 11, 12, 13, 14, 15, 16, 17, 18,
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+    };
+    byte[] actualTopDown = FrameEncoding.FlipVerticalRgb24(bottomUp, 3, 2);
+    Assert(actualTopDown.SequenceEqual(expectedTopDown), "3x2 RGB24 rows flipped to top-down");
+    AssertThrows<ArgumentException>(
+        () => FrameEncoding.FlipVerticalRgb24(new byte[17], 3, 2),
+        "RGB24 row flip rejects truncated payload"
+    );
+
+    Console.WriteLine("PASS: 10 bridge configuration/runtime/frame assertions");
 }
 finally
 {

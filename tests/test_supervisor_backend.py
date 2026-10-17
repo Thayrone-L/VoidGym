@@ -56,6 +56,7 @@ class FakeBridge:
     player_dead_after_action: bool = False
     shade_pending_after_action: bool = False
     run_failed_after_action: bool = False
+    capture_encodings: list[str | None] = field(default_factory=list)
 
     def start(self) -> threading.Thread:
         thread = threading.Thread(target=self._run, daemon=True)
@@ -85,6 +86,7 @@ class FakeBridge:
                 "token": self.endpoint.token,
                 "game_profile": self.endpoint.game_profile,
                 "game_version": "fake",
+                "capabilities": ["frame_png_rgb8", "frame_raw_rgb8"],
             },
         )
         await write_message(writer, hello)
@@ -93,7 +95,10 @@ class FakeBridge:
         active_episode: str | None = None
         last_action: int | None = None
         frame_id = 0
-        pixels = np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
+        pixels = np.array(
+            [[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
+            dtype=np.uint8,
+        )
         try:
             while True:
                 command = await read_message(reader)
@@ -130,20 +135,29 @@ class FakeBridge:
                     payload = {"command_type": "RELEASE_ALL", "status": "released"}
                 elif command.message_type == "CAPTURE_ONCE":
                     assert command.payload.get("episode_id") == active_episode
+                    capture_encoding = command.payload.get("encoding")
+                    self.capture_encodings.append(
+                        capture_encoding if isinstance(capture_encoding, str) else None
+                    )
                     frame_id += 1
                     frame_pixels = (pixels.astype(np.uint16) + frame_id - 1).astype(np.uint8)
-                    png = _png_rgb8(frame_pixels)
+                    frame_data = (
+                        frame_pixels.tobytes()
+                        if capture_encoding == "raw_rgb8"
+                        else _png_rgb8(frame_pixels)
+                    )
                     response_type = "FRAME"
                     payload = {
                         "episode_id": active_episode or "",
                         "frame_id": frame_id,
                         "capture_monotonic_ns": time.monotonic_ns(),
                         "width": 2,
-                        "height": 1,
+                        "height": 2,
                         "channels": 3,
                         "pixel_format": "RGB8",
-                        "encoding": "png",
-                        "data_base64": base64.b64encode(png).decode("ascii"),
+                        "encoding": capture_encoding or "png",
+                        "payload_bytes": len(frame_data),
+                        "data_base64": base64.b64encode(frame_data).decode("ascii"),
                         "scene_transition": False,
                         "player_dead": self.player_dead_after_action and last_action is not None,
                         "death_persisted": self.player_dead_after_action
@@ -155,6 +169,8 @@ class FakeBridge:
                         "duplicate_of": None,
                         "last_applied_action_id": last_action,
                     }
+                    if capture_encoding != "raw_rgb8":
+                        payload["png_bytes"] = len(frame_data)
                 else:
                     raise AssertionError(f"unexpected command: {command.message_type}")
                 outbound_seq += 1
@@ -203,7 +219,10 @@ def test_real_backend_action_to_correlated_rgb_frame() -> None:
         reset = backend.reset(seed=7, options=None)
         assert reset.frame.episode_id == reset.episode_id
         assert reset.frame.last_applied_action_id is None
-        assert reset.frame.pixels.tolist() == [[ [1, 2, 3], [4, 5, 6] ]]
+        assert reset.frame.pixels.tolist() == [
+            [[1, 2, 3], [4, 5, 6]],
+            [[7, 8, 9], [10, 11, 12]],
+        ]
 
         step = backend.step(action_id=41, buttons=("RIGHT", "JUMP"), lease_ms=1)
         assert step.applied_action.action_id == 41
@@ -212,6 +231,7 @@ def test_real_backend_action_to_correlated_rgb_frame() -> None:
         assert step.frame.frame_id > reset.frame.frame_id
         assert step.frame.pixels.dtype == np.uint8
         assert fake is not None
+        assert fake.capture_encodings == ["raw_rgb8", "raw_rgb8"]
         assert fake.commands == [
             "BEGIN_EPISODE",
             "CAPTURE_ONCE",
@@ -308,6 +328,7 @@ def test_backend_bootstraps_before_episode_and_keeps_menu_out_of_experience(
         reset = backend.reset(seed=1, options=None)
         assert reset.frame.last_applied_action_id is None
         assert fake is not None
+        assert fake.capture_encodings == [None, None, None, "raw_rgb8"]
         assert fake.commands == [
             "CAPTURE_ONCE",
             "APPLY_MENU_ACTION",

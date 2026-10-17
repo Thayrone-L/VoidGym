@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from hk_agent.protocol import ProtocolError
-from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
+from hk_agent.supervisor import (
+    AcceptedBridge,
+    CapturedFrame,
+    SupervisorServer,
+    require_png_frame,
+)
 
 GAMEPLAY_BUTTONS = frozenset(
     {"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "DASH", "CAST", "SUPER_DASH", "DREAM_NAIL"}
@@ -289,6 +294,7 @@ class GameplayControlServer:
 
 
 def _write_frame_atomic(path: Path, frame: CapturedFrame) -> None:
+    require_png_frame(frame)
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     temporary.write_bytes(frame.data)
     temporary.replace(path)
