@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,6 +21,8 @@ internal sealed class VisualCaptureBackend : IDisposable
     private long _nextFrameId = -1;
     private int _outstanding;
     private bool _disposed;
+    private readonly Queue<float> _frameDeltas = new();
+    private float _frameDeltaTotal;
 
     public VisualCaptureBackend(Action<string> log)
     {
@@ -55,7 +58,7 @@ internal sealed class VisualCaptureBackend : IDisposable
     private bool TryTakeRequest(out CaptureRequest request) =>
         _requests.TryDequeue(out request!);
 
-    private IEnumerator CaptureAtEndOfFrame(CaptureRequest request)
+    private IEnumerator CaptureAtEndOfFrame(CaptureRequest request, double queuedToStartMs)
     {
         yield return new WaitForEndOfFrame();
         if (request.IsCompleted)
@@ -68,8 +71,12 @@ internal sealed class VisualCaptureBackend : IDisposable
         RenderTexture? scaled = null;
         RenderTexture? previousRenderTarget = null;
         bool changedRenderTarget = false;
+        double captureMs = 0;
+        double encodeMs = 0;
+        int pngBytes = 0;
         try
         {
+            long captureStarted = Stopwatch.GetTimestamp();
             screenshot = ScreenCapture.CaptureScreenshotAsTexture();
             if (screenshot == null || screenshot.width <= 0 || screenshot.height <= 0)
             {
@@ -93,8 +100,12 @@ internal sealed class VisualCaptureBackend : IDisposable
             output = new Texture2D(width, height, TextureFormat.RGB24, false);
             output.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
             output.Apply(false, false);
+            captureMs = ElapsedMilliseconds(captureStarted);
 
+            long encodeStarted = Stopwatch.GetTimestamp();
             byte[] png = output.EncodeToPNG();
+            encodeMs = ElapsedMilliseconds(encodeStarted);
+            pngBytes = png.Length;
             if (png == null || png.Length == 0)
             {
                 throw new InvalidOperationException("Unity returned an empty PNG");
@@ -107,16 +118,16 @@ internal sealed class VisualCaptureBackend : IDisposable
             }
 
             long frameId = Interlocked.Increment(ref _nextFrameId);
+            long logStarted = Stopwatch.GetTimestamp();
+            _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {png.Length} bytes");
+            double logMs = ElapsedMilliseconds(logStarted);
             request.TrySetResult(
                 new CapturedFrame(
-                    frameId,
-                    MonotonicNanoseconds(),
-                    output.width,
-                    output.height,
-                    png
+                    frameId, MonotonicNanoseconds(), output.width, output.height, png,
+                    queuedToStartMs, captureMs, encodeMs, png.Length, logMs,
+                    AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount
                 )
             );
-            _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {png.Length} bytes");
         }
         catch (Exception exception)
         {
@@ -164,6 +175,12 @@ internal sealed class VisualCaptureBackend : IDisposable
         return checked((long)(timestamp * (1_000_000_000.0 / Stopwatch.Frequency)));
     }
 
+    private static double ElapsedMilliseconds(long start) =>
+        (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+
+    private float AverageFps() =>
+        _frameDeltaTotal > 0 ? _frameDeltas.Count / _frameDeltaTotal : 0;
+
     public void Dispose()
     {
         if (_disposed)
@@ -187,6 +204,16 @@ internal sealed class VisualCaptureBackend : IDisposable
 
         private void Update()
         {
+            float delta = Time.unscaledDeltaTime;
+            _owner?._frameDeltas.Enqueue(delta);
+            if (_owner != null)
+            {
+                _owner._frameDeltaTotal += delta;
+                if (_owner._frameDeltas.Count > 60)
+                {
+                    _owner._frameDeltaTotal -= _owner._frameDeltas.Dequeue();
+                }
+            }
             if (_captureInProgress || _owner == null || !_owner.TryTakeRequest(out CaptureRequest request))
             {
                 return;
@@ -196,12 +223,14 @@ internal sealed class VisualCaptureBackend : IDisposable
                 return;
             }
             _captureInProgress = true;
-            StartCoroutine(RunCapture(request));
+            double queuedToStartMs = (Stopwatch.GetTimestamp() - request.QueuedTimestamp)
+                * 1000.0 / Stopwatch.Frequency;
+            StartCoroutine(RunCapture(request, queuedToStartMs));
         }
 
-        private IEnumerator RunCapture(CaptureRequest request)
+        private IEnumerator RunCapture(CaptureRequest request, double queuedToStartMs)
         {
-            yield return _owner!.CaptureAtEndOfFrame(request);
+            yield return _owner!.CaptureAtEndOfFrame(request, queuedToStartMs);
             _captureInProgress = false;
         }
     }
@@ -225,6 +254,7 @@ internal sealed class VisualCaptureBackend : IDisposable
         }
 
         public TaskCompletionSource<CapturedFrame> Completion { get; }
+        public long QueuedTimestamp { get; } = Stopwatch.GetTimestamp();
         public bool IsCompleted => Completion.Task.IsCompleted;
         public void TrySetResult(CapturedFrame frame) => Completion.TrySetResult(frame);
         public void TrySetException(Exception exception) => Completion.TrySetException(exception);
@@ -238,7 +268,15 @@ internal sealed class CapturedFrame
         long captureMonotonicNanoseconds,
         int width,
         int height,
-        byte[] pngBytes
+        byte[] pngBytes,
+        double queuedToStartMs,
+        double captureMs,
+        double encodeMs,
+        int pngByteCount,
+        double logMs,
+        float unityFps,
+        int targetFrameRate,
+        int vSyncCount
     )
     {
         FrameId = frameId;
@@ -246,6 +284,14 @@ internal sealed class CapturedFrame
         Width = width;
         Height = height;
         PngBytes = pngBytes;
+        QueuedToStartMs = queuedToStartMs;
+        CaptureMs = captureMs;
+        EncodeMs = encodeMs;
+        PngByteCount = pngByteCount;
+        LogMs = logMs;
+        UnityFps = unityFps;
+        TargetFrameRate = targetFrameRate;
+        VSyncCount = vSyncCount;
     }
 
     public long FrameId { get; }
@@ -253,4 +299,12 @@ internal sealed class CapturedFrame
     public int Width { get; }
     public int Height { get; }
     public byte[] PngBytes { get; }
+    public double QueuedToStartMs { get; }
+    public double CaptureMs { get; }
+    public double EncodeMs { get; }
+    public int PngByteCount { get; }
+    public double LogMs { get; }
+    public float UnityFps { get; }
+    public int TargetFrameRate { get; }
+    public int VSyncCount { get; }
 }

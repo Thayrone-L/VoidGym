@@ -71,6 +71,8 @@ class PixelFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    decode_ms: float = 0.0
+    bridge_timing: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +477,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
             geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
             geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+            decode_ms=frame.decode_ms,
+            bridge_timing=frame.bridge_timing,
         )
 
     def _validate_applied_action(

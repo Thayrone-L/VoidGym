@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import math
 import os
 import secrets
 import time
@@ -56,6 +57,43 @@ class CapturedFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    # Optional diagnostics from the bridge (name, value); never used as observation.
+    bridge_timing: tuple[tuple[str, float], ...] = ()
+
+
+# Optional, diagnostic-only FRAME fields emitted by the bridge's capture backend.
+BRIDGE_TIMING_FIELDS = (
+    "queued_to_start_ms",
+    "capture_ms",
+    "encode_ms",
+    "png_bytes",
+    "log_ms",
+    "unity_fps",
+    "target_frame_rate",
+    "vsync_count",
+)
+def parse_bridge_timing(payload: dict[str, object]) -> tuple[tuple[str, float], ...]:
+    """Keep only well-formed optional metrics; malformed values are dropped, not fatal.
+
+    Every value is non-negative, because the environment rejects negative timings.
+    Unity reports target_frame_rate = -1 for "platform default"; that becomes the
+    flag target_frame_rate_default = 1.
+    """
+    metrics: list[tuple[str, float]] = []
+    for name in BRIDGE_TIMING_FIELDS:
+        value = payload.get(name)
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = float(value)
+        if not math.isfinite(number):
+            continue
+        if name == "target_frame_rate" and number < 0:
+            metrics.append(("target_frame_rate_default", 1.0))
+            continue
+        if number < 0:
+            continue
+        metrics.append((name, number))
+    return tuple(metrics)
 
 
 class SupervisorServer:
@@ -346,6 +384,7 @@ class SupervisorServer:
             hp_lost_since_last_frame=hp_lost_since_last_frame,
             geo_gained_since_last_frame=geo_gained_since_last_frame,
             geo_spent_since_last_frame=geo_spent_since_last_frame,
+            bridge_timing=parse_bridge_timing(payload),
         )
 
     async def _handle_client(

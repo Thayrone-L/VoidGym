@@ -32,6 +32,7 @@ internal sealed class AgentInputBackend : IDisposable
     private readonly List<ActionBinding> _addedBindings = new();
     private readonly object _stateLock = new();
     private readonly GameObject _pumpObject;
+    private readonly PointerInputGuard _pointerGuard;
     private AgentInputDevice? _device;
     private HeroActions? _boundActions;
     private InputDevice? _previousDevice;
@@ -44,6 +45,7 @@ internal sealed class AgentInputBackend : IDisposable
     public AgentInputBackend(Action<string> log)
     {
         _log = log;
+        _pointerGuard = new PointerInputGuard(log);
         _pumpObject = new GameObject("HK Agent Input Pump");
         UnityEngine.Object.DontDestroyOnLoad(_pumpObject);
         InputPump pump = _pumpObject.AddComponent<InputPump>();
@@ -293,7 +295,18 @@ internal sealed class AgentInputBackend : IDisposable
 
         public void Initialize(AgentInputBackend owner) => _owner = owner;
 
-        private void Update() => _owner?.AttachWhenReady();
+        private void Update()
+        {
+            if (_owner == null)
+            {
+                return;
+            }
+            _owner.AttachWhenReady();
+            if (!_owner._disposed)
+            {
+                _owner._pointerGuard.Enforce();
+            }
+        }
     }
 
     private sealed class ActionBinding
