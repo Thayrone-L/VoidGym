@@ -26,7 +26,7 @@ from hk_agent.protocol import ProtocolError
 from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
 
 _T = TypeVar("_T")
-_PNG_SIGNATURE = b"\x89PNG\n\x1a\n"
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 @dataclass(frozen=True, slots=True)

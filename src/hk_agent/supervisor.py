@@ -363,7 +363,7 @@ class SupervisorServer:
             raise ProtocolError("FRAME data_base64 is invalid") from error
         payload_bytes = payload.get("payload_bytes")
         if frame_encoding == "png":
-            if not data.startswith(b"\x89PNG\n\x1a\n"):
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ProtocolError("FRAME payload is not a PNG")
             if payload_bytes is not None and (
                 not isinstance(payload_bytes, int)

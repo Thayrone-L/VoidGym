@@ -33,6 +33,7 @@ internal sealed class AgentInputBackend : IDisposable
     private readonly object _stateLock = new();
     private readonly GameObject _pumpObject;
     private readonly PointerInputGuard _pointerGuard;
+    private readonly AudioMuteGuard _audioMute;
     private AgentInputDevice? _device;
     private HeroActions? _boundActions;
     private InputDevice? _previousDevice;
@@ -46,6 +47,7 @@ internal sealed class AgentInputBackend : IDisposable
     {
         _log = log;
         _pointerGuard = new PointerInputGuard(log);
+        _audioMute = new AudioMuteGuard(log);
         _pumpObject = new GameObject("HK Agent Input Pump");
         UnityEngine.Object.DontDestroyOnLoad(_pumpObject);
         InputPump pump = _pumpObject.AddComponent<InputPump>();
@@ -305,6 +307,7 @@ internal sealed class AgentInputBackend : IDisposable
             if (!_owner._disposed)
             {
                 _owner._pointerGuard.Enforce();
+                _owner._audioMute.Enforce();
             }
         }
     }
