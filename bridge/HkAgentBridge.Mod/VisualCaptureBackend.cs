@@ -148,6 +148,7 @@ internal sealed class VisualCaptureBackend : IDisposable
                 throw new InvalidOperationException("Unity returned an empty frame");
 
             long frameId = Interlocked.Increment(ref _nextFrameId);
+            ActionAvailability? availability = ReadActionAvailability();
             long logStarted = Stopwatch.GetTimestamp();
             _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {frameBytes.Length} bytes ({request.Encoding})");
             double logMs = ElapsedMilliseconds(logStarted);
@@ -156,7 +157,8 @@ internal sealed class VisualCaptureBackend : IDisposable
                     frameId, MonotonicNanoseconds(), output.width, output.height,
                     request.Encoding, frameBytes, frameBytes.Length, pngBytes,
                     queuedToStartMs, captureMs, encodeMs, logMs,
-                    AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount
+                    AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount,
+                    availability
                 )
             );
         }
@@ -183,6 +185,16 @@ internal sealed class VisualCaptureBackend : IDisposable
                 UnityEngine.Object.Destroy(screenshot);
             }
         }
+    }
+
+    private static ActionAvailability? ReadActionAvailability()
+    {
+        PlayerData? data = PlayerData.instance;
+        HeroController? hero = HeroController.instance;
+        if (data == null || hero == null) return null;
+        return new ActionAvailability(data.MPCharge, data.equippedCharm_33 ? 24 : 33, 33,
+            data.fireballLevel, data.quakeLevel, data.screamLevel, data.hasNailArt,
+            data.hasCyclone, data.hasDashSlash, data.hasUpwardSlash);
     }
 
     private static void CalculateOutputSize(
@@ -311,7 +323,8 @@ internal sealed class CapturedFrame
         double logMs,
         float unityFps,
         int targetFrameRate,
-        int vSyncCount
+        int vSyncCount,
+        ActionAvailability? actionAvailability
     )
     {
         FrameId = frameId;
@@ -329,6 +342,7 @@ internal sealed class CapturedFrame
         UnityFps = unityFps;
         TargetFrameRate = targetFrameRate;
         VSyncCount = vSyncCount;
+        ActionAvailability = actionAvailability;
     }
 
     public long FrameId { get; }
@@ -346,4 +360,9 @@ internal sealed class CapturedFrame
     public float UnityFps { get; }
     public int TargetFrameRate { get; }
     public int VSyncCount { get; }
+    public ActionAvailability? ActionAvailability { get; }
 }
+
+internal sealed record ActionAvailability(int mp_charge, int spell_cost, int focus_cost,
+    int fireball_level, int quake_level, int scream_level, bool has_nail_art,
+    bool has_cyclone, bool has_dash_slash, bool has_upward_slash);

@@ -12,6 +12,7 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.route_memory import TopologicalRouteMemory
 from hk_agent.temporal_actions import (
@@ -198,6 +199,7 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._shade_recovery_reward_paid = False
         self._route_action_trace: list[int] = []
         self._done = True
+        self.mask_unavailable_count = 0
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -220,6 +222,7 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._shade_recovery_reward_paid = False
         self._route_action_trace.clear()
         self._done = False
+        self.mask_unavailable_count = 0
         self._action_history.reset()
         if self.route_memory is not None:
             self.route_memory.reset_episode()
@@ -232,11 +235,26 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             raise RuntimeError("reset() is required before step()")
         if not self.action_space.contains(action):
             raise ValueError(f"invalid task action: {action!r}")
+        decision = decide_masked_action(
+            int(action), SCENE_CHANGE_ACTION_NAMES,
+            getattr(self.environment, "latest_action_availability", None),
+        )
+        if decision.availability is None:
+            self.mask_unavailable_count += 1
+        action = decision.executed_index
+        audit = action_mask_audit(decision, self.mask_unavailable_count)
         action_template = SCENE_CHANGE_ACTION_TEMPLATES[int(action)]
         action_lease_ms = action_template.resolve_lease_ms(self.environment.lease_ms)
-        observation, _, terminated, truncated, base_info = self.environment.step(
-            action_template.raw_action_index, lease_ms=action_lease_ms
-        )
+        if isinstance(self.environment, HollowKnightEnv):
+            observation, _, terminated, truncated, base_info = self.environment.step(
+                action_template.raw_action_index,
+                lease_ms=action_lease_ms,
+                action_audit=audit,
+            )
+        else:
+            observation, _, terminated, truncated, base_info = self.environment.step(
+                action_template.raw_action_index, lease_ms=action_lease_ms
+            )
         if base_info.get("valid") is not True:
             self._done = True
             reason = base_info.get("termination_reason")
@@ -417,6 +435,7 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "reward_components": components,
             "scene_change_event": regime_changed,
             "visual_regime_change_detected": regime_changed,
+            **audit,
             "detector": {
                 "phase": "settle" if self._transition_seen else "seek_transition",
                 "dark_run": self._dark_run,
@@ -443,6 +462,7 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "task_action": action_template.name,
             "raw_action_index": action_template.raw_action_index,
             "lease_ms": action_lease_ms,
+            **audit,
             "reward": {"total": reward, "components": components},
             "scene_change_event": regime_changed,
             "visual_regime_change_detected": regime_changed,
@@ -469,9 +489,16 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     def close(self) -> None:
         self.environment.close()
 
+    def action_masks(self) -> NDArray[np.bool_]:
+        return build_action_mask(
+            SCENE_CHANGE_ACTION_NAMES,
+            getattr(self.environment, "latest_action_availability", None),
+        )
+
     def task_contract(self) -> dict[str, Any]:
         return {
             "reward_version": SCENE_CHANGE_REWARD_VERSION,
+            "legal_action_mask": {"version": "action_availability_v1", "source": "frame_action_availability"},
             "action_names": list(SCENE_CHANGE_ACTION_NAMES),
             "raw_action_indices": list(SCENE_CHANGE_ACTIONS),
             "actions": action_contract(

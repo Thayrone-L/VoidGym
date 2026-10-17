@@ -11,6 +11,7 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.temporal_actions import (
     TEMPORAL_COMBAT_ACTIONS,
@@ -137,6 +138,7 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._enemy_kill_reward_paid = 0.0
         self._shade_recovery_reward_paid = False
         self._done = True
+        self.mask_unavailable_count = 0
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -151,6 +153,7 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._enemy_kill_reward_paid = 0.0
         self._shade_recovery_reward_paid = False
         self._done = False
+        self.mask_unavailable_count = 0
         self._action_history.reset()
         return self._action_history.apply(observation), {}
 
@@ -161,11 +164,24 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             raise RuntimeError("reset() is required before step()")
         if not self.action_space.contains(action):
             raise ValueError(f"invalid task action: {action!r}")
+        decision = decide_masked_action(
+            int(action), TASK_ACTION_NAMES,
+            getattr(self.environment, "latest_action_availability", None),
+        )
+        if decision.availability is None:
+            self.mask_unavailable_count += 1
+        action = decision.executed_index
+        audit = action_mask_audit(decision, self.mask_unavailable_count)
         action_template = TASK_ACTION_TEMPLATES[int(action)]
         action_lease_ms = action_template.resolve_lease_ms(self.environment.lease_ms)
-        observation, _, terminated, truncated, base_info = self.environment.step(
-            action_template.raw_action_index, lease_ms=action_lease_ms
-        )
+        if isinstance(self.environment, HollowKnightEnv):
+            observation, _, terminated, truncated, base_info = self.environment.step(
+                action_template.raw_action_index, lease_ms=action_lease_ms, action_audit=audit
+            )
+        else:
+            observation, _, terminated, truncated, base_info = self.environment.step(
+                action_template.raw_action_index, lease_ms=action_lease_ms
+            )
         if base_info.get("valid") is not True:
             self._done = True
             reason = base_info.get("termination_reason")
@@ -266,6 +282,8 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "motion_fraction": motion_fraction,
             "diagnostic_motion_detected": target_reached_now,
             "diagnostic_bonus_awarded": award_diagnostic_target,
+            **audit,
+            "mask_unavailable_count": self.mask_unavailable_count,
         }
         _copy_lifecycle_info(base_info, info)
         self._append_task_log(
@@ -275,6 +293,8 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "step": self._steps,
                 "task_action": action_template.name,
                 "raw_action_index": action_template.raw_action_index,
+                **audit,
+                "mask_unavailable_count": self.mask_unavailable_count,
                 "lease_ms": action_lease_ms,
                 "motion_fraction": motion_fraction,
                 "diagnostic_motion_detected": target_reached_now,
@@ -287,12 +307,18 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             }
         )
         return observation, reward, task_terminated, task_truncated, info
+
+    def action_masks(self) -> NDArray[np.bool_]:
+        return build_action_mask(
+            TASK_ACTION_NAMES, getattr(self.environment, "latest_action_availability", None)
+        )
     def close(self) -> None:
         self.environment.close()
 
     def task_contract(self) -> dict[str, Any]:
         return {
             "reward_version": VISUAL_MOTION_REWARD_VERSION,
+            "legal_action_mask": {"version": "action_availability_v1", "source": "frame_action_availability"},
             "action_names": list(TASK_ACTION_NAMES),
             "raw_action_indices": list(TASK_ACTIONS),
             "actions": action_contract(

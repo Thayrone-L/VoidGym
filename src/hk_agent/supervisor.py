@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from hk_agent.action_masking import ActionAvailability, parse_action_availability
 from hk_agent.protocol import PROTOCOL_VERSION, Envelope, ProtocolError, read_message, write_message
 from hk_agent.session import SessionError, SessionMachine, SessionState
 
@@ -60,6 +61,7 @@ class CapturedFrame:
     geo_spent_since_last_frame: int = 0
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
+    action_availability: ActionAvailability | None = None
 
 
 def require_png_frame(frame: CapturedFrame) -> None:
@@ -361,7 +363,7 @@ class SupervisorServer:
             raise ProtocolError("FRAME data_base64 is invalid") from error
         payload_bytes = payload.get("payload_bytes")
         if frame_encoding == "png":
-            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            if not data.startswith(b"\x89PNG\n\x1a\n"):
                 raise ProtocolError("FRAME payload is not a PNG")
             if payload_bytes is not None and (
                 not isinstance(payload_bytes, int)
@@ -422,6 +424,7 @@ class SupervisorServer:
             geo_gained_since_last_frame=geo_gained_since_last_frame,
             geo_spent_since_last_frame=geo_spent_since_last_frame,
             bridge_timing=parse_bridge_timing(payload),
+            action_availability=parse_action_availability(payload.get("action_availability")),
         )
 
     async def _handle_client(

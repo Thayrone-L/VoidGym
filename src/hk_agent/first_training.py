@@ -128,8 +128,18 @@ def _validated_resume_manifest(
         raise ValueError("resume checkpoint has no readable training manifest") from error
     if not isinstance(manifest, dict):
         raise TypeError("resume manifest must be an object")
-    if manifest.get("task_contract") != dict(task_contract):
-        raise ValueError("resume checkpoint task contract differs from this campaign")
+    algorithm = manifest.get("algorithm")
+    source_contract = manifest.get("task_contract")
+    if algorithm == "PPO" and isinstance(source_contract, Mapping):
+        compatible_contract = dict(task_contract)
+        compatible_contract.pop("legal_action_mask", None)
+        if dict(source_contract) != compatible_contract:
+            raise ValueError("legacy PPO resume task contract differs from this campaign")
+    elif algorithm == "MaskablePPO":
+        if source_contract != dict(task_contract):
+            raise ValueError("resume checkpoint task contract differs from this campaign")
+    else:
+        raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
     expected_fingerprint = portable_compatibility_fingerprint(task_contract, provenance)
     source_fingerprint = manifest.get("compatibility_fingerprint")
     if not isinstance(source_fingerprint, str):
@@ -138,7 +148,7 @@ def _validated_resume_manifest(
         if not isinstance(source_contract, Mapping) or not isinstance(source_provenance, Mapping):
             raise TypeError("resume checkpoint has no compatible provenance")
         source_fingerprint = portable_compatibility_fingerprint(source_contract, source_provenance)
-    if source_fingerprint != expected_fingerprint:
+    if algorithm != "PPO" and source_fingerprint != expected_fingerprint:
         raise ValueError("resume checkpoint provenance differs from this campaign")
     entries = manifest.get("checkpoints")
     if not isinstance(entries, list):
@@ -173,7 +183,7 @@ def train_ppo(
     manifest: dict[str, Any] = {
         "schema_version": 3,
         "status": "RUNNING",
-        "algorithm": "PPO",
+        "algorithm": "MaskablePPO",
         "seed": config.seed,
         "duration_mode": "continuous" if config.continuous else "limited",
         "total_timesteps": None if config.continuous else config.total_timesteps,
@@ -203,7 +213,8 @@ def train_ppo(
         try:
             stable_baselines3 = importlib.import_module("stable_baselines3")
             torch = importlib.import_module("torch")
-            PPO = stable_baselines3.PPO
+            sb3_contrib = importlib.import_module("sb3_contrib")
+            MaskablePPO = sb3_contrib.MaskablePPO
         except ImportError as error:
             raise RuntimeError(
                 "training dependencies are absent; install the project training extra"
@@ -231,6 +242,7 @@ def train_ppo(
             "python": platform.python_version(),
             "numpy": np.__version__,
             "stable_baselines3": stable_baselines3.__version__,
+            "sb3_contrib": sb3_contrib.__version__,
             "torch": torch.__version__,
         }
         atomic_json(manifest_path, manifest)
@@ -241,7 +253,14 @@ def train_ppo(
                 task_contract=task_contract,
                 provenance=dict(provenance or {}),
             )
-            model = PPO.load(str(resume_path), env=environment, device=config.training_device)
+            algorithm = source_manifest.get("algorithm")
+            if algorithm == "PPO":
+                model = stable_baselines3.PPO.load(str(resume_path), env=environment, device=config.training_device)
+            elif algorithm == "MaskablePPO":
+                model = MaskablePPO.load(str(resume_path), env=environment, device=config.training_device)
+            else:
+                raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
+            manifest["algorithm"] = algorithm
             completed = int(model.num_timesteps)
             manifest["resumed_from"] = {
                 "path": str(resume_path),
@@ -249,7 +268,7 @@ def train_ppo(
                 "completed_timesteps": source_manifest.get("completed_timesteps"),
             }
         else:
-            model = PPO(
+            model = MaskablePPO(
                 "MultiInputPolicy",
                 environment,
                 seed=config.seed,

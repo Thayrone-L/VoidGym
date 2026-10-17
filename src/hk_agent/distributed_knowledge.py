@@ -16,7 +16,7 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json$")
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "torch"})
+_VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
 _REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
@@ -27,6 +27,7 @@ _TASK_CONTRACT_KEYS = frozenset(
         "config",
         "information_boundary",
         "reward_only_signals",
+        "legal_action_mask",
         "detector_inputs",
         "privileged_state",
         "route_memory",
@@ -339,6 +340,12 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     result: dict[str, Any] = {}
     if contract["reward_version"] not in _REWARD_VERSIONS:
         raise KnowledgeValidationError("task_contract.reward_version is not supported")
+    if "legal_action_mask" in contract:
+        mask = _expect_dict(contract["legal_action_mask"], "task_contract.legal_action_mask")
+        _expect_allowed_keys(mask, {"version", "source"}, "task_contract.legal_action_mask")
+        if mask != {"version": "action_availability_v1", "source": "frame_action_availability"}:
+            raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
+        result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     action_names = contract["action_names"]
     if not isinstance(action_names, list) or not all(
@@ -665,7 +672,7 @@ def validate_contribution(value: object) -> dict[str, Any]:
             raise KnowledgeValidationError(f"contribution.{key} must be lowercase SHA-256")
     training = _expect_dict(contribution["training"], "contribution.training")
     _expect_exact_keys(training, _TRAINING_KEYS, "contribution.training")
-    if training["algorithm"] != "PPO":
+    if training["algorithm"] not in {"PPO", "MaskablePPO"}:
         raise KnowledgeValidationError("training.algorithm is not supported")
     if training["reward_version"] not in _REWARD_VERSIONS:
         raise KnowledgeValidationError("training.reward_version is not supported")

@@ -375,11 +375,22 @@ def import_policy_artifact(
         raise PolicyArtifactError("policy manifest ID differs from its frozen identity")
     if manifest["compatibility_fingerprint"] != expected_fingerprint:
         raise PolicyArtifactError("portable policy compatibility fingerprint differs")
-    if manifest["policy_class"] != _policy_class(policy):
+    source_policy_class = manifest["policy_class"]
+    target_policy_class = _policy_class(policy)
+    compatible_masked_pair = {
+        source_policy_class,
+        target_policy_class,
+    } == {
+        "stable_baselines3.common.policies.MultiInputActorCriticPolicy",
+        "sb3_contrib.common.maskable.policies.MaskableMultiInputActorCriticPolicy",
+    }
+    if source_policy_class != target_policy_class and not compatible_masked_pair:
         raise PolicyArtifactError("portable policy class differs")
     _, expected_inventory = _state_inventory(policy)
     if manifest["tensors"] != expected_inventory:
-        raise PolicyArtifactError("portable policy tensor schema differs from the target policy")
+        raise PolicyArtifactError(
+            "portable policy tensor schema differs from the target policy (names or shapes); refusing partial warm-start"
+        )
     safe_open, _ = _safetensors_api()
     loaded: dict[str, Any] = {}
     snapshot = _private_snapshot(

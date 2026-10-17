@@ -13,6 +13,7 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.action_masking import ActionAvailability
 from hk_agent.shade_run_lifecycle import ShadeRunTracker, ShadeRunUpdate
 
 BUTTON_ORDER: tuple[str, ...] = (
@@ -73,6 +74,7 @@ class PixelFrame:
     geo_spent_since_last_frame: int = 0
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
+    action_availability: ActionAvailability | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +228,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._shade_runs = ShadeRunTracker()
         self._shade_run_update: ShadeRunUpdate | None = None
 
+    @property
+    def latest_action_availability(self) -> ActionAvailability | None:
+        """Availability metadata from the latest accepted frame, for action masking only."""
+        return self._frames[-1].action_availability if self._frames else None
+
     def reset(
         self,
         *,
@@ -270,7 +277,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         return self._observation(), self._info(frame_ids=self._frame_ids())
 
     def step(
-        self, action: int, *, lease_ms: int | None = None
+        self, action: int, *, lease_ms: int | None = None, action_audit: Mapping[str, Any] | None = None
     ) -> tuple[dict[str, NDArray[np.generic]], float, bool, bool, dict[str, Any]]:
         self._ensure_open()
         if self._episode_id is None or self._episode_done:
@@ -364,6 +371,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 reason=reason,
                 timing_ms=timing_ms,
                 frame=frame,
+                action_audit=action_audit,
             )
         except Exception as error:  # noqa: BLE001 - persistence is an operational boundary
             self._best_effort_release()
@@ -404,6 +412,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
     def _validate_frame(
         self,
         frame: PixelFrame,
+        action_audit: Mapping[str, Any] | None = None,
         *,
         previous: PixelFrame | None,
         expected_action_id: int | None,
@@ -479,6 +488,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
+            action_availability=frame.action_availability,
         )
 
     def _validate_applied_action(
@@ -593,6 +603,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         reason: str | None,
         timing_ms: Mapping[str, float],
         frame: PixelFrame,
+        action_audit: Mapping[str, Any] | None = None,
     ) -> None:
         writer = self._transition_writer()
         if writer is None:
@@ -634,6 +645,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                     "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
                 },
                 "timing_ms": dict(timing_ms),
+                **(dict(action_audit) if action_audit is not None else {}),
                 "valid": True,
             }
         )

@@ -26,7 +26,7 @@ from hk_agent.protocol import ProtocolError
 from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
 
 _T = TypeVar("_T")
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_SIGNATURE = b"\x89PNG\n\x1a\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +564,7 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
         decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
         bridge_timing=frame.bridge_timing,
+        action_availability=frame.action_availability,
     )
 
 

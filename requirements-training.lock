@@ -1,6 +1,7 @@
 # Resolved on Windows / Python 3.12.10 for the first diagnostic training round.
 safetensors==0.8.0
 stable-baselines3==2.9.0
+sb3-contrib==2.9.0
 torch==2.14.1
 filelock==4.1.1
 fsspec==2026.9.0

@@ -334,6 +334,9 @@ def main() -> int:
     training_task_path = (PROJECT_ROOT / "src" / "hk_agent" / "training_task.py").resolve(
         strict=True
     )
+    action_masking_path = (PROJECT_ROOT / "src" / "hk_agent" / "action_masking.py").resolve(
+        strict=True
+    )
     temporal_actions_path = (PROJECT_ROOT / "src" / "hk_agent" / "temporal_actions.py").resolve(
         strict=True
     )
@@ -372,6 +375,10 @@ def main() -> int:
             "curriculum_source": {
                 "path": str(training_task_path),
                 "sha256": sha256_file(training_task_path),
+            },
+            "action_masking_source": {
+                "path": str(action_masking_path),
+                "sha256": sha256_file(action_masking_path),
             },
             "temporal_actions_source": {
                 "path": str(temporal_actions_path),

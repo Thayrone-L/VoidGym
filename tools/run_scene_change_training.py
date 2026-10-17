@@ -145,6 +145,7 @@ def _provenance(
         raise RuntimeError("the bootstrap plan has no readiness reference")
     reference_path = bootstrap_plan.readiness.reference_image.resolve(strict=True)
     source_path = (PROJECT_ROOT / "src" / "hk_agent" / "scene_change_task.py").resolve(strict=True)
+    action_masking_source = (PROJECT_ROOT / "src" / "hk_agent" / "action_masking.py").resolve(strict=True)
     route_memory_source = (PROJECT_ROOT / "src" / "hk_agent" / "route_memory.py").resolve(
         strict=True
     )
@@ -166,6 +167,7 @@ def _provenance(
         "game_executable": game_executable,
         "mod_dll": mod_dll,
         "curriculum_source": source_path,
+        "action_masking_source": action_masking_source,
         "route_memory_source": route_memory_source,
         "temporal_actions_source": temporal_actions_source,
         "environment_source": gym_env_source,
@@ -341,8 +343,20 @@ def main() -> int:
         )
     dependencies = {
         "stable_baselines3": importlib.util.find_spec("stable_baselines3") is not None,
+        "sb3_contrib": importlib.util.find_spec("sb3_contrib") is not None,
         "torch": importlib.util.find_spec("torch") is not None,
     }
+    algorithm = "MaskablePPO"
+    if args.resume_checkpoint is not None:
+        resume_manifest = args.resume_checkpoint.resolve(strict=True).parent.parent / "manifest.json"
+        try:
+            source_manifest = json.loads(resume_manifest.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit("resume checkpoint has no readable manifest") from error
+        source_algorithm = source_manifest.get("algorithm")
+        if source_algorithm not in {"PPO", "MaskablePPO"}:
+            raise SystemExit(f"unsupported resume algorithm: {source_algorithm!r}")
+        algorithm = source_algorithm
     plan: dict[str, object] = {
         "mode": "execute" if args.execute else "dry-run",
         "curriculum": "reach_scene_change_v1",
@@ -350,7 +364,7 @@ def main() -> int:
             "pixel-only stable visual-regime-change diagnostic; room transition "
             "not yet validated against a holdout corpus"
         ),
-        "algorithm": "PPO",
+        "algorithm": algorithm,
         "seed": args.seed,
         "duration_mode": "continuous" if args.continuous else "limited",
         "timesteps": None if args.continuous else args.timesteps,
@@ -406,7 +420,7 @@ def main() -> int:
         result: dict[str, Any] = {
             "schema_version": 2,
             "status": "CANCELLED",
-            "algorithm": "PPO",
+            "algorithm": algorithm,
             "seed": training_config.seed,
             "duration_mode": "continuous" if training_config.continuous else "limited",
             "total_timesteps": (

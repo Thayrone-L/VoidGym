@@ -239,6 +239,10 @@ def test_training_applies_and_records_effective_resources_without_mutating_envir
     sb3.PPO = FakeModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setenv("OMP_NUM_THREADS", "11")
     monkeypatch.setenv("MKL_NUM_THREADS", "12")
@@ -281,6 +285,10 @@ def test_training_fails_clearly_without_torch_thread_control(
     torch = ModuleType("torch")
     torch.__version__ = "test"  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     with pytest.raises(RuntimeError, match="intra-op thread budget"):
@@ -302,6 +310,10 @@ def test_training_rejects_unavailable_requested_cuda(
     torch.cuda = ModuleType("torch.cuda")  # type: ignore[attr-defined]
     torch.cuda.is_available = lambda: False  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     with pytest.raises(RuntimeError, match="CUDA training was requested"):
@@ -383,6 +395,10 @@ def test_training_writes_atomic_checkpoints_and_honest_manifest(
     sb3.PPO = FakeModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     result = train_ppo(
@@ -422,6 +438,10 @@ def test_portable_policy_warm_starts_a_fresh_model_without_loading_zip(
     sb3.PPO = FreshOnlyModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     artifact = tmp_path / "source" / "policy.safetensors"
     sidecar = tmp_path / "source" / "policy.policy.manifest.json"
@@ -480,6 +500,10 @@ def test_constructor_failure_marks_manifest_failed_and_closes_environment(
     sb3.PPO = FailingConstructorModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     try:
@@ -509,6 +533,10 @@ def test_training_resumes_only_from_hash_validated_compatible_checkpoint(
     sb3.PPO = FakeModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     source = tmp_path / "source"
     provenance = {"game_profile": "development", "build": "same"}
@@ -567,6 +595,10 @@ def test_invalid_transition_fails_run_without_checkpoint(
     sb3.PPO = InvalidTransitionModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     try:
@@ -599,6 +631,10 @@ def test_stop_request_cancels_with_final_resumable_checkpoint(
     sb3.PPO = StopDuringRolloutModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
 
@@ -628,6 +664,10 @@ def test_continuous_training_runs_until_stop_and_rotates_checkpoints(
     sb3.PPO = ContinuousStopModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     result = train_ppo(
@@ -665,6 +705,10 @@ def test_environment_run_failed_does_not_abort_continuous_campaign(
     sb3.PPO = RunFailedModel  # type: ignore[attr-defined]
     torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     stop_file = tmp_path / "stop.request"

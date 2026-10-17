@@ -97,6 +97,7 @@ internal sealed class BridgeClient : IDisposable
                             "apply_menu_action",
                             "player_death_terminal",
                             "shade_run_lifecycle",
+                            "action_availability_v1",
                         },
                     }
                 );
@@ -400,6 +401,19 @@ internal sealed class BridgeClient : IDisposable
                                 ["unity_fps"] = frame.UnityFps,
                                 ["target_frame_rate"] = frame.TargetFrameRate,
                                 ["vsync_count"] = frame.VSyncCount,
+                                ["action_availability"] = frame.ActionAvailability == null ? null : new Dictionary<string, object>
+                                {
+                                    ["mp_charge"] = frame.ActionAvailability.mp_charge,
+                                    ["spell_cost"] = frame.ActionAvailability.spell_cost,
+                                    ["focus_cost"] = frame.ActionAvailability.focus_cost,
+                                    ["fireball_level"] = frame.ActionAvailability.fireball_level,
+                                    ["quake_level"] = frame.ActionAvailability.quake_level,
+                                    ["scream_level"] = frame.ActionAvailability.scream_level,
+                                    ["has_nail_art"] = frame.ActionAvailability.has_nail_art,
+                                    ["has_cyclone"] = frame.ActionAvailability.has_cyclone,
+                                    ["has_dash_slash"] = frame.ActionAvailability.has_dash_slash,
+                                    ["has_upward_slash"] = frame.ActionAvailability.has_upward_slash,
+                                },
                                 ["scene_transition"] = false,
                                 ["player_dead"] = lifecycle.PlayerDead,
                                 ["death_persisted"] = lifecycle.PlayerDead,
