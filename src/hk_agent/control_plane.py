@@ -27,6 +27,13 @@ from hk_agent.win_job import WindowsJob, process_identity, resume_process
 
 _REAL_POPEN = subprocess.Popen
 
+OWNER_LOCK_NAME = ".control-plane.owner.json"
+
+
+class ControlPlaneBusyError(RuntimeError):
+    """Another live process already owns this control plane."""
+
+
 # Must match SceneChangeProbeConfig.validate (hk_agent.scene_change_probe).
 PROBE_MAX_HORIZON = 10_000
 PROBE_RUNNER_CAMPAIGNS = frozenset({"scene_change_probe", "parallel_smoke"})
@@ -273,6 +280,7 @@ class ControlPlane:
         torch_interop_threads: int = 1,
         preparation_timeout_seconds: float = 600.0,
         monotonic_clock: Any = time.monotonic,
+        observer: bool = False,
     ) -> None:
         if max_active_launches < 1:
             raise ValueError("max_active_launches must be positive")
@@ -301,7 +309,109 @@ class ControlPlane:
         self._preparing_watchdogs: dict[str, threading.Event] = {}
         self._slot_owners: dict[int, str] = {}
         self._slot_fences: dict[int, str] = {}
+        self.observer = observer
+        self._owner_lock_path = self.control_root / OWNER_LOCK_NAME
+        if observer:
+            # Read-only view: never recovers, rewrites, captures or reserves anything.
+            return
+        self._acquire_owner_lock()
         self._recover_active_launch()
+
+    def _acquire_owner_lock(self) -> None:
+        """Make this process the single owner of control_root.
+
+        A second process that constructed a full ControlPlane used to run the
+        "panel restarted" recovery against launches another live process still
+        owned, marking them FAILED and capturing saves of running games. Now a live
+        foreign owner makes construction fail; use observer=True for read-only
+        status. Several instances inside one process (tests, restarts) are allowed,
+        and a lock left by a dead process is taken over.
+        """
+        self.control_root.mkdir(parents=True, exist_ok=True)
+        try:
+            identity: dict[str, object] = dict(process_identity(os.getpid()))
+        except OSError:
+            identity = {"pid": os.getpid(), "creation_time": None, "executable": sys.executable}
+        payload = json.dumps(identity, ensure_ascii=False).encode("utf-8")
+        for _attempt in range(3):
+            try:
+                descriptor = os.open(
+                    self._owner_lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+            except FileExistsError:
+                owner = self._read_owner_lock()
+                if owner is not None and owner.get("pid") != os.getpid() and self._owner_alive(owner):
+                    raise ControlPlaneBusyError(
+                        f"control plane at {self.control_root} is owned by live process "
+                        f"{owner.get('pid')}; open it with observer=True for read-only status"
+                    ) from None
+                # Same process or stale owner: replace atomically, then verify.
+                temporary = self._owner_lock_path.with_name(
+                    f"{self._owner_lock_path.name}.{secrets.token_hex(6)}.tmp"
+                )
+                temporary.write_bytes(payload)
+                os.replace(temporary, self._owner_lock_path)
+            else:
+                try:
+                    os.write(descriptor, payload)
+                finally:
+                    os.close(descriptor)
+            current = self._read_owner_lock()
+            if current is not None and current.get("pid") == os.getpid():
+                return
+        raise ControlPlaneBusyError(f"could not acquire control plane ownership at {self.control_root}")
+
+    def _read_owner_lock(self) -> dict[str, object] | None:
+        try:
+            value = json.loads(self._owner_lock_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _owner_alive(owner: Mapping[str, object]) -> bool:
+        pid = owner.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return False
+        try:
+            actual = process_identity(pid)
+        except OSError:
+            return False
+        expected = owner.get("creation_time")
+        return expected is None or actual.get("creation_time") == expected
+
+    def close(self) -> None:
+        """Release ownership if this process holds it."""
+        if self.observer:
+            return
+        owner = self._read_owner_lock()
+        if owner is not None and owner.get("pid") == os.getpid():
+            try:
+                self._owner_lock_path.unlink()
+            except OSError:
+                pass
+
+    def _require_owner(self) -> None:
+        if self.observer:
+            raise PermissionError("this ControlPlane is a read-only observer")
+
+    def _observer_snapshot(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        launch_root = self.control_root / "launches"
+        if not launch_root.exists():
+            return records
+        for path in sorted(launch_root.glob("*/launch.json"), reverse=True):
+            try:
+                record = json.loads(path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("status") in {
+                "PREPARING",
+                "RUNNING",
+                "STOP_REQUESTED",
+            }:
+                records.append(record)
+        return records
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -542,6 +652,7 @@ class ControlPlane:
         return sorted(campaigns, key=lambda item: str(item.get("created_at", "")), reverse=True)
 
     def create_campaign(self, payload: Mapping[str, object]) -> dict[str, object]:
+        self._require_owner()
         spec = CampaignSpec.from_payload(payload)
         directory = self.control_root / "campaigns" / spec.campaign_id
         existing = list(directory.glob("v*.json")) if directory.exists() else []
@@ -713,6 +824,7 @@ class ControlPlane:
                     record["slot_state"] = "released"
 
     def launch(self, campaign_id: str, *, version: int | None, execute: bool) -> dict[str, object]:
+        self._require_owner()
         project_config = None
         with self._lock:
             self._refresh_locked()
@@ -1371,6 +1483,17 @@ class ControlPlane:
         return isinstance(origin, Mapping) and bool(origin.get("isolated_save_root"))
 
     def status(self) -> dict[str, object]:
+        if self.observer:
+            observed = self._observer_snapshot()
+            return {
+                "observer": True,
+                "allow_execute": False,
+                "capacity": self.max_active_launches,
+                "parallel_enabled": self.parallel_enabled,
+                "active_count": len(observed),
+                "active_launches": observed,
+                "active": observed[0] if observed else None,
+            }
         with self._lock:
             self._refresh_locked()
             active_launches = self._active_records_locked()
@@ -1392,6 +1515,7 @@ class ControlPlane:
             }
 
     def stop(self, launch_id: str | None = None) -> dict[str, object]:
+        self._require_owner()
         with self._lock:
             self._refresh_locked()
             preparing_ids = set(self._preparing_ids)

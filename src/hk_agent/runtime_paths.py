@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from collections.abc import Callable
 from pathlib import Path
 
+# Every file Hollow Knight / the Modding API keeps per save slot:
+#   user1.dat, user1_1.5.78.11833.dat (versioned copy), user1.dat.bak1 (rotating
+#   backup the game creates on save), user1.modded.json and their .bak variants.
+SAVE_FILE_PATTERN = re.compile(
+    r"^user\d+(?:_[0-9.]+)?\.(?:dat|modded\.json)(?:\.bak\d*)?$", re.IGNORECASE
+)
+
+
+def is_save_file(name: str) -> bool:
+    """True for any per-slot save artifact, including the game's rotating backups."""
+    return SAVE_FILE_PATTERN.fullmatch(name) is not None
+
 
 def _save_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    return [path for path in root.iterdir() if path.is_file() and
-            (path.name.startswith("user") and (path.suffix == ".dat" or
-             path.name.endswith(".modded.json") or path.name.endswith(".dat.bak") or
-             path.name.endswith(".modded.json.bak")))]
+    return [path for path in root.iterdir() if path.is_file() and is_save_file(path.name)]
 
 
 def _check_fence(

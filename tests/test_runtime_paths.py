@@ -167,3 +167,41 @@ def test_runtime_comparison_is_case_insensitive_on_windows(tmp_path: Path) -> No
             backup=tmp_path / "backup",
             game_install=tmp_path / "game",
         )
+
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["user1.dat", "USER2.DAT", "user1.dat.bak", "user1.dat.bak1", "user1.dat.bak12",
+     "user1_1.5.78.11833.dat", "user1.modded.json", "user1.modded.json.bak",
+     "user4.modded.json.bak3"],
+)
+def test_save_pattern_includes_game_rotating_backups(name: str) -> None:
+    """Regression (soak): the game renames user1.dat to user1.dat.bak1 when saving;
+    it must be moved, seeded and captured like any other save file."""
+    from hk_agent.runtime_paths import is_save_file
+
+    assert is_save_file(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["ModLog.txt", "AppConfig.ini", "user1.txt", "user.dat", "settings.json",
+     "user1.dat.old", "xuser1.dat", "user1.dat.bak1.tmp"],
+)
+def test_save_pattern_rejects_non_save_files(name: str) -> None:
+    from hk_agent.runtime_paths import is_save_file
+
+    assert not is_save_file(name)
+
+
+def test_previous_state_moves_rotating_backups(tmp_path: Path) -> None:
+    from hk_agent.runtime_paths import _save_files
+
+    root = tmp_path / "instance"
+    root.mkdir()
+    for name in ("user1.dat", "user1.dat.bak1", "user1_1.5.78.11833.dat", "ModLog.txt"):
+        (root / name).write_text("x", encoding="utf-8")
+    assert sorted(p.name for p in _save_files(root)) == [
+        "user1.dat", "user1.dat.bak1", "user1_1.5.78.11833.dat"
+    ]

@@ -22,6 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from hk_agent.config import load_config
 from hk_agent.control_plane import ControlPlane
 from hk_agent.instance_marker import load_instance_marker
+from hk_agent.runtime_paths import is_save_file
 
 
 def hash_tree(root: Path) -> dict[str, str]:
@@ -140,10 +141,8 @@ def _not_older(child: object, parent: object) -> bool:
 
 
 def _is_save_file(path: str) -> bool:
-    name = Path(path).name.casefold()
-    return name.startswith("user") and name.endswith(
-        (".dat", ".modded.json", ".dat.bak", ".modded.json.bak")
-    )
+    # Single source of truth shared with save preparation/capture.
+    return is_save_file(PureWindowsPath(path).name)
 
 
 def verify_no_orphans(processes: Iterable[Mapping[str, Any]], known_pids: set[int]) -> None:

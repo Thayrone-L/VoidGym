@@ -221,3 +221,14 @@ def test_exited_process_is_reported_dead_not_raised(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(psutil, "Process", gone)
     assert smoke._same_process_alive(8288, 1.0) is False
+
+
+
+def test_game_rotating_backup_is_an_expected_instance_file() -> None:
+    """Regression (soak): user1.dat.bak1 in the instance's own data root was
+    reported as an unexpected non-save change."""
+    before = {"slot0": {"user1.dat": "a"}, "slot1": {"user1.dat": "b"}}
+    after = {"slot0": {"user1.dat": "a2", "user1.dat.bak1": "a"}, "slot1": {"user1.dat": "b"}}
+    verify_root_isolation(before, after, {"slot0": "slot0", "slot1": "slot1"})
+    assert _is_save_file("user1.dat.bak1")
+    assert _is_save_file("user1_1.5.78.11833.dat")

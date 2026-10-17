@@ -1554,3 +1554,79 @@ def test_requested_stop_with_job_draining_stays_cancelled(
     assert persisted["status"] == expected
     if expected == "CANCELLED":
         assert "failure" not in persisted
+
+
+def _foreign_owner(control_root: Path, pid: int = 424242, creation_time: object = 99) -> Path:
+    control_root.mkdir(parents=True, exist_ok=True)
+    lock = control_root / ".control-plane.owner.json"
+    lock.write_text(json.dumps({"pid": pid, "creation_time": creation_time}), encoding="utf-8")
+    return lock
+
+
+def test_second_process_cannot_take_over_a_live_control_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (soak): a status query from another process built a full
+    ControlPlane, ran restart recovery on live launches and marked them FAILED."""
+    from hk_agent.control_plane import ControlPlaneBusyError
+
+    root = _project(tmp_path)
+    control_root = root / "artifacts" / "control-plane"
+    _foreign_owner(control_root)
+    live = control_root / "launches" / "L-live" / "launch.json"
+    live.parent.mkdir(parents=True)
+    record = {"launch_id": "L-live", "mode": "execute", "status": "RUNNING", "pid": 5151,
+              "resources": {"slot_id": 0}}
+    live.write_text(json.dumps(record), encoding="utf-8")
+    before = live.read_bytes()
+
+    def identity(pid: int) -> dict[str, object]:
+        if pid == 424242:
+            return {"pid": pid, "creation_time": 99, "executable": "python.exe"}
+        return {"pid": pid, "creation_time": 1, "executable": "python.exe"}
+
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", identity)
+    with pytest.raises(ControlPlaneBusyError, match="observer=True"):
+        ControlPlane(root)
+    assert live.read_bytes() == before  # nothing recovered or rewritten
+
+    observer = ControlPlane(root, observer=True)
+    status = observer.status()
+    assert status["observer"] is True
+    assert status["active_count"] == 1
+    assert live.read_bytes() == before
+    with pytest.raises(PermissionError, match="observer"):
+        observer.stop("L-live")
+    with pytest.raises(PermissionError, match="observer"):
+        observer.create_campaign(_payload())
+    assert live.read_bytes() == before
+
+
+def test_stale_owner_lock_from_dead_process_is_taken_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    lock = _foreign_owner(root / "artifacts" / "control-plane")
+
+    def identity(pid: int) -> dict[str, object]:
+        if pid == 424242:
+            raise OSError("no such process")
+        return {"pid": pid, "creation_time": 7, "executable": "python.exe"}
+
+    monkeypatch.setattr("hk_agent.control_plane.process_identity", identity)
+    control = ControlPlane(root)
+    assert json.loads(lock.read_text("utf-8"))["pid"] == os.getpid()
+    control.close()
+    assert not lock.exists()
+
+
+def test_reused_owner_pid_with_different_creation_time_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    _foreign_owner(root / "artifacts" / "control-plane", creation_time=99)
+    monkeypatch.setattr(
+        "hk_agent.control_plane.process_identity",
+        lambda pid: {"pid": pid, "creation_time": 12345, "executable": "python.exe"},
+    )
+    ControlPlane(root)  # PID reused by an unrelated process: not a live owner

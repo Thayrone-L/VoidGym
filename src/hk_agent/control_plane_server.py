@@ -10,7 +10,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from hk_agent.config import ConfigError, load_config
-from hk_agent.control_plane import ControlPlane, parse_json_body, require_keys
+from hk_agent.control_plane import (
+    ControlPlane,
+    ControlPlaneBusyError,
+    parse_json_body,
+    require_keys,
+)
 
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
@@ -234,7 +239,7 @@ def main() -> int:
     static_root = Path(__file__).resolve().parent / "control_plane_web"
     try:
         control_plane = build_control_plane(project_root, allow_execute=args.allow_execute)
-    except ConfigError as error:
+    except (ConfigError, ControlPlaneBusyError) as error:
         raise SystemExit(str(error)) from error
     server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root)
     print(

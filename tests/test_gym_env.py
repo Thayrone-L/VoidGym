@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -467,3 +468,41 @@ def test_transition_log_failure_truncates_before_observation_advances(
     assert np.array_equal(after["pixels"], before["pixels"])
     assert backend.releases == 1
     env.close()
+
+
+
+def test_extended_length_path_is_a_noop_off_windows_and_idempotent() -> None:
+    from hk_agent.gym_env import extended_length_path
+
+    assert extended_length_path("/tmp/x", os_name="posix") == "/tmp/x"
+    prefixed = "\\\\?\\C:\\already\\long"
+    assert extended_length_path(prefixed, os_name="nt") == prefixed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH behaviour")
+def test_extended_length_path_prefixes_drive_and_unc_paths() -> None:
+    from hk_agent.gym_env import extended_length_path
+
+    assert extended_length_path("C:\\data\\file.jsonl") == "\\\\?\\C:\\data\\file.jsonl"
+    assert extended_length_path("\\\\server\\share\\f.jsonl") == "\\\\?\\UNC\\server\\share\\f.jsonl"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH behaviour")
+def test_jsonl_writer_survives_paths_beyond_max_path(tmp_path: Path) -> None:
+    """Regression: per-launch runtime roots made the experience tree exceed
+    MAX_PATH (WinError 206) and every transition was rejected."""
+    from hk_agent.gym_env import AtomicJsonlWriter
+
+    deep = tmp_path
+    for index in range(8):
+        deep = deep / f"episode-51042e97-4d58-4dab-a796-b5502883b9cf-{index}"
+    target = deep / "transitions.jsonl"
+    assert len(str(target)) > 300
+    writer = AtomicJsonlWriter(target)
+    writer.append({"step": 1})
+    writer.append({"step": 2})
+    with open("\\\\?\\" + str(target), encoding="utf-8") as stream:
+        assert [line for line in stream.read().splitlines() if line] == [
+            '{"step":1}',
+            '{"step":2}',
+        ]
