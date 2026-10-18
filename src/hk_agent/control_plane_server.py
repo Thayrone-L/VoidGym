@@ -28,6 +28,25 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/status":
             self._json(HTTPStatus.OK, self.server.control_plane.status())
+        elif path == "/api/operator":
+            self._json(HTTPStatus.OK, self.server.control_plane.operator_snapshot())
+        elif path == "/api/reports":
+            self._json(HTTPStatus.OK, {"reports": self.server.control_plane.list_reports()})
+        elif path == "/api/report":
+            query = parse_qs(urlsplit(self.path).query)
+            relative = query.get("path", [""])[0]
+            try:
+                content, content_type = self.server.control_plane.read_report(relative)
+            except (OSError, ValueError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
         elif path == "/api/runs":
             self._json(HTTPStatus.OK, {"runs": self.server.control_plane.list_runs()})
         elif path == "/api/campaigns":
@@ -55,7 +74,46 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             payload = self._payload()
-            if path == "/api/campaigns":
+            if path == "/api/operator/start":
+                require_keys(payload, ("instances", "duration_kind", "duration_value"))
+                if set(payload) != {"instances", "duration_kind", "duration_value"}:
+                    raise ValueError("start accepts only number of instances and duration")
+                if not self.server.control_plane.allow_execute:
+                    raise PermissionError("Start the panel with --allow-execute to open game windows")
+                result = self.server.control_plane.start_operator_campaign(
+                    instances=payload.get("instances"), duration_kind=payload.get("duration_kind"),
+                    duration_value=payload.get("duration_value"),
+                )
+                self._json(HTTPStatus.ACCEPTED, result)
+            elif path == "/api/operator/continue":
+                if payload:
+                    raise ValueError("continue does not accept settings")
+                if not self.server.control_plane.allow_execute:
+                    raise PermissionError("Start the panel with --allow-execute to open game windows")
+                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.continue_operator_campaign())
+            elif path == "/api/operator/repeat":
+                if payload:
+                    raise ValueError("repeat does not accept reward settings")
+                if not self.server.control_plane.allow_execute:
+                    raise PermissionError("Start the panel with --allow-execute to open game windows")
+                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.repeat_operator_campaign())
+            elif path == "/api/operator/stop":
+                if payload:
+                    raise ValueError("safe stop does not accept settings")
+                current = self.server.control_plane.status()
+                active = current.get("active_launches", [])
+                if not isinstance(active, list) or not active:
+                    raise RuntimeError("No training is currently running")
+                actor = next((row for row in active if isinstance(row, Mapping) and row.get("role") == "actor"), active[0])
+                launch_id = actor.get("launch_id") if isinstance(actor, Mapping) else None
+                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.stop(str(launch_id)))
+            elif path == "/api/reports/generate":
+                require_keys(payload, ("campaign_id",))
+                campaign_id = payload.get("campaign_id")
+                if not isinstance(campaign_id, str):
+                    raise ValueError("campaign_id must be a string")
+                self._json(HTTPStatus.CREATED, self.server.control_plane.generate_run_report(campaign_id))
+            elif path == "/api/campaigns":
                 require_keys(
                     payload,
                     (

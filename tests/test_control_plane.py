@@ -62,7 +62,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 8
+    assert first["schema_version"] == 9
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 
@@ -538,7 +538,7 @@ def test_runner_sidecar_with_reused_pid_is_rejected(
     assert saved["status"] == "FAILED"
 
 
-def test_default_reward_values_are_valid_in_the_browser_form() -> None:
+def test_operator_browser_form_hides_fixed_reward_weights() -> None:
     html = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -546,17 +546,13 @@ def test_default_reward_values_are_valid_in_the_browser_form() -> None:
         / "control_plane_web"
         / "index.html"
     ).read_text("utf-8")
-    assert 'name="success_reward"' in html
-    assert 'name="visual_change_scale"' in html
-    assert 'name="enemy_kill_reward"' in html
-    assert 'name="enemy_kill_reward_budget"' in html
-    assert 'name="shade_recovery_reward"' in html
-    assert 'name="damage_penalty"' in html
-    assert 'name="geo_gain_reward"' in html
-    assert 'name="geo_spend_reward"' in html
-    assert 'name="death_penalty"' in html
-    assert 'name="run_failed_penalty"' in html
-    assert html.count('step="any"') == 19
+    assert 'name="success_reward"' not in html
+    assert 'name="enemy_kill_reward"' not in html
+    assert 'name="death_penalty"' not in html
+    assert 'class="panel advanced"' in html
+    assert 'id="start-training"' in html
+    assert 'id="continue-training"' in html
+    assert 'id="repeat-training"' in html
 
 
 class _FakeProcess:

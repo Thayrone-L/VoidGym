@@ -1,0 +1,39 @@
+ETAPA 49 — PAINEL DO OPERADOR
+================================
+Data: 18/10/2026 (America/Sao_Paulo)
+Status: VERDE
+
+Entregue
+- Painel principal em português, orientado ao operador: iniciar com contagem e duração,
+  continuar checkpoint, repetir com nova campanha, parar cooperativamente e acompanhar
+  instâncias, recursos, progresso, salas, avaliações, mortes/sombras e alertas. Campos de
+  duração condicional e lista de instâncias revisados visualmente.
+- ControlPlane grava prazo absoluto nos registros do learner/atores; prazo vencido escreve
+  stop.request cooperativo para todo o grupo, inclusive após reinício/reanexação do painel.
+- Pesos não são aceitos pelo endpoint de ação do operador; API legada continua preservando
+  campanhas antigas e seus pesos para leitura/retomada.
+- Relatórios JSON + HTML autocontido em artifacts/reports/<campanha>/, com geração manual
+  e automática após encerramento; novas continuações produzem relatório sem substituir o
+  anterior. Endpoints validam que leitura fique dentro da pasta de relatórios.
+- Guia curto atualizado em docs/PAINEL_DE_TREINAMENTO.md. Backup de arquivos anteriores em
+  agent-prompts/backup-agente49-20261018-143032.
+
+Validação
+- Ruff: aprovado.
+- Mypy: aprovado, 43 arquivos.
+- Pytest completo: 539 passed, 2 skipped, 8 subtests passed.
+- Incluídos testes sintéticos para limite e stop cooperativo, retomada do checkpoint, nova
+  campanha/semente, seções do relatório, atualização automática e endpoint local que recusa
+  pesos do formulário.
+- Chromium/Edge headless com servidor sintético 127.0.0.1; captura revisada em
+  relatorios/49_painel/dashboard-synthetic.png. Playwright não disponível no ambiente.
+- Nenhum jogo foi aberto nem campanha iniciada. Nenhum processo de jogo permanece ativo.
+
+Falhas e correções
+- A execução direta do pytest inicialmente não resolveu o pacote local tools; a suíte foi
+  executada com python -m pytest e concluiu com código 0.
+- Revisão da captura identificou controles de duração duplicados e falta de estados por
+  instância; CSS, frontend e captura foram corrigidos.
+
+Commit solicitado: Operator-focused training dashboard with run reports
+Push: origin/codex/parallel-instances-isolation (PR #8)

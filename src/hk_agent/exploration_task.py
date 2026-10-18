@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -96,6 +97,40 @@ def save_campaign_counts(path: Path, counts: dict[str, int], limit: int = 4096) 
             del counts[key]
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"schema_version": 1, "counts": counts}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_scene_first_seen(path: Path, limit: int = 4096) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text("utf-8"))
+    records = payload.get("first_seen_unix_ns") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(records, dict):
+        raise ValueError("scene first-seen file has an unsupported schema")
+    result: dict[str, int] = {}
+    for name, timestamp in records.items():
+        if not isinstance(name, str) or not name or isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
+            raise ValueError("scene first-seen file contains an invalid record")
+        if len(result) < limit:
+            result[name] = timestamp
+    return result
+
+
+def save_scene_first_seen(path: Path, records: dict[str, int], limit: int = 4096) -> None:
+    if len(records) > limit:
+        for key in list(records)[:len(records) - limit]:
+            del records[key]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"schema_version": 1, "first_seen_unix_ns": records}, sort_keys=True, separators=(",", ":"), allow_nan=False)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
@@ -275,6 +310,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._scene_paid = 0.0
         self._campaign_scene_path: Path | None = None
         self._campaign_enemy_path: Path | None = None
+        self._scene_first_seen_path: Path | None = None
+        self._scene_first_seen: dict[str, int] = {}
         self._progress_elapsed_seconds = 0.0
         self._previous_scene_name: str | None = None
         self._episode_scene_names: set[str] = set()
@@ -310,8 +347,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             if self.config.reward_version == "explore_v3" and memory_root is not None:
                 self._campaign_scene_path = memory_root / "lifelong-scenes.json"
                 self._campaign_enemy_path = memory_root / "lifelong-enemies.json"
+                self._scene_first_seen_path = memory_root / "lifelong-scene-first-seen.json"
                 self._scene_visits = load_campaign_counts(self._campaign_scene_path, self.config.lifelong_archive_max)
                 self._enemy_visits = load_campaign_counts(self._campaign_enemy_path, self.config.lifelong_archive_max)
+                self._scene_first_seen = load_scene_first_seen(self._scene_first_seen_path, self.config.lifelong_archive_max)
         self._archive.clear()
         self._archive.append(descriptor)
         self._paid_scenes = [descriptor.copy()]
@@ -470,6 +509,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                         scene_event_paid = True
                         if prior_visits == 0:
                             self._episode_campaign_new_scenes.append(current_scene)
+                            self._scene_first_seen.setdefault(current_scene, time.time_ns())
+                            if self._scene_first_seen_path is not None:
+                                save_scene_first_seen(self._scene_first_seen_path, self._scene_first_seen, self.config.lifelong_archive_max)
                         if self._campaign_scene_path is not None:
                             save_campaign_counts(self._campaign_scene_path, self._scene_visits, self.config.lifelong_archive_max)
                 self._previous_scene_name = current_scene

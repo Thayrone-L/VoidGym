@@ -85,6 +85,7 @@ class CampaignSpec:
     window_width: int = 960
     window_height: int = 540
     duration_mode: str = "limited"
+    duration_limit_seconds: float = 0.0
     max_checkpoints: int = 5
     save_source: str = "existing_save"
     save_slot: int = 1
@@ -105,7 +106,7 @@ class CampaignSpec:
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
     straggler_timeout_seconds: float = 45.0
-    schema_version: int = 8
+    schema_version: int = 9
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -229,6 +230,11 @@ class CampaignSpec:
             "continuous",
         }:
             raise ValueError("duration_mode must be limited or continuous")
+        duration_limit_seconds = _bounded_float(
+            payload.get("duration_limit_seconds", 0.0), "duration_limit_seconds", 0.0, 72 * 3600.0
+        )
+        if campaign_type == "scene_change_probe" and duration_limit_seconds:
+            raise ValueError("scene-change probes do not support a time limit")
         if campaign_type == "scene_change_probe" and duration_mode != "limited":
             raise ValueError("scene-change probes do not support continuous duration")
         if campaign_type == "parallel_smoke" and duration_mode != "limited":
@@ -269,6 +275,7 @@ class CampaignSpec:
                 payload.get("window_height", 540), "window_height", 320, 7680
             ),
             duration_mode=duration_mode,
+            duration_limit_seconds=duration_limit_seconds,
             max_checkpoints=_bounded_int(
                 payload.get("max_checkpoints", 5), "max_checkpoints", 2, 100
             ),
@@ -384,6 +391,7 @@ class ControlPlane:
         self._shared_actor_restarts: dict[str, list[float]] = {}
         self._slot_fences: dict[int, str] = {}
         self.observer = observer
+        self._system_cpu_previous: tuple[int, int] | None = None
         self._owner_lock_path = self.control_root / OWNER_LOCK_NAME
         if observer:
             # Read-only view: never recovers, rewrites, captures or reserves anything.
@@ -571,6 +579,9 @@ class ControlPlane:
                     self._slot_fences[reattached_slot_id] = secrets.token_hex(16)
                     record["slot_fence_token"] = self._slot_fences[reattached_slot_id]
                 atomic_json(path, record)
+                deadline = record.get("deadline_unix_ns")
+                if isinstance(deadline, int) and deadline <= time.time_ns():
+                    self._request_deadline_stop_locked(launch_id, record)
                 continue
             record.update(
                 {
@@ -725,6 +736,283 @@ class ControlPlane:
                 campaigns.append(payload)
         return sorted(campaigns, key=lambda item: str(item.get("created_at", "")), reverse=True)
 
+    def _operator_system_resources(self) -> dict[str, object]:
+        if os.name != "nt":
+            return {"cpu_percent": None, "memory_percent": None, "memory_used_bytes": None, "memory_total_bytes": None}
+        import ctypes
+        from ctypes import wintypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+        idle, kernel, user = FileTime(), FileTime(), FileTime()
+        cpu_percent: float | None = None
+        if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            values = tuple((item.high << 32) | item.low for item in (idle, kernel, user))
+            total = values[1] + values[2]
+            if self._system_cpu_previous is not None:
+                previous_total, previous_idle = self._system_cpu_previous
+                delta_total = total - previous_total
+                delta_idle = values[0] - previous_idle
+                if delta_total > 0:
+                    cpu_percent = round(max(0.0, min(100.0, 100.0 * (delta_total - delta_idle) / delta_total)), 1)
+            self._system_cpu_previous = (total, values[0])
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", wintypes.DWORD), ("memory_load", wintypes.DWORD),
+                ("total_physical", ctypes.c_ulonglong), ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong), ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        memory = MemoryStatus()
+        memory.length = ctypes.sizeof(memory)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory)):
+            return {"cpu_percent": cpu_percent, "memory_percent": int(memory.memory_load),
+                    "memory_used_bytes": int(memory.total_physical - memory.available_physical),
+                    "memory_total_bytes": int(memory.total_physical)}
+        return {"cpu_percent": cpu_percent, "memory_percent": None, "memory_used_bytes": None, "memory_total_bytes": None}
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def operator_snapshot(self) -> dict[str, object]:
+        status = self.status()
+        self._ensure_auto_reports(status)
+        active = status.get("active_launches", [])
+        active_records = [row for row in active if isinstance(row, Mapping)] if isinstance(active, list) else []
+        campaigns = self.list_campaigns()
+        campaign_id = next((str(row.get("campaign_id")) for row in active_records if row.get("campaign_id")), None)
+        if campaign_id is None and campaigns:
+            campaign_id = str(campaigns[0].get("campaign_id", "")) or None
+        shared_root_value = next((row.get("shared_root") for row in active_records if isinstance(row.get("shared_root"), str)), None)
+        shared_root = Path(str(shared_root_value)) if shared_root_value else (self.runtime_root / "shared" / campaign_id if campaign_id else None)
+        manifest = self._read_json(shared_root / "manifest.json") if shared_root is not None else {}
+        if shared_root is not None and not manifest.get("evaluations"):
+            eval_file = shared_root / "evaluations.jsonl"
+            if eval_file.is_file():
+                try:
+                    manifest["evaluations"] = [json.loads(line) for line in eval_file.read_text("utf-8").splitlines() if line.strip()]
+                except (OSError, json.JSONDecodeError):
+                    manifest["evaluations"] = []
+        progress = manifest.get("episode_progress", [])
+        progress_rows = [row for row in progress if isinstance(row, Mapping)] if isinstance(progress, list) else []
+        evaluations = manifest.get("evaluations", [])
+        evaluation_rows = [row for row in evaluations if isinstance(row, Mapping)] if isinstance(evaluations, list) else []
+        now_ns = time.time_ns()
+        started_values: list[int] = [int(row["started_unix_ns"]) for row in active_records if isinstance(row.get("started_unix_ns"), int)]
+        if not started_values and campaign_id:
+            records = self._campaign_launch_records(campaign_id)
+            started_values = [int(row["started_unix_ns"]) for row in records if isinstance(row.get("started_unix_ns"), int)]
+        started_ns = min(started_values) if started_values else None
+        elapsed_seconds = max(0.0, (now_ns - started_ns) / 1_000_000_000) if isinstance(started_ns, int) else 0.0
+        deadlines: list[int] = [int(row["deadline_unix_ns"]) for row in active_records if isinstance(row.get("deadline_unix_ns"), int)]
+        remaining_seconds = max(0.0, (min(deadlines) - now_ns) / 1_000_000_000) if deadlines else None
+        completed_timesteps = int(manifest.get("completed_timesteps", 0) or 0)
+        learner_round = int(manifest.get("round", 0) or 0)
+        hours = max(elapsed_seconds / 3600.0, 1 / 3600.0)
+        scene_rows = self._campaign_scene_discoveries(campaign_id) if campaign_id else []
+        discoveries = {str(row["scene_name"]): int(row["first_seen_unix_ns"]) for row in scene_rows}
+        deaths = sum(int(row.get("deaths", 0) or 0) for row in progress_rows)
+        recoveries = sum(int(row.get("shade_recoveries", 0) or 0) for row in progress_rows)
+        shade_losses = sum(int(row.get("shade_losses", 0) or 0) for row in progress_rows)
+        first_scene_steps = [int(row["steps_to_first_scene_change"]) for row in progress_rows if isinstance(row.get("steps_to_first_scene_change"), int)]
+        alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
+        latest_shared = next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True), None)
+        latest_shared_id = str(latest_shared.get("campaign_id")) if isinstance(latest_shared, Mapping) else None
+        latest_checkpoint_exists = bool(latest_shared_id and any((self.runtime_root / "shared" / latest_shared_id / "checkpoints").glob("round-*.zip")))
+        last_completion: dict[str, object] | None = None
+        if not active_records and campaign_id:
+            terminal_records = self._campaign_launch_records(campaign_id)
+            finished = sorted((row for row in terminal_records if row.get("status") in {"CANCELLED", "COMPLETED", "FAILED"}), key=lambda row: int(row.get("finished_unix_ns", 0) or 0))
+            if finished:
+                newest_group = finished[-1].get("shared_group")
+                group_rows = [row for row in finished if row.get("shared_group") == newest_group] if newest_group else [finished[-1]]
+                save_states = [row.get("final_save_status") for row in group_rows if row.get("mode") == "execute"]
+                last_completion = {"safe": bool(save_states) and all(value == "captured" for value in save_states),
+                                  "saves_restored": bool(save_states) and all(value == "captured" for value in save_states),
+                                  "status": group_rows[-1].get("status"),
+                                  "reason": group_rows[-1].get("stop_reason") or group_rows[-1].get("failure")}
+        if elapsed_seconds >= 7200 and (not discoveries or max(discoveries.values(), default=0) < now_ns - 7_200_000_000_000):
+            alerts.append("Sem novas salas descobertas nas últimas 2 h")
+        restart_count = 0
+        instance_rows: list[dict[str, object]] = []
+        shared_root_for_slots = shared_root
+        if shared_root_for_slots is not None:
+            actors_root = shared_root_for_slots / "actors"
+            for slot_file in actors_root.glob("slot-*.json"):
+                actor = self._read_json(slot_file)
+                restart_times = actor.get("restart_times_unix_ns", [])
+                recent_restarts = [stamp for stamp in restart_times if isinstance(stamp, int) and stamp >= now_ns - 3_600_000_000_000] if isinstance(restart_times, list) else []
+                restart_count += len(recent_restarts)
+                instance_rows.append({"slot": actor.get("slot"), "status": actor.get("status", "unknown"), "restarts_last_hour": len(recent_restarts), "problem": actor.get("status") == "FAILED"})
+                if len(recent_restarts) >= 3:
+                    alerts.append(f"Instância {actor.get('slot')} reiniciou {len(recent_restarts)} vezes na última hora")
+        if "same_scene_action_over_40_percent_without_novelty" in alerts:
+            alerts[alerts.index("same_scene_action_over_40_percent_without_novelty")] = "A IA parece estar repetindo o mesmo lugar"
+        raw_capacity = status.get("capacity", 1)
+        capacity = raw_capacity if isinstance(raw_capacity, int) and not isinstance(raw_capacity, bool) else 1
+        return {
+            "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
+            "remaining_seconds": remaining_seconds, "instances": instance_rows,
+            "training_steps": completed_timesteps, "steps_per_second": completed_timesteps / max(elapsed_seconds, 1.0),
+            "learner_updates": learner_round, "updates_per_hour": learner_round / hours,
+            "deaths_per_hour": deaths / hours, "shade_recoveries_per_hour": recoveries / hours,
+            "shade_losses": shade_losses, "average_steps_to_first_scene": sum(first_scene_steps) / len(first_scene_steps) if first_scene_steps else None,
+            "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
+            "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-100:], "evaluation_trend": manifest.get("evaluation_trend", []),
+            "alerts": sorted(set(alerts)), "instance_restarts_last_hour": restart_count,
+            "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
+            "max_instances": min(3, capacity),
+            "can_continue": latest_checkpoint_exists, "has_campaign": bool(latest_shared),
+            "last_completion": last_completion,
+            "checkpoints": manifest.get("checkpoints", []), "reward_version": next((row.get("reward_version") for row in campaigns if row.get("campaign_id") == campaign_id), None),
+            "advanced": {"launch_ids": [row.get("launch_id") for row in active_records], "shared_root": str(shared_root) if shared_root else None,
+                         "artifact_path": str(shared_root) if shared_root else None},
+            "system": self._operator_system_resources(), "reports": self.list_reports()[:10],
+        }
+
+    def _campaign_launch_records(self, campaign_id: str) -> list[dict[str, Any]]:
+        records = []
+        root = self.control_root / "launches"
+        if root.exists():
+            for path in root.glob("*/launch.json"):
+                item = self._read_json(path)
+                if item.get("campaign_id") == campaign_id:
+                    records.append(item)
+        return records
+
+    def _campaign_scene_discoveries(self, campaign_id: str | None) -> list[dict[str, Any]]:
+        if not campaign_id:
+            return []
+        discoveries: dict[str, int] = {}
+        campaign_memory = self.runtime_root / "campaign-memory" / campaign_id
+        for path in campaign_memory.glob("slot-*/lifelong-scene-first-seen.json"):
+            memory = self._read_json(path).get("first_seen_unix_ns", {})
+            if isinstance(memory, Mapping):
+                for scene, timestamp in memory.items():
+                    if isinstance(scene, str) and isinstance(timestamp, int):
+                        discoveries[scene] = min(discoveries.get(scene, timestamp), timestamp)
+        return [{"scene_name": name, "first_seen": time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp / 1_000_000_000)), "first_seen_unix_ns": stamp}
+                for name, stamp in sorted(discoveries.items(), key=lambda item: item[1])]
+
+    def _ensure_auto_reports(self, status: Mapping[str, object]) -> None:
+        active = status.get("active_launches", [])
+        active_campaigns = {str(row.get("campaign_id")) for row in active if isinstance(row, Mapping) and row.get("campaign_id")} if isinstance(active, list) else set()
+        candidates = {
+            str(row.get("campaign_id"))
+            for row in self.list_campaigns()
+            if row.get("campaign_id") and row.get("shared_learner") is True
+            and row.get("reward_version") == "explore_v3"
+        }
+        existing: dict[str, int] = {}
+        for report in self.list_reports():
+            campaign = str(report.get("campaign_id", ""))
+            finished = report.get("last_finished_unix_ns")
+            if isinstance(finished, int):
+                existing[campaign] = max(existing.get(campaign, 0), finished)
+        for campaign_id in candidates - active_campaigns:
+            records = self._campaign_launch_records(campaign_id)
+            if records and all(row.get("status") in {"CANCELLED", "COMPLETED", "FAILED"} for row in records):
+                latest_finish = max(
+                    (int(row["finished_unix_ns"]) for row in records if isinstance(row.get("finished_unix_ns"), int)),
+                    default=0,
+                )
+                if latest_finish <= existing.get(campaign_id, 0):
+                    continue
+                try:
+                    self.generate_run_report(campaign_id)
+                except (OSError, ValueError, TypeError):
+                    continue
+
+    def list_reports(self) -> list[dict[str, object]]:
+        root = self.artifacts_root / "reports"
+        reports = []
+        if root.exists():
+            for path in root.glob("*/*.json"):
+                item = self._read_json(path)
+                reports.append({"campaign_id": item.get("campaign_id", path.parent.name),
+                                "created_at": item.get("created_at"),
+                                "html": path.with_suffix(".html").relative_to(self.project_root).as_posix(),
+                                "json": path.relative_to(self.project_root).as_posix(),
+                                "training_steps": item.get("training_steps", 0),
+                                "learner_updates": item.get("learner_updates", 0),
+                                "last_finished_unix_ns": item.get("last_finished_unix_ns", 0)})
+        return sorted(reports, key=lambda row: str(row.get("created_at", "")), reverse=True)
+
+    def _campaign_report_data(self, campaign_id: str) -> dict[str, Any]:
+        if not _IDENTIFIER.fullmatch(campaign_id):
+            raise ValueError("invalid campaign_id")
+        records = self._campaign_launch_records(campaign_id)
+        shared_root = next((Path(str(row["shared_root"])) for row in reversed(records) if isinstance(row.get("shared_root"), str)), self.runtime_root / "shared" / campaign_id)
+        manifest = self._read_json(shared_root / "manifest.json")
+        status_rows = [self._read_json(self.control_root / "launches" / str(row.get("launch_id")) / "launch.json") for row in records]
+        starts: list[int] = [int(row["started_unix_ns"]) for row in status_rows if isinstance(row.get("started_unix_ns"), int)]
+        ends: list[int] = [int(row["finished_unix_ns"]) for row in status_rows if isinstance(row.get("finished_unix_ns"), int)]
+        duration = max(0.0, ((max(ends) if ends else time.time_ns()) - min(starts)) / 1_000_000_000) if starts else 0.0
+        slots = {resources.get("slot_id") for row in status_rows if isinstance((resources := row.get("resources")), Mapping) and isinstance(resources.get("slot_id"), int)}
+        episodes = [row for row in manifest.get("episode_progress", []) if isinstance(row, Mapping)] if isinstance(manifest.get("episode_progress", []), list) else []
+        evaluations = [row for row in manifest.get("evaluations", []) if isinstance(row, Mapping)] if isinstance(manifest.get("evaluations", []), list) else []
+        scenes = self._campaign_scene_discoveries(campaign_id)
+        alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
+        checkpoints = manifest.get("checkpoints", [])
+        if not isinstance(checkpoints, list):
+            checkpoints = [str(path) for path in sorted((shared_root / "checkpoints").glob("round-*.zip"))]
+        save_states = [row.get("final_save_status") for row in status_rows if row.get("mode") == "execute"]
+        save_checks = "restauração concluída" if save_states and all(item == "captured" for item in save_states) else "em andamento ou sem comprovação"
+        return {
+            "campaign_id": campaign_id, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "duration_seconds": duration, "instances": len(slots),
+            "training_steps": int(manifest.get("completed_timesteps", 0) or 0),
+            "learner_updates": int(manifest.get("round", 0) or 0),
+            "scenes_discovered": scenes,
+            "episode_progress": episodes, "evaluations": evaluations,
+            "deaths": sum(int(row.get("deaths", 0) or 0) for row in episodes),
+            "shade_recoveries": sum(int(row.get("shade_recoveries", 0) or 0) for row in episodes),
+            "shade_losses": sum(int(row.get("shade_losses", 0) or 0) for row in episodes),
+            "alerts": alerts, "instance_restarts": sum(int(row.get("relaunches", 0) or 0) for row in status_rows),
+            "checkpoints_saved": checkpoints, "save_safety_checks": save_checks,
+            "last_finished_unix_ns": max(ends, default=0),
+            "end_reason": next((row.get("stop_reason") for row in status_rows if row.get("stop_reason")),
+                               next((row.get("failure") for row in status_rows if row.get("failure")),
+                                    "parada solicitada" if any(row.get("status") == "CANCELLED" for row in status_rows) else "fim desconhecido")),
+            "task_contract": next((row.get("reward_version") for row in self.list_campaigns() if row.get("campaign_id") == campaign_id), "explore_v3"),
+        }
+
+    def generate_run_report(self, campaign_id: str) -> dict[str, object]:
+        from hk_agent.operator_reports import build_report
+
+        data, document = build_report(self._campaign_report_data(campaign_id))
+        folder = self.artifacts_root / "reports" / campaign_id
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{time.time_ns() % 1_000_000_000:09d}"
+        json_path = folder / f"relatorio-{stamp}.json"
+        html_path = json_path.with_suffix(".html")
+        atomic_json(json_path, data)
+        html_path.write_text(document, encoding="utf-8", newline="\n")
+        return {"campaign_id": campaign_id, "html": html_path.relative_to(self.project_root).as_posix(),
+                "json": json_path.relative_to(self.project_root).as_posix(), "created_at": data["created_at"]}
+
+    def read_report(self, relative_path: str) -> tuple[bytes, str]:
+        requested = Path(relative_path)
+        report_root = (self.artifacts_root / "reports").resolve(strict=False)
+        target = (self.project_root / requested).resolve(strict=True)
+        try:
+            target.relative_to(report_root)
+        except ValueError as error:
+            raise ValueError("report path is outside artifacts/reports") from error
+        if target.suffix not in {".html", ".json"} or not target.is_file():
+            raise ValueError("report file was not found")
+        content_type = "text/html; charset=utf-8" if target.suffix == ".html" else "application/json; charset=utf-8"
+        return target.read_bytes(), content_type
+
     def create_campaign(self, payload: Mapping[str, object]) -> dict[str, object]:
         self._require_owner()
         spec = CampaignSpec.from_payload(payload)
@@ -742,6 +1030,92 @@ class ControlPlane:
         atomic_json(path, record)
         record["spec_path"] = path.relative_to(self.project_root).as_posix()
         return record
+
+    @staticmethod
+    def _operator_duration(kind: object, value: object) -> float:
+        if kind == "until_stopped":
+            return 0.0
+        if kind == "hours":
+            hours = _bounded_float(value, "duration_hours", 0.25, 72.0)
+            return hours * 3600.0
+        if kind == "until_time":
+            if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                raise ValueError("end_time must use HH:MM")
+            now = time.localtime()
+            hour, minute = (int(part) for part in value.split(":"))
+            seconds = (hour * 3600 + minute * 60) - (now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec)
+            if seconds <= 0:
+                seconds += 24 * 3600
+            return float(seconds)
+        raise ValueError("duration_kind must be until_stopped, hours, or until_time")
+
+    def start_operator_campaign(self, *, instances: object, duration_kind: object, duration_value: object) -> dict[str, object]:
+        from hk_agent.config import load_config
+
+        config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
+        count = _bounded_int(instances, "instances", 1, 3)
+        if count > min(3, config.instance_count):
+            raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
+        limit_seconds = self._operator_duration(duration_kind, duration_value)
+        seed = secrets.randbelow(2**31)
+        now_slug = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        campaign_id = f"explore-{now_slug}-{secrets.token_hex(2)}"
+        payload: dict[str, object] = {
+            "campaign_id": campaign_id,
+            "name": f"Exploration {time.strftime('%d/%m %H:%M', time.localtime())}",
+            "campaign_type": "exploration_training",
+            "reward_version": "explore_v3",
+            "shared_learner": True,
+            "actors": count,
+            "rollout_steps": 512,
+            "batch_size": 256,
+            "checkpoint_interval": 512 * count,
+            "timesteps": 10_000_000,
+            "episodes": 1,
+            "horizon": 3000,
+            "action_repeat": 3,
+            "lease_ms": 80,
+            "duration_mode": "continuous",
+            "duration_limit_seconds": limit_seconds,
+            "seed": seed,
+            "save_source": "existing_save",
+            "save_slot": 1,
+            "weights": {},
+        }
+        campaign = self.create_campaign(payload)
+        launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
+        return {"campaign": campaign, "launch": launched}
+
+    def continue_operator_campaign(self) -> dict[str, object]:
+        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True]
+        for prior in campaigns:
+            campaign_id = str(prior.get("campaign_id", ""))
+            shared_root = self.runtime_root / "shared" / campaign_id
+            checkpoints = sorted((shared_root / "checkpoints").glob("round-*.zip"))
+            if not checkpoints:
+                continue
+            data = dict(prior)
+            data.update({"name": str(prior.get("name", "Exploration")), "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31-1)})
+            campaign = self.create_campaign(data)
+            launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
+            return {"campaign": campaign, "launch": launched, "checkpoint": str(checkpoints[-1])}
+        raise RuntimeError("No shared-learner checkpoint is available to continue")
+
+    def repeat_operator_campaign(self) -> dict[str, object]:
+        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True]
+        if not campaigns:
+            raise RuntimeError("No operator training campaign is available to repeat")
+        prior = campaigns[0]
+        data = dict(prior)
+        data.pop("version", None)
+        data.pop("created_at", None)
+        data.pop("spec_path", None)
+        data["campaign_id"] = f"{str(prior['campaign_id'])[:48]}-repeat-{secrets.token_hex(2)}"
+        data["name"] = f"{str(prior.get('name', 'Exploration'))[:56]} repeat"
+        data["seed"] = secrets.randbelow(2**31)
+        campaign = self.create_campaign(data)
+        launched = self.launch(str(campaign["campaign_id"]), version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
+        return {"campaign": campaign, "launch": launched}
 
     def _resolve_campaign(self, campaign_id: str, version: int | None) -> tuple[CampaignSpec, Path]:
         if not _IDENTIFIER.fullmatch(campaign_id):
@@ -989,6 +1363,7 @@ class ControlPlane:
     ) -> dict[str, object]:
         self._require_owner()
         launch_id = time.strftime("launch-%Y%m%dT%H%M%S", time.gmtime()) + f"-{secrets.token_hex(3)}"
+        started_ns = time.time_ns()
         launch_root = self.control_root / "launches" / launch_id
         launch_root.mkdir(parents=True, exist_ok=False)
         stop_file = launch_root / "stop.request"
@@ -1011,7 +1386,8 @@ class ControlPlane:
             "campaign_version": version, "mode": "shared-learner", "role": "learner",
             "shared_group": group_id, "shared_root": str(shared_root),
             "resources": {"slot_id": None, "training_device": "cpu"},
-            "started_unix_ns": time.time_ns(), "heartbeat_unix_ns": time.time_ns(),
+            "started_unix_ns": started_ns, "heartbeat_unix_ns": started_ns,
+            "deadline_unix_ns": started_ns + int(spec.duration_limit_seconds * 1_000_000_000) if spec.duration_limit_seconds else None,
             "status": "RUNNING", "phase": "starting", "command": command[1:],
             "log_path": log_path.relative_to(self.project_root).as_posix(),
             "stop_file": stop_file.relative_to(self.project_root).as_posix(),
@@ -1204,6 +1580,8 @@ class ControlPlane:
                 "heartbeat_unix_ns": time.time_ns(),
                 "command": command[1:],
             }
+            if spec.duration_limit_seconds:
+                record["deadline_unix_ns"] = _bounded_int(record["started_unix_ns"], "started_unix_ns", 0, 2**63 - 1) + int(spec.duration_limit_seconds * 1_000_000_000)
             self._launches[launch_id] = record
             fence_token = secrets.token_hex(16) if execute and slot_id is not None else None
             if slot_id is not None and fence_token is not None:
@@ -1694,6 +2072,7 @@ class ControlPlane:
         # The waiter owns the terminal transition and persists it before releasing
         # the active slot.  Clearing here would race with it and could leave the
         # launch record permanently at STOP_REQUESTED.
+        self._enforce_deadlines_locked()
         for tracked_id in set(self._processes) | set(self._reattached_pids):
             self._merge_game_identity_locked(tracked_id)
         for launch_id, pid in list(self._reattached_pids.items()):
@@ -1734,6 +2113,40 @@ class ControlPlane:
             atomic_json(self.control_root / "launches" / launch_id / "launch.json", record)
             self._reattached_pids.pop(launch_id, None)
             self._release_slot_locked(launch_id)
+
+    def _request_deadline_stop_locked(self, launch_id: str, record: dict[str, object]) -> None:
+        if record.get("status") == "STOP_REQUESTED":
+            return
+        stop_value = record.get("stop_file")
+        if not isinstance(stop_value, str) or not stop_value:
+            return
+        stop_path = Path(stop_value)
+        if not stop_path.is_absolute():
+            stop_path = self.project_root / stop_path
+        pending = stop_path.with_suffix(stop_path.suffix + ".pending")
+        pending.write_text(json.dumps({"requested_unix_ns": time.time_ns(), "reason": "time_limit"}), encoding="utf-8")
+        os.replace(pending, stop_path)
+        record.update({"status": "STOP_REQUESTED", "stop_reason": "time_limit"})
+        atomic_json(self.control_root / "launches" / launch_id / "launch.json", record)
+
+    def _enforce_deadlines_locked(self) -> None:
+        now = time.time_ns()
+        active_ids = set(self._processes) | set(self._reattached_pids) | self._preparing_ids
+        expired_groups: set[str] = set()
+        for launch_id in active_ids:
+            record = self._launches.get(launch_id)
+            deadline = record.get("deadline_unix_ns") if isinstance(record, dict) else None
+            if isinstance(record, dict) and isinstance(deadline, int) and deadline <= now:
+                group = record.get("shared_group")
+                if isinstance(group, str):
+                    expired_groups.add(group)
+                else:
+                    self._request_deadline_stop_locked(launch_id, record)
+        for group in expired_groups:
+            for launch_id in active_ids:
+                record = self._launches.get(launch_id)
+                if isinstance(record, dict) and record.get("shared_group") == group:
+                    self._request_deadline_stop_locked(launch_id, record)
 
     def _active_records_locked(self) -> list[dict[str, object]]:
         live_ids = set(self._processes) | set(self._reattached_pids) | self._preparing_ids | set(self._slot_owners.values())

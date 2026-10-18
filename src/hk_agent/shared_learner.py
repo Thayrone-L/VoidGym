@@ -922,6 +922,18 @@ def run_shared_actor(
     if not isinstance(contract_body, Mapping):
         raise SharedLearnerError("shared calibration has no actor contract")
     fingerprint = _safe_fingerprint(contract_body.get("task_contract_fingerprint"))
+    try:
+        previous_actor_status = json.loads(store.actor_status_path(slot).read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous_actor_status = {}
+    restart_times = previous_actor_status.get("restart_times_unix_ns", []) if isinstance(previous_actor_status, Mapping) else []
+    restart_times = [stamp for stamp in restart_times if isinstance(stamp, int) and stamp > time.time_ns() - 86_400_000_000_000] if isinstance(restart_times, list) else []
+    if os.environ.get("HK_AGENT_RESTART_OF"):
+        restart_times.append(time.time_ns())
+    store.publish_actor_status(
+        slot=slot, launch_id=launch_id, status="STARTING",
+        relaunches=len(restart_times), restart_times_unix_ns=restart_times,
+    )
     status: dict[str, Any] = {
         "schema_version": SHARED_SCHEMA_VERSION,
         "status": "RUNNING",
@@ -934,7 +946,8 @@ def run_shared_actor(
         "policy_import_retries": 0,
         "policy_import_skips": 0,
         "stale_rollouts": 0,
-        "relaunches": int(bool(os.environ.get("HK_AGENT_RESTART_OF"))),
+        "relaunches": len(restart_times),
+        "restart_times_unix_ns": restart_times,
         "started_unix_ns": time.time_ns(),
     }
     _atomic_json(output_root / "manifest.json", status)
