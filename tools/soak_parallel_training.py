@@ -585,7 +585,8 @@ def _write_report(manifest: Mapping[str, Any], path: Path) -> None:
 
 
 def _run_shared_learner_soak(
-    project_root: Path, duration_seconds: int = 1200, restart_at_seconds: int = 600
+    project_root: Path, duration_seconds: int = 1200, restart_at_seconds: int = 600,
+    *, start_long_campaign: bool = True,
 ) -> tuple[dict[str, Any], ControlPlane | None]:
     """Run the 20-minute shared soak, then leave the long run under panel ownership."""
     from hk_agent.scene_change_task import SCENE_CHANGE_ACTION_NAMES
@@ -953,34 +954,37 @@ def _run_shared_learner_soak(
                        "actor_restarted_and_learner_continued": True,
                        "personal_save_baseline_registry_isolation_orphans": True},
         })
-        long_payload = _shared_campaign_payload("longa-learner-1-" + stamp, "longa-learner-1")
-        long_payload["max_checkpoints"] = 5
-        long_campaign = control.create_campaign(long_payload)
-        long_launch = control.launch(str(long_campaign["campaign_id"]),
-                                     version=int(long_campaign["version"]), execute=True)
-        long_group_id = str(long_launch["shared_group"])
-        long_root = Path(str(long_launch["shared_root"]))
-        long_status: dict[str, Any] = {}
-        for _ in range(600):
-            try:
-                long_status = _load_json_retry(long_root / "learner.json")
-            except (OSError, json.JSONDecodeError):
-                long_status = {}
-            if long_status.get("status") in {"FAILED", "CANCELLED", "COMPLETED"}:
-                raise RuntimeError(f"long learner ended during startup: {long_status}")
-            if long_status.get("status") in {"WAITING", "TRAINING", "RUNNING"}:
-                break
-            time.sleep(1)
+        if start_long_campaign:
+            long_payload = _shared_campaign_payload("longa-learner-1-" + stamp, "longa-learner-1")
+            long_payload["max_checkpoints"] = 5
+            long_campaign = control.create_campaign(long_payload)
+            long_launch = control.launch(str(long_campaign["campaign_id"]),
+                                         version=int(long_campaign["version"]), execute=True)
+            long_group_id = str(long_launch["shared_group"])
+            long_root = Path(str(long_launch["shared_root"]))
+            long_status: dict[str, Any] = {}
+            for _ in range(600):
+                try:
+                    long_status = _load_json_retry(long_root / "learner.json")
+                except (OSError, json.JSONDecodeError):
+                    long_status = {}
+                if long_status.get("status") in {"FAILED", "CANCELLED", "COMPLETED"}:
+                    raise RuntimeError(f"long learner ended during startup: {long_status}")
+                if long_status.get("status") in {"WAITING", "TRAINING", "RUNNING"}:
+                    break
+                time.sleep(1)
+            else:
+                raise TimeoutError("long learner did not publish a live heartbeat")
+            manifest["long_campaign"] = {
+                "campaign_id": long_campaign["campaign_id"], "version": long_campaign["version"],
+                "shared_group": long_group_id, "shared_root": str(long_root),
+                "launch_ids": [str(long_launch["learner"]["launch_id"]),
+                               *[str(actor["launch_id"]) for actor in long_launch["actors"]]],
+                "status": long_status["status"], "panel_url": "http://127.0.0.1:8765",
+                "stop_instructions": "No painel, selecione qualquer membro ativo do grupo e clique em Parar.",
+            }
         else:
-            raise TimeoutError("long learner did not publish a live heartbeat")
-        manifest["long_campaign"] = {
-            "campaign_id": long_campaign["campaign_id"], "version": long_campaign["version"],
-            "shared_group": long_group_id, "shared_root": str(long_root),
-            "launch_ids": [str(long_launch["learner"]["launch_id"]),
-                           *[str(actor["launch_id"]) for actor in long_launch["actors"]]],
-            "status": long_status["status"], "panel_url": "http://127.0.0.1:8765",
-            "stop_instructions": "No painel, selecione qualquer membro ativo do grupo e clique em Parar.",
-        }
+            manifest["long_campaign"] = None
         path = project_root / "agent-prompts" / "relatorios" / "46_resoak_learner.txt"
         _write_shared_report(manifest, path)
         manifest["report_path"] = str(path)
@@ -1185,15 +1189,22 @@ def main() -> int:
                         help="authorize this script to open both managed Hollow Knight instances")
     parser.add_argument("--shared-learner", action="store_true",
                         help="run prompt 44's shared learner soak and long campaign")
+    parser.add_argument("--no-long-campaign", action="store_true",
+                        help="stop after the soak and leave the shared group safely stopped")
     args = parser.parse_args()
     if not args.confirm_open_games:
         print("No games opened. Run with --confirm-open-games after authorization.")
         return 2
     if args.shared_learner:
-        result, control = _run_shared_learner_soak(PROJECT_ROOT)
+        result, control = _run_shared_learner_soak(
+            PROJECT_ROOT, start_long_campaign=not args.no_long_campaign
+        )
         if result.get("status") != "PASSED" or control is None:
             print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
             return 1
+        if args.no_long_campaign:
+            print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+            return 0
         from hk_agent.control_plane_server import ControlPlaneHTTPServer
 
         static_root = PROJECT_ROOT / "src" / "hk_agent" / "control_plane_web"
