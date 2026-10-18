@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -21,6 +22,21 @@ from hk_agent.shared_learner import (
 )
 
 FINGERPRINT = "a" * 64
+
+
+def test_actor_liveness_grace_covers_rollout_publication_but_not_restart(tmp_path):
+    store = SharedRoundStore(tmp_path)
+    now = time.time_ns()
+    assert store.publish_actor_status(
+        slot=0, launch_id="actor-1", status="PUBLISHING", heartbeat_unix_ns=now
+    )
+    assert store.actor_available(0, now_unix_ns=now + 80_000_000_000) is True
+    assert store.actor_available(0, now_unix_ns=now + 91_000_000_000) is False
+
+    store.publish_actor_status(
+        slot=0, launch_id="actor-1", status="RESTARTING", heartbeat_unix_ns=now
+    )
+    assert store.actor_available(0, now_unix_ns=now + 1_000_000_000) is False
 
 
 def _publish_arrays(root, *, round_number=1, fingerprint=FINGERPRINT):
