@@ -47,6 +47,14 @@ class FirstTrainingConfig:
     training_device: str = "cpu"
     torch_threads: int = 3
     torch_interop_threads: int = 1
+    ent_coef: float | None = None
+    gamma: float | None = None
+    gae_lambda: float | None = None
+    n_epochs: int | None = None
+    target_kl: float | None = None
+    learning_rate: float | None = None
+    clip_range: float | None = None
+    shared_actors: int = 1
 
     def validate(self) -> None:
         if not 1 <= self.total_timesteps <= 10_000_000:
@@ -59,8 +67,10 @@ class FirstTrainingConfig:
             raise ValueError("total_timesteps must be a multiple of rollout_steps")
         if self.checkpoint_interval % self.rollout_steps != 0:
             raise ValueError("checkpoint_interval must be a multiple of rollout_steps")
-        if self.rollout_steps % self.batch_size != 0:
-            raise ValueError("batch_size must divide rollout_steps")
+        if not 1 <= self.shared_actors <= 3:
+            raise ValueError("shared_actors must be in [1, 3]")
+        if self.rollout_steps * self.shared_actors % self.batch_size != 0:
+            raise ValueError("batch_size must divide rollout_steps times actors")
         if not 2 <= self.max_checkpoints <= 100:
             raise ValueError("max_checkpoints must be in [2, 100]")
         if self.resume_checkpoint is not None and self.resume_checkpoint.suffix != ".zip":
@@ -97,6 +107,14 @@ class FirstTrainingConfig:
             raise ValueError("torch_threads must be in [1, 8]")
         if not 1 <= self.torch_interop_threads <= 4:
             raise ValueError("torch_interop_threads must be in [1, 4]")
+        for name in ("ent_coef", "gamma", "gae_lambda", "target_kl", "learning_rate", "clip_range"):
+            value = getattr(self, name)
+            if value is not None and (not np.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be positive and finite")
+        if self.gamma is not None and self.gamma > 1 or self.gae_lambda is not None and self.gae_lambda > 1:
+            raise ValueError("gamma and gae_lambda cannot exceed 1")
+        if self.n_epochs is not None and self.n_epochs < 1:
+            raise ValueError("n_epochs must be positive")
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -208,6 +226,11 @@ def train_ppo(
         "duration_mode": "continuous" if config.continuous else "limited",
         "total_timesteps": None if config.continuous else config.total_timesteps,
         "checkpoint_interval": config.checkpoint_interval,
+        "rollout_steps": config.rollout_steps,
+        "batch_size": config.batch_size,
+        "ppo_hyperparameters": {name: getattr(config, name) for name in (
+            "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+        ) if getattr(config, name) is not None},
         "max_checkpoints": config.max_checkpoints,
         "reward_version": reward_version,
         "diagnostic_training": diagnostic_training,
@@ -296,6 +319,9 @@ def train_ppo(
                 batch_size=config.batch_size,
                 verbose=1,
                 device=config.training_device,
+                **{name: getattr(config, name) for name in (
+                    "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+                ) if getattr(config, name) is not None},
             )
             if (
                 config.warm_start_policy is not None

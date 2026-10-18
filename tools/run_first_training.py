@@ -32,6 +32,7 @@ from hk_agent.campaign_source import (
     validate_save_precondition,
 )
 from hk_agent.config import load_config
+from hk_agent.exploration_task import ExplorationTask, ExplorationTaskConfig, calibrate_novelty
 from hk_agent.first_training import FirstTrainingConfig, atomic_json, sha256_file, train_ppo
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.launch_options import windowed_game_arguments
@@ -49,6 +50,7 @@ from hk_agent.training_task import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run diagnostic PPO against Hollow Knight")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
+    parser.add_argument("--task", choices=("visual_motion", "exploration"), default="visual_motion")
     parser.add_argument(
         "--bootstrap-plan",
         type=Path,
@@ -72,6 +74,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--ent-coef", type=float)
+    parser.add_argument("--gamma", type=float)
+    parser.add_argument("--gae-lambda", type=float)
+    parser.add_argument("--n-epochs", type=int)
+    parser.add_argument("--target-kl", type=float)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--clip-range", type=float)
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path)
@@ -92,6 +101,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-interop-threads", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--horizon", type=int, default=128)
     parser.add_argument("--visual-change-scale", type=float, default=0.1)
+    parser.add_argument("--novelty-reward", type=float, default=0.05)
+    parser.add_argument("--novelty-threshold", type=float, default=0.02)
+    parser.add_argument("--novelty-budget", type=float, default=20.0)
+    parser.add_argument("--scene-change-reward", type=float, default=5.0)
     parser.add_argument("--time-cost", type=float, default=-0.001)
     parser.add_argument("--success-reward", type=float, default=1.0)
     parser.add_argument("--enemy-kill-reward", type=float, default=2.0)
@@ -120,7 +133,7 @@ def build_task(
     bootstrap_plan: MenuBootstrapPlan,
     bootstrap_plan_provider: Callable[[], MenuBootstrapPlan] | None,
     output_root: Path,
-    task_config: VisualMotionTaskConfig,
+    task_config: Any,
     args: argparse.Namespace,
     phase: str,
 ) -> tuple[VisualMotionTask, IsolatedEpisodeProcessOwner]:
@@ -161,8 +174,9 @@ def build_task(
             max_episode_steps=task_config.horizon_steps,
             log_root=phase_root / "experience",
         )
+        task_class = ExplorationTask if args.task == "exploration" else VisualMotionTask
         return (
-            VisualMotionTask(
+            task_class(
                 environment,
                 config=task_config,
                 task_log_path=phase_root / "task-transitions.jsonl",
@@ -198,6 +212,21 @@ def calibrate(
         if terminated or truncated or info.get("valid") is not True:
             raise RuntimeError("active calibration ended before its sample budget")
         active.append(float(info["motion_fraction"]))
+    return noop, active, stop_file is not None and stop_file.is_file()
+
+
+def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path | None = None):
+    task.reset(seed=seed)
+    noop: list[list[float]] = []
+    active: list[list[float]] = []
+    for target, actions in ((noop, [0] * 10), (active, [1 if i % 2 == 0 else 2 for i in range(10)])):
+        for action in actions:
+            if stop_file is not None and stop_file.is_file():
+                return noop, active, True
+            _, _, terminated, truncated, info = task.step(action)
+            if terminated or truncated or info.get("valid") is not True:
+                raise RuntimeError("exploration calibration ended before its sample budget")
+            target.append(info["descriptor"])
     return noop, active, stop_file is not None and stop_file.is_file()
 
 
@@ -266,6 +295,15 @@ def main() -> int:
         training_device=args.training_device,
         torch_threads=args.torch_threads,
         torch_interop_threads=args.torch_interop_threads,
+        ent_coef=args.ent_coef if args.ent_coef is not None else (0.01 if args.task == "exploration" else None),
+        gamma=args.gamma if args.gamma is not None else (0.995 if args.task == "exploration" else None),
+        gae_lambda=args.gae_lambda if args.gae_lambda is not None else (0.95 if args.task == "exploration" else None),
+        n_epochs=args.n_epochs if args.n_epochs is not None else (4 if args.task == "exploration" else None),
+        target_kl=args.target_kl if args.target_kl is not None else (0.03 if args.task == "exploration" else None),
+        learning_rate=args.learning_rate if args.learning_rate is not None else (2.5e-4 if args.task == "exploration" else None),
+        clip_range=args.clip_range if args.clip_range is not None else (0.2 if args.task == "exploration" else None),
+        shared_actors=(int(os.environ.get("HK_AGENT_SHARED_ACTORS", "1"))
+                       if os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" else 1),
     )
     training_config.validate()
     dependency_state = {
@@ -274,8 +312,10 @@ def main() -> int:
     }
     plan: dict[str, object] = {
         "mode": "execute" if args.execute else "dry-run",
-        "diagnostic_training": True,
-        "claim": "motor-signal diagnostic; not game progress or task success",
+        "diagnostic_training": args.task != "exploration",
+        "claim": ("pixel-only exploration with bounded reward-only bridge signals"
+                  if args.task == "exploration" else
+                  "motor-signal diagnostic; not game progress or task success"),
         "algorithm": "PPO",
         "seed": args.seed,
         "duration_mode": "continuous" if args.continuous else "limited",
@@ -335,9 +375,10 @@ def main() -> int:
     config_path = args.config.resolve(strict=True)
     bootstrap_path = resolved_bootstrap.base_path
     reference_path = bootstrap_plan.readiness.reference_image.resolve(strict=True)
-    training_task_path = (PROJECT_ROOT / "src" / "hk_agent" / "training_task.py").resolve(
-        strict=True
-    )
+    training_task_path = (
+        PROJECT_ROOT / "src" / "hk_agent"
+        / ("exploration_task.py" if args.task == "exploration" else "training_task.py")
+    ).resolve(strict=True)
     action_masking_path = (PROJECT_ROOT / "src" / "hk_agent" / "action_masking.py").resolve(
         strict=True
     )
@@ -422,7 +463,27 @@ def main() -> int:
     run_root = args.output_root.resolve(strict=False) / (
         time.strftime("run-%Y%m%dT%H%M%S") + f"-{secrets.token_hex(3)}"
     )
-    base_task_config = VisualMotionTaskConfig(
+    if args.task == "exploration":
+        base_task_config = ExplorationTaskConfig(
+            horizon_steps=args.horizon, novelty_reward=args.novelty_reward,
+            novelty_threshold=args.novelty_threshold, novelty_budget=args.novelty_budget,
+            scene_change_reward=args.scene_change_reward, enemy_kill_reward=args.enemy_kill_reward,
+            enemy_kill_reward_budget=args.enemy_kill_reward_budget,
+            shade_recovery_reward=args.shade_recovery_reward, damage_penalty=args.damage_penalty,
+            geo_gain_reward=args.geo_gain_reward, geo_spend_reward=args.geo_spend_reward,
+            death_penalty=args.death_penalty, run_failed_penalty=args.run_failed_penalty,
+            time_cost=args.time_cost, lease_base_ms=args.lease_ms,
+            ent_coef=args.ent_coef if args.ent_coef is not None else 0.01,
+            gamma=args.gamma if args.gamma is not None else 0.995,
+            gae_lambda=args.gae_lambda if args.gae_lambda is not None else 0.95,
+            n_epochs=args.n_epochs if args.n_epochs is not None else 4,
+            target_kl=args.target_kl if args.target_kl is not None else 0.03,
+            learning_rate=args.learning_rate if args.learning_rate is not None else 2.5e-4,
+            clip_range=args.clip_range if args.clip_range is not None else 0.2,
+        )
+        base_task_config.validate()
+    else:
+        base_task_config = VisualMotionTaskConfig(
         horizon_steps=None if args.continuous else args.horizon,
         visual_change_scale=args.visual_change_scale,
         time_cost=args.time_cost,
@@ -435,8 +496,8 @@ def main() -> int:
         geo_spend_reward=args.geo_spend_reward,
         death_penalty=args.death_penalty,
         run_failed_penalty=args.run_failed_penalty,
-    )
-    base_task_config.validate()
+        )
+        base_task_config.validate()
 
     if args.stop_file is not None and args.stop_file.is_file():
         result = cancelled_result(training_config, run_root / "training", provenance)
@@ -453,13 +514,26 @@ def main() -> int:
         phase="calibration",
     )
     try:
-        noop_motion, active_motion, cancelled = calibrate(
-            calibration_task,
-            seed=args.seed,
-            samples=args.calibration_samples,
-            stop_file=args.stop_file,
-        )
-        if not cancelled:
+        if args.task == "exploration":
+            noop_motion, active_motion, cancelled = calibrate_exploration(
+                calibration_task, seed=args.seed, stop_file=args.stop_file
+            )
+            if not cancelled:
+                threshold = calibrate_novelty(
+                    [__import__("numpy").asarray(value, dtype="float32") for value in noop_motion],
+                    [__import__("numpy").asarray(value, dtype="float32") for value in active_motion],
+                )
+                calibrated = replace(base_task_config, novelty_threshold=threshold)
+                atomic_json(run_root / "calibration.json", {
+                    "schema_version": 1, "status": "PASSED", "noop_descriptors": noop_motion,
+                    "active_descriptors": active_motion, "novelty_threshold": threshold,
+                })
+        else:
+            noop_motion, active_motion, cancelled = calibrate(
+                calibration_task, seed=args.seed, samples=args.calibration_samples,
+                stop_file=args.stop_file,
+            )
+        if not cancelled and args.task != "exploration":
             calibrated = resolve_calibrated_config(
                 base_task_config,
                 noop_motion=noop_motion,
@@ -476,7 +550,7 @@ def main() -> int:
                 },
             )
         shared_root_value = os.environ.get("HK_AGENT_SHARED_ROOT")
-        if not cancelled and os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" and shared_root_value:
+        if not cancelled and args.task != "exploration" and os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" and shared_root_value:
             from hk_agent.shared_learner import share_calibration
 
             shared_calibration = share_calibration(
@@ -497,6 +571,22 @@ def main() -> int:
                 active_motion=[float(value) for value in shared_active],
             )
             atomic_json(run_root / "calibration.json", shared_calibration)
+        elif not cancelled and args.task == "exploration" and os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" and shared_root_value:
+            from hk_agent.shared_learner import share_calibration
+            shared_calibration = share_calibration(Path(shared_root_value), {
+                "noop_descriptors": noop_motion, "active_descriptors": active_motion,
+                "novelty_threshold": calibrated.novelty_threshold,
+            })
+            shared_noop = shared_calibration.get("noop_descriptors")
+            shared_active = shared_calibration.get("active_descriptors")
+            if not isinstance(shared_noop, list) or not isinstance(shared_active, list):
+                raise ValueError("shared exploration calibration arrays are invalid")
+            threshold = calibrate_novelty(
+                [__import__("numpy").asarray(value, dtype="float32") for value in shared_noop],
+                [__import__("numpy").asarray(value, dtype="float32") for value in shared_active],
+            )
+            calibrated = replace(base_task_config, novelty_threshold=threshold)
+            atomic_json(run_root / "calibration.json", {**shared_calibration, "novelty_threshold": threshold})
     finally:
         try:
             calibration_task.close()

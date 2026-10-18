@@ -44,6 +44,7 @@ def _windows_job_enabled() -> bool:
 
 CAMPAIGN_TO_TOOL = {
     "visual_motion_training": "run_first_training.py",
+    "exploration_training": "run_first_training.py",
     "scene_change_probe": "run_scene_change_probe.py",
     "parallel_smoke": "run_scene_change_probe.py",
     "scene_change_training": "run_scene_change_training.py",
@@ -93,7 +94,14 @@ class CampaignSpec:
     actors: int = 2
     rollout_steps: int = 256
     batch_size: int = 64
-    schema_version: int = 6
+    ent_coef: float | None = None
+    gamma: float | None = None
+    gae_lambda: float | None = None
+    n_epochs: int | None = None
+    target_kl: float | None = None
+    learning_rate: float | None = None
+    clip_range: float | None = None
+    schema_version: int = 7
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -103,8 +111,8 @@ class CampaignSpec:
         shared_learner = payload.get("shared_learner", False)
         if not isinstance(shared_learner, bool):
             raise TypeError("shared_learner must be a boolean")
-        if shared_learner and campaign_type != "visual_motion_training":
-            raise ValueError("shared learner campaigns currently require visual_motion_training")
+        if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
+            raise ValueError("shared learner requires a supported PPO training campaign")
         name = str(payload.get("name", "")).strip()
         if not 1 <= len(name) <= 80 or any(ord(char) < 32 for char in name):
             raise ValueError("name must contain 1 to 80 printable characters")
@@ -135,8 +143,18 @@ class CampaignSpec:
             }
             if campaign_type == "visual_motion_training"
             else {
+                "time_cost", "novelty_reward", "novelty_budget", "scene_change_reward",
+                "enemy_kill_reward", "enemy_kill_reward_budget", "shade_recovery_reward",
+                "damage_penalty", "geo_gain_reward", "geo_spend_reward", "death_penalty",
+                "run_failed_penalty",
+            }
+            if campaign_type == "exploration_training"
+            else {
                 "time_cost",
                 "novelty_shaping_budget",
+                "novelty_reward",
+                "novelty_budget",
+                "scene_change_reward",
                 "success_reward",
                 "enemy_kill_reward",
                 "enemy_kill_reward_budget",
@@ -214,20 +232,24 @@ class CampaignSpec:
                 raise ValueError("scene-change probes cannot consume a worker policy")
             worker_session_id = raw_worker_session
         actors = _bounded_int(payload.get("actors", 2), "actors", 1, 3)
-        rollout_steps = _bounded_int(payload.get("rollout_steps", 256), "rollout_steps", 1, 100_000)
-        batch_size = _bounded_int(payload.get("batch_size", 64), "batch_size", 1, 100_000)
-        shared_checkpoint_default = rollout_steps * actors if shared_learner else 128
+        rollout_steps = _bounded_int(payload.get("rollout_steps", 512 if campaign_type == "exploration_training" else 256), "rollout_steps", 1, 100_000)
+        batch_size = _bounded_int(payload.get("batch_size", 256 if campaign_type == "exploration_training" else 64), "batch_size", 1, 100_000)
+        shared_checkpoint_default = (
+            rollout_steps * actors if shared_learner
+            else rollout_steps if campaign_type == "exploration_training"
+            else 128
+        )
         spec = cls(
             campaign_id=identifier,
             name=name,
             campaign_type=campaign_type,
             seed=_bounded_int(payload.get("seed", 7), "seed", 0, 2**31 - 1),
-            timesteps=_bounded_int(payload.get("timesteps", 256), "timesteps", 1, 10_000_000),
+            timesteps=_bounded_int(payload.get("timesteps", 4096 if campaign_type == "exploration_training" else 256), "timesteps", 1, 10_000_000),
             checkpoint_interval=_bounded_int(
                 payload.get("checkpoint_interval", shared_checkpoint_default), "checkpoint_interval", 1, 1_000_000
             ),
             episodes=_bounded_int(payload.get("episodes", 3), "episodes", 1, 10_000),
-            horizon=_bounded_int(payload.get("horizon", 512), "horizon", 8, 100_000),
+            horizon=_bounded_int(payload.get("horizon", 3000 if campaign_type == "exploration_training" else 512), "horizon", 8, 100_000),
             action_repeat=_bounded_int(payload.get("action_repeat", 3), "action_repeat", 1, 32),
             lease_ms=_bounded_int(payload.get("lease_ms", 80), "lease_ms", 20, 5_000),
             window_width=_bounded_int(payload.get("window_width", 960), "window_width", 320, 7680),
@@ -246,6 +268,13 @@ class CampaignSpec:
             actors=actors,
             rollout_steps=rollout_steps,
             batch_size=batch_size,
+            ent_coef=_bounded_float(payload.get("ent_coef", 0.01), "ent_coef", 0.000001, 10.0) if campaign_type == "exploration_training" else None,
+            gamma=_bounded_float(payload.get("gamma", 0.995), "gamma", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
+            gae_lambda=_bounded_float(payload.get("gae_lambda", 0.95), "gae_lambda", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
+            n_epochs=_bounded_int(payload.get("n_epochs", 4), "n_epochs", 1, 100) if campaign_type == "exploration_training" else None,
+            target_kl=_bounded_float(payload.get("target_kl", 0.03), "target_kl", 0.000001, 10.0) if campaign_type == "exploration_training" else None,
+            learning_rate=_bounded_float(payload.get("learning_rate", 0.00025), "learning_rate", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
+            clip_range=_bounded_float(payload.get("clip_range", 0.2), "clip_range", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
         )
         if spec.rollout_steps * spec.actors % spec.batch_size:
             raise ValueError("batch_size must divide rollout_steps times actors")
@@ -331,6 +360,7 @@ class ControlPlane:
         self._preparing_paths: dict[str, tuple[Path, Path]] = {}
         self._preparing_watchdogs: dict[str, threading.Event] = {}
         self._slot_owners: dict[int, str] = {}
+        self._shared_actor_restarts: dict[str, list[float]] = {}
         self._slot_fences: dict[int, str] = {}
         self.observer = observer
         self._owner_lock_path = self.control_root / OWNER_LOCK_NAME
@@ -773,8 +803,24 @@ class ControlPlane:
                 "--horizon",
                 str(spec.horizon),
             ]
-            if spec.campaign_type == "visual_motion_training":
+            if spec.campaign_type in {"visual_motion_training", "exploration_training"}:
                 command += ["--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size)]
+            if spec.campaign_type == "exploration_training":
+                command += ["--task", "exploration", "--ent-coef", str(spec.ent_coef), "--gamma", str(spec.gamma),
+                            "--gae-lambda", str(spec.gae_lambda), "--n-epochs", str(spec.n_epochs), "--target-kl", str(spec.target_kl),
+                            "--learning-rate", str(spec.learning_rate), "--clip-range", str(spec.clip_range),
+                            "--novelty-reward", str(spec.weights.get("novelty_reward", 0.05)),
+                            "--novelty-budget", str(spec.weights.get("novelty_budget", 20.0)),
+                            "--scene-change-reward", str(spec.weights.get("scene_change_reward", 5.0)),
+                            "--enemy-kill-reward", str(spec.weights.get("enemy_kill_reward", 1.0)),
+                            "--enemy-kill-reward-budget", str(spec.weights.get("enemy_kill_reward_budget", 5.0)),
+                            "--shade-recovery-reward", str(spec.weights.get("shade_recovery_reward", 1.0)),
+                            "--damage-penalty", str(spec.weights.get("damage_penalty", -0.5)),
+                            "--death-penalty", str(spec.weights.get("death_penalty", -5.0)),
+                            "--run-failed-penalty", str(spec.weights.get("run_failed_penalty", -5.0)),
+                            "--geo-gain-reward", str(spec.weights.get("geo_gain_reward", 0.01)),
+                            "--geo-spend-reward", str(spec.weights.get("geo_spend_reward", 0.02)),
+                            "--time-cost", str(spec.weights.get("time_cost", -0.001))]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
             command += [
@@ -1221,7 +1267,7 @@ class ControlPlane:
                 })
                 record.update({
                     "role": "actor", "shared_group": shared_group,
-                    "shared_root": str(shared_root),
+                    "shared_root": str(shared_root), "shared_actor_count": shared_actor_count,
                 })
             if slot_id is not None:
                 assert project_config is not None
@@ -1320,6 +1366,67 @@ class ControlPlane:
                 daemon=True,
             ).start()
             return dict(record)
+
+    def restart_shared_actor(
+        self, launch_id: str, *, reason: str = "supervised actor restart", timeout: float = 90.0
+    ) -> dict[str, object]:
+        """Gracefully stop one shared actor and relaunch it in the learner's current round."""
+        self._require_owner()
+        with self._lock:
+            self._refresh_locked()
+            record = self._launches.get(launch_id)
+            if record is None or record.get("role") != "actor":
+                raise ValueError("launch_id is not a shared actor")
+            group = record.get("shared_group")
+            if not isinstance(group, str):
+                raise TypeError("shared actor group is missing")
+            now = time.monotonic()
+            recent = [value for value in self._shared_actor_restarts.get(group, []) if now - value < 3600]
+            if len(recent) >= 3:
+                raise RuntimeError("shared actor restart limit reached (3 per hour)")
+            recent.append(now)
+            self._shared_actor_restarts[group] = recent
+            campaign_id = str(record["campaign_id"])
+            version_value = record.get("campaign_version")
+            if isinstance(version_value, bool) or not isinstance(version_value, int):
+                raise TypeError("shared actor campaign version is invalid")
+            version = version_value
+            shared_root = Path(str(record["shared_root"]))
+            actors_value = record.get("shared_actor_count")
+            if isinstance(actors_value, bool) or not isinstance(actors_value, int):
+                raise TypeError("shared actor count is invalid")
+            actors = actors_value
+        if record.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}:
+            self.stop(launch_id, _shared_member=True)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.status()
+                current = self._launches.get(launch_id, {})
+                if current.get("status") in {"COMPLETED", "CANCELLED", "FAILED"}:
+                    break
+                time.sleep(0.25)
+            else:
+                raise TimeoutError(f"shared actor did not stop cooperatively: {launch_id}")
+        replacement = self._launch_single(
+            campaign_id, version=version, execute=True, shared_role="actor",
+            shared_root=shared_root, shared_group=group, shared_actor_count=actors,
+        )
+        restart_record = {
+            "time_unix_ns": time.time_ns(), "shared_group": group,
+            "old_launch_id": launch_id, "new_launch_id": replacement["launch_id"],
+            "reason": reason, "restart_number_in_hour": len(recent),
+        }
+        restart_log = shared_root / "actor-restarts.jsonl"
+        restart_log.parent.mkdir(parents=True, exist_ok=True)
+        with restart_log.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(restart_record, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        replacement.update({"restart_of": launch_id, "restart_reason": reason,
+                            "restart_number_in_hour": len(recent)})
+        launch_path = self.control_root / "launches" / str(replacement["launch_id"]) / "launch.json"
+        atomic_json(launch_path, replacement)
+        return replacement
 
     def _wait_for_process(
         self,

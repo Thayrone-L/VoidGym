@@ -61,9 +61,37 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 6
+    assert first["schema_version"] == 7
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
+
+
+def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Path) -> None:
+    payload = _payload("exploration_training")
+    payload["shared_learner"] = True
+    payload["rollout_steps"] = 512
+    payload["batch_size"] = 256
+    payload["horizon"] = 3000
+    payload["checkpoint_interval"] = 1024
+    payload["weights"] = {
+        "time_cost": -0.001, "novelty_reward": 0.05, "novelty_budget": 20.0,
+        "scene_change_reward": 5.0, "enemy_kill_reward": 1.0,
+        "enemy_kill_reward_budget": 5.0, "shade_recovery_reward": 1.0,
+        "damage_penalty": -0.5, "geo_gain_reward": 0.01,
+        "geo_spend_reward": 0.02, "death_penalty": -5.0,
+        "run_failed_penalty": -5.0,
+    }
+    spec = CampaignSpec.from_payload(payload)
+    command = ControlPlane(_project(tmp_path)).build_command(spec, execute=False)
+    assert spec.shared_learner is True
+    assert spec.ent_coef == 0.01 and spec.gamma == 0.995
+    assert spec.gae_lambda == 0.95 and spec.n_epochs == 4
+    assert spec.target_kl == 0.03 and spec.learning_rate == 0.00025
+    assert spec.clip_range == 0.2
+    assert "--task" in command and command[command.index("--task") + 1] == "exploration"
+    assert command[command.index("--rollout-steps") + 1] == "512"
+    assert command[command.index("--batch-size") + 1] == "256"
+    assert command[command.index("--gamma") + 1] == "0.995"
 
 
 @pytest.mark.parametrize(
@@ -489,7 +517,7 @@ def test_default_reward_values_are_valid_in_the_browser_form() -> None:
     assert 'name="geo_spend_reward"' in html
     assert 'name="death_penalty"' in html
     assert 'name="run_failed_penalty"' in html
-    assert html.count('step="any"') == 10
+    assert html.count('step="any"') == 19
 
 
 class _FakeProcess:
@@ -1630,3 +1658,37 @@ def test_reused_owner_pid_with_different_creation_time_is_stale(
         lambda pid: {"pid": pid, "creation_time": 12345, "executable": "python.exe"},
     )
     ControlPlane(root)  # PID reused by an unrelated process: not a live owner
+
+
+def test_shared_actor_restart_is_bounded_and_recorded(tmp_path: Path) -> None:
+    control = ControlPlane.__new__(ControlPlane)
+    control.observer = False
+    control._lock = threading.RLock()
+    control._refresh_locked = lambda: None
+    control._launches = {
+        "actor-old": {
+            "role": "actor", "shared_group": "campaign-v0001", "shared_root": str(tmp_path / "shared"),
+            "shared_actor_count": 2, "campaign_id": "campaign", "campaign_version": 1,
+            "status": "CANCELLED",
+        }
+    }
+    control._shared_actor_restarts = {}
+    control.control_root = tmp_path / "control"
+    launch_number = 0
+
+    def launch(campaign_id: str, **kwargs: object) -> dict[str, object]:
+        nonlocal launch_number
+        launch_number += 1
+        launch_id = f"actor-new-{launch_number}"
+        launch_dir = control.control_root / "launches" / launch_id
+        launch_dir.mkdir(parents=True)
+        return {"launch_id": launch_id, "status": "RUNNING"}
+
+    control._launch_single = launch
+    for _ in range(3):
+        control.restart_shared_actor("actor-old", reason="soak test")
+    with pytest.raises(RuntimeError, match="3 per hour"):
+        control.restart_shared_actor("actor-old", reason="limit test")
+    rows = (tmp_path / "shared" / "actor-restarts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 3
+    assert json.loads(rows[-1])["restart_number_in_hour"] == 3

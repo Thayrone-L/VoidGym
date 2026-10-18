@@ -17,7 +17,7 @@ _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
-_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
         "reward_version",
@@ -33,6 +33,7 @@ _TASK_CONTRACT_KEYS = frozenset(
         "route_memory",
         "diagnostic_training",
         "claim",
+        "ppo_hyperparameters",
     }
 )
 _TASK_CONFIG_KEYS = frozenset(
@@ -75,6 +76,9 @@ _TASK_CONFIG_KEYS = frozenset(
         "novelty_shaping_budget",
         "success_reward",
         "terminate_on_scene_change",
+        "novelty_reward", "novelty_threshold", "novelty_budget", "archive_max",
+        "scene_change_reward", "lease_base_ms", "ent_coef", "gamma", "gae_lambda",
+        "n_epochs", "target_kl", "learning_rate", "clip_range",
     }
 )
 _BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST"})
@@ -117,6 +121,8 @@ _REWARD_ONLY_SIGNALS = frozenset(
         "geo_gained_since_last_frame",
         "geo_spent_since_last_frame",
         "shade_recovered",
+        "death",
+        "run_failed",
     }
 )
 _DETECTOR_INPUTS = frozenset({"cropped_rgb_pixels", "temporal_pixel_descriptors"})
@@ -127,6 +133,7 @@ _CLAIMS = frozenset(
             "pixel-only stable visual-regime-change diagnostic; room transition "
             "not yet validated against a holdout corpus"
         ),
+        "pixel-only exploration with bounded reward-only bridge signals",
     }
 )
 _ROUTE_LITERAL_FIELDS = {
@@ -356,7 +363,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     if "raw_action_indices" in contract:
         indices = contract["raw_action_indices"]
         if not isinstance(indices, list) or not all(
-            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 127
+            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 511
             for index in indices
         ):
             raise KnowledgeValidationError("task_contract.raw_action_indices is invalid")
@@ -382,7 +389,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
             if (
                 not isinstance(raw_index, int)
                 or isinstance(raw_index, bool)
-                or not 0 <= raw_index <= 127
+                or not 0 <= raw_index <= 511
             ):
                 raise KnowledgeValidationError("task_contract action index is invalid")
             if (
@@ -434,6 +441,14 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         if contract["claim"] not in _CLAIMS:
             raise KnowledgeValidationError("task_contract.claim is not an approved public claim")
         result["claim"] = contract["claim"]
+    if "ppo_hyperparameters" in contract:
+        ppo = _expect_dict(contract["ppo_hyperparameters"], "task_contract.ppo_hyperparameters")
+        allowed_ppo = {"ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range"}
+        _expect_allowed_keys(ppo, allowed_ppo, "task_contract.ppo_hyperparameters")
+        result["ppo_hyperparameters"] = {
+            key: _finite_number(value, f"task_contract.ppo_hyperparameters.{key}")
+            for key, value in ppo.items()
+        }
     return result
 
 

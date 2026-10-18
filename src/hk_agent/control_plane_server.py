@@ -76,6 +76,17 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                         "save_source",
                         "save_slot",
                         "weights",
+                        "shared_learner",
+                        "actors",
+                        "rollout_steps",
+                        "batch_size",
+                        "ent_coef",
+                        "gamma",
+                        "gae_lambda",
+                        "n_epochs",
+                        "target_kl",
+                        "learning_rate",
+                        "clip_range",
                     ),
                 )
                 result = self.server.control_plane.create_campaign(payload)

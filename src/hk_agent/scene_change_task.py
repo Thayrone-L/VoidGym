@@ -39,6 +39,44 @@ SCENE_CHANGE_ACTION_NAMES: tuple[str, ...] = tuple(
 )
 
 
+def detect_scene_change(
+    *,
+    descriptor: NDArray[np.float32],
+    frame: NDArray[np.uint8],
+    config: SceneChangeTaskConfig,
+    anchor: NDArray[np.float32] | None,
+    previous_descriptor: NDArray[np.float32] | None,
+    transition_seen: bool,
+    dark_run: int,
+    stable_run: int,
+    base_done: bool,
+) -> dict[str, Any]:
+    """Shared fade-confirmed scene detector used by both training tasks."""
+    luma_mean, dark_fraction, white_fraction, entropy_bits = visual_quality_metrics(frame, config)
+    anchor_luma = float(np.mean(anchor)) if anchor is not None else 1.0
+    dark_limit = min(config.dark_luma_absolute, anchor_luma * config.dark_luma_ratio)
+    is_dark = anchor is not None and luma_mean <= dark_limit and dark_fraction >= config.dark_pixel_fraction
+    is_white = white_fraction >= config.white_pixel_fraction
+    informative = not is_dark and not is_white and entropy_bits >= config.minimum_entropy_bits
+    if not transition_seen:
+        dark_run = dark_run + 1 if is_dark else 0
+        transition_seen = dark_run >= config.transition_dark_frames
+        if transition_seen:
+            stable_run = 0
+    anchor_distance = descriptor_distance(anchor, descriptor) if anchor is not None else 0.0
+    frame_distance = descriptor_distance(previous_descriptor, descriptor) if previous_descriptor is not None else 1.0
+    candidate = transition_seen and informative and anchor_distance >= config.new_scene_distance and frame_distance <= config.stable_frame_distance
+    stable_run = stable_run + 1 if candidate else 0
+    return {
+        "transition_seen": transition_seen, "dark_run": dark_run, "stable_run": stable_run,
+        "anchor_distance": anchor_distance, "frame_distance": frame_distance,
+        "informative": informative, "candidate": candidate,
+        "scene_changed": stable_run >= config.stable_frames and not base_done,
+        "luma_mean": luma_mean, "dark_fraction": dark_fraction,
+        "white_fraction": white_fraction, "entropy_bits": entropy_bits,
+    }
+
+
 def route_detector_signature(config: SceneChangeTaskConfig) -> str:
     fields = {
         name: getattr(config, name)
@@ -301,56 +339,34 @@ class ReachSceneChangeTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                         route_event = self.route_memory.observe_start(candidate_anchor)
                         self._route_action_trace.clear()
 
-        anchor_luma = float(np.mean(self._anchor)) if self._anchor is not None else 1.0
-        dark_limit = min(
-            self.config.dark_luma_absolute,
-            anchor_luma * self.config.dark_luma_ratio,
-        )
-        is_dark = (
-            self._anchor is not None
-            and luma_mean <= dark_limit
-            and dark_fraction >= self.config.dark_pixel_fraction
-        )
-        is_white = white_fraction >= self.config.white_pixel_fraction
-        visually_informative = (
-            not is_dark and not is_white and entropy_bits >= self.config.minimum_entropy_bits
-        )
-        if not self._transition_seen:
-            self._dark_run = self._dark_run + 1 if is_dark else 0
-            if self._dark_run >= self.config.transition_dark_frames:
-                self._transition_seen = True
-                self._stable_run = 0
-
-        anchor_distance = (
-            descriptor_distance(self._anchor, descriptor) if self._anchor is not None else 0.0
-        )
-        frame_distance = (
-            descriptor_distance(self._previous_descriptor, descriptor)
-            if self._previous_descriptor is not None
-            else 1.0
-        )
-        candidate = (
-            self._transition_seen
-            and visually_informative
-            and anchor_distance >= self.config.new_scene_distance
-            and frame_distance <= self.config.stable_frame_distance
-        )
-        self._stable_run = self._stable_run + 1 if candidate else 0
         # A base-environment terminal/truncation (for example death or a
         # capture failure) always wins over a visual candidate observed in the
         # same step. It must never be relabelled or rewarded as curriculum
         # success.
         base_done = terminated or truncated
-        regime_changed = (
-            self._stable_run >= self.config.stable_frames and not base_done
+        detection = detect_scene_change(
+            descriptor=descriptor, frame=current_frame, config=self.config,
+            anchor=self._anchor, previous_descriptor=self._previous_descriptor,
+            transition_seen=self._transition_seen, dark_run=self._dark_run,
+            stable_run=self._stable_run, base_done=base_done,
         )
+        self._transition_seen = bool(detection["transition_seen"])
+        self._dark_run = int(detection["dark_run"])
+        self._stable_run = int(detection["stable_run"])
+        anchor_distance = float(detection["anchor_distance"])
+        frame_distance = float(detection["frame_distance"])
+        luma_mean = float(detection["luma_mean"])
+        dark_fraction = float(detection["dark_fraction"])
+        white_fraction = float(detection["white_fraction"])
+        entropy_bits = float(detection["entropy_bits"])
+        regime_changed = bool(detection["scene_changed"])
         if regime_changed and self.route_memory is not None:
             route_event = self.route_memory.observe_transition(
                 descriptor, action_trace=tuple(self._route_action_trace)
             )
             self._route_action_trace.clear()
         novelty_increment = 0.0
-        if candidate:
+        if detection["candidate"]:
             novelty = min(1.0, anchor_distance / self.config.new_scene_distance)
             self._best_novelty = max(self._best_novelty, novelty)
         # Optional shaping remains zero until the complete stability gate has

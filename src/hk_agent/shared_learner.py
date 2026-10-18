@@ -24,6 +24,10 @@ class SharedLearnerError(RuntimeError):
     """Shared actor/learner protocol error."""
 
 
+class SharedLearnerStopped(SharedLearnerError):
+    """Cooperative stop requested while waiting for shared calibration."""
+
+
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
@@ -77,6 +81,11 @@ def _space_to_payload(space: gym.Space[Any]) -> dict[str, Any]:
         }
     if isinstance(space, gym.spaces.Discrete):
         return {"type": "Discrete", "n": space.n, "start": space.start}
+    if isinstance(space, gym.spaces.MultiDiscrete):
+        return {
+            "type": "MultiDiscrete", "nvec": space.nvec.tolist(),
+            "start": space.start.tolist(), "dtype": np.dtype(space.dtype).str,
+        }
     raise SharedLearnerError(f"unsupported shared learner space: {type(space).__name__}")
 
 
@@ -110,6 +119,21 @@ def _space_from_payload(payload: Mapping[str, Any]) -> gym.Space[Any]:
         if isinstance(start, bool) or not isinstance(start, int):
             raise SharedLearnerError("calibration Discrete start is invalid")
         return gym.spaces.Discrete(n, start=start)
+    if kind == "MultiDiscrete":
+        nvec_value, start_value, dtype_value = payload.get("nvec"), payload.get("start"), payload.get("dtype")
+        if not isinstance(dtype_value, str) or not isinstance(nvec_value, list) or not isinstance(start_value, list):
+            raise SharedLearnerError("calibration MultiDiscrete space is invalid")
+        try:
+            dtype = np.dtype(dtype_value)
+            nvec = np.asarray(nvec_value)
+            start = np.asarray(start_value)
+        except (TypeError, ValueError) as error:
+            raise SharedLearnerError("calibration MultiDiscrete values are invalid") from error
+        if (not np.issubdtype(dtype, np.integer) or not np.issubdtype(nvec.dtype, np.integer)
+                or not np.issubdtype(start.dtype, np.integer) or nvec.size == 0
+                or nvec.shape != start.shape or np.any(nvec < 1)):
+            raise SharedLearnerError("calibration MultiDiscrete dimensions are invalid")
+        return gym.spaces.MultiDiscrete(nvec.astype(dtype), dtype=dtype, start=start.astype(dtype))
     raise SharedLearnerError("calibration space type is unsupported")
 
 
@@ -207,10 +231,12 @@ class SharedRoundStore:
         finally:
             lock.unlink(missing_ok=True)
 
-    def wait_for_contract(self, timeout: float = 600.0) -> dict[str, Any]:
+    def wait_for_contract(self, timeout: float = 600.0, stop_file: Path | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         path = self.root / "calibration.json"
         while time.monotonic() < deadline:
+            if stop_file is not None and stop_file.is_file():
+                raise SharedLearnerStopped("stop requested while waiting for actor calibration")
             try:
                 value = json.loads(path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -367,7 +393,13 @@ class SharedRoundStore:
             raise SharedLearnerError("rollout task contract fingerprint differs")
         if metadata.get("n_steps") != n_steps:
             raise SharedLearnerError("rollout n_steps differs from contract")
-        expected_obs = {f"obs__{name}": (n_steps, *space.shape) for name, space in observation_space.spaces.items() if isinstance(space, gym.spaces.Box)}
+        supported_obs = (gym.spaces.Box, gym.spaces.Discrete, gym.spaces.MultiDiscrete)
+        if any(not isinstance(space, supported_obs) for space in observation_space.spaces.values()):
+            raise SharedLearnerError("rollout Dict contains an unsupported observation space")
+        expected_obs = {
+            f"obs__{name}": (n_steps, *tuple(space.shape or ()))
+            for name, space in observation_space.spaces.items()
+        }
         required = set(expected_obs) | {"actions", "rewards", "episode_starts", "values", "log_probs", "advantages", "returns", "action_masks"}
         try:
             with np.load(artifact, allow_pickle=False) as packed:
@@ -548,6 +580,20 @@ def actor_join_round(learner_status: Mapping[str, Any]) -> int:
     return cast(int, value)
 
 
+def _shared_ppo_parameters(task_contract: Mapping[str, Any]) -> dict[str, Any]:
+    if task_contract.get("reward_version") != "explore_v1":
+        return {}
+    defaults = {
+        "ent_coef": 0.01, "gamma": 0.995, "gae_lambda": 0.95,
+        "n_epochs": 4, "target_kl": 0.03, "learning_rate": 2.5e-4,
+        "clip_range": 0.2,
+    }
+    supplied = task_contract.get("ppo_hyperparameters")
+    if isinstance(supplied, Mapping):
+        defaults.update({key: supplied[key] for key in defaults if key in supplied})
+    return defaults
+
+
 def run_shared_actor(
     environment: gym.Env[Any, Any],
     *,
@@ -579,6 +625,7 @@ def run_shared_actor(
         batch_size=config.batch_size,
         verbose=0,
         device=config.training_device,
+        **_shared_ppo_parameters(task_contract),
     )
     _, callback = model._setup_learn(
         total_timesteps=config.rollout_steps,
@@ -698,7 +745,18 @@ def run_shared_learner(
     torch.manual_seed(seed)
     store = SharedRoundStore(shared_root)
     store.heartbeat(status="STARTING", round=0, completed_timesteps=0, accepted_rollouts=0, rejected_rollouts=0)
-    calibration = store.wait_for_contract(timeout=rollout_timeout_seconds)
+    try:
+        calibration = store.wait_for_contract(timeout=rollout_timeout_seconds, stop_file=stop_file)
+    except SharedLearnerStopped:
+        manifest = {
+            "schema_version": 1, "artifact_type": "shared_learner", "algorithm": "MaskablePPO",
+            "status": "CANCELLED", "rounds": [], "actors_per_round": {},
+            "rejected_rollouts": [], "completed_timesteps": 0, "round": 0,
+            "finished_unix_ns": time.time_ns(),
+        }
+        store.heartbeat(status="CANCELLED", round=0, completed_timesteps=0)
+        _atomic_json(shared_root / "manifest.json", manifest)
+        return manifest
     contract = calibration.get("contract")
     if not isinstance(contract, Mapping):
         raise SharedLearnerError("shared calibration contract is invalid")
@@ -719,6 +777,7 @@ def run_shared_learner(
     model = contrib.MaskablePPO(
         "MultiInputPolicy", environment, seed=seed, n_steps=rollout_steps,
         batch_size=batch_size, verbose=0, device="cpu",
+        **_shared_ppo_parameters(contract.get("task_contract", {}) if isinstance(contract.get("task_contract"), Mapping) else {}),
     )
     checkpoints = shared_root / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
@@ -751,6 +810,12 @@ def run_shared_learner(
     manifest["status"] = "RUNNING"
     manifest["algorithm"] = "MaskablePPO"
     manifest["task_contract_fingerprint"] = fingerprint
+    manifest["rollout_steps"] = rollout_steps
+    manifest["batch_size"] = batch_size
+    manifest["ppo_hyperparameters"] = _shared_ppo_parameters(
+        contract.get("task_contract", {}) if isinstance(contract.get("task_contract"), Mapping) else {}
+    )
+    manifest.setdefault("round_timings", [])
     next_checkpoint = ((completed // checkpoint_interval) + 1) * checkpoint_interval
 
     def save_checkpoint(round_number: int) -> None:
@@ -792,7 +857,9 @@ def run_shared_learner(
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"
                 break
+            training_started = time.perf_counter()
             transitions = train_shared_round(model, rollouts)
+            training_seconds = time.perf_counter() - training_started
             completed += transitions
             current_round += 1
             store.publish_policy(current_round, model.policy, fingerprint)
@@ -802,6 +869,14 @@ def run_shared_learner(
             actor_rounds = manifest.get("actors_per_round")
             if isinstance(actor_rounds, dict):
                 actor_rounds[str(current_round - 1)] = slots
+            timings = manifest.get("round_timings")
+            if isinstance(timings, list):
+                timings.append({
+                    "round": current_round - 1,
+                    "training_seconds": training_seconds,
+                    "transitions": transitions,
+                    "completed_timesteps": completed,
+                })
             manifest["completed_timesteps"] = completed
             manifest["round"] = current_round
             rejected_count = 0
@@ -811,7 +886,7 @@ def run_shared_learner(
             store.heartbeat(
                 status="TRAINING", round=current_round, completed_timesteps=completed,
                 accepted_rollouts=len(slots),
-                rejected_rollouts=rejected_count,
+                rejected_rollouts=rejected_count, last_training_seconds=training_seconds,
             )
             if completed >= next_checkpoint:
                 save_checkpoint(current_round)

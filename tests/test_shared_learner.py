@@ -10,6 +10,9 @@ import pytest
 from hk_agent.shared_learner import (
     SharedLearnerError,
     SharedRoundStore,
+    _shared_ppo_parameters,
+    _space_from_payload,
+    _space_to_payload,
     actor_join_round,
     train_shared_round,
 )
@@ -23,6 +26,7 @@ def _publish_arrays(root, *, round_number=1, fingerprint=FINGERPRINT):
     folder.mkdir(parents=True, exist_ok=True)
     arrays = {
         "obs__image": np.zeros((2, 3), dtype=np.float32),
+        "obs__history": np.array([[0, 1], [1, 2]], dtype=np.int64),
         "actions": np.array([0, 1], dtype=np.int64),
         "rewards": np.ones(2, dtype=np.float32),
         "episode_starts": np.zeros(2, dtype=np.float32),
@@ -44,7 +48,16 @@ def _publish_arrays(root, *, round_number=1, fingerprint=FINGERPRINT):
 
 
 def _spaces():
-    return gym.spaces.Dict({"image": gym.spaces.Box(0, 1, (3,), np.float32)}), 2
+    return gym.spaces.Dict({
+        "image": gym.spaces.Box(0, 1, (3,), np.float32),
+        "history": gym.spaces.MultiDiscrete([3, 4]),
+    }), 2
+
+
+def test_dict_multidiscrete_space_round_trips_strictly():
+    source = gym.spaces.Dict({"history": gym.spaces.MultiDiscrete([3, 4], start=[1, 0])})
+    restored = _space_from_payload(_space_to_payload(source))
+    assert restored == source
 
 
 def test_rollout_round_trip_and_rejects_old_round(tmp_path):
@@ -112,6 +125,28 @@ def test_one_actor_satisfies_quorum_after_timeout(tmp_path):
 def test_restarted_actor_joins_current_learner_round():
     assert actor_join_round({"round": 7}) == 7
     assert actor_join_round({"round": True}) == 0
+
+
+def test_exploration_learner_uses_explicit_campaign_ppo_parameters():
+    values = _shared_ppo_parameters({
+        "reward_version": "explore_v1",
+        "ppo_hyperparameters": {"ent_coef": 0.02, "gamma": 0.99},
+    })
+    assert values == {
+        "ent_coef": 0.02, "gamma": 0.99, "gae_lambda": 0.95,
+        "n_epochs": 4, "target_kl": 0.03, "learning_rate": 2.5e-4,
+        "clip_range": 0.2,
+    }
+    assert _shared_ppo_parameters({"reward_version": "visual_motion_v1"}) == {}
+
+
+def test_learner_waiting_for_calibration_honors_stop_file(tmp_path):
+    from hk_agent.shared_learner import SharedLearnerStopped
+
+    stop_file = tmp_path / "stop.request"
+    stop_file.write_text("stop", encoding="utf-8")
+    with pytest.raises(SharedLearnerStopped, match="stop requested"):
+        SharedRoundStore(tmp_path).wait_for_contract(timeout=1, stop_file=stop_file)
 
 
 def test_two_actor_rollouts_fill_and_train_one_learner_buffer(tmp_path):
