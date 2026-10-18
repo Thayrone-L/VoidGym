@@ -1288,7 +1288,11 @@ class ControlPlane:
         return path.read_bytes()
 
     def save_map_scene_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
-        from hk_agent.run_journey import fit_two_point_calibration, save_scene_calibration
+        from hk_agent.run_journey import (
+            fit_two_point_calibration,
+            propagate_room_calibrations,
+            save_scene_calibration,
+        )
 
         digest = str(self.map_art_status().get("sha256") or "")
         if not digest or self.map_art_status().get("tiles_ready") is not True:
@@ -1299,16 +1303,40 @@ class ControlPlane:
             raise ValueError("choose a valid scene")
         def anchor(value: object) -> tuple[float, float, float, float]:
             if not isinstance(value, Mapping):
-                raise TypeError("each calibration anchor must include screenshot and map coordinates")
-            keys = ("frame_x", "frame_y", "map_x", "map_y")
+                raise TypeError("each calibration anchor must include world and map coordinates")
+            keys = ("world_x", "world_y", "map_x", "map_y")
             numbers = tuple(value.get(key) for key in keys)
             if any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)) for number in numbers):
                 raise ValueError("calibration anchor coordinates must be finite numbers")
             return tuple(float(number) for number in numbers)  # type: ignore[arg-type,return-value]
         transform = fit_two_point_calibration(anchor(first), anchor(second))
         path = self.map_art_runtime_root() / "cache" / "map-art" / digest / "calibration.json"
+        campaign_id = payload.get("campaign_id")
+        if not isinstance(campaign_id, str) or not _IDENTIFIER.fullmatch(campaign_id):
+            raise ValueError("choose a valid campaign for passage propagation")
+        campaign_root = (self.runtime_root / "shared" / campaign_id / "journey").resolve()
+        transitions: list[Mapping[str, Any]] = []
+        if campaign_root.exists():
+            for diary in campaign_root.glob("actor-*/episode-*.json"):
+                try:
+                    raw = json.loads(diary.read_text("utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                route = raw.get("route") if isinstance(raw, Mapping) else None
+                if isinstance(route, list):
+                    transitions.extend(row for row in route if isinstance(row, Mapping))
+        calibrations = propagate_room_calibrations(
+            transitions, anchor_scene=scene, anchor_transform=transform
+        )
         save_scene_calibration(path, map_sha256=digest, scene=scene, transform=transform, confidence=1.0)
-        return {"scene": scene, "map_sha256": digest, "transform": list(transform), "positioned": True}
+        for room, calibration in calibrations.items():
+            if room == scene:
+                continue
+            save_scene_calibration(path, map_sha256=digest, scene=room,
+                                   transform=calibration["affine"],
+                                   confidence=float(calibration["confidence"]))
+        return {"scene": scene, "map_sha256": digest, "transform": list(transform),
+                "positioned": True, "propagated_scenes": sorted(calibrations)}
 
     def import_operator_map_art(self, body: Any, length: int) -> dict[str, object]:
         if length < 24 or length > 1_073_741_824:

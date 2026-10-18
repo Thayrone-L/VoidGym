@@ -13,14 +13,17 @@ from hk_agent.run_journey import (
     RunDiary,
     apply_affine,
     atomic_json,
+    build_transition_graph,
     cache_map_file,
     download_mediafire_map,
     fit_affine,
     fit_two_point_calibration,
     load_scene_calibration,
+    propagate_room_calibrations,
     rebuild_progress,
     save_scene_calibration,
     schematic_svg,
+    solve_room_origins,
     validate_png_header,
 )
 
@@ -165,6 +168,31 @@ def test_manual_two_point_calibration_maps_both_anchors() -> None:
     transform = fit_two_point_calibration((0, 0, 10, 20), (1, 0, 10, 22))
     assert apply_affine(transform, 0, 0) == pytest.approx((10, 20))
     assert apply_affine(transform, 1, 0) == pytest.approx((10, 22))
+
+
+def test_passage_graph_filters_nonspatial_and_fits_cycles_with_median() -> None:
+    rows = [
+        {"from": "A", "to": "B", "spatial": True, "exit_x": x, "exit_y": 0,
+         "entry_x": 0, "entry_y": 0} for x in (10, 11, 9, 900)
+    ]
+    rows += [
+        {"from": "B", "to": "C", "spatial": True, "exit_x": 20, "exit_y": 0,
+         "entry_x": 0, "entry_y": 0},
+        {"from": "C", "to": "A", "spatial": True, "exit_x": -30, "exit_y": 0,
+         "entry_x": 0, "entry_y": 0},
+        {"from": "A", "to": "X", "spatial": False, "exit_x": 1, "exit_y": 1,
+         "entry_x": 0, "entry_y": 0},
+    ]
+    graph = build_transition_graph(rows)
+    assert len(graph) == 3
+    assert next(edge for edge in graph if edge["from"] == "A")["outliers"] == 1
+    origins = solve_room_origins(graph, "A")
+    assert origins["B"] == pytest.approx((10, 0))
+    assert origins["C"] == pytest.approx((30, 0))
+    assert "X" not in origins
+    calibrations = propagate_room_calibrations(rows, anchor_scene="A",
+                                                anchor_transform=(2, 0, 100, 0, 2, 200))
+    assert apply_affine(calibrations["C"]["affine"], 0, 0) == pytest.approx((160, 200))
 
 
 def test_scene_transform_is_versioned_by_map_sha_and_low_confidence_is_unplaced(

@@ -121,6 +121,33 @@ using (JsonDocument serializedFrame = JsonDocument.Parse(JsonSerializer.Serializ
         "FRAME payload must preserve confirmed milestone events");
 }
 
+var passageTelemetry = new OperatorTelemetryState();
+var noFlags = Array.Empty<KeyValuePair<string, bool>>();
+passageTelemetry.Observe("Room_A", "Zone_A", 9, 4, 9, 4, new[] { 0f, 0f, 20f, 10f }, 0, 0, noFlags);
+passageTelemetry.Observe("Room_A", "Zone_A", 10, 4, 9, 4, new[] { 0f, 0f, 20f, 10f }, 0, 0, noFlags);
+passageTelemetry.Observe("Room_B", "Zone_B", 1, 4, 1, 4, new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags);
+passageTelemetry.Observe("Room_B", "Zone_B", 1.1f, 4.1f, 1, 4, new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags);
+Dictionary<string, object?> passageFrame = passageTelemetry.Snapshot();
+var passageEvents = (Dictionary<string, object?>[])passageFrame["milestone_events_since_last_frame"]!;
+var passage = Array.Find(passageEvents, item => (string)item["category"]! == "scene_transition")!;
+Assert((string)passage["from"]! == "Room_A" && (string)passage["to"]! == "Room_B",
+    "scene transition must preserve both room names");
+Assert((float)passage["exit_x"]! == 10 && (float)passage["entry_x"]! == 1,
+    "scene transition must preserve last exit and first stable entry positions");
+Assert((bool)passage["spatial"]!, "valid stable passage positions must be marked spatial");
+Assert((string)passage["from_map_zone"]! == "Zone_A" && (string)passage["to_map_zone"]! == "Zone_B",
+    "scene transition must preserve map zones");
+
+var respawnTelemetry = new OperatorTelemetryState();
+respawnTelemetry.Observe("Room_A", "Zone_A", 10, 4, 9, 4, new[] { 0f, 0f, 20f, 10f }, 0, 0, noFlags);
+respawnTelemetry.RecordEvent("death", "death_1", 10, 4);
+respawnTelemetry.Observe("Room_B", "Zone_B", 1, 4, 1, 4, new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags);
+respawnTelemetry.Observe("Room_B", "Zone_B", 1.1f, 4.1f, 1, 4, new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags);
+var respawnEvents = (Dictionary<string, object?>[])respawnTelemetry.Snapshot()["milestone_events_since_last_frame"]!;
+var respawnTransition = Array.Find(respawnEvents, item => (string)item["category"]! == "scene_transition")!;
+Assert(!(bool)respawnTransition["spatial"]! && (string)respawnTransition["transition_kind"]! == "death_respawn",
+    "death/respawn scene changes must not become spatial passage edges");
+
 string saveRoot = Path.Combine(Path.GetTempPath(), $"hk-agent-save-{Guid.NewGuid():N}");
 Directory.CreateDirectory(saveRoot);
 try

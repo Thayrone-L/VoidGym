@@ -248,6 +248,7 @@ class RunDiary:
         ts = int(time.time() * 1000)
         scene = telemetry.get("scene_name")
         confirmed: list[dict[str, Any]] = []
+        source_events = telemetry.get("events", telemetry.get("milestone_events_since_last_frame", []))
         geo_delta = telemetry.get("geo_gained_since_last_frame", 0)
         if isinstance(geo_delta, int) and not isinstance(geo_delta, bool) and geo_delta > 0:
             self.data["geo_collected"] = int(self.data.get("geo_collected", 0)) + geo_delta
@@ -262,6 +263,23 @@ class RunDiary:
         if isinstance(scene, str) and scene:
             if scene != self._last_scene:
                 transition = {"from": self._last_scene, "to": scene, "unix_ms": ts}
+                if isinstance(source_events, list):
+                    evidence = next((event for event in source_events
+                                     if isinstance(event, Mapping)
+                                     and event.get("category") == "scene_transition"
+                                     and event.get("from") == self._last_scene
+                                     and event.get("to") == scene), None)
+                    if evidence is not None:
+                        for key in ("spatial", "transition_kind", "gate", "exit_x", "exit_y",
+                                    "entry_x", "entry_y", "from_map_zone", "to_map_zone"):
+                            if key in evidence:
+                                transition[key] = evidence[key]
+                    else:
+                        transition["spatial"] = False
+                        transition["transition_kind"] = "missing_bridge_evidence"
+                else:
+                    transition["spatial"] = False
+                    transition["transition_kind"] = "missing_bridge_evidence"
                 self.data["route"].append(transition)
                 self._last_scene = scene
                 confirmed.append({"category": "scene", "key": scene, "scene": scene, "unix_ms": ts})
@@ -332,7 +350,7 @@ class RunDiary:
                     for key, value in self._last_map_view.items():
                         self.data["positions"][-1][key] = value
                     self._last_sample = now
-        raw_events = telemetry.get("events", [])
+        raw_events = source_events
         if isinstance(geo_delta, int) and not isinstance(geo_delta, bool) and geo_delta > 0:
             raw_events = list(raw_events) if isinstance(raw_events, list) else []
             raw_events.append(
@@ -649,6 +667,126 @@ def fit_affine(
         )
     )
     return (values[0], values[1], values[2], values[3], values[4], values[5])
+
+
+def build_transition_graph(transitions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate spatial passage observations and reject inconsistent outliers."""
+    import numpy as np
+
+    grouped: dict[tuple[str, str, str], list[tuple[float, float]]] = {}
+    excluded_tokens = ("dream", "stag", "station", "elevator", "respawn", "load", "menu", "title")
+    for item in transitions:
+        source, target = item.get("from"), item.get("to")
+        gate = item.get("gate", "")
+        if (item.get("spatial") is not True or not isinstance(source, str) or not source
+                or not isinstance(target, str) or not target or source == target
+                or item.get("transition_kind") not in (None, "spatial")):
+            continue
+        gate_name = gate if isinstance(gate, str) else ""
+        if any(token in (gate_name + " " + source + " " + target).lower() for token in excluded_tokens):
+            continue
+        exit_x, exit_y = item.get("exit_x"), item.get("exit_y")
+        entry_x, entry_y = item.get("entry_x"), item.get("entry_y")
+        coordinates = (exit_x, exit_y, entry_x, entry_y)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(float(value)) for value in coordinates):
+            continue
+        exit_x, exit_y, entry_x, entry_y = (float(cast(float, value)) for value in coordinates)
+        delta = (exit_x - entry_x, exit_y - entry_y)
+        grouped.setdefault((source, target, gate_name), []).append(delta)
+
+    edges: list[dict[str, Any]] = []
+    for (source, target, gate), samples in sorted(grouped.items()):
+        values: np.ndarray = np.asarray(samples, dtype=np.float64)
+        center: np.ndarray = np.median(values, axis=0)
+        residual = np.linalg.norm(values - center, axis=1)
+        mad = float(np.median(np.abs(residual - np.median(residual))))
+        threshold = max(1.0, float(np.median(residual)) + 3.0 * 1.4826 * mad)
+        accepted = values[residual <= threshold]
+        if not len(accepted):
+            continue
+        median = np.median(accepted, axis=0)
+        edges.append({"from": source, "to": target, "gate": gate or None,
+                      "dx": float(median[0]), "dy": float(median[1]),
+                      "samples": len(accepted), "outliers": len(values) - len(accepted)})
+    return edges
+
+
+def solve_room_origins(edges: Sequence[Mapping[str, Any]], anchor_scene: str) -> dict[str, tuple[float, float]]:
+    """Propagate room origins from an anchor; fit cycles by anchored least squares."""
+    import numpy as np
+
+    adjacency: dict[str, list[tuple[str, float, float]]] = {}
+    valid_edges: list[Mapping[str, Any]] = []
+    for edge in edges:
+        source, target = edge.get("from"), edge.get("to")
+        dx, dy = edge.get("dx"), edge.get("dy")
+        if (not isinstance(source, str) or not isinstance(target, str)
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(float(value)) for value in (dx, dy))):
+            continue
+        edge_dx, edge_dy = float(cast(float, dx)), float(cast(float, dy))
+        adjacency.setdefault(source, []).append((target, edge_dx, edge_dy))
+        adjacency.setdefault(target, []).append((source, -edge_dx, -edge_dy))
+        valid_edges.append(edge)
+    if anchor_scene not in adjacency:
+        return {anchor_scene: (0.0, 0.0)}
+
+    seeds: dict[str, tuple[float, float]] = {anchor_scene: (0.0, 0.0)}
+    queue = [anchor_scene]
+    for current in queue:
+        for neighbor, dx, dy in adjacency.get(current, []):
+            if neighbor not in seeds:
+                origin = seeds[current]
+                seeds[neighbor] = (origin[0] + dx, origin[1] + dy)
+                queue.append(neighbor)
+
+    nodes = sorted(seeds)
+    variables = [node for node in nodes if node != anchor_scene]
+    indices = {node: index for index, node in enumerate(variables)}
+    rows: list[list[float]] = []
+    targets: list[tuple[float, float]] = []
+    weights: list[float] = []
+    for edge in valid_edges:
+        source, target = str(edge["from"]), str(edge["to"])
+        if source not in seeds or target not in seeds:
+            continue
+        row = [0.0] * len(variables)
+        if source != anchor_scene:
+            row[indices[source]] -= 1.0
+        if target != anchor_scene:
+            row[indices[target]] += 1.0
+        dx, dy = float(edge["dx"]), float(edge["dy"])
+        targets.append((dx, dy))
+        rows.append(row)
+        weights.append(math.sqrt(max(1, int(edge.get("samples", 1)))))
+    if variables and rows:
+        matrix = np.asarray(rows, dtype=np.float64)
+        weight_array = np.asarray(weights, dtype=np.float64)[:, None]
+        rhs = np.asarray(targets, dtype=np.float64)
+        solution = np.linalg.lstsq(matrix * weight_array, rhs * weight_array, rcond=None)[0]
+        seeds.update({node: (float(solution[index, 0]), float(solution[index, 1]))
+                      for node, index in indices.items()})
+    return seeds
+
+
+def propagate_room_calibrations(
+    transitions: Sequence[Mapping[str, Any]], *, anchor_scene: str,
+    anchor_transform: Sequence[float],
+) -> dict[str, dict[str, Any]]:
+    """Copy the anchor scale/orientation to connected rooms using passage offsets."""
+    edges = build_transition_graph(transitions)
+    origins = solve_room_origins(edges, anchor_scene)
+    a, b, c, d, e, f = (float(value) for value in anchor_transform)
+    result: dict[str, dict[str, Any]] = {}
+    for scene, (origin_x, origin_y) in origins.items():
+        transform = (a, b, c + a * origin_x + b * origin_y,
+                     d, e, f + d * origin_x + e * origin_y)
+        confidence = 1.0 if scene == anchor_scene else 0.95
+        result[scene] = {"affine": list(transform), "confidence": confidence,
+                         "positioned": True,
+                         "source": "manual_anchor" if scene == anchor_scene else "observed_passages"}
+    return result
 
 
 def apply_affine(transform: Sequence[float], x: float, y: float) -> tuple[float, float]:
