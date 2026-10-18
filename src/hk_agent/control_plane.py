@@ -1004,11 +1004,12 @@ class ControlPlane:
             "MKL_NUM_THREADS": str(self.torch_threads),
             "OPENBLAS_NUM_THREADS": str(self.torch_threads),
         })
-        with log_path.open("wb") as log_handle:
-            creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            windows_job = WindowsJob.create() if _windows_job_enabled() and subprocess.Popen is _REAL_POPEN else None
-            if _windows_job_enabled():
-                creation_flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        log_handle = log_path.open("wb")
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        windows_job = WindowsJob.create() if _windows_job_enabled() and subprocess.Popen is _REAL_POPEN else None
+        if _windows_job_enabled():
+            creation_flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        try:
             process = subprocess.Popen(
                 command, cwd=self.project_root, stdin=subprocess.DEVNULL,
                 stdout=log_handle, stderr=subprocess.STDOUT, shell=False,
@@ -1023,6 +1024,11 @@ class ControlPlane:
                     windows_job.close()
                     process.kill()
                     raise
+        except BaseException:
+            log_handle.close()
+            if windows_job is not None and launch_id not in self._jobs:
+                windows_job.close()
+            raise
         record["pid"] = process.pid
         record["runner_process"] = process_identity(process.pid)
         record["launch_nonce"] = launch_id
@@ -1030,6 +1036,11 @@ class ControlPlane:
         with self._lock:
             self._launches[launch_id] = record
             self._processes[launch_id] = process
+            threading.Thread(
+                target=self._wait_for_process,
+                args=(launch_id, process, log_handle, launch_root),
+                daemon=True,
+            ).start()
         return dict(record)
 
     def _launch_single(

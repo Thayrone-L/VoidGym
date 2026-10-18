@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hk_agent import control_plane as control_plane_module
 from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.control_plane import CampaignSpec, ControlPlane
 from hk_agent.control_plane_server import ControlPlaneHTTPServer
@@ -1633,6 +1634,50 @@ def test_shared_learner_terminal_transition_skips_game_job_and_save_drain(tmp_pa
     assert record["shared_learner_status"] == "CANCELLED"
     assert record["final_save_status"] == "not_applicable"
     assert calls == {"query": 0, "close": 1}
+
+
+def test_shared_learner_launch_starts_terminal_status_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    (shared_root / "learner.json").write_text(
+        json.dumps({"status": "CANCELLED", "round": 1}), encoding="utf-8"
+    )
+    payload = _payload("exploration_training")
+    payload.update({"shared_learner": True, "actors": 2, "rollout_steps": 512, "batch_size": 256})
+    payload["weights"] = {}
+    spec = CampaignSpec.from_payload(payload)
+    process = _FakeProcess([])
+    process._return_code = 0
+    process._done.set()
+
+    class ImmediateThread:
+        def __init__(self, *, target: Any, args: tuple[Any, ...], daemon: bool) -> None:
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+    monkeypatch.setattr(control_plane_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(control_plane_module, "process_identity", lambda _pid: {"pid": process.pid})
+    monkeypatch.setattr(control_plane_module.threading, "Thread", ImmediateThread)
+    record = control._launch_shared_learner(
+        spec, version=1, group_id="group", shared_root=shared_root
+    )
+
+    assert record["status"] == "CANCELLED"
+    assert record["shared_learner_status"] == "CANCELLED"
+    assert record["final_save_status"] == "not_applicable"
+    assert record["launch_id"] not in control._processes
+    persisted = json.loads(
+        (control.control_root / "launches" / str(record["launch_id"]) / "launch.json").read_text()
+    )
+    assert persisted["status"] == "CANCELLED"
 
 
 @pytest.mark.parametrize("learner_finishes_last", [True, False])
