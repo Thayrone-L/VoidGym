@@ -51,7 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run diagnostic PPO against Hollow Knight")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
     parser.add_argument("--task", choices=("visual_motion", "exploration"), default="visual_motion")
-    parser.add_argument("--reward-version", choices=("explore_v1", "explore_v2", "explore_v3"))
+    parser.add_argument(
+        "--reward-version", choices=("explore_v1", "explore_v2", "explore_v3", "explore_v4")
+    )
     parser.add_argument("--stuck-seconds", type=float, default=120.0)
     parser.add_argument("--evaluation-interval", type=int, default=20)
     parser.add_argument("--lifelong-memory-root", type=Path)

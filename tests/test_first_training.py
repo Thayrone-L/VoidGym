@@ -723,3 +723,13 @@ def test_environment_run_failed_does_not_abort_continuous_campaign(
     manifest = json.loads((tmp_path / "run" / "manifest.json").read_text("utf-8"))
     assert result["status"] == "CANCELLED"
     assert manifest["gameplay_run_failures"] == 1
+
+
+def test_training_cli_accepts_explore_v4(monkeypatch: Any) -> None:
+    script = Path(__file__).parents[1] / "tools" / "run_first_training.py"
+    monkeypatch.setattr(
+        sys, "argv", [str(script), "--task", "exploration", "--reward-version", "explore_v4"]
+    )
+    namespace = runpy.run_path(str(script), run_name="test_run_first_training_cli")
+    args = namespace["parse_args"]()
+    assert args.reward_version == "explore_v4"
