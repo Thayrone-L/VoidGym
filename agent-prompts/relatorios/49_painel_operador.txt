@@ -36,4 +36,4 @@ Falhas e correções
   instância; CSS, frontend e captura foram corrigidos.
 
 Commit solicitado: Operator-focused training dashboard with run reports
-Push: origin/codex/parallel-instances-isolation (PR #8)
+Commit/push: 97d1b6a enviado para origin/codex/parallel-instances-isolation (PR #8)
