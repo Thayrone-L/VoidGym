@@ -356,11 +356,20 @@ class SharedRoundStore:
             and status.get("status") in {"STARTING", "WAITING", "TRAINING", "RUNNING"}
         )
 
-    def publish_policy(self, round_number: int, policy: Any, fingerprint: str) -> dict[str, Any]:
+    def publish_policy(
+        self, round_number: int, policy: Any, fingerprint: str, *, reuse_existing: bool = False
+    ) -> dict[str, Any]:
         fingerprint = _safe_fingerprint(fingerprint)
         stem = f"round-{round_number:08d}"
-        artifact = self.policy_root / f"{stem}.safetensors"
-        sidecar = self.policy_root / f"{stem}.policy.manifest.json"
+        pointer_path = self.policy_root / f"{stem}.json"
+        if pointer_path.exists():
+            if reuse_existing:
+                self.import_policy(round_number, policy, fingerprint)
+                return cast(dict[str, Any], json.loads(pointer_path.read_text("utf-8")))
+            raise SharedLearnerError(f"policy round {round_number} was already published")
+        generation = secrets.token_hex(8)
+        artifact = self.policy_root / f"{stem}-{generation}.safetensors"
+        sidecar = self.policy_root / f"{stem}-{generation}.policy.manifest.json"
         exported = export_policy_artifact(
             policy, artifact, compatibility_fingerprint=fingerprint, manifest_path=sidecar
         )
@@ -374,7 +383,31 @@ class SharedRoundStore:
             "manifest_id": exported["manifest_id"],
             "task_contract_fingerprint": fingerprint,
         }
-        _atomic_json(self.policy_root / f"{stem}.json", pointer)
+        pending_pointer = self.policy_root / f".{stem}.{generation}.pointer.tmp"
+        try:
+            with pending_pointer.open("xb") as stream:
+                stream.write(_canonical_json(pointer) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(pending_pointer, pointer_path)
+            except FileExistsError as error:
+                raise SharedLearnerError(
+                    f"policy round {round_number} was already published"
+                ) from error
+        finally:
+            pending_pointer.unlink(missing_ok=True)
+        for old_artifact in self.policy_root.glob("round-*.safetensors"):
+            try:
+                old_round = int(old_artifact.name[6:14])
+            except ValueError:
+                continue
+            if old_round < round_number - 2:
+                old_artifact.unlink(missing_ok=True)
+                old_manifest = old_artifact.with_name(
+                    old_artifact.name.removesuffix(".safetensors") + ".policy.manifest.json"
+                )
+                old_manifest.unlink(missing_ok=True)
         return pointer
 
     def import_policy(self, round_number: int, policy: Any, fingerprint: str) -> dict[str, Any]:
@@ -795,6 +828,8 @@ def run_shared_actor(
         "algorithm": "MaskablePPO",
         "task_contract_fingerprint": fingerprint,
         "rounds_published": 0,
+        "policy_import_retries": 0,
+        "policy_import_skips": 0,
         "stale_rollouts": 0,
         "relaunches": int(bool(os.environ.get("HK_AGENT_RESTART_OF"))),
         "started_unix_ns": time.time_ns(),
@@ -842,7 +877,23 @@ def run_shared_actor(
             if status["status"] == "CANCELLED":
                 break
             wait_policy_ms = (time.perf_counter() - wait_policy_started) * 1000
-            store.import_policy(round_number, model.policy, fingerprint)
+            imported = False
+            for attempt in range(3):
+                try:
+                    store.import_policy(round_number, model.policy, fingerprint)
+                    imported = True
+                    break
+                except (OSError, UnicodeError, json.JSONDecodeError, SharedLearnerError, ValueError) as error:
+                    status["policy_import_retries"] = int(status["policy_import_retries"]) + 1
+                    if attempt < 2:
+                        time.sleep(0.2)
+                    else:
+                        status["policy_import_skips"] = int(status["policy_import_skips"]) + 1
+                        status["last_policy_import_error"] = f"{type(error).__name__}: {error}"
+                        _atomic_json(output_root / "manifest.json", status)
+            if not imported:
+                round_number += 1
+                continue
             callback.round_number = round_number
             callback.resets = 0
             store.publish_actor_status(
@@ -1057,7 +1108,6 @@ def run_shared_learner(
         target = checkpoints / f"round-{round_number:08d}.zip"
         model.save(temporary)
         os.replace(temporary, target)
-        store.publish_policy(round_number, model.policy, fingerprint)
         checkpoint_paths = sorted(checkpoints.glob("round-*.zip"))
         for stale in checkpoint_paths[:-max_checkpoints]:
             stale.unlink(missing_ok=True)
@@ -1071,7 +1121,7 @@ def run_shared_learner(
         next_checkpoint = ((completed // checkpoint_interval) + 1) * checkpoint_interval
 
     try:
-        store.publish_policy(current_round, model.policy, fingerprint)
+        store.publish_policy(current_round, model.policy, fingerprint, reuse_existing=True)
         while True:
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"

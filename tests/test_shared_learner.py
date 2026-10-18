@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 
 import gymnasium as gym
@@ -22,6 +23,50 @@ from hk_agent.shared_learner import (
 )
 
 FINGERPRINT = "a" * 64
+
+
+def _tiny_torch_policy():
+    torch = pytest.importorskip("torch")
+    return torch.nn.Linear(2, 3)
+
+
+def test_shared_policy_is_immutable_and_resume_reuses_pointer(tmp_path):
+    policy = _tiny_torch_policy()
+    store = SharedRoundStore(tmp_path)
+    published = store.publish_policy(4, policy, FINGERPRINT)
+    pointer_path = store.policy_root / "round-00000004.json"
+    before = pointer_path.read_bytes()
+    assert "-" in published["artifact"]
+    with pytest.raises(SharedLearnerError, match="already published"):
+        store.publish_policy(4, policy, FINGERPRINT)
+    assert store.publish_policy(4, policy, FINGERPRINT, reuse_existing=True) == published
+    assert pointer_path.read_bytes() == before
+
+
+def test_actor_imports_while_policy_is_published(tmp_path):
+    policy = _tiny_torch_policy()
+    store = SharedRoundStore(tmp_path)
+    failures = []
+    started = threading.Event()
+
+    def publish_and_checkpoint():
+        try:
+            store.publish_policy(1, policy, FINGERPRINT)
+            started.set()
+            # Checkpointing must not republish or alter this immutable generation.
+            for _ in range(25):
+                time.sleep(0.002)
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=publish_and_checkpoint)
+    thread.start()
+    assert started.wait(5)
+    for _ in range(25):
+        store.import_policy(1, _tiny_torch_policy(), FINGERPRINT)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert failures == []
 
 
 def test_actor_liveness_grace_covers_rollout_publication_but_not_restart(tmp_path):
