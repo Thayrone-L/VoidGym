@@ -40,6 +40,7 @@
             <label>Atores<input name="actors" type="number" value="2" min="1" max="3"></label>
             <label>Passos por rodada<input id="rollout-steps" name="rollout_steps" type="number" value="512" min="1" max="65536"></label>
             <label>Batch PPO<input id="batch-size" name="batch_size" type="number" value="256" min="1" max="65536"></label>
+            <label>Timeout de straggler (s)<input name="straggler_timeout_seconds" type="number" value="45" min="1" max="300" step="1"></label>
             <label class="exploration-ppo">Entropia<input name="ent_coef" type="number" value="0.01" min="0.000001" max="10" step="any"></label>
             <label class="exploration-ppo">Gamma<input name="gamma" type="number" value="0.995" min="0.000001" max="1" step="any"></label>
             <label class="exploration-ppo">GAE lambda<input name="gae_lambda" type="number" value="0.95" min="0.000001" max="1" step="any"></label>

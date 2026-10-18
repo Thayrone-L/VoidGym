@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +34,18 @@ _ALLOWED_SAFE_DTYPES = frozenset(_DTYPE_TO_SAFE.values())
 
 class PolicyArtifactError(ValueError):
     """Raised when a portable policy artifact fails closed validation."""
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Retry brief Windows sharing violations while readers load a prior artifact."""
+    for attempt in range(20):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.025)
 
 
 class _Tensor(Protocol):
@@ -313,13 +326,13 @@ def export_policy_artifact(
         }
         manifest = {"manifest_id": hashlib.sha256(_canonical_bytes(body)).hexdigest(), **body}
         validate_policy_manifest(manifest)
-        os.replace(pending, target)
+        _replace_with_retry(pending, target)
         pending_json = sidecar.with_name(
             f".{sidecar.name}.{os.getpid()}.{secrets.token_hex(8)}.pending"
         )
         try:
             pending_json.write_bytes(_canonical_bytes(manifest) + b"\n")
-            os.replace(pending_json, sidecar)
+            _replace_with_retry(pending_json, sidecar)
         finally:
             if pending_json.exists():
                 pending_json.unlink()

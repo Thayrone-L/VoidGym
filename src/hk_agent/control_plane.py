@@ -101,6 +101,7 @@ class CampaignSpec:
     target_kl: float | None = None
     learning_rate: float | None = None
     clip_range: float | None = None
+    straggler_timeout_seconds: float = 45.0
     schema_version: int = 7
 
     @classmethod
@@ -275,6 +276,10 @@ class CampaignSpec:
             target_kl=_bounded_float(payload.get("target_kl", 0.03), "target_kl", 0.000001, 10.0) if campaign_type == "exploration_training" else None,
             learning_rate=_bounded_float(payload.get("learning_rate", 0.00025), "learning_rate", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             clip_range=_bounded_float(payload.get("clip_range", 0.2), "clip_range", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
+            straggler_timeout_seconds=_bounded_float(
+                payload.get("straggler_timeout_seconds", 45.0),
+                "straggler_timeout_seconds", 1.0, 300.0,
+            ) if shared_learner else 45.0,
         )
         if spec.rollout_steps * spec.actors % spec.batch_size:
             raise ValueError("batch_size must divide rollout_steps times actors")
@@ -282,6 +287,8 @@ class CampaignSpec:
             spec.checkpoint_interval % (spec.rollout_steps * spec.actors)
         ):
             raise ValueError("shared checkpoint_interval must be a multiple of rollout_steps times actors")
+        if spec.shared_learner and spec.rollout_steps % spec.batch_size:
+            raise ValueError("batch_size must divide one actor rollout for straggler quorum")
         if spec.campaign_type == "visual_motion_training" and spec.horizon < 16:
             raise ValueError("visual-motion horizon must be at least 16 for calibration")
         if (
@@ -976,6 +983,7 @@ class ControlPlane:
             "--max-checkpoints", str(spec.max_checkpoints), "--timesteps", str(spec.timesteps),
             "--seed", str(spec.seed), "--torch-threads", str(self.torch_threads),
             "--torch-interop-threads", str(self.torch_interop_threads),
+            "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
         ]
         if spec.duration_mode == "continuous":
             command.append("--continuous")
@@ -1034,6 +1042,7 @@ class ControlPlane:
         shared_root: Path | None = None,
         shared_group: str | None = None,
         shared_actor_count: int | None = None,
+        shared_restart_of: str | None = None,
     ) -> dict[str, object]:
         self._require_owner()
         project_config = None
@@ -1265,6 +1274,8 @@ class ControlPlane:
                     "HK_AGENT_SHARED_ROOT": str(shared_root),
                     "HK_AGENT_SHARED_ACTORS": str(shared_actor_count),
                 })
+                if shared_restart_of is not None:
+                    environment["HK_AGENT_RESTART_OF"] = shared_restart_of
                 record.update({
                     "role": "actor", "shared_group": shared_group,
                     "shared_root": str(shared_root), "shared_actor_count": shared_actor_count,
@@ -1397,6 +1408,17 @@ class ControlPlane:
                 raise TypeError("shared actor count is invalid")
             actors = actors_value
         if record.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}:
+            from hk_agent.shared_learner import SharedRoundStore
+
+            resources = record.get("resources")
+            slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+            if isinstance(slot, bool) or not isinstance(slot, int):
+                raise TypeError("shared actor slot id is invalid")
+            SharedRoundStore(shared_root).publish_actor_status(
+                slot=slot,
+                launch_id=launch_id, status="RESTARTING",
+                restart_requested_unix_ns=time.time_ns(),
+            )
             self.stop(launch_id, _shared_member=True)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -1410,6 +1432,7 @@ class ControlPlane:
         replacement = self._launch_single(
             campaign_id, version=version, execute=True, shared_role="actor",
             shared_root=shared_root, shared_group=group, shared_actor_count=actors,
+            shared_restart_of=launch_id,
         )
         restart_record = {
             "time_unix_ns": time.time_ns(), "shared_group": group,
@@ -1442,6 +1465,42 @@ class ControlPlane:
         with self._lock:
             initial_record = self._launches.get(launch_id) or {}
             stop_requested_before_exit = initial_record.get("status") == "STOP_REQUESTED"
+        if initial_record.get("role") == "learner":
+            learner_status: dict[str, Any] = {}
+            try:
+                shared_root = Path(str(initial_record["shared_root"]))
+                learner_status = json.loads(
+                    (shared_root / "learner.json").read_text("utf-8")
+                )
+            except (OSError, json.JSONDecodeError, KeyError):
+                pass
+            cooperative_status = learner_status.get("status")
+            status = (
+                str(cooperative_status)
+                if return_code == 0 and cooperative_status in {"CANCELLED", "COMPLETED"}
+                else "FAILED"
+            )
+            failure = None
+            if status == "FAILED":
+                failure = str(learner_status.get("failure") or
+                              f"learner process exited with code {return_code} and status {cooperative_status!r}")
+            with self._lock:
+                record = self._launches.get(launch_id)
+                if record is not None and self._processes.get(launch_id) is process:
+                    record.update({
+                        "status": status, "return_code": return_code,
+                        "finished_unix_ns": time.time_ns(),
+                        "final_save_status": "not_applicable",
+                        "shared_learner_status": cooperative_status,
+                    })
+                    if failure is not None:
+                        record["failure"] = failure
+                    atomic_json(launch_root / "launch.json", record)
+                    self._processes.pop(launch_id, None)
+                    job = self._jobs.pop(launch_id, None)
+                    if job is not None:
+                        job.close()
+            return
         job = self._jobs.get(launch_id)
         remaining_pids: list[int] = []
         job_failure = False
@@ -1544,6 +1603,21 @@ class ControlPlane:
                     }
                 )
                 atomic_json(launch_root / "launch.json", record)
+                resource_map = record.get("resources")
+                if record.get("role") == "actor" and isinstance(resource_map, Mapping):
+                    slot = resource_map.get("slot_id")
+                    shared_root_value = record.get("shared_root")
+                    if isinstance(slot, int) and not isinstance(slot, bool) and isinstance(shared_root_value, str):
+                        try:
+                            from hk_agent.shared_learner import SharedRoundStore
+
+                            SharedRoundStore(Path(shared_root_value)).publish_actor_status(
+                                slot=slot, launch_id=launch_id,
+                                status=str(record["status"]),
+                                finished_unix_ns=record["finished_unix_ns"],
+                            )
+                        except (OSError, ValueError):
+                            pass
                 self._processes.pop(launch_id, None)
                 self._release_slot_locked(launch_id)
                 job = self._jobs.pop(launch_id, None)
@@ -1857,6 +1931,23 @@ class ControlPlane:
             atomic_json(launch_root / "launch.json", record)
             pid = process.pid if process is not None else self._reattached_pids[launch_id]
             return {"status": "STOP_REQUESTED", "pid": pid}
+
+    def shared_group_stopped(self, shared_group: str) -> bool:
+        """A group is stopped only when its learner and every actor are terminal."""
+        self.status()
+        terminal = {"COMPLETED", "CANCELLED", "FAILED"}
+        with self._lock:
+            members = [
+                row for row in self._launches.values()
+                if row.get("shared_group") == shared_group
+            ]
+            learners = [row for row in members if row.get("role") == "learner"]
+            actors = [row for row in members if row.get("role") == "actor"]
+            return (
+                len(learners) == 1 and bool(actors)
+                and learners[0].get("status") in terminal
+                and all(row.get("status") in terminal for row in actors)
+            )
 
     def read_log(
         self, offset: int = 0, limit: int = 65_536, launch_id: str | None = None

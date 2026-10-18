@@ -73,6 +73,7 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     payload["batch_size"] = 256
     payload["horizon"] = 3000
     payload["checkpoint_interval"] = 1024
+    payload["straggler_timeout_seconds"] = 30.0
     payload["weights"] = {
         "time_cost": -0.001, "novelty_reward": 0.05, "novelty_budget": 20.0,
         "scene_change_reward": 5.0, "enemy_kill_reward": 1.0,
@@ -88,6 +89,7 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert spec.gae_lambda == 0.95 and spec.n_epochs == 4
     assert spec.target_kl == 0.03 and spec.learning_rate == 0.00025
     assert spec.clip_range == 0.2
+    assert spec.straggler_timeout_seconds == 30.0
     assert "--task" in command and command[command.index("--task") + 1] == "exploration"
     assert command[command.index("--rollout-steps") + 1] == "512"
     assert command[command.index("--batch-size") + 1] == "256"
@@ -102,6 +104,15 @@ def test_campaign_rejects_out_of_range_values(field: str, value: int) -> None:
     payload = _payload()
     payload[field] = value
     with pytest.raises(ValueError, match=field):
+        CampaignSpec.from_payload(payload)
+
+
+def test_shared_campaign_rejects_straggler_timeout_above_supported_bound() -> None:
+    payload = _payload("exploration_training")
+    payload["shared_learner"] = True
+    payload["straggler_timeout_seconds"] = 301
+    payload["weights"] = {}
+    with pytest.raises(ValueError, match="straggler_timeout_seconds"):
         CampaignSpec.from_payload(payload)
 
 
@@ -1582,6 +1593,116 @@ def test_requested_stop_with_job_draining_stays_cancelled(
     assert persisted["status"] == expected
     if expected == "CANCELLED":
         assert "failure" not in persisted
+
+
+def test_shared_learner_terminal_transition_skips_game_job_and_save_drain(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    launch_id = "shared-learner"
+    launch_root = control.control_root / "launches" / launch_id
+    launch_root.mkdir(parents=True)
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    (shared_root / "learner.json").write_text(
+        json.dumps({"status": "CANCELLED", "round": 4}), encoding="utf-8"
+    )
+    record: dict[str, object] = {
+        "launch_id": launch_id, "role": "learner", "shared_group": "group",
+        "shared_root": str(shared_root), "status": "STOP_REQUESTED",
+        "resources": {"slot_id": None},
+    }
+    process = _FakeProcess([])
+    process._return_code = 0
+    process._done.set()
+    calls = {"query": 0, "close": 0}
+
+    class LearnerJob:
+        def process_ids(self) -> list[int]:
+            calls["query"] += 1
+            raise AssertionError("learner terminal path must not wait on game-process drain")
+
+        def close(self) -> None:
+            calls["close"] += 1
+
+    control._launches[launch_id] = record
+    control._processes[launch_id] = process
+    control._jobs[launch_id] = LearnerJob()  # type: ignore[assignment]
+    log_handle = (launch_root / "process.log").open("wb")
+    control._wait_for_process(launch_id, process, log_handle, launch_root)  # type: ignore[arg-type]
+    assert record["status"] == "CANCELLED"
+    assert record["shared_learner_status"] == "CANCELLED"
+    assert record["final_save_status"] == "not_applicable"
+    assert calls == {"query": 0, "close": 1}
+
+
+@pytest.mark.parametrize("learner_finishes_last", [True, False])
+def test_shared_group_requires_terminal_learner_and_all_actors(
+    tmp_path: Path, learner_finishes_last: bool
+) -> None:
+    control = ControlPlane.__new__(ControlPlane)
+    control._lock = threading.RLock()
+    control.status = lambda: {"active_count": 0}  # type: ignore[method-assign]
+    control._launches = {
+        "learner": {"shared_group": "g", "role": "learner", "status": "RUNNING"},
+        "actor-0": {"shared_group": "g", "role": "actor", "status": "RUNNING"},
+        "actor-1": {"shared_group": "g", "role": "actor", "status": "RUNNING"},
+    }
+    if learner_finishes_last:
+        control._launches["actor-0"]["status"] = "CANCELLED"
+        control._launches["actor-1"]["status"] = "CANCELLED"
+        assert not control.shared_group_stopped("g")
+        control._launches["learner"]["status"] = "CANCELLED"
+    else:
+        control._launches["learner"]["status"] = "CANCELLED"
+        assert not control.shared_group_stopped("g")
+        control._launches["actor-0"]["status"] = "CANCELLED"
+        control._launches["actor-1"]["status"] = "COMPLETED"
+    assert control.shared_group_stopped("g")
+
+
+@pytest.mark.parametrize("actors_finish_first", [True, False])
+def test_shared_group_stop_waits_for_fake_processes_in_either_order(
+    tmp_path: Path, actors_finish_first: bool
+) -> None:
+    root = _project(tmp_path)
+    control = ControlPlane(root)
+    group = "shared-stop-order"
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    (shared_root / "learner.json").write_text(
+        json.dumps({"status": "CANCELLED", "round": 1}), encoding="utf-8"
+    )
+    launches: dict[str, tuple[dict[str, object], _FakeProcess, Path]] = {}
+    for launch_id, role in (("learner", "learner"), ("actor-0", "actor"), ("actor-1", "actor")):
+        launch_root = control.control_root / "launches" / launch_id
+        launch_root.mkdir(parents=True)
+        process = _FakeProcess([])
+        process._return_code = 0
+        process._done.set()
+        record: dict[str, object] = {
+            "launch_id": launch_id, "mode": "execute", "role": role,
+            "shared_group": group, "shared_root": str(shared_root),
+            "status": "RUNNING", "pid": process.pid,
+            "resources": {"slot_id": None},
+            "stop_file": (launch_root / "stop.request").relative_to(root).as_posix(),
+        }
+        (launch_root / "launch.json").write_text(json.dumps(record), encoding="utf-8")
+        control._launches[launch_id] = record
+        control._processes[launch_id] = process
+        launches[launch_id] = (record, process, launch_root)
+
+    result = control.stop("learner")
+    assert result["status"] == "STOP_REQUESTED"
+    assert all(row[0]["status"] == "STOP_REQUESTED" for row in launches.values())
+    order = ["actor-0", "actor-1", "learner"] if actors_finish_first else ["learner", "actor-0", "actor-1"]
+    for launch_id in order:
+        record, process, launch_root = launches[launch_id]
+        with (launch_root / "process.log").open("wb") as log_handle:
+            control._wait_for_process(launch_id, process, log_handle, launch_root)  # type: ignore[arg-type]
+        if launch_id != order[-1]:
+            assert not control.shared_group_stopped(group)
+    assert control.shared_group_stopped(group)
+    assert all(row[0]["status"] == "CANCELLED" for row in launches.values())
 
 
 def _foreign_owner(control_root: Path, pid: int = 424242, creation_time: object = 99) -> Path:

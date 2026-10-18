@@ -219,7 +219,11 @@ def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path |
     task.reset(seed=seed)
     noop: list[list[float]] = []
     active: list[list[float]] = []
-    for target, actions in ((noop, [0] * 10), (active, [1 if i % 2 == 0 else 2 for i in range(10)])):
+    # Sustained directional jumps make a reliable camera/scene-change signal
+    # during startup calibration, including when horizontal movement alone is
+    # blocked by a nearby wall or a stationary spawn position.
+    active_actions = [6 if i % 2 == 0 else 8 for i in range(10)]
+    for target, actions in ((noop, [0] * 10), (active, active_actions)):
         for action in actions:
             if stop_file is not None and stop_file.is_file():
                 return noop, active, True

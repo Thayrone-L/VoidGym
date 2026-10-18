@@ -7,9 +7,12 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
+from hk_agent import shared_learner as shared
 from hk_agent.shared_learner import (
     SharedLearnerError,
     SharedRoundStore,
+    _atomic_json,
+    _canonical_json,
     _shared_ppo_parameters,
     _space_from_payload,
     _space_to_payload,
@@ -55,9 +58,62 @@ def _spaces():
 
 
 def test_dict_multidiscrete_space_round_trips_strictly():
-    source = gym.spaces.Dict({"history": gym.spaces.MultiDiscrete([3, 4], start=[1, 0])})
+    source = gym.spaces.Dict({
+        "history": gym.spaces.MultiDiscrete([3, 4], start=[1, 0]),
+        "pixels": gym.spaces.Box(0, 1, (3, 4, 5), dtype=np.float32),
+    })
     restored = _space_from_payload(_space_to_payload(source))
     assert restored == source
+
+
+def test_atomic_json_normalizes_numpy_scalars_and_arrays(tmp_path):
+    path = tmp_path / "contract.json"
+    _atomic_json(path, {"count": np.int64(4), "shape": np.asarray([2, 3], dtype=np.int64)})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"count": 4, "shape": [2, 3]}
+    assert json.loads(_canonical_json({"count": np.int64(4)})) == {"count": 4}
+
+
+def test_atomic_json_retries_windows_replace_sharing_error(tmp_path, monkeypatch):
+    path = tmp_path / "status.json"
+    original = shared.os.replace
+    attempts = 0
+
+    def flaky_replace(source, target):
+        nonlocal attempts
+        if attempts == 0:
+            attempts += 1
+            raise PermissionError("simulated Windows sharing lock")
+        original(source, target)
+
+    monkeypatch.setattr(shared.os, "replace", flaky_replace)
+    _atomic_json(path, {"status": "WAITING"})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "WAITING"}
+    assert attempts == 1
+
+
+def test_published_rollout_normalizes_maskable_buffer_masks_to_bool(tmp_path):
+    from types import SimpleNamespace
+
+    store = SharedRoundStore(tmp_path)
+    buffer = SimpleNamespace(
+        pos=2, buffer_size=2, full=True,
+        observations={"image": np.zeros((2, 1, 3), dtype=np.float32)},
+        actions=np.zeros((2, 1), dtype=np.int64),
+        rewards=np.ones((2, 1), dtype=np.float32),
+        episode_starts=np.zeros((2, 1), dtype=np.float32),
+        values=np.zeros((2, 1), dtype=np.float32),
+        log_probs=np.zeros((2, 1), dtype=np.float32),
+        advantages=np.ones((2, 1), dtype=np.float32),
+        returns=np.ones((2, 1), dtype=np.float32),
+        action_masks=np.ones((2, 1, 2), dtype=np.float32),
+    )
+    store.publish_rollout(round_number=1, slot=0, launch_id="actor", buffer=buffer, fingerprint=FINGERPRINT)
+    observation_space = gym.spaces.Dict({"image": gym.spaces.Box(0, 1, (3,), dtype=np.float32)})
+    arrays = store.read_rollout(
+        round_number=1, slot=0, fingerprint=FINGERPRINT, n_steps=2,
+        observation_space=observation_space, action_count=2,
+    )
+    assert arrays["action_masks"].dtype == np.bool_
 
 
 def test_rollout_round_trip_and_rejects_old_round(tmp_path):
@@ -114,12 +170,50 @@ def test_rollout_rejects_empty_mask_and_unavailable_action(tmp_path):
 def test_one_actor_satisfies_quorum_after_timeout(tmp_path):
     store = _publish_arrays(tmp_path)
     observation_space, action_count = _spaces()
-    rollouts, slots = store.wait_rollouts(
+    rollouts, slots, metrics = store.wait_rollouts(
         round_number=1, actors=2, fingerprint=FINGERPRINT, n_steps=2,
         observation_space=observation_space, action_count=action_count, timeout=0.01,
     )
     assert slots == [0]
     assert len(rollouts) == 1
+    assert metrics["received_slots"] == [0]
+
+
+def test_straggler_timeout_trains_with_one_actor_rollout(tmp_path):
+    store = _publish_arrays(tmp_path)
+    store.publish_actor_status(slot=1, launch_id="actor-1", status="COLLECTING")
+    observation_space, action_count = _spaces()
+    started = __import__("time").monotonic()
+    rollouts, slots, metrics = store.wait_rollouts(
+        round_number=1, actors=2, fingerprint=FINGERPRINT, n_steps=2,
+        observation_space=observation_space, action_count=action_count,
+        timeout=2, straggler_timeout=0.05,
+    )
+    assert slots == [0]
+    assert len(rollouts) == 1
+    assert metrics["straggler_wait_ms"] < 1000
+    assert __import__("time").monotonic() - started < 1
+
+
+def test_restarting_actor_does_not_hold_rollout_quorum(tmp_path):
+    store = _publish_arrays(tmp_path)
+    store.publish_actor_status(slot=1, launch_id="actor-1", status="RESTARTING")
+    observation_space, action_count = _spaces()
+    rollouts, slots, metrics = store.wait_rollouts(
+        round_number=1, actors=2, fingerprint=FINGERPRINT, n_steps=2,
+        observation_space=observation_space, action_count=action_count,
+        timeout=2, straggler_timeout=45,
+    )
+    assert slots == [0]
+    assert len(rollouts) == 1
+    assert metrics["straggler_wait_ms"] < 1000
+
+
+def test_stale_rollouts_are_counted_separately_from_bug_rejections(tmp_path):
+    store = SharedRoundStore(tmp_path)
+    store.record_stale_rollout(round_number=2, slot=0, launch_id="restarted")
+    assert store.stale_rollout_count() == 1
+    assert not (tmp_path / "rejected.jsonl").exists()
 
 
 def test_restarted_actor_joins_current_learner_round():

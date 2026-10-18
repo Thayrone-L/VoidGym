@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--torch-threads", type=int, default=3)
     parser.add_argument("--torch-interop-threads", type=int, default=1)
     parser.add_argument("--rollout-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--straggler-timeout-seconds", type=float, default=45.0)
     args = parser.parse_args()
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, str(args.torch_threads))
@@ -44,6 +45,7 @@ def main() -> int:
         torch_threads=args.torch_threads,
         torch_interop_threads=args.torch_interop_threads,
         rollout_timeout_seconds=args.rollout_timeout_seconds,
+        straggler_timeout_seconds=args.straggler_timeout_seconds,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("status") in {"COMPLETED", "CANCELLED"} else 1

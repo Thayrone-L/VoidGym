@@ -17,6 +17,8 @@ from hk_agent.policy_artifact import export_policy_artifact, import_policy_artif
 
 MAX_ROLLOUT_BYTES = 512 * 1024 * 1024
 LEARNER_STALE_SECONDS = 300.0
+ACTOR_HEARTBEAT_STALE_SECONDS = 10.0
+DEFAULT_STRAGGLER_TIMEOUT_SECONDS = 45.0
 SHARED_SCHEMA_VERSION = 1
 
 
@@ -29,7 +31,17 @@ class SharedLearnerStopped(SharedLearnerError):
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False, default=_json_default
+    ).encode()
+
+
+def _json_default(item: Any) -> Any:
+    if isinstance(item, np.generic):
+        return item.item()
+    if isinstance(item, np.ndarray):
+        return item.tolist()
+    raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:
@@ -40,13 +52,23 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(pending, path)
+        for attempt in range(20):
+            try:
+                os.replace(pending, path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.025)
     finally:
         pending.unlink(missing_ok=True)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_bytes(path, json.dumps(value, indent=2, allow_nan=False).encode("utf-8") + b"\n")
+    _atomic_bytes(
+        path,
+        json.dumps(value, indent=2, allow_nan=False, default=_json_default).encode("utf-8") + b"\n",
+    )
 
 
 def _sha256(data: bytes) -> str:
@@ -105,9 +127,12 @@ def _space_from_payload(payload: Mapping[str, Any]) -> gym.Space[Any]:
             raise SharedLearnerError("calibration Box shape is invalid")
         if not isinstance(dtype, str):
             raise SharedLearnerError("calibration Box dtype is invalid")
+        low_payload, high_payload = payload.get("low"), payload.get("high")
+        low = low_payload if isinstance(low_payload, (int, float)) else np.asarray(low_payload, dtype=np.dtype(dtype))
+        high = high_payload if isinstance(high_payload, (int, float)) else np.asarray(high_payload, dtype=np.dtype(dtype))
         return gym.spaces.Box(
-            low=np.asarray(payload.get("low"), dtype=np.dtype(dtype)),
-            high=np.asarray(payload.get("high"), dtype=np.dtype(dtype)),
+            low=low,
+            high=high,
             shape=tuple(shape),
             dtype=np.dtype(dtype),
         )
@@ -190,6 +215,66 @@ class SharedRoundStore:
         self.root = root.resolve(strict=False)
         self.policy_root = self.root / "policy"
         self.rollout_root = self.root / "rollouts"
+
+    def actor_status_path(self, slot: int) -> Path:
+        return self.root / "actors" / f"slot-{slot}.json"
+
+    def publish_actor_status(
+        self, *, slot: int, launch_id: str, status: str, **values: Any
+    ) -> bool:
+        """Publish a slot heartbeat without letting a retired actor overwrite its replacement."""
+        path = self.actor_status_path(slot)
+        try:
+            current = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        if current.get("status") == "RESTARTING" and current.get("launch_id") == launch_id:
+            return False
+        if current.get("launch_id") not in (None, launch_id) and current.get("status") not in {
+            "RESTARTING", "CANCELLED", "FAILED", "COMPLETED",
+        }:
+            return False
+        _atomic_json(path, {
+            **current, **values, "slot": slot, "launch_id": launch_id,
+            "status": status, "heartbeat_unix_ns": time.time_ns(),
+        })
+        return True
+
+    def actor_available(self, slot: int, *, now_unix_ns: int | None = None) -> bool | None:
+        """Return None until known, then whether the current slot heartbeat is live."""
+        try:
+            record = json.loads(self.actor_status_path(slot).read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if record.get("status") in {"RESTARTING", "CANCELLED", "FAILED", "COMPLETED"}:
+            return False
+        beat = record.get("heartbeat_unix_ns")
+        if not isinstance(beat, int):
+            return False
+        now = time.time_ns() if now_unix_ns is None else now_unix_ns
+        return (now - beat) / 1_000_000_000 <= ACTOR_HEARTBEAT_STALE_SECONDS
+
+    def record_stale_rollout(self, *, round_number: int, slot: int, launch_id: str) -> None:
+        path = self.root / "telemetry" / "stale-rollouts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({
+            "event": "stale_rollout", "round": round_number, "slot": slot,
+            "launch_id": launch_id, "time_unix_ns": time.time_ns(),
+        }, allow_nan=False).encode("utf-8") + b"\n"
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def stale_rollout_count(self) -> int:
+        path = self.root / "telemetry" / "stale-rollouts.jsonl"
+        try:
+            with path.open("rb") as stream:
+                return sum(1 for _ in stream)
+        except OSError:
+            return 0
 
     @property
     def learner_status_path(self) -> Path:
@@ -337,6 +422,10 @@ class SharedRoundStore:
             if value is None:
                 raise SharedLearnerError(f"actor rollout is missing {name}")
             array = np.asarray(value[:steps, 0]).copy()
+            if name == "action_masks":
+                if not np.isfinite(array).all() or not np.isin(array, (0, 1)).all():
+                    raise SharedLearnerError("actor rollout action masks must contain only finite 0/1 values")
+                array = array.astype(np.bool_, copy=False)
             if name in {"values", "log_probs", "advantages", "returns", "rewards", "episode_starts"}:
                 array = array.reshape(steps)
             arrays[name] = array
@@ -449,11 +538,17 @@ class SharedRoundStore:
         observation_space: gym.spaces.Dict,
         action_count: int,
         timeout: float = 600.0,
+        straggler_timeout: float = DEFAULT_STRAGGLER_TIMEOUT_SECONDS,
         stop_file: Path | None = None,
-    ) -> tuple[list[dict[str, np.ndarray]], list[int]]:
+    ) -> tuple[list[dict[str, np.ndarray]], list[int], dict[str, Any]]:
+        if straggler_timeout <= 0:
+            raise ValueError("straggler_timeout must be positive")
         deadline = time.monotonic() + timeout
         accepted: dict[int, dict[str, np.ndarray]] = {}
         inspected: dict[int, tuple[int, int]] = {}
+        first_rollout_at: float | None = None
+        wait_started = time.monotonic()
+        stale_count = self.stale_rollout_count()
         while time.monotonic() < deadline and len(accepted) < actors:
             if stop_file is not None and stop_file.is_file():
                 break
@@ -475,6 +570,8 @@ class SharedRoundStore:
                     )
                     accepted[slot] = data
                     inspected[slot] = marker
+                    if first_rollout_at is None:
+                        first_rollout_at = time.monotonic()
                 except FileNotFoundError:
                     continue
                 except (OSError, SharedLearnerError, zipfile.BadZipFile, json.JSONDecodeError) as error:
@@ -488,12 +585,30 @@ class SharedRoundStore:
             self.heartbeat(round=round_number, status="WAITING", accepted_rollouts=len(accepted))
             if len(accepted) >= actors:
                 break
+            availability = [self.actor_available(slot) for slot in range(actors)]
+            if not accepted and availability and all(value is False for value in availability):
+                raise TimeoutError("all shared actor slots are unavailable before the first rollout")
+            if first_rollout_at is not None:
+                unavailable = [slot for slot in range(actors)
+                               if slot not in accepted and availability[slot] is False]
+                if unavailable or time.monotonic() - first_rollout_at >= straggler_timeout:
+                    break
             time.sleep(0.2)
         if not accepted:
             if stop_file is not None and stop_file.is_file():
-                return [], []
+                return [], [], {
+                    "wait_rollouts_ms": round((time.monotonic() - wait_started) * 1000, 3),
+                    "straggler_wait_ms": 0.0, "received_slots": [], "stale_rollouts": stale_count,
+                }
             raise TimeoutError("no valid actor rollouts arrived before quorum timeout")
-        return [accepted[slot] for slot in sorted(accepted)], sorted(accepted)
+        waited = time.monotonic() - wait_started
+        straggler_wait = 0.0 if first_rollout_at is None else max(0.0, time.monotonic() - first_rollout_at)
+        return [accepted[slot] for slot in sorted(accepted)], sorted(accepted), {
+            "wait_rollouts_ms": round(waited * 1000, 3),
+            "straggler_wait_ms": round(straggler_wait * 1000, 3),
+            "received_slots": sorted(accepted),
+            "stale_rollouts": self.stale_rollout_count() - stale_count,
+        }
 
 
 def train_shared_round(model: Any, rollouts: Sequence[Mapping[str, np.ndarray]]) -> int:
@@ -613,6 +728,7 @@ def run_shared_actor(
     importlib.import_module("stable_baselines3")
     torch = importlib.import_module("torch")
     contrib = importlib.import_module("sb3_contrib")
+    from stable_baselines3.common.callbacks import BaseCallback
     torch.set_num_threads(config.torch_threads)
     torch.set_num_interop_threads(config.torch_interop_threads)
     torch.manual_seed(config.seed)
@@ -627,12 +743,36 @@ def run_shared_actor(
         device=config.training_device,
         **_shared_ppo_parameters(task_contract),
     )
-    _, callback = model._setup_learn(
+    store = SharedRoundStore(shared_root)
+
+    class ActorHeartbeatCallback(BaseCallback):
+        def __init__(self) -> None:
+            super().__init__(verbose=0)
+            self.round_number = 0
+            self.last_heartbeat = 0.0
+            self.resets = 0
+
+        def _on_step(self) -> bool:
+            if stop_file is not None and stop_file.is_file():
+                return False
+            dones = self.locals.get("dones")
+            if dones is not None:
+                self.resets += int(np.count_nonzero(dones))
+            now = time.monotonic()
+            if now - self.last_heartbeat >= 1.0:
+                store.publish_actor_status(
+                    slot=slot, launch_id=launch_id, status="COLLECTING",
+                    round=self.round_number, collected_steps=self.n_calls,
+                )
+                self.last_heartbeat = now
+            return True
+
+    callback = ActorHeartbeatCallback()
+    model._setup_learn(
         total_timesteps=config.rollout_steps,
-        callback=lambda _locals, _globals: True,
+        callback=callback,
         reset_num_timesteps=True,
     )
-    store = SharedRoundStore(shared_root)
     contract = store.publish_contract(
         task_contract=task_contract,
         fingerprint=__import__("hk_agent.distributed_knowledge", fromlist=["portable_compatibility_fingerprint"])
@@ -655,6 +795,8 @@ def run_shared_actor(
         "algorithm": "MaskablePPO",
         "task_contract_fingerprint": fingerprint,
         "rounds_published": 0,
+        "stale_rollouts": 0,
+        "relaunches": int(bool(os.environ.get("HK_AGENT_RESTART_OF"))),
         "started_unix_ns": time.time_ns(),
     }
     _atomic_json(output_root / "manifest.json", status)
@@ -683,15 +825,69 @@ def run_shared_actor(
                 status["failure"] = "learner heartbeat expired"
                 break
             policy_path = store.policy_root / f"round-{round_number:08d}.json"
-            if not policy_path.is_file():
+            wait_policy_started = time.perf_counter()
+            last_wait_heartbeat = 0.0
+            while not policy_path.is_file():
+                if stop_file is not None and stop_file.is_file():
+                    status["status"] = "CANCELLED"
+                    break
+                now = time.monotonic()
+                if now - last_wait_heartbeat >= 1.0:
+                    store.publish_actor_status(
+                        slot=slot, launch_id=launch_id,
+                        status="WAITING_POLICY", round=round_number,
+                    )
+                    last_wait_heartbeat = now
                 time.sleep(0.25)
-                continue
+            if status["status"] == "CANCELLED":
+                break
+            wait_policy_ms = (time.perf_counter() - wait_policy_started) * 1000
             store.import_policy(round_number, model.policy, fingerprint)
+            callback.round_number = round_number
+            callback.resets = 0
+            store.publish_actor_status(
+                slot=slot, launch_id=launch_id, status="COLLECTING",
+                round=round_number, collected_steps=0,
+            )
+            collect_started = time.perf_counter()
             if not model.collect_rollouts(
                 model.get_env(), callback, model.rollout_buffer, n_rollout_steps=config.rollout_steps
             ):
                 status["status"] = "CANCELLED"
                 break
+            collect_ms = (time.perf_counter() - collect_started) * 1000
+            try:
+                learner_status = json.loads(store.learner_status_path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                learner_status = {}
+            latest_round = actor_join_round(learner_status)
+            if latest_round > round_number:
+                store.record_stale_rollout(
+                    round_number=round_number, slot=slot, launch_id=launch_id
+                )
+                status["stale_rollouts"] = int(status["stale_rollouts"]) + 1
+                store.publish_actor_status(
+                    slot=slot, launch_id=launch_id, status="WAITING_POLICY",
+                    round=latest_round, stale_rollouts=status["stale_rollouts"],
+                )
+                _append_actor_telemetry(shared_root, slot, {
+                    "round": round_number, "launch_id": launch_id,
+                    "wait_policy_ms": wait_policy_ms, "collect_ms": collect_ms,
+                    "publish_ms": 0.0, "stale_rollouts": 1,
+                    "relaunches": int(
+                        bool(os.environ.get("HK_AGENT_RESTART_OF"))
+                        and not status.get("relaunch_recorded")
+                    ), "resets": callback.resets,
+                })
+                status["resets"] = int(status.get("resets", 0)) + callback.resets
+                status["relaunch_recorded"] = True
+                round_number = latest_round
+                _atomic_json(output_root / "manifest.json", status)
+                continue
+            store.publish_actor_status(
+                slot=slot, launch_id=launch_id, status="PUBLISHING", round=round_number
+            )
+            publish_started = time.perf_counter()
             store.publish_rollout(
                 round_number=round_number,
                 slot=slot,
@@ -699,18 +895,52 @@ def run_shared_actor(
                 buffer=model.rollout_buffer,
                 fingerprint=fingerprint,
             )
+            publish_ms = (time.perf_counter() - publish_started) * 1000
+            _append_actor_telemetry(shared_root, slot, {
+                "round": round_number, "launch_id": launch_id,
+                "wait_policy_ms": wait_policy_ms, "collect_ms": collect_ms,
+                "publish_ms": publish_ms, "stale_rollouts": 0,
+                "relaunches": int(
+                    bool(os.environ.get("HK_AGENT_RESTART_OF"))
+                    and not status.get("relaunch_recorded")
+                ), "resets": callback.resets,
+            })
+            status["resets"] = int(status.get("resets", 0)) + callback.resets
+            status["relaunch_recorded"] = True
             round_number += 1
             status["rounds_published"] = int(status["rounds_published"]) + 1
             status["last_policy_round"] = round_number - 1
             _atomic_json(output_root / "manifest.json", status)
+            store.publish_actor_status(
+                slot=slot, launch_id=launch_id, status="WAITING_POLICY",
+                round=round_number, rounds_published=status["rounds_published"],
+                stale_rollouts=status["stale_rollouts"],
+            )
     except BaseException as error:
         status.update({"status": "FAILED", "failure": f"{type(error).__name__}: {error}"})
         raise
     finally:
         status["finished_unix_ns"] = time.time_ns()
         _atomic_json(output_root / "manifest.json", status)
+        store.publish_actor_status(
+            slot=slot, launch_id=launch_id,
+            status=str(status.get("status", "FAILED")), round=round_number,
+            rounds_published=status["rounds_published"], stale_rollouts=status["stale_rollouts"],
+        )
         environment.close()
     return status
+
+
+def _append_actor_telemetry(shared_root: Path, slot: int, row: Mapping[str, Any]) -> None:
+    path = shared_root / "telemetry" / f"actor-slot-{slot}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(dict(row), allow_nan=False).encode("utf-8") + b"\n"
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def run_shared_learner(
@@ -728,10 +958,13 @@ def run_shared_learner(
     torch_threads: int = 3,
     torch_interop_threads: int = 1,
     rollout_timeout_seconds: float = 600.0,
+    straggler_timeout_seconds: float = DEFAULT_STRAGGLER_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Train one PPO learner from all valid actor files in each policy round."""
-    if rollout_steps < 1 or actors < 1 or batch_size < 1 or rollout_steps * actors % batch_size:
-        raise ValueError("shared rollout size must be positive and divisible by batch_size")
+    if rollout_steps < 1 or actors < 1 or batch_size < 1 or rollout_steps % batch_size:
+        raise ValueError("each shared actor rollout must be positive and divisible by batch_size")
+    if not 0 < straggler_timeout_seconds <= rollout_timeout_seconds:
+        raise ValueError("straggler_timeout_seconds must be positive and no larger than rollout_timeout_seconds")
     if checkpoint_interval < rollout_steps * actors or checkpoint_interval % (rollout_steps * actors):
         raise ValueError("checkpoint_interval must be a multiple of rollout_steps times actors")
     if not continuous and total_timesteps < 1:
@@ -849,10 +1082,11 @@ def run_shared_learner(
             store.heartbeat(
                 status="WAITING", round=current_round, completed_timesteps=completed
             )
-            rollouts, slots = store.wait_rollouts(
+            rollouts, slots, wait_metrics = store.wait_rollouts(
                 round_number=current_round, actors=actors, fingerprint=fingerprint,
                 n_steps=rollout_steps, observation_space=observation_space,
-                action_count=int(action_space.n), timeout=rollout_timeout_seconds, stop_file=stop_file,
+                action_count=int(action_space.n), timeout=rollout_timeout_seconds,
+                straggler_timeout=straggler_timeout_seconds, stop_file=stop_file,
             )
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"
@@ -876,6 +1110,11 @@ def run_shared_learner(
                     "training_seconds": training_seconds,
                     "transitions": transitions,
                     "completed_timesteps": completed,
+                    "wait_rollouts_ms": wait_metrics["wait_rollouts_ms"],
+                    "straggler_wait_ms": wait_metrics["straggler_wait_ms"],
+                    "train_ms": round(training_seconds * 1000, 3),
+                    "actors_received": slots,
+                    "stale_rollouts": wait_metrics["stale_rollouts"],
                 })
             manifest["completed_timesteps"] = completed
             manifest["round"] = current_round
@@ -887,6 +1126,11 @@ def run_shared_learner(
                 status="TRAINING", round=current_round, completed_timesteps=completed,
                 accepted_rollouts=len(slots),
                 rejected_rollouts=rejected_count, last_training_seconds=training_seconds,
+                last_wait_rollouts_ms=wait_metrics["wait_rollouts_ms"],
+                last_straggler_wait_ms=wait_metrics["straggler_wait_ms"],
+                last_train_ms=round(training_seconds * 1000, 3),
+                last_actors_received=slots,
+                stale_rollouts_total=store.stale_rollout_count(),
             )
             if completed >= next_checkpoint:
                 save_checkpoint(current_round)

@@ -22,6 +22,19 @@ def test_campaign_is_continuous_cpu_sized_training(campaign_type: str) -> None:
     assert payload["save_slot"] == 1
 
 
+def test_shared_exploration_campaign_uses_prompt_45_parameters() -> None:
+    payload = soak._shared_campaign_payload("shared-test", "test")
+    assert payload["campaign_type"] == "exploration_training"
+    assert payload["shared_learner"] is True
+    assert payload["actors"] == 2
+    assert payload["rollout_steps"] == 512
+    assert payload["batch_size"] == 256
+    assert payload["horizon"] == 3000
+    assert payload["checkpoint_interval"] == 2048
+    assert payload["weights"]["novelty_reward"] == 0.05
+    assert payload["weights"]["death_penalty"] == -5.0
+
+
 def test_soak_control_places_output_under_launch_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     control = object.__new__(soak._SoakControlPlane)
     control.runtime_root = tmp_path / "runtime"
@@ -33,6 +46,24 @@ def test_soak_control_places_output_under_launch_runtime(tmp_path: Path, monkeyp
         stop_file=tmp_path / "control" / "launches" / "launch-abc" / "stop.request",
     )
     assert command[-2:] == ["--output-root", str(tmp_path / "runtime" / "launches" / "launch-abc" / soak.SOAK_OUTPUT_DIR)]
+
+
+def test_status_json_reader_retries_atomic_replace_sharing_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "learner.json"
+    path.write_text('{"status":"WAITING"}', encoding="utf-8")
+    original = Path.read_text
+    attempts = 0
+
+    def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal attempts
+        if self == path and attempts == 0:
+            attempts += 1
+            raise PermissionError("simulated Windows atomic replace lock")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+    assert soak._load_json_retry(path, delay_seconds=0) == {"status": "WAITING"}
+    assert attempts == 1
 
 
 def test_read_training_manifest_and_tree_size(tmp_path: Path) -> None:
@@ -129,6 +160,33 @@ def test_progress_detects_a_real_stall_in_steady_state() -> None:
 def test_progress_after_stop_is_not_judged() -> None:
     rows = _progress([(183, 100), (244, 200), (305, 300), (366, 300), (427, 300), (488, 300)])
     assert soak.evaluate_progress(rows, stop_elapsed=310) == []
+
+
+def test_progress_checker_accepts_configured_restart_bound() -> None:
+    rows = _progress([(183, 100), (244, 100), (305, 200), (366, 200)])
+    assert soak.evaluate_progress(rows, max_gap_seconds=121) == []
+    assert soak.evaluate_progress(rows, max_gap_seconds=50)
+
+
+def test_shared_telemetry_reports_actor_occupancy_and_learner_wait(tmp_path: Path) -> None:
+    telemetry = tmp_path / "telemetry"
+    telemetry.mkdir()
+    (telemetry / "actor-slot-0.jsonl").write_text(
+        '{"round":0,"collect_ms":800,"wait_policy_ms":180,"publish_ms":20,"resets":1,"relaunches":0}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "manifest.json").write_text(
+        '{"round_timings":[{"wait_rollouts_ms":100,"straggler_wait_ms":50,'
+        '"train_ms":200,"actors_received":[0],"stale_rollouts":0}],"completed_timesteps":512}',
+        encoding="utf-8",
+    )
+    summary = soak._shared_telemetry_summary(tmp_path)
+    actor = summary["actors"]["0"]
+    assert actor["collect_percent"] == 80
+    assert actor["wait_policy_percent"] == 18
+    assert actor["resets"] == 1
+    assert summary["learner"]["train_ms"] == 200
+    assert summary["recommendation"]["rollout_steps"] == 512
 
 
 def test_no_progress_at_all_fails() -> None:
