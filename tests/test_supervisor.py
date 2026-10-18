@@ -242,6 +242,9 @@ class SupervisorTests(unittest.TestCase):
                         "shade_hits_since_last_frame": 2,
                         "shade_distance": 1.25,
                         "scene_name": "Room_Test",
+                        "enemy_events_since_last_frame": [
+                            {"scene_name": "Room_Test", "enemy_type": "Crawler"}
+                        ],
                         "duplicate_of": None,
                         "last_applied_action_id": None,
                     },
@@ -263,6 +266,7 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(captured.shade_hits_since_last_frame, 2)
                 self.assertEqual(captured.shade_distance, 1.25)
                 self.assertEqual(captured.scene_name, "Room_Test")
+                self.assertEqual(captured.enemy_events_since_last_frame, (("Room_Test", "Crawler"),))
 
                 fallback_task = asyncio.create_task(
                     supervisor.capture_once(bridge=accepted, encoding="raw_rgb8")

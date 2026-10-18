@@ -76,6 +76,7 @@ class PixelFrame:
     shade_hits_since_last_frame: int = 0
     shade_distance: float | None = None
     scene_name: str | None = None
+    enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -497,6 +498,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
             shade_distance=frame.shade_distance,
             scene_name=frame.scene_name,
+            enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
             action_availability=frame.action_availability,
@@ -564,6 +566,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             or frame.shade_hits_since_last_frame
             or frame.shade_distance is not None
             or frame.scene_name is not None
+            or frame.enemy_events_since_last_frame
         ):
             return {}
         lifecycle = self._shade_run_update
@@ -577,6 +580,10 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             "shade_distance": frame.shade_distance,
             "scene_name": frame.scene_name,
             "shade_pending": frame.shade_pending,
+            "enemy_events_since_last_frame": [
+                {"scene_name": scene, "enemy_type": enemy_type}
+                for scene, enemy_type in frame.enemy_events_since_last_frame
+            ],
             "run_failed": lifecycle.run_failed if lifecycle is not None else frame.run_failed,
             "supervisor": {
                 "player_dead": frame.player_dead,
@@ -590,6 +597,10 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
                 "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
                 "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
+                "enemy_events_since_last_frame": [
+                    {"scene_name": scene, "enemy_type": enemy_type}
+                    for scene, enemy_type in frame.enemy_events_since_last_frame
+                ],
                 "gameplay_run_index": (
                     lifecycle.logical_run_index if lifecycle is not None else 1
                 ),

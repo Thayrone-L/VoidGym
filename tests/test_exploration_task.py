@@ -38,6 +38,7 @@ class _Environment(gym.Env):
         self.terminal = False
         self.truncated = False
         self.extra = {}
+        self.initial_scene = "Room-A"
 
     @staticmethod
     def _frame(shift: int) -> NDArray[np.uint8]:
@@ -54,7 +55,7 @@ class _Environment(gym.Env):
         self.frame = self._frame(0)
         self.terminal = False
         self.truncated = False
-        return self._obs(), {}
+        return self._obs(), {"scene_name": self.initial_scene}
 
     def step(self, action: int, *, lease_ms: int):
         if action == 1:
@@ -206,6 +207,112 @@ def test_exploration_contract_is_pixel_only_and_fingerprint_stable() -> None:
 def _v2_config(**kwargs):
     return ExplorationTaskConfig(reward_version="explore_v2", geo_gain_reward=0, geo_spend_reward=0,
         shade_recovery_reward=4.0, **kwargs)
+
+
+def _v3_config(**kwargs):
+    return ExplorationTaskConfig(reward_version="explore_v3", geo_gain_reward=0, geo_spend_reward=0,
+        shade_recovery_reward=4.0, **kwargs)
+
+
+def test_v3_scene_and_enemy_rewards_decay_and_persist(tmp_path: Path) -> None:
+    from hk_agent.exploration_task import load_campaign_counts
+
+    memory = tmp_path / "actor-memory"
+    expected_scene = (10.0, 2.0 + 8.0 / np.sqrt(2))
+    expected_enemy = (1.0, 1.0 / np.sqrt(2))
+    for scene_reward, enemy_reward in zip(expected_scene, expected_enemy, strict=True):
+        env = _Environment()
+        env.extra = {"scene_name": "Room-B", "enemy_events_since_last_frame": [
+            {"scene_name": "Room-B", "enemy_type": "Crawler"}]}
+        task = ExplorationTask(env, config=_v3_config(), lifelong_memory_root=memory)
+        task.reset()
+        _, _, _, _, info = task.step(0)
+        assert info["reward_components"]["scene_change"] == pytest.approx(scene_reward)
+        assert info["reward_components"]["confirmed_enemy_kills"] == pytest.approx(enemy_reward)
+        task.close()
+    assert load_campaign_counts(memory / "lifelong-scenes.json")["Room-B"] == 2
+    assert load_campaign_counts(memory / "lifelong-enemies.json")["Room-B|Crawler"] == 2
+
+
+def test_v3_stuck_truncates_after_threshold_but_progress_resets_timer(tmp_path: Path) -> None:
+    env = _Environment()
+    task = ExplorationTask(env, config=_v3_config(stuck_seconds=0.12, horizon_steps=30),
+                           lifelong_memory_root=tmp_path / "memory")
+    task.reset()
+    _, _, _, truncated, _first = task.step(0)
+    assert not truncated
+    env.extra = {"scene_name": "Room-B"}
+    _, _, _, truncated, room = task.step(0)
+    assert not truncated
+    assert room["reward_components"]["scene_change"] > 0
+    env.extra = {"scene_name": "Room-B"}
+    _, _, _, truncated, _next_step = task.step(0)
+    assert not truncated
+    assert task._progress_elapsed_seconds == pytest.approx(0.08)
+    _, _, _, truncated, final = task.step(0)
+    assert truncated
+    assert final["termination_reason"] == "stuck"
+    assert final["episode_progress"]["termination_reason"] == "stuck"
+
+
+def test_v3_alert_thresholds_and_return_bounds() -> None:
+    task = ExplorationTask(_Environment(), config=_v3_config(horizon_steps=3000))
+    assert task.config.maximum_positive_episode_reward() == pytest.approx(55.2)
+    assert task.config.minimum_negative_episode_reward() == pytest.approx(-35.5)
+    for _ in range(1999):
+        assert task._record_farm_window({"novelty": 0.1}, "A", "LEFT") == []
+    assert "component_over_60_percent" in task._record_farm_window({"novelty": 0.1}, "A", "LEFT")
+    task = ExplorationTask(_Environment(), config=_v3_config(horizon_steps=1000))
+    alerts = []
+    for index in range(2000):
+        scene, action = ("A", "LEFT") if index < 1200 else (f"scene-{index}", "RIGHT")
+        alerts.extend(task._record_farm_window({}, scene, action))
+    assert "same_scene_action_over_40_percent_without_novelty" in alerts
+
+
+def test_v3_caps_damage_and_shade_components_per_episode(tmp_path: Path) -> None:
+    env = _Environment()
+    env.extra = {"scene_name": "Room-A", "shade_pending": True, "shade_distance": 100.0,
+                 "shade_hits_since_last_frame": 4, "hp_lost_since_last_frame": 9}
+    task = ExplorationTask(env, config=_v3_config(horizon_steps=40), lifelong_memory_root=tmp_path / "memory")
+    task.reset()
+    components = []
+    for distance in list(range(99, 79, -1)) + list(range(80, 100)):
+        env.extra = {"scene_name": "Room-A", "shade_pending": True, "shade_distance": float(distance),
+                     "shade_hits_since_last_frame": 4, "hp_lost_since_last_frame": 9}
+        components.append(task.step(0)[4]["reward_components"])
+    assert sum(item["shade_hits"] for item in components) == pytest.approx(1.2)
+    assert sum(item["damage_taken"] for item in components) == pytest.approx(-4.5)
+    assert sum(max(0.0, item["shade_approach"]) for item in components) <= 1.0
+    assert sum(min(0.0, item["shade_approach"]) for item in components) >= -1.0
+
+
+def test_v3_rejects_reward_budgets_that_break_theoretical_bound() -> None:
+    with pytest.raises(ValueError, match="fixed by the reward version"):
+        _v3_config(time_cost=-0.01).validate()
+    with pytest.raises(ValueError, match="stable episode-return contract"):
+        _v3_config(scene_reward_budget=100).validate()
+
+
+def test_v3_time_cost_has_an_episode_cap(tmp_path: Path) -> None:
+    task = ExplorationTask(_Environment(), config=_v3_config(time_cost_budget=0.02, horizon_steps=50),
+                           lifelong_memory_root=tmp_path / "memory")
+    task.reset()
+    paid = sum(task.step(0)[4]["reward_components"]["time_cost"] for _ in range(50))
+    assert paid == pytest.approx(-0.02)
+
+
+def test_v3_contract_exposes_progress_signals_only_to_reward(tmp_path: Path) -> None:
+    from hk_agent.distributed_knowledge import _public_task_contract
+
+    task = ExplorationTask(_Environment(), config=_v3_config(), lifelong_memory_root=tmp_path / "memory")
+    observation, _ = task.reset()
+    contract = task.task_contract()
+    assert contract["task_contract_schema_version"] == 3
+    assert "scene_name" in contract["reward_only_signals"]
+    assert "enemy_events_since_last_frame" in contract["reward_only_signals"]
+    assert "scene_name" not in observation
+    assert _public_task_contract(contract, from_manifest=False)["reward_version"] == "explore_v3"
 
 
 def test_v2_masks_hud_and_requires_persistent_scene_change(tmp_path: Path) -> None:

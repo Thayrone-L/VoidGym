@@ -6,7 +6,7 @@ import os
 import secrets
 import time
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -561,6 +561,38 @@ class SharedRoundStore:
             stream.flush()
             os.fsync(stream.fileno())
 
+    def append_evaluation(self, record: Mapping[str, Any]) -> None:
+        path = self.root / "evaluations.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        key = (record.get("round"), record.get("slot"))
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(existing, Mapping) and (existing.get("round"), existing.get("slot")) == key:
+                    return
+        payload = json.dumps(dict(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def read_evaluations(self, limit: int = 200) -> list[dict[str, Any]]:
+        path = self.root / "evaluations.jsonl"
+        if not path.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                rows.append(record)
+        return rows[-limit:]
+
     def wait_rollouts(
         self,
         *,
@@ -728,6 +760,62 @@ def actor_join_round(learner_status: Mapping[str, Any]) -> int:
     return cast(int, value)
 
 
+def run_deterministic_evaluation(
+    model: Any, environment: Any, *, round_number: int, slot: int,
+    max_steps: int, stop_file: Path | None = None,
+    heartbeat: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Run one direct-policy episode; this path never calls the rollout collector."""
+    from sb3_contrib.common.maskable.utils import get_action_masks
+
+    try:
+        environment.env_method("set_evaluation_mode", True)
+    except (AttributeError, NotImplementedError):
+        pass
+    observation = environment.reset()
+    episode_return = 0.0
+    episode_progress: dict[str, Any] = {}
+    completed = False
+    steps = 0
+    last_heartbeat = time.monotonic()
+    try:
+        for steps in range(1, max_steps + 1):
+            if stop_file is not None and stop_file.is_file():
+                break
+            masks = get_action_masks(environment)
+            actions, _ = model.predict(observation, deterministic=True, action_masks=masks)
+            observation, rewards, dones, infos = environment.step(actions)
+            episode_return += float(np.asarray(rewards).reshape(-1)[0])
+            info = infos[0] if infos else {}
+            if isinstance(info, Mapping) and isinstance(info.get("episode_progress"), Mapping):
+                episode_progress = dict(info["episode_progress"])
+            if bool(np.asarray(dones).reshape(-1)[0]):
+                completed = True
+                break
+            if heartbeat is not None and time.monotonic() - last_heartbeat >= 5.0:
+                heartbeat(steps)
+                last_heartbeat = time.monotonic()
+    finally:
+        try:
+            environment.env_method("set_evaluation_mode", False)
+        except (AttributeError, NotImplementedError):
+            pass
+    model._last_obs = observation
+    model._last_episode_starts = np.asarray([completed], dtype=np.bool_)
+    return {
+        "schema_version": 1,
+        "round": round_number,
+        "slot": slot,
+        "deterministic": True,
+        "steps": steps,
+        "return": episode_return,
+        "completed": completed,
+        "rollout_submitted": False,
+        "episode_progress": episode_progress,
+        "finished_unix_ns": time.time_ns(),
+    }
+
+
 def _shared_ppo_parameters(task_contract: Mapping[str, Any]) -> dict[str, Any]:
     if task_contract.get("reward_version") not in {"explore_v1", "explore_v2", "explore_v3"}:
         return {}
@@ -784,6 +872,8 @@ def run_shared_actor(
             self.round_number = 0
             self.last_heartbeat = 0.0
             self.resets = 0
+            self.latest_episode_progress: dict[str, Any] = {}
+            self.farm_alerts: set[str] = set()
 
         def _on_step(self) -> bool:
             if stop_file is not None and stop_file.is_file():
@@ -791,11 +881,24 @@ def run_shared_actor(
             dones = self.locals.get("dones")
             if dones is not None:
                 self.resets += int(np.count_nonzero(dones))
+            infos = self.locals.get("infos")
+            if isinstance(infos, (list, tuple)):
+                for info in infos:
+                    if not isinstance(info, Mapping):
+                        continue
+                    progress = info.get("episode_progress")
+                    if isinstance(progress, Mapping) and info.get("evaluation_only") is not True:
+                        self.latest_episode_progress = dict(progress)
+                    alerts = info.get("farm_alerts")
+                    if isinstance(alerts, list):
+                        self.farm_alerts.update(item for item in alerts if isinstance(item, str))
             now = time.monotonic()
             if now - self.last_heartbeat >= 1.0:
                 store.publish_actor_status(
                     slot=slot, launch_id=launch_id, status="COLLECTING",
                     round=self.round_number, collected_steps=self.n_calls,
+                    episode_progress=self.latest_episode_progress,
+                    farm_alerts=sorted(self.farm_alerts),
                 )
                 self.last_heartbeat = now
             return True
@@ -896,6 +999,36 @@ def run_shared_actor(
                 continue
             callback.round_number = round_number
             callback.resets = 0
+            contract_config = task_contract.get("config", {})
+            evaluation_interval = (
+                int(contract_config.get("evaluation_interval", 20))
+                if isinstance(contract_config, Mapping) else 20
+            )
+            if (
+                task_contract.get("reward_version") == "explore_v3"
+                and round_number > 0
+                and evaluation_interval > 0
+                and round_number % evaluation_interval == 0
+                and not any(row.get("round") == round_number and row.get("slot") == slot for row in store.read_evaluations())
+            ):
+                store.publish_actor_status(slot=slot, launch_id=launch_id, status="EVALUATING", round=round_number)
+                def publish_evaluation_heartbeat(steps: int, round_number: int = round_number) -> None:
+                    store.publish_actor_status(
+                        slot=slot, launch_id=launch_id, status="EVALUATING",
+                        round=round_number, evaluation_steps=steps,
+                    )
+                evaluation = run_deterministic_evaluation(
+                    model, model.get_env(), round_number=round_number, slot=slot,
+                    max_steps=max(1, int(contract_config.get("horizon_steps", 3000))),
+                    stop_file=stop_file,
+                    heartbeat=publish_evaluation_heartbeat,
+                )
+                store.append_evaluation(evaluation)
+                status["evaluations_completed"] = int(status.get("evaluations_completed", 0)) + 1
+                _atomic_json(output_root / "manifest.json", status)
+                if stop_file is not None and stop_file.is_file():
+                    status["status"] = "CANCELLED"
+                    break
             store.publish_actor_status(
                 slot=slot, launch_id=launch_id, status="COLLECTING",
                 round=round_number, collected_steps=0,
@@ -1166,6 +1299,40 @@ def run_shared_learner(
                     "actors_received": slots,
                     "stale_rollouts": wait_metrics["stale_rollouts"],
                 })
+            evaluation_rows = store.read_evaluations()
+            manifest["evaluations"] = evaluation_rows
+            manifest["evaluation_trend"] = [
+                {"round": row.get("round"), "return": row.get("return"), "steps": row.get("steps")}
+                for row in evaluation_rows
+            ]
+            progress_rows = manifest.setdefault("episode_progress", [])
+            if isinstance(progress_rows, list):
+                known_progress = {
+                    (row.get("slot"), row.get("episode"))
+                    for row in progress_rows if isinstance(row, Mapping)
+                }
+                for actor_slot in range(actors):
+                    try:
+                        actor_status = json.loads(store.actor_status_path(actor_slot).read_text("utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    episode = actor_status.get("episode_progress")
+                    key = (actor_slot, episode.get("episode")) if isinstance(episode, Mapping) else None
+                    if key is not None and key not in known_progress:
+                        progress_rows.append({"slot": actor_slot, **dict(episode)})
+                        known_progress.add(key)
+                del progress_rows[:-500]
+            existing_alerts = manifest.get("farm_alerts", [])
+            alert_set = {item for item in existing_alerts if isinstance(item, str)} if isinstance(existing_alerts, list) else set()
+            for actor_slot in range(actors):
+                try:
+                    actor_status = json.loads(store.actor_status_path(actor_slot).read_text("utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                alerts = actor_status.get("farm_alerts")
+                if isinstance(alerts, list):
+                    alert_set.update(item for item in alerts if isinstance(item, str))
+            manifest["farm_alerts"] = sorted(alert_set)
             manifest["completed_timesteps"] = completed
             manifest["round"] = current_round
             rejected_count = 0
@@ -1181,6 +1348,8 @@ def run_shared_learner(
                 last_train_ms=round(training_seconds * 1000, 3),
                 last_actors_received=slots,
                 stale_rollouts_total=store.stale_rollout_count(),
+                evaluation_count=len(evaluation_rows),
+                farm_alerts=manifest["farm_alerts"],
             )
             if completed >= next_checkpoint:
                 save_checkpoint(current_round)

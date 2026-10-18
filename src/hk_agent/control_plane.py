@@ -101,7 +101,9 @@ class CampaignSpec:
     target_kl: float | None = None
     learning_rate: float | None = None
     clip_range: float | None = None
-    reward_version: str = "explore_v2"
+    reward_version: str = "explore_v3"
+    stuck_seconds: float = 120.0
+    evaluation_interval: int = 20
     straggler_timeout_seconds: float = 45.0
     schema_version: int = 8
 
@@ -110,13 +112,16 @@ class CampaignSpec:
         campaign_type = str(payload.get("campaign_type", ""))
         if campaign_type not in CAMPAIGN_TO_TOOL:
             raise ValueError("campaign_type is not allowlisted")
-        shared_learner = payload.get("shared_learner", False)
+        shared_learner = payload.get(
+            "shared_learner",
+            campaign_type == "exploration_training" and payload.get("reward_version", "explore_v3") == "explore_v3",
+        )
         if not isinstance(shared_learner, bool):
             raise TypeError("shared_learner must be a boolean")
         if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
             raise ValueError("shared learner requires a supported PPO training campaign")
-        reward_version = payload.get("reward_version", "explore_v2")
-        if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2"}:
+        reward_version = payload.get("reward_version", "explore_v3")
+        if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2", "explore_v3"}:
             raise ValueError("unsupported exploration reward version")
         if campaign_type != "exploration_training":
             reward_version = "explore_v1"
@@ -283,6 +288,8 @@ class CampaignSpec:
             learning_rate=_bounded_float(payload.get("learning_rate", 0.00025), "learning_rate", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             clip_range=_bounded_float(payload.get("clip_range", 0.2), "clip_range", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             reward_version=str(reward_version),
+            stuck_seconds=_bounded_float(payload.get("stuck_seconds", 120.0), "stuck_seconds", 1.0, 3600.0) if campaign_type == "exploration_training" else 120.0,
+            evaluation_interval=_bounded_int(payload.get("evaluation_interval", 20), "evaluation_interval", 1, 10_000) if campaign_type == "exploration_training" else 20,
             straggler_timeout_seconds=_bounded_float(
                 payload.get("straggler_timeout_seconds", 45.0),
                 "straggler_timeout_seconds", 1.0, 300.0,
@@ -763,6 +770,7 @@ class ControlPlane:
         game_install: Path | None = None,
         instance_data_root: Path | None = None,
         log_file: Path | None = None,
+        slot_id: int | None = None,
     ) -> list[str]:
         tool_name = CAMPAIGN_TO_TOOL[spec.campaign_type]
         tool_path = (self.project_root / "tools" / tool_name).resolve(strict=True)
@@ -830,13 +838,15 @@ class ControlPlane:
                             "--scene-change-reward", str(spec.weights.get("scene_change_reward", 5.0)),
                             "--enemy-kill-reward", str(spec.weights.get("enemy_kill_reward", 1.0)),
                             "--enemy-kill-reward-budget", str(spec.weights.get("enemy_kill_reward_budget", 5.0)),
-                            "--shade-recovery-reward", str(4.0 if spec.reward_version == "explore_v2" else spec.weights.get("shade_recovery_reward", 1.0)),
+                            "--shade-recovery-reward", str(4.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("shade_recovery_reward", 1.0)),
                             "--damage-penalty", str(spec.weights.get("damage_penalty", -0.5)),
                             "--death-penalty", str(spec.weights.get("death_penalty", -5.0)),
                             "--run-failed-penalty", str(spec.weights.get("run_failed_penalty", -5.0)),
-                            "--geo-gain-reward", str(0.0 if spec.reward_version == "explore_v2" else spec.weights.get("geo_gain_reward", 0.01)),
-                            "--geo-spend-reward", str(0.0 if spec.reward_version == "explore_v2" else spec.weights.get("geo_spend_reward", 0.02)),
-                            "--time-cost", str(spec.weights.get("time_cost", -0.001))]
+                            "--geo-gain-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("geo_gain_reward", 0.01)),
+                            "--geo-spend-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("geo_spend_reward", 0.02)),
+                            "--time-cost", str(spec.weights.get("time_cost", -0.001)),
+                            "--stuck-seconds", str(spec.stuck_seconds), "--evaluation-interval", str(spec.evaluation_interval),
+                            "--lifelong-memory-root", str(self.runtime_root / "campaign-memory" / spec.campaign_id / f"slot-{slot_id if slot_id is not None else 0}")]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
             command += [
@@ -1154,6 +1164,7 @@ class ControlPlane:
                 game_install=install_root,
                 instance_data_root=data_root,
                 log_file=(self.runtime_root / "launches" / launch_id / "Player.log") if execute else None,
+                slot_id=slot_id,
             )
             player_log_path = (self.runtime_root / "launches" / launch_id / "Player.log") if execute else None
             log_path = launch_root / "process.log"

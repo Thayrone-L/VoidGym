@@ -19,6 +19,7 @@ from hk_agent.shared_learner import (
     _space_from_payload,
     _space_to_payload,
     actor_join_round,
+    run_deterministic_evaluation,
     train_shared_round,
 )
 
@@ -295,6 +296,53 @@ def test_exploration_learner_uses_explicit_campaign_ppo_parameters():
     assert _shared_ppo_parameters({"reward_version": "visual_motion_v1"}) == {}
     v2_values = _shared_ppo_parameters({"reward_version": "explore_v2"})
     assert v2_values["ent_coef"] == 0.01 and v2_values["gamma"] == 0.995
+
+
+def test_deterministic_evaluation_does_not_submit_training_rollout():
+    class Env:
+        def __init__(self):
+            self.steps = 0
+            self.evaluation = False
+
+        def env_method(self, name, *args):
+            if name == "set_evaluation_mode":
+                self.evaluation = bool(args[0])
+                return [None]
+            if name == "action_masks":
+                return [np.ones(2, dtype=np.bool_)]
+            raise AssertionError(name)
+
+        def get_wrapper_attr(self, name):
+            assert name == "action_masks"
+            return lambda: np.ones(2, dtype=np.bool_)
+
+        def reset(self):
+            return np.zeros((1, 2), dtype=np.float32)
+
+        def step(self, actions):
+            self.steps += 1
+            return np.zeros((1, 2), dtype=np.float32), np.array([1.0]), np.array([self.steps == 2]), [
+                {"episode_progress": {"distinct_scenes": 2}}
+            ]
+
+    class Model:
+        def __init__(self):
+            self.deterministic_values = []
+            self.collect_rollouts_called = False
+
+        def predict(self, observation, *, deterministic, action_masks):
+            self.deterministic_values.append(deterministic)
+            assert action_masks.shape == (2,)
+            return np.array([0]), None
+
+    env, model = Env(), Model()
+    result = run_deterministic_evaluation(model, env, round_number=4, slot=0, max_steps=10)
+    assert result["completed"] is True
+    assert result["rollout_submitted"] is False
+    assert result["episode_progress"]["distinct_scenes"] == 2
+    assert model.deterministic_values == [True, True]
+    assert env.evaluation is False
+    assert not model.collect_rollouts_called
 
 
 def test_learner_waiting_for_calibration_honors_stop_file(tmp_path):

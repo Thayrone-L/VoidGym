@@ -1,7 +1,19 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace HkAgentBridge;
+
+internal readonly struct EnemyKillEvent
+{
+    public EnemyKillEvent(string enemyType, string sceneName)
+    {
+        EnemyType = enemyType;
+        SceneName = sceneName;
+    }
+    public string EnemyType { get; }
+    public string SceneName { get; }
+}
 
 internal readonly struct EpisodeLifecycleSnapshot
 {
@@ -17,7 +29,8 @@ internal readonly struct EpisodeLifecycleSnapshot
         int healthRestoredSinceLastFrame,
         int shadeHitsSinceLastFrame,
         string? sceneName,
-        float? shadeDistance
+        float? shadeDistance,
+        IReadOnlyList<EnemyKillEvent> enemyEvents
     )
     {
         PlayerDead = playerDead;
@@ -32,6 +45,7 @@ internal readonly struct EpisodeLifecycleSnapshot
         ShadeHitsSinceLastFrame = shadeHitsSinceLastFrame;
         SceneName = sceneName;
         ShadeDistance = shadeDistance;
+        EnemyEventsSinceLastFrame = enemyEvents;
     }
 
     public bool PlayerDead { get; }
@@ -46,6 +60,7 @@ internal readonly struct EpisodeLifecycleSnapshot
     public int ShadeHitsSinceLastFrame { get; }
     public string? SceneName { get; }
     public float? ShadeDistance { get; }
+    public IReadOnlyList<EnemyKillEvent> EnemyEventsSinceLastFrame { get; }
 }
 
 /// <summary>
@@ -66,6 +81,8 @@ internal sealed class EpisodeLifecycleState
     private int _healthRestoredSinceLastFrame;
     private int _shadeHitsSinceLastFrame;
     private int _shadeHitCycleTotal;
+    private readonly object _enemyEventLock = new();
+    private readonly List<EnemyKillEvent> _enemyEventsSinceLastFrame = new();
 
     public bool IsDeathStarted => Volatile.Read(ref _deathStarted) != 0 || Volatile.Read(ref _playerDead) != 0;
     public bool ShadePending => Volatile.Read(ref _shadePending) != 0;
@@ -83,7 +100,8 @@ internal sealed class EpisodeLifecycleState
             Interlocked.Exchange(ref _healthRestoredSinceLastFrame, 0),
             Interlocked.Exchange(ref _shadeHitsSinceLastFrame, 0),
             sceneName,
-            shadeDistance
+            shadeDistance,
+            DrainEnemyEvents()
         );
 
     public void BeginEpisode(bool? shadePendingFromSave)
@@ -93,6 +111,7 @@ internal sealed class EpisodeLifecycleState
         Interlocked.Exchange(ref _runFailed, 0);
         Interlocked.Exchange(ref _deathStarted, 0);
         Interlocked.Exchange(ref _enemyKillsSinceLastFrame, 0);
+        lock (_enemyEventLock) _enemyEventsSinceLastFrame.Clear();
         Interlocked.Exchange(ref _healthLostSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoGainedSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoSpentSinceLastFrame, 0);
@@ -121,9 +140,42 @@ internal sealed class EpisodeLifecycleState
         }
     }
 
-    public void RecordConfirmedEnemyKill()
+    public void RecordConfirmedEnemyKill(string enemyType = "Unknown", string sceneName = "Unknown")
     {
         Interlocked.Increment(ref _enemyKillsSinceLastFrame);
+        lock (_enemyEventLock)
+        {
+            if (_enemyEventsSinceLastFrame.Count < 128)
+            {
+                _enemyEventsSinceLastFrame.Add(new EnemyKillEvent(enemyType, sceneName));
+            }
+        }
+    }
+
+    internal static string NormalizeEnemyType(string name)
+    {
+        string result = name.Trim();
+        const string clone = "(Clone)";
+        if (result.EndsWith(clone, StringComparison.Ordinal)) result = result.Substring(0, result.Length - clone.Length).TrimEnd();
+        int suffix = result.LastIndexOf(" (", StringComparison.Ordinal);
+        if (suffix >= 0 && result.EndsWith(")", StringComparison.Ordinal))
+        {
+            string digits = result.Substring(suffix + 2, result.Length - suffix - 3);
+            bool numeric = digits.Length > 0;
+            foreach (char character in digits) numeric &= character >= '0' && character <= '9';
+            if (numeric) result = result.Substring(0, suffix);
+        }
+        return result;
+    }
+
+    private IReadOnlyList<EnemyKillEvent> DrainEnemyEvents()
+    {
+        lock (_enemyEventLock)
+        {
+            EnemyKillEvent[] events = _enemyEventsSinceLastFrame.ToArray();
+            _enemyEventsSinceLastFrame.Clear();
+            return events;
+        }
     }
 
     public void RecordHealthLost(int amount)

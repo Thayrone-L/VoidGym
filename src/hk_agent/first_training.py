@@ -247,6 +247,8 @@ def train_ppo(
         "gameplay_run_index": 1,
         "gameplay_run_failures": 0,
         "episode_count": 0,
+        "episode_progress": [],
+        "farm_alerts": [],
         "shade_pending": False,
         "started_unix_ns": time.time_ns(),
     }
@@ -381,6 +383,25 @@ def train_ppo(
                         manifest["gameplay_run_failures"] = run_failures
                         changed = True
                     if isinstance(info, Mapping):
+                        progress = info.get("episode_progress")
+                        if isinstance(progress, Mapping) and info.get("evaluation_only") is not True:
+                            entries = manifest.setdefault("episode_progress", [])
+                            if isinstance(entries, list) and not any(
+                                isinstance(item, Mapping) and item.get("episode") == progress.get("episode")
+                                for item in entries
+                            ):
+                                entries.append(dict(progress))
+                                del entries[:-500]
+                                changed = True
+                        alerts = info.get("farm_alerts")
+                        if isinstance(alerts, list) and alerts:
+                            entries = manifest.setdefault("farm_alerts", [])
+                            if isinstance(entries, list):
+                                for alert in alerts:
+                                    if isinstance(alert, str):
+                                        entries.append({"alert": alert, "step": int(model.num_timesteps)})
+                                del entries[:-500]
+                                changed = True
                         supervisor = info.get("supervisor")
                         if isinstance(supervisor, Mapping):
                             for source, target in (

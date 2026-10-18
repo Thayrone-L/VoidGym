@@ -1,0 +1,40 @@
+PROMPT 51 — FILA 46b → 47 → 48 → 49
+====================================
+Execução iniciada: 18/10/2026 12:30 (America/Sao_Paulo)
+Regras: uma etapa por vez; só avançar após verde + commit + push. Sem campanha longa e
+sem desligar o PC. Testes curtos com jogo para 47/48 autorizados sem campanha ativa.
+
+Etapa 46b — VERDE
+- Commits enviados ao PR #8: 09bf093, d555ed1, bdad6a5.
+- Política compartilhada imutável, re-soak de 20 minutos aprovado, parada do ControlPlane
+  certificada e testes completos passaram. Evidência em relatorios/46b_resoak.txt.
+
+Etapa 47 — VERDE
+- Implementado explore_v2 com máscara HUD exclusiva para novidade, estabilidade de dois
+  passos, memória vitalícia por ator, geo zero e contenção de ataque parado.
+- Adendos de cura/sombra implementados em Python e bridge C#. Política segue recebendo
+  observação completa; sinais privilegiados só afetam recompensa.
+- 3 PNGs reais revisados e anotados; relatório detalhado em
+  relatorios/47_explore_v2.txt; teste curto final em short-game-test.json.
+- Teste final: 300 s; NOOP 2/106 (1,89%), movimento 23/1172 (1,96%), ataque parado 0/298;
+  calibração NOOP 0/10; grupo encerrado e active_count=0. Duas primeiras tentativas de
+  diagnóstico levaram às correções descritas no relatório. Nenhuma morte foi forçada.
+- Ruff e mypy limpos; pytest 525 passed, 2 skipped, 8 subtests; C# build/harness aprovados.
+  Release e duas DLLs implantadas com mesmo SHA-256; marcadores sincronizados e validados.
+- Commit/push: `98f8f0b` enviado ao PR #8.
+- Sem campanha longa e sem desligar PC.
+
+Etapa 48 — VERDE
+- Implementado explore_v3: novidade vitalícia de salas/inimigos por ator, truncamento stuck, progresso, avaliações determinísticas, alertas e tetos de recompensa.
+- Ruff/mypy limpos; pytest 534 passed, 2 skipped, 8 subtests; bridge Release/harness passaram; duas DLLs instaladas e marcadores conferidos.
+- Teste de 300 s concluiu 256 passos, rodada 2 e avaliação determinística na rodada 1 (rollout_submitted=false); sem alertas, active_count=0. Duas tentativas corrigidas estão detalhadas no relatório.
+- Retorno limitado teoricamente a +55,2 / -35,5. Relatório: relatorios/48_explore_v3.txt.
+- Commit/push pendentes.
+
+Etapa 49 — PENDENTE
+- Só iniciar após etapa 48 verde com commit+push. Painel de operador, relatórios HTML/JSON,
+  testes com dados sintéticos e documentação.
+
+
+Etapa 48 — VERDE
+- Início 18/10/2026 13:59. Backup: agent-prompts/backup-agente48-20261018-135931. Nenhum jogo/Steam estava ativo no início.

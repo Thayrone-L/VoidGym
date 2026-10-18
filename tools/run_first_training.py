@@ -52,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
     parser.add_argument("--task", choices=("visual_motion", "exploration"), default="visual_motion")
     parser.add_argument("--reward-version", choices=("explore_v1", "explore_v2", "explore_v3"))
+    parser.add_argument("--stuck-seconds", type=float, default=120.0)
+    parser.add_argument("--evaluation-interval", type=int, default=20)
+    parser.add_argument("--lifelong-memory-root", type=Path)
     parser.add_argument(
         "--bootstrap-plan",
         type=Path,
@@ -176,11 +179,19 @@ def build_task(
             log_root=phase_root / "experience",
         )
         task_class = ExplorationTask if args.task == "exploration" else VisualMotionTask
+        memory_root = None
+        if args.task == "exploration":
+            actor_slot = int(os.environ.get("HK_AGENT_SLOT_ID", "0"))
+            if phase == "calibration":
+                memory_root = phase_root / "isolated-campaign-memory"
+            elif args.lifelong_memory_root is not None:
+                memory_root = args.lifelong_memory_root / f"actor-{actor_slot}"
         return (
             task_class(
                 environment,
                 config=task_config,
                 task_log_path=phase_root / "task-transitions.jsonl",
+                lifelong_memory_root=memory_root,
             ),
             owner,
         )
@@ -235,7 +246,7 @@ def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path |
             target.append(info["descriptor"])
             if target is noop and info.get("reward_components", {}).get("novelty", 0.0) > 0:
                 noop_awards += 1
-    if task.config.reward_version == "explore_v2" and noop_awards / max(1, len(noop)) > 0.01:
+    if task.config.reward_version in {"explore_v2", "explore_v3"} and noop_awards / max(1, len(noop)) > 0.01:
         raise ValueError("explore_v2 novelty rate on NOOP exceeded the 1% calibration ceiling")
     return noop, active, stop_file is not None and stop_file.is_file()
 
@@ -266,7 +277,7 @@ def cancelled_result(
 
 def main() -> int:
     args = parse_args()
-    reward_version = args.reward_version or ("explore_v2" if args.task == "exploration" else "explore_v1")
+    reward_version = args.reward_version or ("explore_v3" if args.task == "exploration" else "explore_v1")
     if args.continuous and args.stop_file is None:
         raise SystemExit("--continuous requires --stop-file for cooperative shutdown")
     origin = CampaignOrigin(args.save_source, args.save_slot)
@@ -481,8 +492,9 @@ def main() -> int:
             novelty_threshold=args.novelty_threshold, novelty_budget=args.novelty_budget,
             scene_change_reward=args.scene_change_reward, enemy_kill_reward=args.enemy_kill_reward,
             enemy_kill_reward_budget=args.enemy_kill_reward_budget,
-            shade_recovery_reward=(4.0 if reward_version == "explore_v2" else args.shade_recovery_reward), damage_penalty=args.damage_penalty,
-            geo_gain_reward=(0.0 if reward_version == "explore_v2" else args.geo_gain_reward), geo_spend_reward=(0.0 if reward_version == "explore_v2" else args.geo_spend_reward),
+            shade_recovery_reward=(4.0 if reward_version in {"explore_v2", "explore_v3"} else args.shade_recovery_reward), damage_penalty=args.damage_penalty,
+            geo_gain_reward=(0.0 if reward_version in {"explore_v2", "explore_v3"} else args.geo_gain_reward), geo_spend_reward=(0.0 if reward_version in {"explore_v2", "explore_v3"} else args.geo_spend_reward),
+            stuck_seconds=args.stuck_seconds, evaluation_interval=args.evaluation_interval,
             death_penalty=args.death_penalty, run_failed_penalty=args.run_failed_penalty,
             time_cost=args.time_cost, lease_base_ms=args.lease_ms,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.01,

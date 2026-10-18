@@ -231,7 +231,10 @@ public sealed class HkAgentBridgeMod : Mod
     {
         if (!eventAlreadyReceived && enemyDeathEffects != null)
         {
-            _lifecycle.RecordConfirmedEnemyKill();
+            _lifecycle.RecordConfirmedEnemyKill(
+                EpisodeLifecycleState.NormalizeEnemyType(enemyDeathEffects.gameObject.name),
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name
+            );
         }
     }
 

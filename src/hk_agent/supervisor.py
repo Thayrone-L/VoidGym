@@ -63,6 +63,7 @@ class CapturedFrame:
     shade_hits_since_last_frame: int = 0
     shade_distance: float | None = None
     scene_name: str | None = None
+    enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -344,6 +345,17 @@ class SupervisorServer:
         shade_hits_since_last_frame = payload.get("shade_hits_since_last_frame", 0)
         shade_distance = payload.get("shade_distance")
         scene_name = payload.get("scene_name")
+        raw_enemy_events = payload.get("enemy_events_since_last_frame", [])
+        if not isinstance(raw_enemy_events, list) or len(raw_enemy_events) > 128:
+            raise ProtocolError("Invalid FRAME field: enemy_events_since_last_frame")
+        enemy_events: list[tuple[str, str]] = []
+        for event in raw_enemy_events:
+            if not isinstance(event, dict):
+                raise ProtocolError("Invalid FRAME enemy event")
+            enemy_type, event_scene = event.get("enemy_type"), event.get("scene_name")
+            if not isinstance(enemy_type, str) or not enemy_type or len(enemy_type) > 128 or not isinstance(event_scene, str) or not event_scene or len(event_scene) > 256:
+                raise ProtocolError("Invalid FRAME enemy event fields")
+            enemy_events.append((event_scene, enemy_type))
         for name, value in (
             ("enemy_kills_since_last_frame", enemy_kills_since_last_frame),
             ("hp_lost_since_last_frame", hp_lost_since_last_frame),
@@ -445,6 +457,7 @@ class SupervisorServer:
             shade_hits_since_last_frame=shade_hits_since_last_frame,
             shade_distance=None if shade_distance is None else float(shade_distance),
             scene_name=scene_name,
+            enemy_events_since_last_frame=tuple(enemy_events),
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),
         )

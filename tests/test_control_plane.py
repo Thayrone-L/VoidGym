@@ -69,6 +69,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
 
 def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Path) -> None:
     payload = _payload("exploration_training")
+    payload["reward_version"] = "explore_v2"
     payload["shared_learner"] = True
     payload["rollout_steps"] = 512
     payload["batch_size"] = 256
@@ -99,6 +100,7 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert command[command.index("--reward-version") + 1] == "explore_v2"
     assert command[command.index("--geo-gain-reward") + 1] == "0.0"
     assert command[command.index("--shade-recovery-reward") + 1] == "4.0"
+    assert "--lifelong-memory-root" in command
 
 
 def test_legacy_exploration_campaign_resolves_as_explore_v1(tmp_path: Path) -> None:
@@ -113,6 +115,13 @@ def test_legacy_exploration_campaign_resolves_as_explore_v1(tmp_path: Path) -> N
     spec_path.write_text(json.dumps(payload), encoding="utf-8")
     spec, _ = control._resolve_campaign("legacy-run", 1)
     assert spec.reward_version == "explore_v1"
+
+
+def test_new_exploration_campaign_defaults_to_explore_v3(tmp_path: Path) -> None:
+    payload = _payload("exploration_training")
+    payload["weights"] = {}
+    spec = CampaignSpec.from_payload(payload)
+    assert spec.reward_version == "explore_v3"
 
 
 @pytest.mark.parametrize(

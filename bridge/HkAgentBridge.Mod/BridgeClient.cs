@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -428,6 +429,11 @@ internal sealed class BridgeClient : IDisposable
                                 ["shade_hits_since_last_frame"] = lifecycle.ShadeHitsSinceLastFrame,
                                 ["shade_distance"] = lifecycle.ShadeDistance,
                                 ["scene_name"] = lifecycle.SceneName,
+                                ["enemy_events_since_last_frame"] = lifecycle.EnemyEventsSinceLastFrame.Select(item => new Dictionary<string, string>
+                                {
+                                    ["enemy_type"] = item.EnemyType,
+                                    ["scene_name"] = item.SceneName,
+                                }).ToArray(),
                                 ["duplicate_of"] = (long?)null,
                                 ["last_applied_action_id"] = correlation.LastAppliedActionId,
                             };

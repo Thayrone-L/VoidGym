@@ -80,6 +80,7 @@ _TASK_CONFIG_KEYS = frozenset(
         "novelty_reward", "novelty_threshold", "novelty_budget", "archive_max",
         "lifelong_archive_max", "novelty_persistence_steps",
         "shade_hit_reward", "hp_restored_reward", "stuck_seconds", "evaluation_interval",
+        "hp_restored_budget", "scene_reward_budget", "time_cost_budget", "shade_hit_budget", "shade_approach_budget",
         "scene_change_reward", "lease_base_ms", "ent_coef", "gamma", "gae_lambda",
         "n_epochs", "target_kl", "learning_rate", "clip_range",
     }
@@ -129,6 +130,7 @@ _REWARD_ONLY_SIGNALS = frozenset(
         "shade_distance",
         "scene_name",
         "enemy_type",
+        "enemy_events_since_last_frame",
         "death",
         "run_failed",
     }
@@ -363,7 +365,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     schema_version = contract.get("task_contract_schema_version", 1)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2}:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3}:
         raise KnowledgeValidationError("task_contract_schema_version is unsupported")
     result["task_contract_schema_version"] = schema_version
     action_names = contract["action_names"]

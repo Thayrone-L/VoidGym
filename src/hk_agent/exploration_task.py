@@ -36,7 +36,7 @@ from hk_agent.training_task import (
 )
 
 EXPLORE_REWARD_VERSION = "explore_v1"
-SUPPORTED_EXPLORE_REWARD_VERSIONS = frozenset({"explore_v1", "explore_v2"})
+SUPPORTED_EXPLORE_REWARD_VERSIONS = frozenset({"explore_v1", "explore_v2", "explore_v3"})
 
 
 def descriptor_hash(descriptor: NDArray[np.generic]) -> str:
@@ -62,6 +62,40 @@ def load_lifelong_visits(path: Path, limit: int) -> dict[str, int]:
 def save_lifelong_visits(path: Path, visits: dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"schema_version": 1, "visits": visits}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_campaign_counts(path: Path, limit: int = 4096) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text("utf-8"))
+    counts = payload.get("counts") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(counts, dict):
+        raise ValueError(f"campaign memory has an unsupported schema: {path.name}")
+    result: dict[str, int] = {}
+    for key, count in counts.items():
+        if not isinstance(key, str) or not key or len(key) > 512 or isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(f"campaign memory contains an invalid record: {path.name}")
+        if len(result) < limit:
+            result[key] = count
+    return result
+
+
+def save_campaign_counts(path: Path, counts: dict[str, int], limit: int = 4096) -> None:
+    if len(counts) > limit:
+        for key in list(counts)[: len(counts) - limit]:
+            del counts[key]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"schema_version": 1, "counts": counts}, sort_keys=True, separators=(",", ":"), allow_nan=False)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
@@ -104,7 +138,14 @@ class ExplorationTaskConfig:
     lifelong_archive_max: int = 4096
     novelty_persistence_steps: int = 2
     shade_hit_reward: float = 0.3
+    shade_hit_budget: float = 1.2
+    shade_approach_budget: float = 1.0
     hp_restored_reward: float = 0.4
+    hp_restored_budget: float = 4.0
+    scene_reward_budget: float = 20.0
+    time_cost_budget: float = 20.0
+    stuck_seconds: float = 120.0
+    evaluation_interval: int = 20
 
     def validate(self) -> None:
         if not 1 <= self.horizon_steps <= 100_000 or self.archive_max < 1 or self.lifelong_archive_max < 1:
@@ -128,6 +169,31 @@ class ExplorationTaskConfig:
                 raise ValueError("Shade recovery reward must remain below death penalty")
             if not 0 <= self.hp_restored_reward < abs(self.damage_penalty):
                 raise ValueError("healing reward must be smaller than damage penalty magnitude")
+        if self.reward_version == "explore_v3":
+            if self.horizon_steps > 3000:
+                raise ValueError("explore_v3 horizon exceeds the bounded episode-return contract")
+            if self.geo_gain_reward != 0 or self.geo_spend_reward != 0:
+                raise ValueError("explore_v3 does not reward Geo")
+            if self.shade_recovery_reward != 4.0 or self.shade_hit_reward != 0.3 or self.shade_recovery_reward >= abs(self.death_penalty):
+                raise ValueError("explore_v3 Shade recovery reward must be 4 and below death penalty")
+            if not 0 <= self.hp_restored_reward < abs(self.damage_penalty):
+                raise ValueError("healing reward must be smaller than damage penalty magnitude")
+            if not 0 < self.stuck_seconds <= 3600 or not 1 <= self.evaluation_interval <= 10_000:
+                raise ValueError("stuck_seconds/evaluation_interval are outside their safe ranges")
+            if self.scene_reward_budget < 0 or self.hp_restored_budget < 0 or self.time_cost_budget < 0:
+                raise ValueError("explore_v3 episode reward budgets must be non-negative")
+            if self.shade_hit_budget < 0 or self.shade_approach_budget < 0:
+                raise ValueError("explore_v3 Shade reward budgets must be non-negative")
+            if (self.novelty_budget > 20.0 or self.scene_reward_budget > 20.0
+                    or self.enemy_kill_reward_budget > 5.0 or self.hp_restored_budget > 4.0
+                    or self.shade_hit_budget > 1.2 or self.shade_approach_budget > 1.0
+                    or self.time_cost_budget > 20.0):
+                raise ValueError("explore_v3 reward budgets exceed the stable episode-return contract")
+            if (self.novelty_reward != 0.05 or self.shade_hit_reward != 0.3
+                    or self.shade_recovery_reward != 4.0 or self.hp_restored_reward != 0.4
+                    or self.damage_penalty != -0.5 or self.death_penalty != -5.0
+                    or self.run_failed_penalty != -5.0 or self.time_cost != -0.001):
+                raise ValueError("explore_v3 component weights are fixed by the reward version")
         if self.damage_penalty > 0 or self.death_penalty >= 0 or self.run_failed_penalty >= 0 or self.time_cost > 0:
             raise ValueError("penalty signs are invalid")
         if self.geo_gain_reward < 0 or self.geo_spend_reward < 0 or self.geo_reward_budget < 0:
@@ -140,6 +206,10 @@ class ExplorationTaskConfig:
             raise ValueError("PPO hyperparameters are outside their safe ranges")
 
     def maximum_positive_episode_reward(self) -> float:
+        if self.reward_version == "explore_v3":
+            return (self.novelty_budget + self.scene_reward_budget + self.enemy_kill_reward_budget
+                    + self.shade_recovery_reward + self.hp_restored_budget
+                    + self.shade_hit_budget + self.shade_approach_budget)
         # At least three stable frames are required per distinct scene event.
         scene_events = self.horizon_steps // 3
         return (
@@ -148,17 +218,30 @@ class ExplorationTaskConfig:
             + self.shade_recovery_reward
         )
 
+    def minimum_negative_episode_reward(self) -> float:
+        if self.reward_version == "explore_v3":
+            return -(abs(self.damage_penalty) * 9 + abs(self.death_penalty)
+                     + abs(self.run_failed_penalty) + self.time_cost_budget
+                     + self.shade_approach_budget)
+        max_lease = max(template.resolve_lease_ms(self.lease_base_ms) for template in SCENE_CHANGE_ACTION_TEMPLATES)
+        max_health = 9
+        time = abs(self.time_cost) * self.horizon_steps * (max_lease / self.lease_base_ms)
+        urgency = 0.001 * self.horizon_steps * (max_lease / 1000.0)
+        shade_approach = self.shade_approach_budget if self.reward_version == "explore_v3" else 0.0
+        return -(abs(self.damage_penalty) * max_health + abs(self.death_penalty) + abs(self.run_failed_penalty) + time + urgency + shade_approach)
+
 
 class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     """Pixel-only exploration rewards; privileged bridge signals affect rewards only."""
 
     def __init__(self, environment: HollowKnightEnv, *, config: ExplorationTaskConfig | None = None,
-                 task_log_path: Path | None = None) -> None:
+                 task_log_path: Path | None = None, lifelong_memory_root: Path | None = None) -> None:
         super().__init__()
         self.environment = environment
         self.config = config or ExplorationTaskConfig()
         self.config.validate()
         self.task_log_path = task_log_path
+        self.lifelong_memory_root = lifelong_memory_root
         self.action_space = gym.spaces.Discrete(len(SCENE_CHANGE_ACTION_TEMPLATES))  # type: ignore[assignment]
         source = cast(gym.spaces.Dict, environment.observation_space)
         self.observation_space = temporal_observation_space(source, number_of_actions=len(SCENE_CHANGE_ACTION_TEMPLATES))  # type: ignore[arg-type, assignment]
@@ -187,15 +270,48 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._novelty_candidate_descriptor: NDArray[np.float32] | None = None
         self._novelty_candidate_steps = 0
         self._shade_distance: tuple[str, float] | None = None
+        self._scene_visits: dict[str, int] = {}
+        self._enemy_visits: dict[str, int] = {}
+        self._scene_paid = 0.0
+        self._campaign_scene_path: Path | None = None
+        self._campaign_enemy_path: Path | None = None
+        self._progress_elapsed_seconds = 0.0
+        self._previous_scene_name: str | None = None
+        self._episode_scene_names: set[str] = set()
+        self._episode_new_scenes: list[str] = []
+        self._episode_campaign_new_scenes: list[str] = []
+        self._episode_kills = 0
+        self._episode_deaths = 0
+        self._episode_shade_recovered = 0
+        self._episode_shade_lost = 0
+        self._steps_to_first_scene: int | None = None
+        self._hp_restored_paid = 0.0
+        self._shade_hits_paid = 0.0
+        self._shade_approach_positive_paid = 0.0
+        self._shade_approach_negative_paid = 0.0
+        self._damage_paid_health = 0.0
+        self._time_cost_paid = 0.0
+        self._recent_reward_window: deque[dict[str, float]] = deque(maxlen=2000)
+        self._recent_no_novelty_pairs: deque[tuple[str, str]] = deque(maxlen=2000)
+        self._farm_alert_latched = False
+        self._episode_total_reward = 0.0
+        self._evaluation_mode = False
+        self._episode_number = 0
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[dict[str, NDArray[np.generic]], dict[str, Any]]:
         super().reset(seed=seed)
-        observation, _ = self.environment.reset(seed=seed, options=options)
+        observation, reset_info = self.environment.reset(seed=seed, options=options)
         descriptor = self._descriptor(observation["pixels"][-1])
-        if self.config.reward_version == "explore_v2":
+        if self.config.reward_version in {"explore_v2", "explore_v3"}:
             run_root = self.task_log_path.parent.parent if self.task_log_path is not None else Path.cwd()
-            self._lifelong_path = run_root / "lifelong-novelty.json" if self.task_log_path is not None else None
+            memory_root = self.lifelong_memory_root or (run_root if self.task_log_path is not None else None)
+            self._lifelong_path = memory_root / "lifelong-novelty.json" if memory_root is not None else None
             self._lifelong_visits = load_lifelong_visits(self._lifelong_path, self.config.lifelong_archive_max) if self._lifelong_path is not None else {}
+            if self.config.reward_version == "explore_v3" and memory_root is not None:
+                self._campaign_scene_path = memory_root / "lifelong-scenes.json"
+                self._campaign_enemy_path = memory_root / "lifelong-enemies.json"
+                self._scene_visits = load_campaign_counts(self._campaign_scene_path, self.config.lifelong_archive_max)
+                self._enemy_visits = load_campaign_counts(self._campaign_enemy_path, self.config.lifelong_archive_max)
         self._archive.clear()
         self._archive.append(descriptor)
         self._paid_scenes = [descriptor.copy()]
@@ -212,6 +328,26 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._steps = 0
         self._novelty_paid = self._kills_paid = self._geo_paid = 0.0
         self._shade_paid = False
+        self._hp_restored_paid = 0.0
+        self._shade_hits_paid = 0.0
+        self._shade_approach_positive_paid = 0.0
+        self._shade_approach_negative_paid = 0.0
+        self._damage_paid_health = 0.0
+        self._time_cost_paid = 0.0
+        self._progress_elapsed_seconds = 0.0
+        self._episode_scene_names = set()
+        self._episode_new_scenes = []
+        self._episode_campaign_new_scenes = []
+        self._scene_paid = 0.0
+        self._episode_kills = self._episode_deaths = 0
+        self._episode_shade_recovered = self._episode_shade_lost = 0
+        self._steps_to_first_scene = None
+        self._episode_total_reward = 0.0
+        self._episode_number += 1
+        initial_scene = reset_info.get("scene_name")
+        self._previous_scene_name = initial_scene if isinstance(initial_scene, str) else None
+        if self._previous_scene_name:
+            self._episode_scene_names.add(self._previous_scene_name)
         self._done = False
         self.mask_unavailable_count = 0
         self._history.reset()
@@ -257,13 +393,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         base_done = terminated or truncated
         novelty = min((descriptor_distance(descriptor, prior) for prior in self._archive), default=1.0)
         eligible = informative and novelty >= self.config.novelty_threshold and not base_done
-        if self.config.reward_version == "explore_v2":
+        if self.config.reward_version in {"explore_v2", "explore_v3"}:
             tokens = set(template.name.split("+"))
             stationary_attack = "ATTACK" in tokens and not tokens.intersection({"LEFT", "RIGHT", "JUMP"})
             if stationary_attack:
                 eligible = False
-        novelty_hash = descriptor_hash(descriptor) if self.config.reward_version == "explore_v2" else None
-        if self.config.reward_version == "explore_v2":
+        novelty_hash = descriptor_hash(descriptor) if self.config.reward_version in {"explore_v2", "explore_v3"} else None
+        if self.config.reward_version in {"explore_v2", "explore_v3"}:
             stable_candidate = (
                 self._novelty_candidate_descriptor is not None
                 and descriptor_distance(descriptor, self._novelty_candidate_descriptor)
@@ -304,7 +440,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._scene_stable = int(detection["stable_run"])
         changed = bool(detection["scene_changed"])
         self._previous_descriptor = descriptor.copy()
-        if changed and not base_done and not any(descriptor_distance(descriptor, prior) < 0.025 for prior in self._paid_scenes):
+        if changed and self.config.reward_version != "explore_v3" and not base_done and not any(descriptor_distance(descriptor, prior) < 0.025 for prior in self._paid_scenes):
             components["scene_change"] = self.config.scene_change_reward
             self._paid_scenes.append(descriptor.copy())
             self._anchor = descriptor.copy()
@@ -314,36 +450,102 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._anchor = descriptor.copy()
             self._transition_seen = False
             self._dark_run = self._scene_stable = 0
+        scene_event_paid = False
+        current_scene = base.get("scene_name")
+        if isinstance(current_scene, str):
+            self._episode_scene_names.add(current_scene)
+            if self._previous_scene_name is None:
+                self._previous_scene_name = current_scene
+            elif current_scene != self._previous_scene_name:
+                self._steps_to_first_scene = self._steps if self._steps_to_first_scene is None else self._steps_to_first_scene
+                if self.config.reward_version == "explore_v3" and not base_done and current_scene not in self._episode_new_scenes:
+                    prior_visits = self._scene_visits.get(current_scene, 0)
+                    requested_reward = 2.0 + 8.0 / float(np.sqrt(1 + prior_visits))
+                    remaining = max(0.0, self.config.scene_reward_budget - self._scene_paid)
+                    components["scene_change"] = min(requested_reward, remaining)
+                    if components["scene_change"] > 0:
+                        self._scene_paid += components["scene_change"]
+                        self._scene_visits[current_scene] = prior_visits + 1
+                        self._episode_new_scenes.append(current_scene)
+                        scene_event_paid = True
+                        if prior_visits == 0:
+                            self._episode_campaign_new_scenes.append(current_scene)
+                        if self._campaign_scene_path is not None:
+                            save_campaign_counts(self._campaign_scene_path, self._scene_visits, self.config.lifelong_archive_max)
+                self._previous_scene_name = current_scene
         combat = confirmed_combat_components(
-            base, enemy_kill_reward=self.config.enemy_kill_reward,
-            shade_recovery_reward=(4.0 if self.config.reward_version == "explore_v2" else self.config.shade_recovery_reward),
+            base, enemy_kill_reward=(0.0 if self.config.reward_version == "explore_v3" else self.config.enemy_kill_reward),
+            shade_recovery_reward=(4.0 if self.config.reward_version in {"explore_v2", "explore_v3"} else self.config.shade_recovery_reward),
             damage_penalty=self.config.damage_penalty, geo_gain_reward=self.config.geo_gain_reward,
             geo_spend_reward=self.config.geo_spend_reward, death_penalty=self.config.death_penalty,
             run_failed_penalty=self.config.run_failed_penalty)
         components["confirmed_enemy_kills"] = min(combat["confirmed_enemy_kills"], max(0.0, self.config.enemy_kill_reward_budget-self._kills_paid))
+        if self.config.reward_version == "explore_v3":
+            events = base.get("enemy_events_since_last_frame", [])
+            if not isinstance(events, list):
+                raise InvalidTrainingTransition("invalid enemy event list")
+            rewardable_events = not base_done and combat["player_death"] >= 0 and combat["gameplay_run_failed"] >= 0
+            if rewardable_events:
+                self._episode_kills += len(events)
+            remaining_kill_budget = max(0.0, self.config.enemy_kill_reward_budget - self._kills_paid)
+            for event in events if rewardable_events else []:
+                if not isinstance(event, dict) or not isinstance(event.get("enemy_type"), str) or not isinstance(event.get("scene_name"), str):
+                    raise InvalidTrainingTransition("invalid typed enemy reward event")
+                key = f"{event['scene_name']}|{event['enemy_type']}"
+                visits = self._enemy_visits.get(key, 0)
+                requested = max(0.2, 1.0 / float(np.sqrt(1 + visits)))
+                award = min(requested, remaining_kill_budget)
+                components["confirmed_enemy_kills"] += award
+                remaining_kill_budget -= award
+                if award > 0:
+                    self._enemy_visits[key] = visits + 1
+            if self._campaign_enemy_path is not None and events and self._enemy_visits:
+                save_campaign_counts(self._campaign_enemy_path, self._enemy_visits, self.config.lifelong_archive_max)
+        if self.config.reward_version == "explore_v3":
+            components["confirmed_enemy_kills"] = min(components["confirmed_enemy_kills"], max(0.0, self.config.enemy_kill_reward_budget-self._kills_paid))
         self._kills_paid += components["confirmed_enemy_kills"]
         components["shade_recovered"] = 0.0 if self._shade_paid else combat["shade_recovered"]
         self._shade_paid |= components["shade_recovered"] > 0
-        if self.config.reward_version == "explore_v2":
+        if components["shade_recovered"] > 0:
+            self._episode_shade_recovered += 1
+        if self.config.reward_version in {"explore_v2", "explore_v3"}:
             hits = int(base.get("shade_hits_since_last_frame", 0))
             if hits < 0:
                 raise InvalidTrainingTransition("invalid Shade hit delta")
-            components["shade_hits"] = min(hits, 4) * self.config.shade_hit_reward
+            hit_budget = self.config.shade_hit_budget if self.config.reward_version == "explore_v3" else float("inf")
+            components["shade_hits"] = min(min(hits, 4) * self.config.shade_hit_reward,
+                                           max(0.0, hit_budget - self._shade_hits_paid))
+            self._shade_hits_paid += components["shade_hits"]
             restored = int(base.get("hp_restored_since_last_frame", 0))
             if restored < 0:
                 raise InvalidTrainingTransition("invalid restored health delta")
-            components["hp_restored"] = restored * self.config.hp_restored_reward
+            hp_budget = self.config.hp_restored_budget if self.config.reward_version == "explore_v3" else float("inf")
+            components["hp_restored"] = min(restored * self.config.hp_restored_reward, max(0.0, hp_budget - self._hp_restored_paid))
+            self._hp_restored_paid += components["hp_restored"]
             distance = base.get("shade_distance")
             scene = base.get("scene_name")
             if isinstance(distance, (int, float)) and not isinstance(distance, bool) and isinstance(scene, str) and base.get("shade_pending") is True:
                 current_distance = float(distance)
                 if np.isfinite(current_distance) and self._shade_distance is not None and self._shade_distance[0] == scene:
-                    components["shade_approach"] = float(np.clip(0.05 * (self._shade_distance[1] - current_distance), -0.05, 0.05))
+                    approach = float(np.clip(0.05 * (self._shade_distance[1] - current_distance), -0.05, 0.05))
+                    if self.config.reward_version == "explore_v3":
+                        if approach > 0:
+                            approach = min(approach, max(0.0, self.config.shade_approach_budget - self._shade_approach_positive_paid))
+                            self._shade_approach_positive_paid += approach
+                        elif approach < 0:
+                            approach = max(approach, -max(0.0, self.config.shade_approach_budget - self._shade_approach_negative_paid))
+                            self._shade_approach_negative_paid += -approach
+                    components["shade_approach"] = approach
                 self._shade_distance = (scene, current_distance)
             else:
                 self._shade_distance = None
             if base.get("shade_pending") is True:
                 components["time_cost"] -= 0.001 * (lease / 1000.0)
+        if self.config.reward_version == "explore_v3":
+            payable_time_cost = min(abs(components["time_cost"]),
+                                    max(0.0, self.config.time_cost_budget - self._time_cost_paid))
+            components["time_cost"] = -payable_time_cost
+            self._time_cost_paid += payable_time_cost
         geo = combat["confirmed_geo_gained"] + combat["confirmed_geo_spent"]
         geo_award = min(geo, max(0.0, self.config.geo_reward_budget-self._geo_paid))
         if geo > 0:
@@ -352,27 +554,64 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             components["confirmed_geo_spent"] = combat["confirmed_geo_spent"] * scale
             self._geo_paid += geo_award
         components["damage_taken"] = combat["confirmed_hp_lost"]
+        if self.config.reward_version == "explore_v3":
+            raw_damage = int(base.get("hp_lost_since_last_frame", 0))
+            if raw_damage < 0:
+                raise InvalidTrainingTransition("invalid confirmed damage delta")
+            payable_damage = min(float(raw_damage), max(0.0, 9.0 - self._damage_paid_health))
+            components["damage_taken"] = -payable_damage * abs(self.config.damage_penalty)
+            self._damage_paid_health += payable_damage
         components["death"] = combat["player_death"]
         components["run_failed"] = combat["gameplay_run_failed"]
+        if components["death"] < 0:
+            self._episode_deaths += 1
+        if components["run_failed"] < 0:
+            self._episode_shade_lost += 1
         # Death/run-failure and any base terminal/truncation suppress all positive rewards on this transition.
         terminal_penalty = components["death"] < 0 or components["run_failed"] < 0
         if base_done or terminal_penalty:
             for name in ("novelty", "scene_change", "confirmed_enemy_kills", "confirmed_geo_gained", "confirmed_geo_spent", "shade_recovered", "shade_hits", "shade_approach", "hp_restored"):
                 components[name] = 0.0
         reward = float(sum(components.values()))
+        self._episode_total_reward += reward
+        if components["novelty"] > 0 or scene_event_paid:
+            self._progress_elapsed_seconds = 0.0
+        else:
+            self._progress_elapsed_seconds += lease / 1000.0
+        stuck = self.config.reward_version == "explore_v3" and self._progress_elapsed_seconds > self.config.stuck_seconds and not base_done and not terminal_penalty
         horizon = self._steps >= self.config.horizon_steps
         task_terminated = terminated or terminal_penalty
-        task_truncated = truncated or (horizon and not task_terminated)
+        task_truncated = truncated or ((horizon or stuck) and not task_terminated)
         termination_reason = base.get("termination_reason")
         if termination_reason is None and components["death"] < 0:
             termination_reason = "player_dead"
         elif termination_reason is None and components["run_failed"] < 0:
             termination_reason = "gameplay_run_failed"
+        elif termination_reason is None and stuck:
+            termination_reason = "stuck"
         elif termination_reason is None and horizon:
             termination_reason = "time_limit"
         self._done = task_terminated or task_truncated
         if self._done:
             self.environment.backend.release_all()
+        farm_alerts = self._record_farm_window(components, current_scene, template.name)
+        episode_progress: dict[str, Any] | None = None
+        if self._done and self.config.reward_version == "explore_v3":
+            episode_progress = {
+                "episode": self._episode_number,
+                "steps": self._steps,
+                "distinct_scenes": len(self._episode_scene_names),
+                "scene_names": sorted(self._episode_scene_names),
+                "new_scenes_in_campaign": self._episode_campaign_new_scenes.copy(),
+                "new_scenes_paid_this_episode": self._episode_new_scenes.copy(),
+                "deaths": self._episode_deaths,
+                "shade_recoveries": self._episode_shade_recovered,
+                "shade_losses": self._episode_shade_lost,
+                "enemy_kills": self._episode_kills,
+                "steps_to_first_scene_change": self._steps_to_first_scene,
+                "termination_reason": termination_reason,
+                "return": self._episode_total_reward,
+            }
         info: dict[str, Any] = {
             "valid": True, "termination_reason": termination_reason,
             "reward_version": self.config.reward_version, "reward_components": components,
@@ -380,29 +619,41 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "novelty_paid": self._novelty_paid, "archive_size": len(self._archive),
             "descriptor": descriptor.tolist(), "visual_quality": [luma, dark_fraction, white_fraction, entropy], **audit,
             "novelty_eligible": eligible,
+            "scene_detector_audit": changed,
+            "farm_alerts": farm_alerts,
         }
+        if episode_progress is not None:
+            info["episode_progress"] = episode_progress
         _copy_lifecycle_info(base, info)
         self._append_log({"schema_version":1,"reward_version":self.config.reward_version,"step":self._steps,
                           "task_action":template.name,"raw_action_index":template.raw_action_index,"lease_ms":lease,
                           "reward":{"total":reward,"components":components},"novelty_distance":novelty,
                           "scene_change_event":changed,"terminated":task_terminated,"truncated":task_truncated,
-                          "termination_reason":info["termination_reason"],"valid":True,**audit})
+                          "termination_reason":info["termination_reason"],"valid":True,
+                          "evaluation_only":self._evaluation_mode,
+                          "scene_name":current_scene if isinstance(current_scene,str) else None,
+                          "stuck_seconds":self._progress_elapsed_seconds,"farm_alerts":farm_alerts,
+                          "episode_progress":episode_progress,**audit})
         return observation, reward, task_terminated, task_truncated, info
 
     def action_masks(self) -> NDArray[np.bool_]:
         return build_action_mask(SCENE_CHANGE_ACTION_NAMES, getattr(self.environment,"latest_action_availability",None))
 
+    def set_evaluation_mode(self, enabled: bool) -> None:
+        self._evaluation_mode = bool(enabled)
+
     def close(self) -> None:
         self.environment.close()
 
     def task_contract(self) -> dict[str, Any]:
-        return {"task_contract_schema_version": 2 if self.config.reward_version == "explore_v2" else 1,
+        schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3}[self.config.reward_version]
+        return {"task_contract_schema_version": schema_version,
                 "reward_version": self.config.reward_version,
                 "legal_action_mask":{"version":"action_availability_v1","source":"frame_action_availability"},
                 "action_names":list(SCENE_CHANGE_ACTION_NAMES),
                 "actions":action_contract(SCENE_CHANGE_ACTION_TEMPLATES,base_lease_ms=self.environment.lease_ms),
                 "config":{key:value for key,value in asdict(self.config).items() if key != "reward_version"},"information_boundary":["pixels","applied_action_history"],
-                "reward_only_signals":["enemy_kills_since_last_frame","hp_lost_since_last_frame","geo_gained_since_last_frame","geo_spent_since_last_frame","shade_recovered","death","run_failed"] + (["hp_restored_since_last_frame","shade_hits_since_last_frame","shade_distance","scene_name"] if self.config.reward_version == "explore_v2" else []),
+                "reward_only_signals":["enemy_kills_since_last_frame","hp_lost_since_last_frame","geo_gained_since_last_frame","geo_spent_since_last_frame","shade_recovered","death","run_failed"] + (["hp_restored_since_last_frame","shade_hits_since_last_frame","shade_distance","scene_name"] if self.config.reward_version in {"explore_v2", "explore_v3"} else []) + (["enemy_events_since_last_frame"] if self.config.reward_version == "explore_v3" else []),
                 "detector_inputs":["cropped_rgb_pixels","temporal_pixel_descriptors"],"privileged_state":[],
                 "diagnostic_training":False,"claim":"pixel-only exploration with bounded reward-only bridge signals",
                 "ppo_hyperparameters": {"ent_coef":self.config.ent_coef,"gamma":self.config.gamma,
@@ -428,6 +679,35 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 grid[index] = cell.mean(axis=(0, 1)) / 255.0
                 index += 1
         return grid
+
+    def _record_farm_window(self, components: dict[str, float], scene: object, action: str) -> list[str]:
+        if self.config.reward_version != "explore_v3":
+            return []
+        self._recent_reward_window.append({name: value for name, value in components.items() if value > 0})
+        novelty_seen = components.get("novelty", 0.0) > 0 or components.get("scene_change", 0.0) > 0
+        if not novelty_seen:
+            self._recent_no_novelty_pairs.append((str(scene or "unknown"), action))
+        triggers: list[str] = []
+        if len(self._recent_reward_window) == 2000:
+            totals: dict[str, float] = {}
+            for row in self._recent_reward_window:
+                for name, value in row.items():
+                    totals[name] = totals.get(name, 0.0) + value
+            positive_total = sum(totals.values())
+            if positive_total > 0 and max(totals.values(), default=0.0) / positive_total > 0.60:
+                triggers.append("component_over_60_percent")
+        if len(self._recent_no_novelty_pairs) == 2000:
+            counts: dict[tuple[str, str], int] = {}
+            for pair in self._recent_no_novelty_pairs:
+                counts[pair] = counts.get(pair, 0) + 1
+            if max(counts.values(), default=0) / 2000 > 0.40:
+                triggers.append("same_scene_action_over_40_percent_without_novelty")
+        if triggers and not self._farm_alert_latched:
+            self._farm_alert_latched = True
+            return triggers
+        if not triggers:
+            self._farm_alert_latched = False
+        return []
 
     def _append_log(self, record: dict[str, Any]) -> None:
         if self.task_log_path is None:

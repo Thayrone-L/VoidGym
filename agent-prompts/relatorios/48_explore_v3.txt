@@ -1,0 +1,69 @@
+PROMPT 48 — explore_v3: progresso real, salas e inimigos
+========================================================
+Status: VERDE
+Data: 18/10/2026 (America/Sao_Paulo)
+
+Implementação
+- `explore_v3` preserva `explore_v1` e `explore_v2`; novas campanhas de exploração usam
+  v3 e campanhas antigas sem `reward_version` continuam resolvendo para v1.
+- Episódios truncam após `stuck_seconds` sem novidade persistente nem troca de sala. O motivo
+  fica como `stuck`; a troca de sala zera o relógio. A parada por horizonte continua sendo
+  truncamento e morte continua sendo término.
+- `scene_name` e eventos de morte tipada `(scene_name, enemy_type)` chegam do bridge somente
+  como sinais de recompensa. A sala paga `2 + 8/sqrt(1 + visitas)` no máximo uma vez por
+  episódio; o abate paga `max(0.2, 1/sqrt(1 + contagem))`, com teto de campanha por episódio.
+  JSONs vitalícios são atômicos. O ControlPlane separa memória por `slot-N` (ator), inclusive
+  no learner compartilhado; calibração permanece isolada.
+- O detector visual de mudança de sala segue registrado para auditoria, sem pagar o prêmio
+  v3. A política recebe somente tela e histórico de ações.
+- Tetos v3: novidade 20, salas 20, abates 5, recuperação da sombra 4, cura 4, acertos da
+  sombra 1,2, aproximação positiva 1, dano em até 9 máscaras perdidas (-4,5), tempo/urgência
+  20 por episódio e aproximação negativa 1. Pesos v3 são validados contra o contrato fixo.
+  Retorno positivo teórico máximo = +55,2. Limite negativo conservador = -35,5 (inclui
+  dano, morte e falha simultaneamente, embora sejam eventos incompatíveis, mais teto de
+  tempo e aproximação negativa). Não há normalização dinâmica.
+- Progresso terminal inclui salas distintas e nomes, salas pagas/n novas na campanha, mortes,
+  recuperações/perdas de sombra, abates, passos até primeira troca de cena, motivo e retorno.
+  Manifesto do learner agrega progresso por ator, alertas e tendência de avaliações.
+- Avaliação determinística ocorre depois de rodadas N (padrão 20), percorre um episódio sem
+  chamar o coletor nem publicar experiência. Registros vão a `evaluations.jsonl`; o painel
+  consome a tendência. Heartbeat do ator é atualizado durante avaliação para que um episódio
+  longo não pareça ator morto.
+- Alertas são informativos: componente >60% da recompensa positiva numa janela de 2.000
+  passos ou mesma sala+ação >40% dos passos sem novidade.
+
+Validação Python
+- Ruff: `All checks passed!`
+- mypy: `Success: no issues found in 42 source files`.
+- pytest completo: `534 passed, 2 skipped, 8 subtests passed`.
+- Testes cobrem truncamento e reset por progresso, decaimento/persistência de salas e inimigos,
+  limites e tetos de retorno, alertas sintéticos, contrato/fingerprint e fronteira de observação,
+  avaliação determinística sem rollout e suporte do learner compartilhado.
+
+Bridge C# e implantação
+- Build Release do mod: 0 avisos, 0 erros. Build e harness de correlação passaram.
+- DLL instalada nas duas cópias gerenciadas e marcadores sincronizados após backup em
+  `agent-prompts/backup-agente48-20261018-135931/deployed-dll/`.
+- SHA-256 Release e das duas cópias: `e78b9089f374a5e91f017b18f4699f20dd8f5f79d54066ba8580b0fdf9f251d6`.
+
+Teste real autorizado — uma instância, 300 s
+- Primeira execução não concluiu: episódio de avaliação longo deixou o heartbeat expirar; o
+  learner terminou antes do primeiro rollout. Correção: avaliação publica heartbeat durante
+  a execução e começa depois da primeira rodada de treino.
+- Segunda tentativa reutilizou um diretório de campanha com status antigo do ator; o learner
+  interpretou o ator anterior como indisponível. Parada cooperativa, sem campanha ativa.
+  Correção: a validação seguinte usou campaign_id e shared root novos.
+- Execução final `explore-v3-short-retry-20261018`, versão 1, launch group
+  `explore-v3-short-retry-20261018-v0001`: rodada 2, 256 passos, 1 avaliação completa na
+  rodada 1, determinística, 120 passos, retorno +0,245915, `rollout_submitted=false`.
+- Episódios observados: episódio 1 treino, +0,41797, 1 sala (`Tutorial_01`), horizonte;
+  episódio 3 avaliação, +0,245915, 1 sala, horizonte; episódio 4 treino, +0,31959, 1 sala,
+  horizonte. Nenhuma morte, recuperação/perda de sombra, abate, troca de sala ou alerta.
+- O grupo parou cooperativamente e o ControlPlane confirmou `active_count=0`. Nenhum jogo,
+  Steam ou treino ficou ativo. Campanha longa não iniciada; PC não desligado.
+- Evidências JSON: `relatorios/48_explore_v3/short-game-test.json` e o
+  `evaluations.jsonl` no shared root do runtime.
+
+Commit/push
+- Commit/push concluído no PR #8; hash registrado em `relatorios/51_fila.txt`.
+- Próxima etapa da fila: prompt 49 — painel do operador.
