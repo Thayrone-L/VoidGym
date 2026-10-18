@@ -29,7 +29,7 @@ Etapa 48 — VERDE
 - Ruff/mypy limpos; pytest 534 passed, 2 skipped, 8 subtests; bridge Release/harness passaram; duas DLLs instaladas e marcadores conferidos.
 - Teste de 300 s concluiu 256 passos, rodada 2 e avaliação determinística na rodada 1 (rollout_submitted=false); sem alertas, active_count=0. Duas tentativas corrigidas estão detalhadas no relatório.
 - Retorno limitado teoricamente a +55,2 / -35,5. Relatório: relatorios/48_explore_v3.txt.
-- Commit/push pendentes.
+- Commit `44aa60b` (“Add explore_v3: campaign novelty for scenes and enemies, stuck truncation, progress metrics”) enviado ao origin `codex/parallel-instances-isolation` / PR #8.
 
 Etapa 49 — PENDENTE
 - Só iniciar após etapa 48 verde com commit+push. Painel de operador, relatórios HTML/JSON,
