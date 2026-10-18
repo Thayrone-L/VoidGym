@@ -35,6 +35,12 @@
         <form id="campaign-form">
           <label>Nome<input name="name" value="Exploração de cenário" maxlength="80" required></label>
           <label>Tipo<select name="campaign_type" id="campaign-type"><option value="scene_change_probe">Probe de cenário</option><option value="scene_change_training">PPO de cenário</option><option value="visual_motion_training">PPO motor</option></select></label>
+          <fieldset id="shared-fields" hidden><legend>Learner compartilhado</legend><div class="field-grid">
+            <label><input name="shared_learner" type="checkbox" value="true"> Uma política para vários atores</label>
+            <label>Atores<input name="actors" type="number" value="2" min="1" max="3"></label>
+            <label>Passos por rodada<input name="rollout_steps" type="number" value="256" min="1" max="65536"></label>
+            <label>Batch PPO<input name="batch_size" type="number" value="64" min="1" max="65536"></label>
+          </div></fieldset>
           <fieldset><legend>Origem da campanha</legend><div class="field-grid">
             <label>Partida<select name="save_source" id="save-source"><option value="existing_save">Usar save existente</option><option value="new_game">Iniciar novo jogo</option></select></label>
             <label>Slot<select name="save_slot"><option value="1">Slot 1</option><option value="2">Slot 2</option><option value="3">Slot 3</option><option value="4">Slot 4</option></select></label>

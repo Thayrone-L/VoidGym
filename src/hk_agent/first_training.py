@@ -175,6 +175,26 @@ def train_ppo(
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "manifest.json"
     task_contract = task.task_contract()
+    if os.environ.get("HK_AGENT_SHARED_ROLE") == "actor":
+        shared_root_value = os.environ.get("HK_AGENT_SHARED_ROOT")
+        if not shared_root_value:
+            raise ValueError("shared actor role requires HK_AGENT_SHARED_ROOT")
+        if config.resume_checkpoint is not None or config.warm_start_policy is not None:
+            raise ValueError("shared actor state comes from learner policy rounds, not local warm-start")
+        from hk_agent.shared_learner import run_shared_actor
+
+        return run_shared_actor(
+            environment,
+            task_contract=task_contract,
+            config=config,
+            output_root=output_root,
+            provenance=dict(provenance or {}),
+            stop_file=stop_file,
+            shared_root=Path(shared_root_value),
+            slot=int(os.environ.get("HK_AGENT_SLOT_ID", "-1")),
+            launch_id=os.environ.get("HK_AGENT_LAUNCH_ID", ""),
+            actors=int(os.environ.get("HK_AGENT_SHARED_ACTORS", "0")),
+        )
     reward_version = str(task_contract.get("reward_version", VISUAL_MOTION_REWARD_VERSION))
     diagnostic_training = bool(task_contract.get("diagnostic_training", True))
     claim = str(

@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--timesteps", type=int, default=256)
     parser.add_argument("--checkpoint-interval", type=int, default=128)
+    parser.add_argument("--rollout-steps", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--resume-checkpoint", type=Path)
@@ -251,6 +253,8 @@ def main() -> int:
         seed=args.seed,
         total_timesteps=args.timesteps,
         checkpoint_interval=args.checkpoint_interval,
+        rollout_steps=args.rollout_steps,
+        batch_size=args.batch_size,
         continuous=args.continuous,
         max_checkpoints=args.max_checkpoints,
         resume_checkpoint=args.resume_checkpoint,
@@ -471,6 +475,28 @@ def main() -> int:
                     "resolved_motion_target_fraction": calibrated.motion_target_fraction,
                 },
             )
+        shared_root_value = os.environ.get("HK_AGENT_SHARED_ROOT")
+        if not cancelled and os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" and shared_root_value:
+            from hk_agent.shared_learner import share_calibration
+
+            shared_calibration = share_calibration(
+                Path(shared_root_value),
+                {
+                    "noop_motion": noop_motion,
+                    "active_motion": active_motion,
+                    "resolved_motion_target_fraction": calibrated.motion_target_fraction,
+                },
+            )
+            shared_noop = shared_calibration.get("noop_motion")
+            shared_active = shared_calibration.get("active_motion")
+            if not isinstance(shared_noop, list) or not isinstance(shared_active, list):
+                raise ValueError("shared learner calibration arrays are invalid")
+            calibrated = resolve_calibrated_config(
+                base_task_config,
+                noop_motion=[float(value) for value in shared_noop],
+                active_motion=[float(value) for value in shared_active],
+            )
+            atomic_json(run_root / "calibration.json", shared_calibration)
     finally:
         try:
             calibration_task.close()

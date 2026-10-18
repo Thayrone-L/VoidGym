@@ -61,7 +61,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 5
+    assert first["schema_version"] == 6
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 

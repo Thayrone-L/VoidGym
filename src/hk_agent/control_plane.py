@@ -89,13 +89,22 @@ class CampaignSpec:
     save_slot: int = 1
     worker_session_id: str | None = None
     weights: Mapping[str, float] = field(default_factory=dict)
-    schema_version: int = 5
+    shared_learner: bool = False
+    actors: int = 2
+    rollout_steps: int = 256
+    batch_size: int = 64
+    schema_version: int = 6
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
         campaign_type = str(payload.get("campaign_type", ""))
         if campaign_type not in CAMPAIGN_TO_TOOL:
             raise ValueError("campaign_type is not allowlisted")
+        shared_learner = payload.get("shared_learner", False)
+        if not isinstance(shared_learner, bool):
+            raise TypeError("shared_learner must be a boolean")
+        if shared_learner and campaign_type != "visual_motion_training":
+            raise ValueError("shared learner campaigns currently require visual_motion_training")
         name = str(payload.get("name", "")).strip()
         if not 1 <= len(name) <= 80 or any(ord(char) < 32 for char in name):
             raise ValueError("name must contain 1 to 80 printable characters")
@@ -204,6 +213,10 @@ class CampaignSpec:
             if campaign_type == "scene_change_probe":
                 raise ValueError("scene-change probes cannot consume a worker policy")
             worker_session_id = raw_worker_session
+        actors = _bounded_int(payload.get("actors", 2), "actors", 1, 3)
+        rollout_steps = _bounded_int(payload.get("rollout_steps", 256), "rollout_steps", 1, 100_000)
+        batch_size = _bounded_int(payload.get("batch_size", 64), "batch_size", 1, 100_000)
+        shared_checkpoint_default = rollout_steps * actors if shared_learner else 128
         spec = cls(
             campaign_id=identifier,
             name=name,
@@ -211,7 +224,7 @@ class CampaignSpec:
             seed=_bounded_int(payload.get("seed", 7), "seed", 0, 2**31 - 1),
             timesteps=_bounded_int(payload.get("timesteps", 256), "timesteps", 1, 10_000_000),
             checkpoint_interval=_bounded_int(
-                payload.get("checkpoint_interval", 128), "checkpoint_interval", 1, 1_000_000
+                payload.get("checkpoint_interval", shared_checkpoint_default), "checkpoint_interval", 1, 1_000_000
             ),
             episodes=_bounded_int(payload.get("episodes", 3), "episodes", 1, 10_000),
             horizon=_bounded_int(payload.get("horizon", 512), "horizon", 8, 100_000),
@@ -229,7 +242,17 @@ class CampaignSpec:
             save_slot=_bounded_int(payload.get("save_slot", 1), "save_slot", 1, 4),
             worker_session_id=worker_session_id,
             weights=weights,
+            shared_learner=shared_learner,
+            actors=actors,
+            rollout_steps=rollout_steps,
+            batch_size=batch_size,
         )
+        if spec.rollout_steps * spec.actors % spec.batch_size:
+            raise ValueError("batch_size must divide rollout_steps times actors")
+        if spec.shared_learner and (
+            spec.checkpoint_interval % (spec.rollout_steps * spec.actors)
+        ):
+            raise ValueError("shared checkpoint_interval must be a multiple of rollout_steps times actors")
         if spec.campaign_type == "visual_motion_training" and spec.horizon < 16:
             raise ValueError("visual-motion horizon must be at least 16 for calibration")
         if (
@@ -750,6 +773,8 @@ class ControlPlane:
                 "--horizon",
                 str(spec.horizon),
             ]
+            if spec.campaign_type == "visual_motion_training":
+                command += ["--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size)]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
             command += [
@@ -824,6 +849,146 @@ class ControlPlane:
                     record["slot_state"] = "released"
 
     def launch(self, campaign_id: str, *, version: int | None, execute: bool) -> dict[str, object]:
+        self._require_owner()
+        spec, spec_path = self._resolve_campaign(campaign_id, version)
+        if not spec.shared_learner:
+            return self._launch_single(campaign_id, version=version, execute=execute)
+        if not execute:
+            raise RuntimeError("shared learner campaigns require Execute to be enabled")
+        from hk_agent.config import load_config
+
+        project_config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
+        if spec.actors > project_config.instance_count:
+            raise RuntimeError(f"shared learner requests {spec.actors} actors but only {project_config.instance_count} managed slots are configured")
+        if spec.actors > 1 and not self.parallel_enabled:
+            raise RuntimeError("shared learner with multiple actors requires parallel execution to be enabled")
+        with self._lock:
+            self._refresh_locked()
+            active_slots = sum(1 for record in self._active_records_locked() if record.get("mode") == "execute")
+            if active_slots + spec.actors > self.max_active_launches:
+                raise RuntimeError("not enough free game slots for shared learner actors")
+        version_number = int(spec_path.stem[1:])
+        group_id = f"{campaign_id}-v{version_number:04d}"
+        shared_root = self.runtime_root / "shared" / campaign_id
+        learner = self._launch_shared_learner(
+            spec,
+            version=version_number,
+            group_id=group_id,
+            shared_root=shared_root,
+        )
+        actors: list[dict[str, object]] = []
+        try:
+            for _ in range(spec.actors):
+                actors.append(
+                    self._launch_single(
+                        campaign_id,
+                        version=version_number,
+                        execute=True,
+                        shared_role="actor",
+                        shared_root=shared_root,
+                        shared_group=group_id,
+                        shared_actor_count=spec.actors,
+                    )
+                )
+        except BaseException:
+            for record in [learner, *actors]:
+                try:
+                    self.stop(str(record["launch_id"]), _shared_member=True)
+                except (RuntimeError, ValueError):
+                    pass
+            raise
+        return {
+            "status": "RUNNING",
+            "campaign_id": campaign_id,
+            "campaign_version": version_number,
+            "shared_group": group_id,
+            "shared_root": str(shared_root),
+            "learner": learner,
+            "actors": actors,
+        }
+
+    def _launch_shared_learner(
+        self,
+        spec: CampaignSpec,
+        *,
+        version: int,
+        group_id: str,
+        shared_root: Path,
+    ) -> dict[str, object]:
+        self._require_owner()
+        launch_id = time.strftime("launch-%Y%m%dT%H%M%S", time.gmtime()) + f"-{secrets.token_hex(3)}"
+        launch_root = self.control_root / "launches" / launch_id
+        launch_root.mkdir(parents=True, exist_ok=False)
+        stop_file = launch_root / "stop.request"
+        log_path = launch_root / "process.log"
+        tool_path = self.project_root / "tools" / "run_shared_learner.py"
+        command = [
+            sys.executable, str(tool_path), "--shared-root", str(shared_root),
+            "--stop-file", str(stop_file), "--actors", str(spec.actors),
+            "--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size),
+            "--checkpoint-interval", str(spec.checkpoint_interval),
+            "--max-checkpoints", str(spec.max_checkpoints), "--timesteps", str(spec.timesteps),
+            "--seed", str(spec.seed), "--torch-threads", str(self.torch_threads),
+            "--torch-interop-threads", str(self.torch_interop_threads),
+        ]
+        if spec.duration_mode == "continuous":
+            command.append("--continuous")
+        record: dict[str, object] = {
+            "schema_version": 1, "launch_id": launch_id, "campaign_id": spec.campaign_id,
+            "campaign_version": version, "mode": "shared-learner", "role": "learner",
+            "shared_group": group_id, "shared_root": str(shared_root),
+            "resources": {"slot_id": None, "training_device": "cpu"},
+            "started_unix_ns": time.time_ns(), "heartbeat_unix_ns": time.time_ns(),
+            "status": "RUNNING", "phase": "starting", "command": command[1:],
+            "log_path": log_path.relative_to(self.project_root).as_posix(),
+            "stop_file": stop_file.relative_to(self.project_root).as_posix(),
+        }
+        environment = clean_bridge_environment(os.environ)
+        environment.update({
+            "HK_AGENT_LAUNCH_ID": launch_id,
+            "OMP_NUM_THREADS": str(self.torch_threads),
+            "MKL_NUM_THREADS": str(self.torch_threads),
+            "OPENBLAS_NUM_THREADS": str(self.torch_threads),
+        })
+        with log_path.open("wb") as log_handle:
+            creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            windows_job = WindowsJob.create() if _windows_job_enabled() and subprocess.Popen is _REAL_POPEN else None
+            if _windows_job_enabled():
+                creation_flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+            process = subprocess.Popen(
+                command, cwd=self.project_root, stdin=subprocess.DEVNULL,
+                stdout=log_handle, stderr=subprocess.STDOUT, shell=False,
+                creationflags=creation_flags, env=environment,
+            )
+            if windows_job is not None:
+                try:
+                    windows_job.assign_pid(process.pid)
+                    resume_process(process.pid)
+                    self._jobs[launch_id] = windows_job
+                except BaseException:
+                    windows_job.close()
+                    process.kill()
+                    raise
+        record["pid"] = process.pid
+        record["runner_process"] = process_identity(process.pid)
+        record["launch_nonce"] = launch_id
+        atomic_json(launch_root / "launch.json", record)
+        with self._lock:
+            self._launches[launch_id] = record
+            self._processes[launch_id] = process
+        return dict(record)
+
+    def _launch_single(
+        self,
+        campaign_id: str,
+        *,
+        version: int | None,
+        execute: bool,
+        shared_role: str | None = None,
+        shared_root: Path | None = None,
+        shared_group: str | None = None,
+        shared_actor_count: int | None = None,
+    ) -> dict[str, object]:
         self._require_owner()
         project_config = None
         with self._lock:
@@ -1046,6 +1211,18 @@ class ControlPlane:
                     "OPENBLAS_NUM_THREADS": str(self.torch_threads),
                 }
             )
+            if shared_role == "actor":
+                if shared_root is None or shared_actor_count is None:
+                    raise RuntimeError("shared actor launch is missing its shared learner contract")
+                environment.update({
+                    "HK_AGENT_SHARED_ROLE": "actor",
+                    "HK_AGENT_SHARED_ROOT": str(shared_root),
+                    "HK_AGENT_SHARED_ACTORS": str(shared_actor_count),
+                })
+                record.update({
+                    "role": "actor", "shared_group": shared_group,
+                    "shared_root": str(shared_root),
+                })
             if slot_id is not None:
                 assert project_config is not None
                 environment["HK_AGENT_SLOT_ID"] = str(slot_id)
@@ -1351,6 +1528,14 @@ class ControlPlane:
         records = []
         for launch_id in live_ids:
             record = dict(self._launches[launch_id])
+            shared_root = record.get("shared_root")
+            if isinstance(shared_root, str):
+                try:
+                    shared_status = json.loads((Path(shared_root) / "learner.json").read_text("utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    shared_status = {}
+                if isinstance(shared_status, dict):
+                    record["shared_status"] = shared_status
             resources = record.get("resources")
             slot_id = resources.get("slot_id") if isinstance(resources, Mapping) else None
             if isinstance(slot_id, int) and self._slot_owners.get(slot_id) == launch_id:
@@ -1514,10 +1699,23 @@ class ControlPlane:
                 "scene_change_gate": self.scene_change_gate(),
             }
 
-    def stop(self, launch_id: str | None = None) -> dict[str, object]:
+    def stop(self, launch_id: str | None = None, *, _shared_member: bool = False) -> dict[str, object]:
         self._require_owner()
         with self._lock:
             self._refresh_locked()
+            if launch_id is not None and not _shared_member:
+                selected = self._launches.get(launch_id)
+                group = selected.get("shared_group") if selected is not None else None
+                if isinstance(group, str):
+                    members = [
+                        item for item in self._active_records_locked()
+                        if item.get("shared_group") == group
+                    ]
+                    results = [
+                        self.stop(str(item["launch_id"]), _shared_member=True)
+                        for item in members
+                    ]
+                    return {"status": "STOP_REQUESTED", "shared_group": group, "members": results}
             preparing_ids = set(self._preparing_ids)
             active_ids = set(self._processes) | set(self._reattached_pids)
             if not active_ids and not preparing_ids:
