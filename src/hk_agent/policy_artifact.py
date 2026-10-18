@@ -378,6 +378,18 @@ def import_policy_artifact(
         raise PolicyArtifactError("policy artifact or manifest exceeds its size limit")
     try:
         sidecar_bytes = sidecar.read_bytes()
+        if expected_sidecar is not None:
+            # Antivirus/indexing and sync filters on Windows can briefly expose
+            # the previous directory-entry contents immediately after replace.
+            # The pointer is published only after the new manifest is durable;
+            # retry a short bounded interval before treating this as tampering.
+            for attempt in range(20):
+                if hashlib.sha256(sidecar_bytes).hexdigest() == expected_sidecar:
+                    break
+                if attempt == 19:
+                    break
+                time.sleep(0.025)
+                sidecar_bytes = sidecar.read_bytes()
         manifest = validate_policy_manifest(json.loads(sidecar_bytes.decode("utf-8")))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PolicyArtifactError("policy manifest is not readable canonical JSON") from error

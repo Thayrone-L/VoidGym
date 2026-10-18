@@ -228,6 +228,38 @@ def test_import_rejects_identity_other_than_the_frozen_preflight(
         )
 
 
+def test_import_retries_transient_stale_manifest_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "policy.safetensors"
+    exported = export_policy_artifact(
+        TinyPolicy(), artifact, compatibility_fingerprint="a" * 64
+    )
+    sidecar = artifact.with_suffix(".manifest.json")
+    expected_manifest_sha256 = policy_artifact.hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    original = Path.read_bytes
+    stale_reads = 0
+
+    def stale_once(path: Path) -> bytes:
+        nonlocal stale_reads
+        if path == sidecar and stale_reads == 0:
+            stale_reads += 1
+            return b"previous directory entry"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", stale_once)
+    imported = import_policy_artifact(
+        TinyPolicy(),
+        artifact,
+        expected_compatibility_fingerprint="a" * 64,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_manifest_id=exported["manifest_id"],
+    )
+
+    assert stale_reads == 1
+    assert imported == exported
+
+
 def test_export_rejects_unsupported_dtype_and_tensor_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
