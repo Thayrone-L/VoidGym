@@ -409,6 +409,9 @@ def _copy_lifecycle_info(source: dict[str, Any], target: dict[str, Any]) -> None
         target["run_failed"] = source["run_failed"]
     if "shade_recovered" in source:
         target["shade_recovered"] = source["shade_recovered"]
+    for name in ("hp_restored_since_last_frame", "shade_hits_since_last_frame", "shade_distance", "scene_name", "shade_pending"):
+        if name in source:
+            target[name] = source[name]
 
 
 class ChannelsFirstObservation(gym.ObservationWrapper):

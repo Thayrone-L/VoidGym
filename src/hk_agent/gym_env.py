@@ -72,6 +72,10 @@ class PixelFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    hp_restored_since_last_frame: int = 0
+    shade_hits_since_last_frame: int = 0
+    shade_distance: float | None = None
+    scene_name: str | None = None
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -449,6 +453,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             ("hp_lost_since_last_frame", frame.hp_lost_since_last_frame),
             ("geo_gained_since_last_frame", frame.geo_gained_since_last_frame),
             ("geo_spent_since_last_frame", frame.geo_spent_since_last_frame),
+            ("hp_restored_since_last_frame", frame.hp_restored_since_last_frame),
+            ("shade_hits_since_last_frame", frame.shade_hits_since_last_frame),
         ):
             if (
                 isinstance(combat_value, bool)
@@ -486,6 +492,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
             geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
             geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+            # Reward-only lifecycle metadata, never inserted in the pixel observation.
+            hp_restored_since_last_frame=frame.hp_restored_since_last_frame,
+            shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
+            shade_distance=frame.shade_distance,
+            scene_name=frame.scene_name,
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
             action_availability=frame.action_availability,
@@ -549,6 +560,10 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             or frame.hp_lost_since_last_frame
             or frame.geo_gained_since_last_frame
             or frame.geo_spent_since_last_frame
+            or frame.hp_restored_since_last_frame
+            or frame.shade_hits_since_last_frame
+            or frame.shade_distance is not None
+            or frame.scene_name is not None
         ):
             return {}
         lifecycle = self._shade_run_update
@@ -557,6 +572,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
             "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
             "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
+            "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
+            "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
+            "shade_distance": frame.shade_distance,
+            "scene_name": frame.scene_name,
+            "shade_pending": frame.shade_pending,
             "run_failed": lifecycle.run_failed if lifecycle is not None else frame.run_failed,
             "supervisor": {
                 "player_dead": frame.player_dead,
@@ -568,6 +588,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
                 "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
                 "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
+                "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
+                "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
                 "gameplay_run_index": (
                     lifecycle.logical_run_index if lifecycle is not None else 1
                 ),

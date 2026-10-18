@@ -729,7 +729,7 @@ def actor_join_round(learner_status: Mapping[str, Any]) -> int:
 
 
 def _shared_ppo_parameters(task_contract: Mapping[str, Any]) -> dict[str, Any]:
-    if task_contract.get("reward_version") != "explore_v1":
+    if task_contract.get("reward_version") not in {"explore_v1", "explore_v2", "explore_v3"}:
         return {}
     defaults = {
         "ent_coef": 0.01, "gamma": 0.995, "gae_lambda": 0.95,

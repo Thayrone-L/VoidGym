@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run diagnostic PPO against Hollow Knight")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
     parser.add_argument("--task", choices=("visual_motion", "exploration"), default="visual_motion")
+    parser.add_argument("--reward-version", choices=("explore_v1", "explore_v2", "explore_v3"))
     parser.add_argument(
         "--bootstrap-plan",
         type=Path,
@@ -223,6 +224,7 @@ def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path |
     # during startup calibration, including when horizontal movement alone is
     # blocked by a nearby wall or a stationary spawn position.
     active_actions = [6 if i % 2 == 0 else 8 for i in range(10)]
+    noop_awards = 0
     for target, actions in ((noop, [0] * 10), (active, active_actions)):
         for action in actions:
             if stop_file is not None and stop_file.is_file():
@@ -231,6 +233,10 @@ def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path |
             if terminated or truncated or info.get("valid") is not True:
                 raise RuntimeError("exploration calibration ended before its sample budget")
             target.append(info["descriptor"])
+            if target is noop and info.get("reward_components", {}).get("novelty", 0.0) > 0:
+                noop_awards += 1
+    if task.config.reward_version == "explore_v2" and noop_awards / max(1, len(noop)) > 0.01:
+        raise ValueError("explore_v2 novelty rate on NOOP exceeded the 1% calibration ceiling")
     return noop, active, stop_file is not None and stop_file.is_file()
 
 
@@ -260,6 +266,7 @@ def cancelled_result(
 
 def main() -> int:
     args = parse_args()
+    reward_version = args.reward_version or ("explore_v2" if args.task == "exploration" else "explore_v1")
     if args.continuous and args.stop_file is None:
         raise SystemExit("--continuous requires --stop-file for cooperative shutdown")
     origin = CampaignOrigin(args.save_source, args.save_slot)
@@ -469,12 +476,13 @@ def main() -> int:
     )
     if args.task == "exploration":
         base_task_config = ExplorationTaskConfig(
+            reward_version=reward_version,
             horizon_steps=args.horizon, novelty_reward=args.novelty_reward,
             novelty_threshold=args.novelty_threshold, novelty_budget=args.novelty_budget,
             scene_change_reward=args.scene_change_reward, enemy_kill_reward=args.enemy_kill_reward,
             enemy_kill_reward_budget=args.enemy_kill_reward_budget,
-            shade_recovery_reward=args.shade_recovery_reward, damage_penalty=args.damage_penalty,
-            geo_gain_reward=args.geo_gain_reward, geo_spend_reward=args.geo_spend_reward,
+            shade_recovery_reward=(4.0 if reward_version == "explore_v2" else args.shade_recovery_reward), damage_penalty=args.damage_penalty,
+            geo_gain_reward=(0.0 if reward_version == "explore_v2" else args.geo_gain_reward), geo_spend_reward=(0.0 if reward_version == "explore_v2" else args.geo_spend_reward),
             death_penalty=args.death_penalty, run_failed_penalty=args.run_failed_penalty,
             time_cost=args.time_cost, lease_base_ms=args.lease_ms,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.01,

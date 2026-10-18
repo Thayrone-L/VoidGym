@@ -424,6 +424,10 @@ internal sealed class BridgeClient : IDisposable
                                 ["hp_lost_since_last_frame"] = lifecycle.HealthLostSinceLastFrame,
                                 ["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame,
                                 ["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame,
+                                ["hp_restored_since_last_frame"] = lifecycle.HealthRestoredSinceLastFrame,
+                                ["shade_hits_since_last_frame"] = lifecycle.ShadeHitsSinceLastFrame,
+                                ["shade_distance"] = lifecycle.ShadeDistance,
+                                ["scene_name"] = lifecycle.SceneName,
                                 ["duplicate_of"] = (long?)null,
                                 ["last_applied_action_id"] = correlation.LastAppliedActionId,
                             };

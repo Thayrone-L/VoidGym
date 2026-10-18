@@ -238,6 +238,10 @@ class SupervisorTests(unittest.TestCase):
                         "hp_lost_since_last_frame": 1,
                         "geo_gained_since_last_frame": 17,
                         "geo_spent_since_last_frame": 4,
+                        "hp_restored_since_last_frame": 1,
+                        "shade_hits_since_last_frame": 2,
+                        "shade_distance": 1.25,
+                        "scene_name": "Room_Test",
                         "duplicate_of": None,
                         "last_applied_action_id": None,
                     },
@@ -255,6 +259,10 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(captured.hp_lost_since_last_frame, 1)
                 self.assertEqual(captured.geo_gained_since_last_frame, 17)
                 self.assertEqual(captured.geo_spent_since_last_frame, 4)
+                self.assertEqual(captured.hp_restored_since_last_frame, 1)
+                self.assertEqual(captured.shade_hits_since_last_frame, 2)
+                self.assertEqual(captured.shade_distance, 1.25)
+                self.assertEqual(captured.scene_name, "Room_Test")
 
                 fallback_task = asyncio.create_task(
                     supervisor.capture_once(bridge=accepted, encoding="raw_rgb8")

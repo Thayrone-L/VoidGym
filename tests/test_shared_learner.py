@@ -293,6 +293,8 @@ def test_exploration_learner_uses_explicit_campaign_ppo_parameters():
         "clip_range": 0.2,
     }
     assert _shared_ppo_parameters({"reward_version": "visual_motion_v1"}) == {}
+    v2_values = _shared_ppo_parameters({"reward_version": "explore_v2"})
+    assert v2_values["ent_coef"] == 0.01 and v2_values["gamma"] == 0.995
 
 
 def test_learner_waiting_for_calibration_honors_stop_file(tmp_path):

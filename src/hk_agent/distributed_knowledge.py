@@ -17,10 +17,11 @@ _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
-_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
         "reward_version",
+        "task_contract_schema_version",
         "action_names",
         "raw_action_indices",
         "actions",
@@ -77,6 +78,8 @@ _TASK_CONFIG_KEYS = frozenset(
         "success_reward",
         "terminate_on_scene_change",
         "novelty_reward", "novelty_threshold", "novelty_budget", "archive_max",
+        "lifelong_archive_max", "novelty_persistence_steps",
+        "shade_hit_reward", "hp_restored_reward", "stuck_seconds", "evaluation_interval",
         "scene_change_reward", "lease_base_ms", "ent_coef", "gamma", "gae_lambda",
         "n_epochs", "target_kl", "learning_rate", "clip_range",
     }
@@ -121,6 +124,11 @@ _REWARD_ONLY_SIGNALS = frozenset(
         "geo_gained_since_last_frame",
         "geo_spent_since_last_frame",
         "shade_recovered",
+        "hp_restored_since_last_frame",
+        "shade_hits_since_last_frame",
+        "shade_distance",
+        "scene_name",
+        "enemy_type",
         "death",
         "run_failed",
     }
@@ -354,6 +362,10 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
             raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
+    schema_version = contract.get("task_contract_schema_version", 1)
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2}:
+        raise KnowledgeValidationError("task_contract_schema_version is unsupported")
+    result["task_contract_schema_version"] = schema_version
     action_names = contract["action_names"]
     if not isinstance(action_names, list) or not all(
         name in _ACTION_NAMES for name in action_names

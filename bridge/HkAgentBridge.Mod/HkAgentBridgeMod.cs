@@ -14,6 +14,7 @@ public sealed class HkAgentBridgeMod : Mod
     private VisualCaptureBackend? _capture;
     private readonly EpisodeLifecycleState _lifecycle = new();
     private int _lastObservedHealth = -1;
+    private int _episodeActive;
 
     public override string GetVersion() =>
         Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
@@ -81,7 +82,7 @@ public sealed class HkAgentBridgeMod : Mod
             (buttons, leaseMilliseconds) =>
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
             (encoding, cancellationToken) => capture.CaptureOnceAsync(encoding, cancellationToken),
-            _lifecycle.Snapshot,
+            SnapshotRewardSignals,
             BeginEpisodeLifecycle
         );
         ModHooks.HeroUpdateHook += OnHeroUpdate;
@@ -90,6 +91,7 @@ public sealed class HkAgentBridgeMod : Mod
         ModHooks.SetPlayerBoolHook += OnSetPlayerBool;
         ModHooks.OnReceiveDeathEventHook += OnReceiveDeathEvent;
         ModHooks.AfterTakeDamageHook += OnAfterTakeDamage;
+        On.HealthManager.TakeDamage += OnHealthManagerTakeDamage;
         On.GeoControl.OnTriggerEnter2D += OnGeoPickupTrigger;
         On.HeroController.TakeGeo += OnHeroTakeGeo;
         ModHooks.ApplicationQuitHook += OnApplicationQuit;
@@ -142,8 +144,54 @@ public sealed class HkAgentBridgeMod : Mod
         PlayerData? playerData = PlayerData.instance;
         if (playerData != null)
         {
-            Interlocked.Exchange(ref _lastObservedHealth, playerData.GetInt("health"));
+            int current = playerData.GetInt("health");
+            int previous = Interlocked.Exchange(ref _lastObservedHealth, current);
+            bool atBench = playerData.GetBool("atBench");
+            int restored = EpisodeLifecycleState.CountHealthRestored(
+                previous, current, Volatile.Read(ref _episodeActive) != 0,
+                _lifecycle.IsDeathStarted, atBench
+            );
+            _lifecycle.RecordHealthRestored(restored);
         }
+    }
+
+    private void OnHealthManagerTakeDamage(
+        On.HealthManager.orig_TakeDamage original,
+        HealthManager self,
+        HitInstance hitInstance
+    )
+    {
+        GameObject? source = hitInstance.Source;
+        HeroController? hero = HeroController.instance;
+        string objectName = self.gameObject.name.Replace("(Clone)", "").Trim();
+        if (hero != null && source != null && objectName == "Hollow Shade" &&
+            source.transform.root == hero.transform.root)
+        {
+            _lifecycle.RecordShadeHit();
+        }
+        original(self, hitInstance);
+    }
+
+    private EpisodeLifecycleSnapshot SnapshotRewardSignals()
+    {
+        string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        float? distance = null;
+        HeroController? hero = HeroController.instance;
+        if (hero != null && _lifecycle.ShadePending)
+        {
+            GameObject[] objects = UnityEngine.Object.FindObjectsOfType<GameObject>();
+            foreach (GameObject item in objects)
+            {
+                if (item != null && item.activeInHierarchy &&
+                    item.name.Replace("(Clone)", "").Trim() == "Hollow Shade" &&
+                    item.scene.handle == hero.gameObject.scene.handle)
+                {
+                    distance = Vector2.Distance(hero.transform.position, item.transform.position);
+                    break;
+                }
+            }
+        }
+        return _lifecycle.Snapshot(scene, distance);
     }
 
     private void OnGeoPickupTrigger(
@@ -242,6 +290,7 @@ public sealed class HkAgentBridgeMod : Mod
         ModHooks.AfterTakeDamageHook -= OnAfterTakeDamage;
         On.GeoControl.OnTriggerEnter2D -= OnGeoPickupTrigger;
         On.HeroController.TakeGeo -= OnHeroTakeGeo;
+        On.HealthManager.TakeDamage -= OnHealthManagerTakeDamage;
         BridgeClient? client = Interlocked.Exchange(ref _client, null);
         client?.Dispose();
         AgentInputBackend? input = Interlocked.Exchange(ref _input, null);
@@ -264,6 +313,7 @@ public sealed class HkAgentBridgeMod : Mod
             );
         }
         _lifecycle.BeginEpisode(playerData.GetBool("soulLimited"));
+        Interlocked.Exchange(ref _episodeActive, 1);
         Interlocked.Exchange(ref _lastObservedHealth, playerData.GetInt("health"));
     }
 

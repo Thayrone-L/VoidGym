@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+import pytest
 from numpy.typing import NDArray
 
 from hk_agent.action_masking import ActionAvailability
 from hk_agent.distributed_knowledge import portable_compatibility_fingerprint
-from hk_agent.exploration_task import ExplorationTask, ExplorationTaskConfig, calibrate_novelty
+from hk_agent.exploration_task import (
+    ExplorationTask,
+    ExplorationTaskConfig,
+    calibrate_novelty,
+    load_lifelong_visits,
+)
 from hk_agent.scene_change_task import scene_descriptor
 
 
@@ -30,6 +37,7 @@ class _Environment(gym.Env):
         self.frame = self._frame(0)
         self.terminal = False
         self.truncated = False
+        self.extra = {}
 
     @staticmethod
     def _frame(shift: int) -> NDArray[np.uint8]:
@@ -58,7 +66,9 @@ class _Environment(gym.Env):
                 "enemy_kills_since_last_frame": 1 if terminal else 0,
                 "hp_lost_since_last_frame": 0, "geo_gained_since_last_frame": 10,
                 "geo_spent_since_last_frame": 0,
-                "supervisor": {"player_dead": terminal}}
+                "shade_hits_since_last_frame": 0,
+                "hp_restored_since_last_frame": 0,
+                "supervisor": {"player_dead": terminal}, **self.extra}
         return self._obs(), 0.0, terminal, self.truncated, info
 
 
@@ -191,3 +201,125 @@ def test_exploration_contract_is_pixel_only_and_fingerprint_stable() -> None:
     assert _public_task_contract(contract, from_manifest=False)["reward_version"] == "explore_v1"
     assert portable_compatibility_fingerprint(contract, {}) == portable_compatibility_fingerprint(contract, {})
     assert scene_descriptor(_Environment._frame(0), __import__("hk_agent.scene_change_task", fromlist=["SceneChangeTaskConfig"]).SceneChangeTaskConfig()).shape == (144, 3)
+
+
+def _v2_config(**kwargs):
+    return ExplorationTaskConfig(reward_version="explore_v2", geo_gain_reward=0, geo_spend_reward=0,
+        shade_recovery_reward=4.0, **kwargs)
+
+
+def test_v2_masks_hud_and_requires_persistent_scene_change(tmp_path: Path) -> None:
+    env = _Environment()
+    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task.reset()
+    base = env.frame.copy()
+    hud = base.copy()
+    hud[:27, :64] = 255 - hud[:27, :64]
+    env.frame = hud
+    _, _, _, _, info = task.step(0)
+    assert info["reward_components"]["novelty"] == 0
+    env.frame = _Environment._frame(1)
+    _, _, _, _, flash = task.step(0)
+    assert flash["reward_components"]["novelty"] == 0
+    env.frame = base
+    task.step(0)
+    env.frame = _Environment._frame(3)
+    task.step(0)
+    slightly_changed = _Environment._frame(3).copy()
+    slightly_changed[60:62, 100:102] = np.clip(slightly_changed[60:62, 100:102].astype(np.int16) + 4, 0, 255).astype(np.uint8)
+    env.frame = slightly_changed
+    _, _, _, _, persistent = task.step(0)
+    assert persistent["reward_components"]["novelty"] == 0.05
+
+
+def test_v2_lifelong_novelty_decays_and_persists_across_task_processes(tmp_path: Path) -> None:
+    path = tmp_path / "run" / "phase" / "task.jsonl"
+    config = _v2_config(novelty_reward=0.05)
+    for expected in (0.05, 0.05 / np.sqrt(2)):
+        env = _Environment()
+        task = ExplorationTask(env, config=config, task_log_path=path)
+        task.reset()
+        env.frame = _Environment._frame(1)
+        task.step(0)
+        _, reward, _, _, info = task.step(0)
+        assert info["reward_components"]["novelty"] == pytest.approx(expected)
+        assert reward > 0
+        task.close()
+    assert len(load_lifelong_visits(tmp_path / "run" / "lifelong-novelty.json", 4096)) == 1
+
+
+def test_v2_contract_and_policy_observation_preserve_full_hud(tmp_path: Path) -> None:
+    from hk_agent.distributed_knowledge import portable_compatibility_fingerprint
+
+    env1, env2 = _Environment(), _Environment()
+    v1 = ExplorationTask(env1)
+    v2 = ExplorationTask(env2, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    obs1, _ = v1.reset(seed=5)
+    obs2, _ = v2.reset(seed=5)
+    assert np.array_equal(obs1["pixels"], obs2["pixels"])
+    c1, c2 = v1.task_contract(), v2.task_contract()
+    assert c2["reward_version"] == "explore_v2"
+    assert c1["task_contract_schema_version"] == 1 and c2["task_contract_schema_version"] == 2
+    assert c2["information_boundary"] == c1["information_boundary"]
+    from hk_agent.distributed_knowledge import _public_task_contract
+    assert _public_task_contract(c2, from_manifest=False)["reward_version"] == "explore_v2"
+    assert portable_compatibility_fingerprint(c1, {}) != portable_compatibility_fingerprint(c2, {})
+    assert c2["config"]["geo_gain_reward"] == c2["config"]["geo_spend_reward"] == 0
+
+
+def test_v2_geo_hp_shade_rewards_are_bounded_and_reward_only(tmp_path: Path) -> None:
+    env = _Environment()
+    env.extra = {"hp_restored_since_last_frame": 2, "shade_hits_since_last_frame": 9,
+        "shade_distance": 9.0, "scene_name": "Room", "shade_pending": True}
+    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task.reset()
+    observation, _, _, _, info = task.step(0)
+    components = info["reward_components"]
+    assert components["confirmed_geo_gained"] == components["confirmed_geo_spent"] == 0
+    assert components["hp_restored"] == 0.8
+    assert components["shade_hits"] == 1.2
+    assert "scene_name" in task.task_contract()["reward_only_signals"]
+    assert set(observation) == {"pixels", "action_history"}
+
+
+def test_v2_shade_potential_is_capped_and_requires_same_scene(tmp_path: Path) -> None:
+    env = _Environment()
+    env.extra = {"shade_distance": 10.0, "scene_name": "Room", "shade_pending": True}
+    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task.reset()
+    _, _, _, _, first = task.step(0)
+    assert first["reward_components"]["shade_approach"] == 0
+    env.extra = {"shade_distance": 1.0, "scene_name": "Room", "shade_pending": True}
+    _, _, _, _, closer = task.step(0)
+    assert closer["reward_components"]["shade_approach"] == 0.05
+    env.extra = {"shade_distance": 0.0, "scene_name": "Other", "shade_pending": True}
+    _, _, _, _, switched = task.step(0)
+    assert switched["reward_components"]["shade_approach"] == 0
+    assert switched["reward_components"]["time_cost"] == pytest.approx(-0.00108)
+
+
+def test_v2_stationary_attack_cannot_farm_novelty_but_movement_can(tmp_path: Path) -> None:
+    from hk_agent.scene_change_task import SCENE_CHANGE_ACTION_NAMES
+
+    env = _Environment()
+    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task.reset()
+    env.frame = _Environment._frame(1)
+    attack = SCENE_CHANGE_ACTION_NAMES.index("ATTACK")
+    _, _, _, _, first = task.step(attack)
+    _, _, _, _, repeat = task.step(attack)
+    assert first["reward_components"]["novelty"] == 0
+    assert repeat["reward_components"]["novelty"] == 0
+    env.frame = _Environment._frame(3)
+    move = SCENE_CHANGE_ACTION_NAMES.index("RIGHT")
+    task.step(move)
+    env.frame = _Environment._frame(3)
+    _, _, _, _, moved = task.step(move)
+    assert moved["reward_components"]["novelty"] == pytest.approx(0.05)
+
+
+def test_v2_reward_safety_constraints_are_enforced() -> None:
+    with pytest.raises(ValueError, match="healing reward"):
+        _v2_config(damage_penalty=-0.4).validate()
+    with pytest.raises(ValueError, match="does not reward Geo"):
+        ExplorationTaskConfig(reward_version="explore_v2", shade_recovery_reward=4.0).validate()

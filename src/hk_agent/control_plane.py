@@ -101,8 +101,9 @@ class CampaignSpec:
     target_kl: float | None = None
     learning_rate: float | None = None
     clip_range: float | None = None
+    reward_version: str = "explore_v2"
     straggler_timeout_seconds: float = 45.0
-    schema_version: int = 7
+    schema_version: int = 8
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -114,6 +115,11 @@ class CampaignSpec:
             raise TypeError("shared_learner must be a boolean")
         if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
             raise ValueError("shared learner requires a supported PPO training campaign")
+        reward_version = payload.get("reward_version", "explore_v2")
+        if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2"}:
+            raise ValueError("unsupported exploration reward version")
+        if campaign_type != "exploration_training":
+            reward_version = "explore_v1"
         name = str(payload.get("name", "")).strip()
         if not 1 <= len(name) <= 80 or any(ord(char) < 32 for char in name):
             raise ValueError("name must contain 1 to 80 printable characters")
@@ -276,6 +282,7 @@ class CampaignSpec:
             target_kl=_bounded_float(payload.get("target_kl", 0.03), "target_kl", 0.000001, 10.0) if campaign_type == "exploration_training" else None,
             learning_rate=_bounded_float(payload.get("learning_rate", 0.00025), "learning_rate", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             clip_range=_bounded_float(payload.get("clip_range", 0.2), "clip_range", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
+            reward_version=str(reward_version),
             straggler_timeout_seconds=_bounded_float(
                 payload.get("straggler_timeout_seconds", 45.0),
                 "straggler_timeout_seconds", 1.0, 300.0,
@@ -740,6 +747,8 @@ class ControlPlane:
             raise ValueError("campaign version was not found")
         path = candidates[-1]
         payload = json.loads(path.read_text("utf-8"))
+        if isinstance(payload, dict) and payload.get("campaign_type") == "exploration_training" and "reward_version" not in payload:
+            payload["reward_version"] = "explore_v1"
         return CampaignSpec.from_payload(payload), path
 
     def build_command(
@@ -813,7 +822,7 @@ class ControlPlane:
             if spec.campaign_type in {"visual_motion_training", "exploration_training"}:
                 command += ["--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size)]
             if spec.campaign_type == "exploration_training":
-                command += ["--task", "exploration", "--ent-coef", str(spec.ent_coef), "--gamma", str(spec.gamma),
+                command += ["--task", "exploration", "--reward-version", spec.reward_version, "--ent-coef", str(spec.ent_coef), "--gamma", str(spec.gamma),
                             "--gae-lambda", str(spec.gae_lambda), "--n-epochs", str(spec.n_epochs), "--target-kl", str(spec.target_kl),
                             "--learning-rate", str(spec.learning_rate), "--clip-range", str(spec.clip_range),
                             "--novelty-reward", str(spec.weights.get("novelty_reward", 0.05)),
@@ -821,12 +830,12 @@ class ControlPlane:
                             "--scene-change-reward", str(spec.weights.get("scene_change_reward", 5.0)),
                             "--enemy-kill-reward", str(spec.weights.get("enemy_kill_reward", 1.0)),
                             "--enemy-kill-reward-budget", str(spec.weights.get("enemy_kill_reward_budget", 5.0)),
-                            "--shade-recovery-reward", str(spec.weights.get("shade_recovery_reward", 1.0)),
+                            "--shade-recovery-reward", str(4.0 if spec.reward_version == "explore_v2" else spec.weights.get("shade_recovery_reward", 1.0)),
                             "--damage-penalty", str(spec.weights.get("damage_penalty", -0.5)),
                             "--death-penalty", str(spec.weights.get("death_penalty", -5.0)),
                             "--run-failed-penalty", str(spec.weights.get("run_failed_penalty", -5.0)),
-                            "--geo-gain-reward", str(spec.weights.get("geo_gain_reward", 0.01)),
-                            "--geo-spend-reward", str(spec.weights.get("geo_spend_reward", 0.02)),
+                            "--geo-gain-reward", str(0.0 if spec.reward_version == "explore_v2" else spec.weights.get("geo_gain_reward", 0.01)),
+                            "--geo-spend-reward", str(0.0 if spec.reward_version == "explore_v2" else spec.weights.get("geo_spend_reward", 0.02)),
                             "--time-cost", str(spec.weights.get("time_cost", -0.001))]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")

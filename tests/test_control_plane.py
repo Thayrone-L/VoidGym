@@ -62,7 +62,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 7
+    assert first["schema_version"] == 8
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 
@@ -86,6 +86,7 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     spec = CampaignSpec.from_payload(payload)
     command = ControlPlane(_project(tmp_path)).build_command(spec, execute=False)
     assert spec.shared_learner is True
+    assert spec.reward_version == "explore_v2"
     assert spec.ent_coef == 0.01 and spec.gamma == 0.995
     assert spec.gae_lambda == 0.95 and spec.n_epochs == 4
     assert spec.target_kl == 0.03 and spec.learning_rate == 0.00025
@@ -95,6 +96,23 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert command[command.index("--rollout-steps") + 1] == "512"
     assert command[command.index("--batch-size") + 1] == "256"
     assert command[command.index("--gamma") + 1] == "0.995"
+    assert command[command.index("--reward-version") + 1] == "explore_v2"
+    assert command[command.index("--geo-gain-reward") + 1] == "0.0"
+    assert command[command.index("--shade-recovery-reward") + 1] == "4.0"
+
+
+def test_legacy_exploration_campaign_resolves_as_explore_v1(tmp_path: Path) -> None:
+    control = ControlPlane(_project(tmp_path))
+    payload = _payload("exploration_training")
+    payload["campaign_id"] = "legacy-run"
+    payload["name"] = "Legacy run"
+    payload["weights"] = {}
+    payload["schema_version"] = 7
+    spec_path = control.control_root / "campaigns" / "legacy-run" / "v0001.json"
+    spec_path.parent.mkdir(parents=True)
+    spec_path.write_text(json.dumps(payload), encoding="utf-8")
+    spec, _ = control._resolve_campaign("legacy-run", 1)
+    assert spec.reward_version == "explore_v1"
 
 
 @pytest.mark.parametrize(

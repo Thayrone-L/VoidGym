@@ -59,6 +59,10 @@ class CapturedFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    hp_restored_since_last_frame: int = 0
+    shade_hits_since_last_frame: int = 0
+    shade_distance: float | None = None
+    scene_name: str | None = None
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -336,14 +340,24 @@ class SupervisorServer:
         hp_lost_since_last_frame = payload.get("hp_lost_since_last_frame", 0)
         geo_gained_since_last_frame = payload.get("geo_gained_since_last_frame", 0)
         geo_spent_since_last_frame = payload.get("geo_spent_since_last_frame", 0)
+        hp_restored_since_last_frame = payload.get("hp_restored_since_last_frame", 0)
+        shade_hits_since_last_frame = payload.get("shade_hits_since_last_frame", 0)
+        shade_distance = payload.get("shade_distance")
+        scene_name = payload.get("scene_name")
         for name, value in (
             ("enemy_kills_since_last_frame", enemy_kills_since_last_frame),
             ("hp_lost_since_last_frame", hp_lost_since_last_frame),
             ("geo_gained_since_last_frame", geo_gained_since_last_frame),
             ("geo_spent_since_last_frame", geo_spent_since_last_frame),
+            ("hp_restored_since_last_frame", hp_restored_since_last_frame),
+            ("shade_hits_since_last_frame", shade_hits_since_last_frame),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ProtocolError(f"Invalid FRAME field: {name}")
+        if shade_distance is not None and (isinstance(shade_distance, bool) or not isinstance(shade_distance, (int, float)) or not math.isfinite(float(shade_distance)) or shade_distance < 0):
+            raise ProtocolError("Invalid FRAME field: shade_distance")
+        if scene_name is not None and (not isinstance(scene_name, str) or len(scene_name) > 256):
+            raise ProtocolError("Invalid FRAME field: scene_name")
         assert isinstance(shade_pending, bool)
         assert isinstance(shade_recovered, bool)
         assert isinstance(run_failed, bool)
@@ -351,6 +365,10 @@ class SupervisorServer:
         assert isinstance(hp_lost_since_last_frame, int)
         assert isinstance(geo_gained_since_last_frame, int)
         assert isinstance(geo_spent_since_last_frame, int)
+        assert isinstance(hp_restored_since_last_frame, int)
+        assert isinstance(shade_hits_since_last_frame, int)
+        assert shade_distance is None or isinstance(shade_distance, (int, float))
+        assert scene_name is None or isinstance(scene_name, str)
         assert isinstance(pixel_format, str)
         assert isinstance(encoding, str)
 
@@ -423,6 +441,10 @@ class SupervisorServer:
             hp_lost_since_last_frame=hp_lost_since_last_frame,
             geo_gained_since_last_frame=geo_gained_since_last_frame,
             geo_spent_since_last_frame=geo_spent_since_last_frame,
+            hp_restored_since_last_frame=hp_restored_since_last_frame,
+            shade_hits_since_last_frame=shade_hits_since_last_frame,
+            shade_distance=None if shade_distance is None else float(shade_distance),
+            scene_name=scene_name,
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),
         )
