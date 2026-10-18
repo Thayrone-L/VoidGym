@@ -1305,17 +1305,6 @@ class ControlPlane:
             "--lease-ms",
             str(spec.lease_ms),
         ]
-        if spec.warm_start_checkpoint:
-            warm_path = Path(spec.warm_start_checkpoint).resolve(strict=True)
-            allowed_warm_root = (self.runtime_root / "shared").resolve(strict=False)
-            try:
-                warm_path.relative_to(allowed_warm_root)
-            except ValueError as error:
-                raise ValueError("warm-start checkpoint must be inside the managed shared runtime") from error
-            if warm_path.suffix.lower() != ".zip" or not warm_path.is_file():
-                raise ValueError("warm-start checkpoint must be an existing PPO ZIP")
-            command += ["--warm-start-checkpoint", spec.warm_start_checkpoint,
-                        "--warm-start-source-campaign", spec.warm_start_source_campaign or "explore_v3"]
         command += [
             "--window-width",
             str(spec.window_width),
@@ -1541,6 +1530,17 @@ class ControlPlane:
             "--torch-interop-threads", str(self.torch_interop_threads),
             "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
         ]
+        if spec.warm_start_checkpoint:
+            warm_path = Path(spec.warm_start_checkpoint).resolve(strict=True)
+            allowed_warm_root = (self.runtime_root / "shared").resolve(strict=False)
+            try:
+                warm_path.relative_to(allowed_warm_root)
+            except ValueError as error:
+                raise ValueError("warm-start checkpoint must be inside the managed shared runtime") from error
+            if warm_path.suffix.lower() != ".zip" or not warm_path.is_file():
+                raise ValueError("warm-start checkpoint must be an existing PPO ZIP")
+            command += ["--warm-start-checkpoint", str(warm_path),
+                        "--warm-start-source-campaign", spec.warm_start_source_campaign or "explore_v3"]
         if spec.duration_mode == "continuous":
             command.append("--continuous")
         record: dict[str, object] = {

@@ -1663,16 +1663,26 @@ def test_shared_learner_launch_starts_terminal_status_watcher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _project(tmp_path)
-    control = ControlPlane(root)
+    runtime = tmp_path / "runtime"
+    control = ControlPlane(root, runtime_root=runtime)
     shared_root = tmp_path / "shared"
     shared_root.mkdir()
     (shared_root / "learner.json").write_text(
         json.dumps({"status": "CANCELLED", "round": 1}), encoding="utf-8"
     )
     payload = _payload("exploration_training")
-    payload.update({"shared_learner": True, "actors": 2, "rollout_steps": 512, "batch_size": 256})
+    checkpoint = runtime / "shared" / "v3" / "checkpoints" / "round-00000002.zip"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"ppo")
+    payload.update({
+        "shared_learner": True, "actors": 2, "rollout_steps": 512, "batch_size": 256,
+        "warm_start_checkpoint": str(checkpoint), "warm_start_source_campaign": "explore_v3",
+    })
     payload["weights"] = {}
     spec = CampaignSpec.from_payload(payload)
+    actor_command = control.build_command(spec, execute=False)
+    assert "--warm-start-checkpoint" not in actor_command
+    assert "--warm-start-source-campaign" not in actor_command
     process = _FakeProcess([])
     process._return_code = 0
     process._done.set()
@@ -1692,6 +1702,10 @@ def test_shared_learner_launch_starts_terminal_status_watcher(
     record = control._launch_shared_learner(
         spec, version=1, group_id="group", shared_root=shared_root
     )
+
+    assert str(checkpoint.resolve()) in record["command"]
+    assert "--warm-start-checkpoint" in record["command"]
+    assert "--warm-start-source-campaign" in record["command"]
 
     assert record["status"] == "CANCELLED"
     assert record["shared_learner_status"] == "CANCELLED"
