@@ -214,6 +214,54 @@ def _v3_config(**kwargs):
         shade_recovery_reward=4.0, **kwargs)
 
 
+def _v4_config(**kwargs):
+    return ExplorationTaskConfig(reward_version="explore_v4", geo_gain_reward=0, geo_spend_reward=0,
+        shade_recovery_reward=4.0, **kwargs)
+
+
+def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> None:
+    from hk_agent.exploration_task import load_campaign_counts
+
+    memory = tmp_path / "campaign-memory"
+    environment = _Environment()
+    environment.extra = {"milestone_events_since_last_frame": [
+        {"category": "boss", "key": "False_Knight", "confirmed": True},
+        {"category": "grub", "key": "grub_1", "confirmed": True},
+    ]}
+    task = ExplorationTask(environment, config=_v4_config(), lifelong_memory_root=memory)
+    task.reset()
+    _, reward_first, _, _, info_first = task.step(0)
+    assert info_first["reward_components"]["milestone_novelty"] == pytest.approx(18.0)
+    assert reward_first > 0
+    first_counts = load_campaign_counts(memory / "lifelong-milestones.json")
+    assert first_counts == {"boss:False_Knight": 1, "grub:grub_1": 1}
+
+    repeated = _Environment()
+    repeated.extra = environment.extra
+    task2 = ExplorationTask(repeated, config=_v4_config(), lifelong_memory_root=memory)
+    task2.reset()
+    _, _, _, _, info_repeated = task2.step(0)
+    expected = 15 / (2 ** 0.5) + 3 / (2 ** 0.5)
+    assert info_repeated["reward_components"]["milestone_novelty"] == pytest.approx(expected)
+
+
+def test_v4_contract_keeps_telemetry_out_of_observation_and_bounds_return() -> None:
+    environment = _Environment()
+    environment.extra = {"operator_telemetry": {"scene_name": "Room-A", "x": 4.0, "y": 8.0}}
+    task = ExplorationTask(environment, config=_v4_config())
+    contract = task.task_contract()
+    assert contract["reward_version"] == "explore_v4"
+    assert contract["task_contract_schema_version"] == 4
+    assert contract["information_boundary"] == ["pixels", "applied_action_history"]
+    assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
+    assert task.config.maximum_positive_episode_reward() <= 75.2
+    observation, _ = task.reset()
+    observation, _, _, _, info = task.step(0)
+    assert "operator_telemetry" in info
+    assert task.observation_space.contains(observation)
+    assert set(observation) == {"pixels", "action_history"}
+
+
 def test_v3_scene_and_enemy_rewards_decay_and_persist(tmp_path: Path) -> None:
     from hk_agent.exploration_task import load_campaign_counts
 

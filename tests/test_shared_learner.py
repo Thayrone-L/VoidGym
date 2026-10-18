@@ -375,3 +375,12 @@ def test_two_actor_rollouts_fill_and_train_one_learner_buffer(tmp_path):
     assert model.num_timesteps == 4
     assert model.rollout_buffer.full
     assert model.rollout_buffer.n_envs == 2
+
+
+def test_v3_to_v4_warm_start_accepts_equal_spaces_and_rejects_mismatch():
+    observation = gym.spaces.Dict({"pixels": gym.spaces.Box(0, 255, (4, 10, 12, 3), dtype=np.uint8)})
+    actions = gym.spaces.Discrete(30)
+    shared.validate_warm_start_spaces(observation, actions, observation, actions)
+    different_actions = gym.spaces.Discrete(29)
+    with pytest.raises(SharedLearnerError, match="spaces differ"):
+        shared.validate_warm_start_spaces(observation, actions, observation, different_actions)

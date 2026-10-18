@@ -13,8 +13,13 @@ public sealed class HkAgentBridgeMod : Mod
     private AgentInputBackend? _input;
     private VisualCaptureBackend? _capture;
     private readonly EpisodeLifecycleState _lifecycle = new();
+    private readonly OperatorTelemetryState _operatorTelemetry = new();
     private int _lastObservedHealth = -1;
     private int _episodeActive;
+    private int _boundsSceneHandle = int.MinValue;
+    private float[]? _cachedSceneBounds;
+    private bool? _shadePending;
+    private static readonly MemberInfo[] ProgressFlagMembers = ReadProgressFlagMembers();
 
     public override string GetVersion() =>
         Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
@@ -83,6 +88,7 @@ public sealed class HkAgentBridgeMod : Mod
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
             (encoding, cancellationToken) => capture.CaptureOnceAsync(encoding, cancellationToken),
             SnapshotRewardSignals,
+            SnapshotOperatorTelemetry,
             BeginEpisodeLifecycle
         );
         ModHooks.HeroUpdateHook += OnHeroUpdate;
@@ -152,8 +158,97 @@ public sealed class HkAgentBridgeMod : Mod
                 _lifecycle.IsDeathStarted, atBench
             );
             _lifecycle.RecordHealthRestored(restored);
+            ObserveOperatorTelemetry(playerData);
         }
     }
+
+    private void ObserveOperatorTelemetry(PlayerData playerData)
+    {
+        HeroController? hero = HeroController.instance;
+        var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+        string? zone = ReadStringMember(playerData, "mapZone");
+        float? x = hero == null ? null : hero.transform.position.x;
+        float? y = hero == null ? null : hero.transform.position.y;
+        Camera? camera = Camera.main;
+        float? cameraX = camera == null ? null : camera.transform.position.x;
+        float? cameraY = camera == null ? null : camera.transform.position.y;
+        if (_boundsSceneHandle != scene.handle)
+        {
+            _cachedSceneBounds = ReadSceneBounds(scene);
+            _boundsSceneHandle = scene.handle;
+        }
+        float[]? bounds = _cachedSceneBounds;
+        int grubs = SafeGetInt(playerData, "grubsCollected");
+        int geo = SafeGetInt(playerData, "geo");
+        var flags = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, bool>>();
+        foreach (MemberInfo member in ProgressFlagMembers)
+        {
+            try
+            {
+                bool value = member is FieldInfo field ? (bool)field.GetValue(playerData)! : (bool)((PropertyInfo)member).GetValue(playerData, null)!;
+                flags.Add(new System.Collections.Generic.KeyValuePair<string, bool>(member.Name, value));
+            }
+            catch (Exception) { }
+        }
+        _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags);
+    }
+
+    private static bool IsProgressFlag(string name)
+    {
+        string lower = name.ToLowerInvariant();
+        return lower.StartsWith("has", StringComparison.Ordinal) || lower.StartsWith("got", StringComparison.Ordinal)
+            || lower.Contains("boss") || lower.Contains("defeated") || lower.Contains("killed");
+    }
+
+    private static MemberInfo[] ReadProgressFlagMembers()
+    {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        var result = new System.Collections.Generic.List<MemberInfo>();
+        foreach (FieldInfo field in typeof(PlayerData).GetFields(members))
+            if (field.FieldType == typeof(bool) && IsProgressFlag(field.Name)) result.Add(field);
+        foreach (PropertyInfo property in typeof(PlayerData).GetProperties(members))
+            if (property.PropertyType == typeof(bool) && property.GetIndexParameters().Length == 0 && property.GetMethod != null && IsProgressFlag(property.Name)) result.Add(property);
+        return result.ToArray();
+    }
+
+    private static string? ReadStringMember(object source, string name)
+    {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        try
+        {
+            object? value = source.GetType().GetField(name, members)?.GetValue(source)
+                ?? source.GetType().GetProperty(name, members)?.GetValue(source, null);
+            return value as string;
+        }
+        catch (Exception) { return null; }
+    }
+
+    private static int SafeGetInt(PlayerData playerData, string name)
+    {
+        try { return Math.Max(0, playerData.GetInt(name)); }
+        catch (Exception) { return 0; }
+    }
+
+    private static float[]? ReadSceneBounds(UnityEngine.SceneManagement.Scene scene)
+    {
+        try
+        {
+            bool found = false;
+            float minX = 0, minY = 0, maxX = 0, maxY = 0;
+            foreach (GameObject root in scene.GetRootGameObjects())
+            foreach (Collider2D collider in root.GetComponentsInChildren<Collider2D>(true))
+            {
+                if (collider == null || !collider.enabled || !collider.gameObject.activeInHierarchy) continue;
+                Bounds b = collider.bounds;
+                if (!found) { minX = b.min.x; minY = b.min.y; maxX = b.max.x; maxY = b.max.y; found = true; }
+                else { minX = Math.Min(minX, b.min.x); minY = Math.Min(minY, b.min.y); maxX = Math.Max(maxX, b.max.x); maxY = Math.Max(maxY, b.max.y); }
+            }
+            return found ? new[] { minX, minY, maxX, maxY } : null;
+        }
+        catch (Exception) { return null; }
+    }
+
+    private System.Collections.Generic.Dictionary<string, object?> SnapshotOperatorTelemetry() => _operatorTelemetry.Snapshot();
 
     private void OnHealthManagerTakeDamage(
         On.HealthManager.orig_TakeDamage original,
@@ -259,12 +354,25 @@ public sealed class HkAgentBridgeMod : Mod
         if (string.Equals(name, "soulLimited", StringComparison.Ordinal))
         {
             _lifecycle.ObserveShadePresence(value);
+            if (_shadePending.HasValue && _shadePending.Value != value && Volatile.Read(ref _episodeActive) != 0)
+            {
+                HeroController? hero = HeroController.instance;
+                _operatorTelemetry.RecordEvent(value ? "shade_created" : "shade_recovered", "shade",
+                    hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
+            }
+            _shadePending = value;
         }
         return value;
     }
 
     private void OnPlayerDead()
     {
+        HeroController? hero = HeroController.instance;
+        _operatorTelemetry.RecordEvent("death", "player_death",
+            hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
+        if (_shadePending == true)
+            _operatorTelemetry.RecordEvent("shade_lost", "shade_lost",
+                hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
         _lifecycle.MarkPlayerDead();
         ReleaseAll();
         LogDebug("Player death marked as episode terminal");
@@ -316,6 +424,7 @@ public sealed class HkAgentBridgeMod : Mod
             );
         }
         _lifecycle.BeginEpisode(playerData.GetBool("soulLimited"));
+        _shadePending = playerData.GetBool("soulLimited");
         Interlocked.Exchange(ref _episodeActive, 1);
         Interlocked.Exchange(ref _lastObservedHealth, playerData.GetInt("health"));
     }

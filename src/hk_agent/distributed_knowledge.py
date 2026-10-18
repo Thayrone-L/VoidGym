@@ -17,7 +17,7 @@ _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
-_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3", "explore_v4"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
         "reward_version",

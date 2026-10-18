@@ -46,11 +46,20 @@ def build_report(summary: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
         "end_reason": payload.get("end_reason", "—"),
     }
     summary_rows = "".join(f"<tr><th>{html.escape(key.replace('_', ' ').title())}</th><td>{html.escape(str(value))}</td></tr>" for key, value in rows.items())
+    journey_svg = payload.get("journey_map_svg", "")
+    if not isinstance(journey_svg, str) or not journey_svg.startswith("<svg ") or "</svg>" not in journey_svg:
+        journey_svg = '<p>O mapa vai se revelar durante a exploração.</p>'
+    journey_records = payload.get("journey_records", {})
+    if not isinstance(journey_records, Mapping):
+        journey_records = {}
+    milestones = payload.get("journey_milestones", [])
+    milestone_items = "".join(f"<li>Run {html.escape(str(item.get('run', '—')))} · {html.escape(str(item.get('category', 'marco')))} · {html.escape(str(item.get('scene', item.get('key', ''))))}</li>" for item in milestones if isinstance(item, Mapping)) if isinstance(milestones, list) else ""
     document = f'''<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Relatório {html.escape(str(payload.get("campaign_id", "treino")))}</title><style>
 body{{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#17212b;background:#f4f7f8}}h1,h2{{color:#103b4d}}section{{background:white;border:1px solid #d5e0e4;border-radius:12px;padding:1rem 1.3rem;margin:1rem 0}}table{{border-collapse:collapse;width:100%}}td,th{{text-align:left;padding:.55rem;border-bottom:1px solid #e2eaed}}th{{width:28%}}small{{color:#50636e}}
 </style><h1>Relatório do treino</h1><small>Campanha: {html.escape(str(payload.get("campaign_id", "—")))}</small>
 <section><h2>Resumo</h2><table>{summary_rows}</table></section>
 <section><h2>Salas descobertas</h2><table><thead><tr><th>Sala</th><th>Primeira descoberta</th></tr></thead><tbody>{scene_rows}</tbody></table></section>
+<section><h2>Jornada, marcos e recordes</h2>{journey_svg}<p>Mais salas: {html.escape(str(journey_records.get('max_scenes', 0)))} · Mais longe: {html.escape(str(journey_records.get('furthest', 0)))} · Menos mortes: {html.escape(str(journey_records.get('fewest_deaths', 0)))}</p><ul>{milestone_items or '<li>Sem marcos registrados</li>'}</ul><small>{html.escape(str(payload.get('sharing_courtesy', '')))}</small></section>
 <section><h2>Evolução por episódio</h2><table><thead><tr><th>Episódio</th><th>Passos</th><th>Salas</th><th>Mortes</th><th>Sombras recuperadas</th><th>Abates</th><th>Fim</th><th>Retorno</th></tr></thead><tbody>{episode_rows}</tbody></table></section>
 <section><h2>Avaliações periódicas</h2><table><thead><tr><th>Rodada</th><th>Passos</th><th>Retorno</th><th>Concluída</th><th>Enviada ao treino</th></tr></thead><tbody>{evaluation_rows}</tbody></table></section>
 <section><h2>Alertas e reinícios</h2><ul>{alert_items}</ul></section>

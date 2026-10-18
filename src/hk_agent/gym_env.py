@@ -76,6 +76,7 @@ class PixelFrame:
     shade_hits_since_last_frame: int = 0
     shade_distance: float | None = None
     scene_name: str | None = None
+    operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
@@ -567,10 +568,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             or frame.shade_distance is not None
             or frame.scene_name is not None
             or frame.enemy_events_since_last_frame
+            or frame.operator_telemetry
         ):
             return {}
         lifecycle = self._shade_run_update
-        return {
+        result: dict[str, Any] = {
             "enemy_kills_since_last_frame": frame.enemy_kills_since_last_frame,
             "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
             "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
@@ -612,6 +614,12 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 ),
             }
         }
+        if frame.operator_telemetry:
+            result["operator_telemetry"] = dict(frame.operator_telemetry)
+            for name in ("map_zone", "x", "y", "camera_x", "camera_y", "scene_bounds", "milestone_events_since_last_frame"):
+                if name in frame.operator_telemetry:
+                    result[name] = frame.operator_telemetry[name]
+        return result
 
     def _observe_shade_lifecycle(self, frame: PixelFrame) -> ShadeRunUpdate:
         return self._shade_runs.observe(

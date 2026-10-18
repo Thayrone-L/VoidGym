@@ -49,7 +49,7 @@ def test_deadline_writes_cooperative_stop_request_for_launch_group(tmp_path: Pat
     assert json.loads(stop_file.read_text("utf-8"))["reason"] == "time_limit"
 
 
-def test_continue_reuses_campaign_and_checkpoint_and_repeat_uses_new_seed(tmp_path: Path) -> None:
+def test_continue_warm_starts_v4_from_v3_and_repeat_uses_new_seed(tmp_path: Path) -> None:
     plane = ControlPlane(tmp_path, allow_execute=True)
     campaign_id = "shared-campaign"
     checkpoint_dir = plane.runtime_root / "shared" / campaign_id / "checkpoints"
@@ -63,7 +63,13 @@ def test_continue_reuses_campaign_and_checkpoint_and_repeat_uses_new_seed(tmp_pa
           patch.object(plane, "launch", return_value={"launch_id": "next"}) as launch):
         resumed = plane.continue_operator_campaign()
         assert resumed["checkpoint"].endswith("round-0002.zip")
-        launch.assert_called_once_with(campaign_id, version=3, execute=True)
+        campaign = resumed["campaign"]
+        assert campaign["campaign_id"] != campaign_id
+        assert campaign["reward_version"] == "explore_v4"
+        assert campaign["warm_start_checkpoint"].endswith("round-0002.zip")
+        assert campaign["warm_start_source_campaign"] == campaign_id
+        assert "conhecimento foi mantido" in resumed["notice"]
+        launch.assert_called_once_with(campaign["campaign_id"], version=3, execute=True)
     with (patch.object(plane, "list_campaigns", return_value=[old]),
           patch.object(plane, "create_campaign", side_effect=lambda data: {**data, "version": 1}),
           patch.object(plane, "launch", return_value={"launch_id": "fresh"}) as launch):
@@ -106,3 +112,16 @@ def test_automatic_report_refreshes_after_a_later_campaign_completion(tmp_path: 
           patch.object(plane, "generate_run_report") as generate):
         plane._ensure_auto_reports({"active_launches": []})
         generate.assert_called_once_with("shared-campaign")
+
+
+def test_journey_summary_wraps_on_narrow_panels_and_map_controls_stay_hidden() -> None:
+    web = Path(__file__).parents[1] / "src" / "hk_agent" / "control_plane_web"
+    html = (web / "index.html").read_text("utf-8")
+    app = (web / "app.js").read_text("utf-8")
+    css = (web / "app.css").read_text("utf-8")
+    assert 'id="map-download"' not in html
+    assert 'id="map-import"' not in html
+    assert "ainda não é exibida" in html
+    assert 'class="journey-run-summary"' in app
+    assert ".journey-run-summary{flex:1 1 100%" in css
+    assert "appearance:none" in css and "data:image/svg+xml" in css

@@ -185,7 +185,9 @@ def build_task(
             if phase == "calibration":
                 memory_root = phase_root / "isolated-campaign-memory"
             elif args.lifelong_memory_root is not None:
-                memory_root = args.lifelong_memory_root / f"actor-{actor_slot}"
+                memory_root = (args.lifelong_memory_root / "shared-v4"
+                               if args.reward_version == "explore_v4"
+                               else args.lifelong_memory_root / f"actor-{actor_slot}")
         return (
             task_class(
                 environment,

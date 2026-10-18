@@ -23,7 +23,7 @@ from hk_agent.menu_bootstrap import (
     run_menu_bootstrap,
 )
 from hk_agent.protocol import ProtocolError
-from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
+from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer, require_png_frame
 
 _T = TypeVar("_T")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -312,6 +312,18 @@ class SupervisorEnvironmentBackend:
             self._episode_id = episode_id
             return ResetResult(episode_id=episode_id, frame=captured)
 
+    def capture_png(self) -> bytes:
+        """Capture an on-demand operator milestone, validating the PNG artifact path."""
+        with self._operation_lock:
+            bridge, episode_id = self._require_episode()
+            frame = self._submit(
+                self._supervisor.capture_once(timeout=self._command_timeout, bridge=bridge,
+                                              episode_id=episode_id, encoding="png"),
+                timeout=self._command_timeout + 0.5,
+            )
+            require_png_frame(frame)
+            return frame.data
+
     def step(self, *, action_id: int, buttons: tuple[str, ...], lease_ms: int) -> BackendStep:
         if action_id < 0 or not 1 <= lease_ms <= 2_000:
             raise ValueError("invalid action_id or lease_ms")
@@ -566,6 +578,7 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
         shade_distance=frame.shade_distance,
         scene_name=frame.scene_name,
+        operator_telemetry=frame.operator_telemetry,
         enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
         decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
         bridge_timing=frame.bridge_timing,

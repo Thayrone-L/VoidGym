@@ -75,6 +75,23 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_warm_start_spaces(
+    source_observation: gym.Space[Any], source_action: gym.Space[Any],
+    target_observation: gym.Space[Any], target_action: gym.Space[Any],
+) -> None:
+    if (_space_to_payload(source_observation) != _space_to_payload(target_observation)
+            or _space_to_payload(source_action) != _space_to_payload(target_action)):
+        raise SharedLearnerError("warm-start observation or action spaces differ from the new campaign")
+
+
 def _space_to_payload(space: gym.Space[Any]) -> dict[str, Any]:
     if isinstance(space, gym.spaces.Dict):
         return {
@@ -817,7 +834,7 @@ def run_deterministic_evaluation(
 
 
 def _shared_ppo_parameters(task_contract: Mapping[str, Any]) -> dict[str, Any]:
-    if task_contract.get("reward_version") not in {"explore_v1", "explore_v2", "explore_v3"}:
+    if task_contract.get("reward_version") not in {"explore_v1", "explore_v2", "explore_v3", "explore_v4"}:
         return {}
     defaults = {
         "ent_coef": 0.01, "gamma": 0.995, "gae_lambda": 0.95,
@@ -1018,7 +1035,7 @@ def run_shared_actor(
                 if isinstance(contract_config, Mapping) else 20
             )
             if (
-                task_contract.get("reward_version") == "explore_v3"
+                task_contract.get("reward_version") in {"explore_v3", "explore_v4"}
                 and round_number > 0
                 and evaluation_interval > 0
                 and round_number % evaluation_interval == 0
@@ -1156,6 +1173,8 @@ def run_shared_learner(
     torch_interop_threads: int = 1,
     rollout_timeout_seconds: float = 600.0,
     straggler_timeout_seconds: float = DEFAULT_STRAGGLER_TIMEOUT_SECONDS,
+    warm_start_checkpoint: Path | None = None,
+    warm_start_source_campaign: str | None = None,
 ) -> dict[str, Any]:
     """Train one PPO learner from all valid actor files in each policy round."""
     if rollout_steps < 1 or actors < 1 or batch_size < 1 or rollout_steps % batch_size:
@@ -1212,6 +1231,16 @@ def run_shared_learner(
     checkpoints = shared_root / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     previous = sorted(checkpoints.glob("round-*.zip"))
+    if warm_start_checkpoint is not None:
+        if previous:
+            raise SharedLearnerError("warm-start campaigns must use a new shared checkpoint directory")
+        source_model = contrib.MaskablePPO.load(str(warm_start_checkpoint), env=environment, device="cpu")
+        validate_warm_start_spaces(source_model.observation_space, source_model.action_space,
+                                   observation_space, action_space)
+        model = source_model
+        model.policy.optimizer.state.clear()
+        model.num_timesteps = 0
+        model._n_updates = 0
     status_path = store.learner_status_path
     completed = 0
     current_round = 0
@@ -1245,6 +1274,14 @@ def run_shared_learner(
     manifest["ppo_hyperparameters"] = _shared_ppo_parameters(
         contract.get("task_contract", {}) if isinstance(contract.get("task_contract"), Mapping) else {}
     )
+    if warm_start_checkpoint is not None:
+        manifest["warm_start"] = {
+            "source_campaign": warm_start_source_campaign,
+            "checkpoint": str(warm_start_checkpoint),
+            "checkpoint_sha256": _sha256_file(warm_start_checkpoint),
+            "optimizer_reset": True,
+            "source_reward_version": "explore_v3",
+        }
     manifest.setdefault("round_timings", [])
     next_checkpoint = ((completed // checkpoint_interval) + 1) * checkpoint_interval
 

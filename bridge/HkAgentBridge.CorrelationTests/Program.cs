@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using HkAgentBridge;
 
@@ -97,6 +98,18 @@ Assert(geo.GeoSpentSinceLastFrame == 3, "negative Geo delta must be reported sep
 EpisodeLifecycleSnapshot consumedGeo = lifecycle.Snapshot();
 Assert(consumedGeo.GeoGainedSinceLastFrame == 0, "Geo gain delta must be consumed once");
 Assert(consumedGeo.GeoSpentSinceLastFrame == 0, "Geo spend delta must be consumed once");
+
+var telemetry = new OperatorTelemetryState();
+var flags = new[] { new KeyValuePair<string, bool>("hasDash", false) };
+telemetry.Observe("Crossroads_01", "Crossroads", 2, 3, 1, 2, new[] { 0f, 0f, 10f, 10f }, 0, 20, flags);
+telemetry.Observe("Crossroads_01", "Crossroads", 3, 4, 1, 2, new[] { 0f, 0f, 10f, 10f }, 1, 22,
+    new[] { new KeyValuePair<string, bool>("hasDash", true) });
+Dictionary<string, object?> telemetryDelta = telemetry.Snapshot();
+var milestoneEvents = (Dictionary<string, object?>[])telemetryDelta["milestone_events_since_last_frame"]!;
+Assert(milestoneEvents.Length == 2, "grub count and false-to-true item flag must become confirmed events");
+Assert((string)milestoneEvents[0]["category"]! == "grub", "grub delta category must be typed");
+Assert((string)milestoneEvents[1]["category"]! == "item", "item flag transition must be typed");
+Assert((string)telemetry.Snapshot()["scene_name"]! == "Crossroads_01", "scene telemetry remains available after deltas are consumed");
 
 string saveRoot = Path.Combine(Path.GetTempPath(), $"hk-agent-save-{Guid.NewGuid():N}");
 Directory.CreateDirectory(saveRoot);

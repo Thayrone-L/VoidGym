@@ -9,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -103,6 +104,8 @@ class CampaignSpec:
     learning_rate: float | None = None
     clip_range: float | None = None
     reward_version: str = "explore_v3"
+    warm_start_checkpoint: str | None = None
+    warm_start_source_campaign: str | None = None
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
     straggler_timeout_seconds: float = 45.0
@@ -115,15 +118,21 @@ class CampaignSpec:
             raise ValueError("campaign_type is not allowlisted")
         shared_learner = payload.get(
             "shared_learner",
-            campaign_type == "exploration_training" and payload.get("reward_version", "explore_v3") == "explore_v3",
+            campaign_type == "exploration_training" and payload.get("reward_version", "explore_v3") in {"explore_v3", "explore_v4"},
         )
         if not isinstance(shared_learner, bool):
             raise TypeError("shared_learner must be a boolean")
         if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
             raise ValueError("shared learner requires a supported PPO training campaign")
         reward_version = payload.get("reward_version", "explore_v3")
-        if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2", "explore_v3"}:
+        if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2", "explore_v3", "explore_v4"}:
             raise ValueError("unsupported exploration reward version")
+        warm_start_checkpoint = payload.get("warm_start_checkpoint")
+        warm_start_source_campaign = payload.get("warm_start_source_campaign")
+        if warm_start_checkpoint is not None and (not isinstance(warm_start_checkpoint, str) or len(warm_start_checkpoint) > 2048):
+            raise ValueError("warm_start_checkpoint must be a bounded path")
+        if warm_start_source_campaign is not None and (not isinstance(warm_start_source_campaign, str) or len(warm_start_source_campaign) > 128):
+            raise ValueError("warm_start_source_campaign must be a bounded campaign id")
         if campaign_type != "exploration_training":
             reward_version = "explore_v1"
         name = str(payload.get("name", "")).strip()
@@ -295,6 +304,8 @@ class CampaignSpec:
             learning_rate=_bounded_float(payload.get("learning_rate", 0.00025), "learning_rate", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             clip_range=_bounded_float(payload.get("clip_range", 0.2), "clip_range", 0.000001, 1.0) if campaign_type == "exploration_training" else None,
             reward_version=str(reward_version),
+            warm_start_checkpoint=warm_start_checkpoint,
+            warm_start_source_campaign=warm_start_source_campaign,
             stuck_seconds=_bounded_float(payload.get("stuck_seconds", 120.0), "stuck_seconds", 1.0, 3600.0) if campaign_type == "exploration_training" else 120.0,
             evaluation_interval=_bounded_int(payload.get("evaluation_interval", 20), "evaluation_interval", 1, 10_000) if campaign_type == "exploration_training" else 20,
             straggler_timeout_seconds=_bounded_float(
@@ -794,6 +805,38 @@ class ControlPlane:
             campaign_id = str(campaigns[0].get("campaign_id", "")) or None
         shared_root_value = next((row.get("shared_root") for row in active_records if isinstance(row.get("shared_root"), str)), None)
         shared_root = Path(str(shared_root_value)) if shared_root_value else (self.runtime_root / "shared" / campaign_id if campaign_id else None)
+        journey: dict[str, object] = {"svg": "", "runs": [], "milestones": [], "records": {}}
+        if shared_root is not None:
+            try:
+                from hk_agent.run_journey import load_json as load_journey
+                from hk_agent.run_journey import schematic_svg
+
+                journey_root = shared_root / "journey"
+                journey_index = load_journey(journey_root / "campaign-progress.json")
+                runs = journey_index.get("runs", [])
+                best = max((row for row in runs if isinstance(row, Mapping)),
+                           key=lambda row: (int(row.get("distinct_scenes", 0)), -int(row.get("deaths", 0))), default={})
+                route_records = best.get("route", []) if isinstance(best, Mapping) else []
+                route = [str(row["to"]) for row in route_records if isinstance(row, Mapping) and isinstance(row.get("to"), str)]
+                journey_index["_layout_path"] = str(journey_root / "map-layout.json")
+                run_maps: dict[str, str] = {}
+                for run in runs[-100:] if isinstance(runs, list) else []:
+                    if isinstance(run, Mapping):
+                        route_rows = run.get("route", [])
+                        run_route = [str(row["to"]) for row in route_rows if isinstance(row, Mapping) and isinstance(row.get("to"), str)] if isinstance(route_rows, list) else []
+                        run_maps[str(run.get("id", ""))] = schematic_svg(journey_index, route=run_route)
+                journey = {"svg": schematic_svg(journey_index, route=route), "runs": runs[-100:],
+                           "milestones": journey_index.get("milestones", [])[-100:],
+                           "records": journey_index.get("records", {}), "best_run": best.get("id") if isinstance(best, Mapping) else None,
+                           "previous_comparison": journey_index.get("previous_comparison"),
+                           "run_maps": run_maps,
+                           "source": "esquemático"}
+            except (OSError, ValueError, TypeError):
+                pass
+        try:
+            journey["map_art"] = self.map_art_status()
+        except RuntimeError:
+            journey["map_art"] = {"cached": False, "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
         manifest = self._read_json(shared_root / "manifest.json") if shared_root is not None else {}
         if shared_root is not None and not manifest.get("evaluations"):
             eval_file = shared_root / "evaluations.jsonl"
@@ -825,7 +868,7 @@ class ControlPlane:
         shade_losses = sum(int(row.get("shade_losses", 0) or 0) for row in progress_rows)
         first_scene_steps = [int(row["steps_to_first_scene_change"]) for row in progress_rows if isinstance(row.get("steps_to_first_scene_change"), int)]
         alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
-        latest_shared = next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True), None)
+        latest_shared = next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True), None)
         latest_shared_id = str(latest_shared.get("campaign_id")) if isinstance(latest_shared, Mapping) else None
         latest_checkpoint_exists = bool(latest_shared_id and any((self.runtime_root / "shared" / latest_shared_id / "checkpoints").glob("round-*.zip")))
         last_completion: dict[str, object] | None = None
@@ -868,6 +911,7 @@ class ControlPlane:
             "shade_losses": shade_losses, "average_steps_to_first_scene": sum(first_scene_steps) / len(first_scene_steps) if first_scene_steps else None,
             "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
             "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-100:], "evaluation_trend": manifest.get("evaluation_trend", []),
+            "journey": journey,
             "alerts": sorted(set(alerts)), "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
             "max_instances": min(3, capacity),
@@ -900,7 +944,8 @@ class ControlPlane:
                 for scene, timestamp in memory.items():
                     if isinstance(scene, str) and isinstance(timestamp, int):
                         discoveries[scene] = min(discoveries.get(scene, timestamp), timestamp)
-        return [{"scene_name": name, "first_seen": time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp / 1_000_000_000)), "first_seen_unix_ns": stamp}
+        from hk_agent.run_journey import friendly_scene
+        return [{"scene_name": name, "scene_name_friendly": friendly_scene(name), "first_seen": time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp / 1_000_000_000)), "first_seen_unix_ns": stamp}
                 for name, stamp in sorted(discoveries.items(), key=lambda item: item[1])]
 
     def _ensure_auto_reports(self, status: Mapping[str, object]) -> None:
@@ -910,7 +955,7 @@ class ControlPlane:
             str(row.get("campaign_id"))
             for row in self.list_campaigns()
             if row.get("campaign_id") and row.get("shared_learner") is True
-            and row.get("reward_version") == "explore_v3"
+            and row.get("reward_version") in {"explore_v3", "explore_v4"}
         }
         existing: dict[str, int] = {}
         for report in self.list_reports():
@@ -961,6 +1006,17 @@ class ControlPlane:
         episodes = [row for row in manifest.get("episode_progress", []) if isinstance(row, Mapping)] if isinstance(manifest.get("episode_progress", []), list) else []
         evaluations = [row for row in manifest.get("evaluations", []) if isinstance(row, Mapping)] if isinstance(manifest.get("evaluations", []), list) else []
         scenes = self._campaign_scene_discoveries(campaign_id)
+        journey_root = shared_root / "journey"
+        journey_progress: dict[str, Any] = {}
+        try:
+            from hk_agent.run_journey import load_json as load_journey
+            from hk_agent.run_journey import schematic_svg
+
+            journey_progress = load_journey(journey_root / "campaign-progress.json")
+            journey_progress["_layout_path"] = str(journey_root / "map-layout.json")
+            journey_svg = schematic_svg(journey_progress)
+        except (OSError, ValueError, TypeError):
+            journey_svg = schematic_svg({})
         alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
         checkpoints = manifest.get("checkpoints", [])
         if not isinstance(checkpoints, list):
@@ -973,6 +1029,11 @@ class ControlPlane:
             "training_steps": int(manifest.get("completed_timesteps", 0) or 0),
             "learner_updates": int(manifest.get("round", 0) or 0),
             "scenes_discovered": scenes,
+            "journey_map_svg": journey_svg,
+            "journey_milestones": journey_progress.get("milestones", []),
+            "journey_records": journey_progress.get("records", {}),
+            "map_art_attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry.",
+            "sharing_courtesy": "Antes de distribuir o projeto, considere avisar o autor e pedir permissão para compartilhar o mapa.",
             "episode_progress": episodes, "evaluations": evaluations,
             "deaths": sum(int(row.get("deaths", 0) or 0) for row in episodes),
             "shade_recoveries": sum(int(row.get("shade_recoveries", 0) or 0) for row in episodes),
@@ -999,6 +1060,77 @@ class ControlPlane:
         html_path.write_text(document, encoding="utf-8", newline="\n")
         return {"campaign_id": campaign_id, "html": html_path.relative_to(self.project_root).as_posix(),
                 "json": json_path.relative_to(self.project_root).as_posix(), "created_at": data["created_at"]}
+
+    def read_journey_capture(self, campaign_id: str, relative_path: str) -> bytes:
+        if not _IDENTIFIER.fullmatch(campaign_id):
+            raise ValueError("invalid campaign_id")
+        root = (self.runtime_root / "shared" / campaign_id / "journey" / "marcos").resolve(strict=True)
+        target = (root / relative_path).resolve(strict=True)
+        try:
+            target.relative_to(root)
+        except ValueError as error:
+            raise ValueError("capture path is outside the milestone directory") from error
+        if target.suffix.lower() != ".png" or not target.is_file() or target.stat().st_size > 24 * 1024 * 1024:
+            raise ValueError("milestone capture is missing or exceeds its limit")
+        from hk_agent.run_journey import validate_png_header
+
+        with target.open("rb") as stream:
+            validate_png_header(stream)
+        return target.read_bytes()
+
+    def map_art_runtime_root(self) -> Path:
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            raise RuntimeError("cache local do mapa não está disponível nesta máquina")
+        return Path(local) / "VoidLab"
+
+    def map_art_status(self) -> dict[str, object]:
+        reference = self.map_art_runtime_root() / "cache" / "map-art" / "reference.json"
+        value = self._read_json(reference)
+        return {"cached": bool(value.get("latest_sha256")), "sha256": value.get("latest_sha256"),
+                "reference_changed": value.get("sha256") != value.get("latest_sha256") if value else False,
+                "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
+
+    def download_operator_map_art(self) -> dict[str, object]:
+        from hk_agent.run_journey import download_mediafire_map
+
+        _path, digest, dimensions, changed = download_mediafire_map(self.map_art_runtime_root())
+        return {"cached": True, "sha256": digest, "dimensions": list(dimensions),
+                "reference_changed": changed, "bytes_notice": "O arquivo de resolução cheia tem cerca de 836 MB.",
+                "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
+
+    def import_operator_map_art(self, body: Any, length: int) -> dict[str, object]:
+        if length < 24 or length > 1_073_741_824:
+            raise ValueError("PNG de mapa fora do limite de tamanho")
+        from hk_agent.run_journey import cache_map_file
+
+        runtime = self.map_art_runtime_root()
+        temporary_root = runtime / "cache" / "map-art"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".import-", suffix=".tmp", dir=temporary_root)
+        target = Path(name)
+        received = 0
+        try:
+            with os.fdopen(fd, "wb") as output:
+                while received < length:
+                    chunk = body.read(min(1024 * 1024, length - received))
+                    if not chunk:
+                        raise ValueError("upload PNG terminou antes do esperado")
+                    received += len(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            cached, digest, dimensions = cache_map_file(target, runtime)
+            reference = temporary_root / "reference.json"
+            previous = self._read_json(reference)
+            changed = bool(previous.get("sha256") and previous.get("sha256") != digest)
+            atomic_json(reference, {"schema_version": 1, "sha256": previous.get("sha256", digest),
+                                    "latest_sha256": digest, "source_page": "importado pelo operador",
+                                    "attribution": "The Embraced One — hallownest.net; Hollow Knight © Team Cherry"})
+            return {"cached": cached.exists(), "sha256": digest, "dimensions": list(dimensions),
+                    "reference_changed": changed}
+        finally:
+            target.unlink(missing_ok=True)
 
     def read_report(self, relative_path: str) -> tuple[bytes, str]:
         requested = Path(relative_path)
@@ -1064,7 +1196,7 @@ class ControlPlane:
             "campaign_id": campaign_id,
             "name": f"Exploration {time.strftime('%d/%m %H:%M', time.localtime())}",
             "campaign_type": "exploration_training",
-            "reward_version": "explore_v3",
+            "reward_version": "explore_v4",
             "shared_learner": True,
             "actors": count,
             "rollout_steps": 512,
@@ -1087,7 +1219,7 @@ class ControlPlane:
         return {"campaign": campaign, "launch": launched}
 
     def continue_operator_campaign(self) -> dict[str, object]:
-        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True]
+        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
         for prior in campaigns:
             campaign_id = str(prior.get("campaign_id", ""))
             shared_root = self.runtime_root / "shared" / campaign_id
@@ -1095,14 +1227,27 @@ class ControlPlane:
             if not checkpoints:
                 continue
             data = dict(prior)
-            data.update({"name": str(prior.get("name", "Exploration")), "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31-1)})
+            source_version = prior.get("reward_version")
+            data.update({"campaign_id": (f"{campaign_id[:42]}-v4-{secrets.token_hex(2)}" if source_version == "explore_v3" else campaign_id),
+                         "name": f"{str(prior.get('name', 'Exploration'))[:55]} v4",
+                         "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31-1),
+                         "reward_version": "explore_v4"})
+            if source_version == "explore_v3":
+                data["warm_start_checkpoint"] = str(checkpoints[-1])
+                data["warm_start_source_campaign"] = campaign_id
+            else:
+                data["reward_version"] = "explore_v4"
+                data.pop("warm_start_checkpoint", None)
+                data.pop("warm_start_source_campaign", None)
             campaign = self.create_campaign(data)
-            launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
-            return {"campaign": campaign, "launch": launched, "checkpoint": str(checkpoints[-1])}
+            new_id = str(campaign["campaign_id"])
+            launched = self.launch(new_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
+            return {"campaign": campaign, "launch": launched, "checkpoint": str(checkpoints[-1]),
+                    "notice": "a pontuação foi atualizada; o conhecimento foi mantido" if source_version == "explore_v3" else "Campanha explore_v4 retomada."}
         raise RuntimeError("No shared-learner checkpoint is available to continue")
 
     def repeat_operator_campaign(self) -> dict[str, object]:
-        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") == "explore_v3" and row.get("shared_learner") is True]
+        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
         if not campaigns:
             raise RuntimeError("No operator training campaign is available to repeat")
         prior = campaigns[0]
@@ -1110,6 +1255,8 @@ class ControlPlane:
         data.pop("version", None)
         data.pop("created_at", None)
         data.pop("spec_path", None)
+        data.pop("warm_start_checkpoint", None)
+        data.pop("warm_start_source_campaign", None)
         data["campaign_id"] = f"{str(prior['campaign_id'])[:48]}-repeat-{secrets.token_hex(2)}"
         data["name"] = f"{str(prior.get('name', 'Exploration'))[:56]} repeat"
         data["seed"] = secrets.randbelow(2**31)
@@ -1158,6 +1305,17 @@ class ControlPlane:
             "--lease-ms",
             str(spec.lease_ms),
         ]
+        if spec.warm_start_checkpoint:
+            warm_path = Path(spec.warm_start_checkpoint).resolve(strict=True)
+            allowed_warm_root = (self.runtime_root / "shared").resolve(strict=False)
+            try:
+                warm_path.relative_to(allowed_warm_root)
+            except ValueError as error:
+                raise ValueError("warm-start checkpoint must be inside the managed shared runtime") from error
+            if warm_path.suffix.lower() != ".zip" or not warm_path.is_file():
+                raise ValueError("warm-start checkpoint must be an existing PPO ZIP")
+            command += ["--warm-start-checkpoint", spec.warm_start_checkpoint,
+                        "--warm-start-source-campaign", spec.warm_start_source_campaign or "explore_v3"]
         command += [
             "--window-width",
             str(spec.window_width),
@@ -1212,15 +1370,19 @@ class ControlPlane:
                             "--scene-change-reward", str(spec.weights.get("scene_change_reward", 5.0)),
                             "--enemy-kill-reward", str(spec.weights.get("enemy_kill_reward", 1.0)),
                             "--enemy-kill-reward-budget", str(spec.weights.get("enemy_kill_reward_budget", 5.0)),
-                            "--shade-recovery-reward", str(4.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("shade_recovery_reward", 1.0)),
+                            "--shade-recovery-reward", str(4.0 if spec.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else spec.weights.get("shade_recovery_reward", 1.0)),
                             "--damage-penalty", str(spec.weights.get("damage_penalty", -0.5)),
                             "--death-penalty", str(spec.weights.get("death_penalty", -5.0)),
                             "--run-failed-penalty", str(spec.weights.get("run_failed_penalty", -5.0)),
-                            "--geo-gain-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("geo_gain_reward", 0.01)),
-                            "--geo-spend-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3"} else spec.weights.get("geo_spend_reward", 0.02)),
+                            "--geo-gain-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else spec.weights.get("geo_gain_reward", 0.01)),
+                            "--geo-spend-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else spec.weights.get("geo_spend_reward", 0.02)),
                             "--time-cost", str(spec.weights.get("time_cost", -0.001)),
                             "--stuck-seconds", str(spec.stuck_seconds), "--evaluation-interval", str(spec.evaluation_interval),
-                            "--lifelong-memory-root", str(self.runtime_root / "campaign-memory" / spec.campaign_id / f"slot-{slot_id if slot_id is not None else 0}")]
+                            "--lifelong-memory-root", str(
+                                self.runtime_root / "campaign-memory" / spec.campaign_id
+                                if spec.reward_version == "explore_v4"
+                                else self.runtime_root / "campaign-memory" / spec.campaign_id / f"slot-{slot_id if slot_id is not None else 0}"
+                            )]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
             command += [
@@ -1682,6 +1844,7 @@ class ControlPlane:
                     "HK_AGENT_SHARED_ROLE": "actor",
                     "HK_AGENT_SHARED_ROOT": str(shared_root),
                     "HK_AGENT_SHARED_ACTORS": str(shared_actor_count),
+                    "HK_AGENT_JOURNEY_ROOT": str(shared_root / "journey"),
                 })
                 if shared_restart_of is not None:
                     environment["HK_AGENT_RESTART_OF"] = shared_restart_of

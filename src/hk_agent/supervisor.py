@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import json
 import math
 import os
 import secrets
@@ -11,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from hk_agent.action_masking import ActionAvailability, parse_action_availability
 from hk_agent.protocol import PROTOCOL_VERSION, Envelope, ProtocolError, read_message, write_message
@@ -63,6 +65,7 @@ class CapturedFrame:
     shade_hits_since_last_frame: int = 0
     shade_distance: float | None = None
     scene_name: str | None = None
+    operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
@@ -345,6 +348,16 @@ class SupervisorServer:
         shade_hits_since_last_frame = payload.get("shade_hits_since_last_frame", 0)
         shade_distance = payload.get("shade_distance")
         scene_name = payload.get("scene_name")
+        operator_telemetry = payload.get("operator_telemetry")
+        if operator_telemetry is not None:
+            if not isinstance(operator_telemetry, dict) or len(operator_telemetry) > 32:
+                raise ProtocolError("Invalid FRAME field: operator_telemetry")
+            try:
+                telemetry_bytes = json.dumps(operator_telemetry, allow_nan=False).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise ProtocolError("Invalid FRAME operator telemetry") from error
+            if len(telemetry_bytes) > 16_384:
+                raise ProtocolError("FRAME operator telemetry exceeds its limit")
         raw_enemy_events = payload.get("enemy_events_since_last_frame", [])
         if not isinstance(raw_enemy_events, list) or len(raw_enemy_events) > 128:
             raise ProtocolError("Invalid FRAME field: enemy_events_since_last_frame")
@@ -457,6 +470,7 @@ class SupervisorServer:
             shade_hits_since_last_frame=shade_hits_since_last_frame,
             shade_distance=None if shade_distance is None else float(shade_distance),
             scene_name=scene_name,
+            operator_telemetry=operator_telemetry,
             enemy_events_since_last_frame=tuple(enemy_events),
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),

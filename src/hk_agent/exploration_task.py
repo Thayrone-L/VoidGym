@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 
 from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.gym_env import HollowKnightEnv
+from hk_agent.run_journey import RunDiary, increment_campaign_count, rebuild_progress
 from hk_agent.scene_change_task import (
     SCENE_CHANGE_ACTION_NAMES,
     SCENE_CHANGE_ACTION_TEMPLATES,
@@ -37,7 +38,7 @@ from hk_agent.training_task import (
 )
 
 EXPLORE_REWARD_VERSION = "explore_v1"
-SUPPORTED_EXPLORE_REWARD_VERSIONS = frozenset({"explore_v1", "explore_v2", "explore_v3"})
+SUPPORTED_EXPLORE_REWARD_VERSIONS = frozenset({"explore_v1", "explore_v2", "explore_v3", "explore_v4"})
 
 
 def descriptor_hash(descriptor: NDArray[np.generic]) -> str:
@@ -204,7 +205,7 @@ class ExplorationTaskConfig:
                 raise ValueError("Shade recovery reward must remain below death penalty")
             if not 0 <= self.hp_restored_reward < abs(self.damage_penalty):
                 raise ValueError("healing reward must be smaller than damage penalty magnitude")
-        if self.reward_version == "explore_v3":
+        if self.reward_version in {"explore_v3", "explore_v4"}:
             if self.horizon_steps > 3000:
                 raise ValueError("explore_v3 horizon exceeds the bounded episode-return contract")
             if self.geo_gain_reward != 0 or self.geo_spend_reward != 0:
@@ -229,6 +230,13 @@ class ExplorationTaskConfig:
                     or self.damage_penalty != -0.5 or self.death_penalty != -5.0
                     or self.run_failed_penalty != -5.0 or self.time_cost != -0.001):
                 raise ValueError("explore_v3 component weights are fixed by the reward version")
+        if self.reward_version == "explore_v4":
+            if self.horizon_steps > 3000 or self.geo_gain_reward != 0 or self.geo_spend_reward != 0:
+                raise ValueError("explore_v4 keeps the bounded horizon and does not reward Geo")
+            if self.shade_recovery_reward != 4.0 or self.shade_hit_reward != 0.3:
+                raise ValueError("explore_v4 inherits the explore_v3 Shade contract")
+            if self.novelty_reward != 0.05 or self.damage_penalty != -0.5 or self.death_penalty != -5.0:
+                raise ValueError("explore_v4 inherits the explore_v3 core reward contract")
         if self.damage_penalty > 0 or self.death_penalty >= 0 or self.run_failed_penalty >= 0 or self.time_cost > 0:
             raise ValueError("penalty signs are invalid")
         if self.geo_gain_reward < 0 or self.geo_spend_reward < 0 or self.geo_reward_budget < 0:
@@ -241,10 +249,11 @@ class ExplorationTaskConfig:
             raise ValueError("PPO hyperparameters are outside their safe ranges")
 
     def maximum_positive_episode_reward(self) -> float:
-        if self.reward_version == "explore_v3":
+        if self.reward_version in {"explore_v3", "explore_v4"}:
             return (self.novelty_budget + self.scene_reward_budget + self.enemy_kill_reward_budget
                     + self.shade_recovery_reward + self.hp_restored_budget
-                    + self.shade_hit_budget + self.shade_approach_budget)
+                    + self.shade_hit_budget + self.shade_approach_budget
+                    + (20.0 if self.reward_version == "explore_v4" else 0.0))
         # At least three stable frames are required per distinct scene event.
         scene_events = self.horizon_steps // 3
         return (
@@ -254,7 +263,7 @@ class ExplorationTaskConfig:
         )
 
     def minimum_negative_episode_reward(self) -> float:
-        if self.reward_version == "explore_v3":
+        if self.reward_version in {"explore_v3", "explore_v4"}:
             return -(abs(self.damage_penalty) * 9 + abs(self.death_penalty)
                      + abs(self.run_failed_penalty) + self.time_cost_budget
                      + self.shade_approach_budget)
@@ -262,7 +271,7 @@ class ExplorationTaskConfig:
         max_health = 9
         time = abs(self.time_cost) * self.horizon_steps * (max_lease / self.lease_base_ms)
         urgency = 0.001 * self.horizon_steps * (max_lease / 1000.0)
-        shade_approach = self.shade_approach_budget if self.reward_version == "explore_v3" else 0.0
+        shade_approach = self.shade_approach_budget if self.reward_version in {"explore_v3", "explore_v4"} else 0.0
         return -(abs(self.damage_penalty) * max_health + abs(self.death_penalty) + abs(self.run_failed_penalty) + time + urgency + shade_approach)
 
 
@@ -334,23 +343,34 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._episode_total_reward = 0.0
         self._evaluation_mode = False
         self._episode_number = 0
+        self._milestone_counts: dict[str, int] = {}
+        self._milestone_path: Path | None = None
+        self._milestone_paid = 0.0
+        journey_value = os.environ.get("HK_AGENT_JOURNEY_ROOT")
+        self._journey_root = Path(journey_value) if journey_value else None
+        self._journey_actor = os.environ.get("HK_AGENT_SLOT_ID", "0")
+        self._diary: RunDiary | None = None
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[dict[str, NDArray[np.generic]], dict[str, Any]]:
         super().reset(seed=seed)
         observation, reset_info = self.environment.reset(seed=seed, options=options)
         descriptor = self._descriptor(observation["pixels"][-1])
-        if self.config.reward_version in {"explore_v2", "explore_v3"}:
+        if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             run_root = self.task_log_path.parent.parent if self.task_log_path is not None else Path.cwd()
             memory_root = self.lifelong_memory_root or (run_root if self.task_log_path is not None else None)
             self._lifelong_path = memory_root / "lifelong-novelty.json" if memory_root is not None else None
             self._lifelong_visits = load_lifelong_visits(self._lifelong_path, self.config.lifelong_archive_max) if self._lifelong_path is not None else {}
-            if self.config.reward_version == "explore_v3" and memory_root is not None:
+            if self.config.reward_version in {"explore_v3", "explore_v4"} and memory_root is not None:
                 self._campaign_scene_path = memory_root / "lifelong-scenes.json"
                 self._campaign_enemy_path = memory_root / "lifelong-enemies.json"
                 self._scene_first_seen_path = memory_root / "lifelong-scene-first-seen.json"
                 self._scene_visits = load_campaign_counts(self._campaign_scene_path, self.config.lifelong_archive_max)
                 self._enemy_visits = load_campaign_counts(self._campaign_enemy_path, self.config.lifelong_archive_max)
                 self._scene_first_seen = load_scene_first_seen(self._scene_first_seen_path, self.config.lifelong_archive_max)
+            if self.config.reward_version == "explore_v4" and memory_root is not None:
+                self._milestone_path = memory_root / "lifelong-milestones.json"
+                self._milestone_counts = load_campaign_counts(self._milestone_path, self.config.lifelong_archive_max)
+        self._milestone_paid = 0.0
         self._archive.clear()
         self._archive.append(descriptor)
         self._paid_scenes = [descriptor.copy()]
@@ -387,6 +407,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._previous_scene_name = initial_scene if isinstance(initial_scene, str) else None
         if self._previous_scene_name:
             self._episode_scene_names.add(self._previous_scene_name)
+        self._diary = None
+        if self._journey_root is not None:
+            self._diary = RunDiary(
+                self._journey_root / f"actor-{self._journey_actor}" / f"episode-{self._episode_number}",
+                self._journey_root, f"actor-{self._journey_actor}", self._episode_number,
+                capture_png=getattr(self.environment.backend, "capture_png", None),
+            )
+            self._diary.observe({"scene_name": self._previous_scene_name}, monotonic_seconds=time.monotonic())
         self._done = False
         self.mask_unavailable_count = 0
         self._history.reset()
@@ -410,6 +438,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 template.raw_action_index, lease_ms=lease, action_audit=audit)
         else:
             observation, _, terminated, truncated, base = self.environment.step(template.raw_action_index, lease_ms=lease)
+        if self._diary is not None:
+            telemetry = base.get("operator_telemetry", {})
+            record = dict(telemetry) if isinstance(telemetry, dict) else {}
+            record.setdefault("scene_name", base.get("scene_name"))
+            if "milestone_events_since_last_frame" in base:
+                record["events"] = base["milestone_events_since_last_frame"]
+            journey_events = self._diary.observe(record)
+            self._diary.capture_firsts(journey_events)
         if base.get("valid") is not True:
             self._done = True
             self.environment.backend.release_all()
@@ -427,18 +463,19 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "shade_recovered": 0.0, "shade_hits": 0.0, "shade_approach": 0.0,
             "hp_restored": 0.0, "damage_taken": 0.0,
             "death": 0.0, "run_failed": 0.0,
+            "milestone_novelty": 0.0,
             "time_cost": self.config.time_cost * (lease / self.config.lease_base_ms),
         }
         base_done = terminated or truncated
         novelty = min((descriptor_distance(descriptor, prior) for prior in self._archive), default=1.0)
         eligible = informative and novelty >= self.config.novelty_threshold and not base_done
-        if self.config.reward_version in {"explore_v2", "explore_v3"}:
+        if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             tokens = set(template.name.split("+"))
             stationary_attack = "ATTACK" in tokens and not tokens.intersection({"LEFT", "RIGHT", "JUMP"})
             if stationary_attack:
                 eligible = False
-        novelty_hash = descriptor_hash(descriptor) if self.config.reward_version in {"explore_v2", "explore_v3"} else None
-        if self.config.reward_version in {"explore_v2", "explore_v3"}:
+        novelty_hash = descriptor_hash(descriptor) if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else None
+        if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             stable_candidate = (
                 self._novelty_candidate_descriptor is not None
                 and descriptor_distance(descriptor, self._novelty_candidate_descriptor)
@@ -479,7 +516,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._scene_stable = int(detection["stable_run"])
         changed = bool(detection["scene_changed"])
         self._previous_descriptor = descriptor.copy()
-        if changed and self.config.reward_version != "explore_v3" and not base_done and not any(descriptor_distance(descriptor, prior) < 0.025 for prior in self._paid_scenes):
+        if changed and self.config.reward_version not in {"explore_v3", "explore_v4"} and not base_done and not any(descriptor_distance(descriptor, prior) < 0.025 for prior in self._paid_scenes):
             components["scene_change"] = self.config.scene_change_reward
             self._paid_scenes.append(descriptor.copy())
             self._anchor = descriptor.copy()
@@ -497,7 +534,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._previous_scene_name = current_scene
             elif current_scene != self._previous_scene_name:
                 self._steps_to_first_scene = self._steps if self._steps_to_first_scene is None else self._steps_to_first_scene
-                if self.config.reward_version == "explore_v3" and not base_done and current_scene not in self._episode_new_scenes:
+                if self.config.reward_version in {"explore_v3", "explore_v4"} and not base_done and current_scene not in self._episode_new_scenes:
                     prior_visits = self._scene_visits.get(current_scene, 0)
                     requested_reward = 2.0 + 8.0 / float(np.sqrt(1 + prior_visits))
                     remaining = max(0.0, self.config.scene_reward_budget - self._scene_paid)
@@ -516,13 +553,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                             save_campaign_counts(self._campaign_scene_path, self._scene_visits, self.config.lifelong_archive_max)
                 self._previous_scene_name = current_scene
         combat = confirmed_combat_components(
-            base, enemy_kill_reward=(0.0 if self.config.reward_version == "explore_v3" else self.config.enemy_kill_reward),
-            shade_recovery_reward=(4.0 if self.config.reward_version in {"explore_v2", "explore_v3"} else self.config.shade_recovery_reward),
+            base, enemy_kill_reward=(0.0 if self.config.reward_version in {"explore_v3", "explore_v4"} else self.config.enemy_kill_reward),
+            shade_recovery_reward=(4.0 if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else self.config.shade_recovery_reward),
             damage_penalty=self.config.damage_penalty, geo_gain_reward=self.config.geo_gain_reward,
             geo_spend_reward=self.config.geo_spend_reward, death_penalty=self.config.death_penalty,
             run_failed_penalty=self.config.run_failed_penalty)
         components["confirmed_enemy_kills"] = min(combat["confirmed_enemy_kills"], max(0.0, self.config.enemy_kill_reward_budget-self._kills_paid))
-        if self.config.reward_version == "explore_v3":
+        if self.config.reward_version in {"explore_v3", "explore_v4"}:
             events = base.get("enemy_events_since_last_frame", [])
             if not isinstance(events, list):
                 raise InvalidTrainingTransition("invalid enemy event list")
@@ -543,25 +580,49 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                     self._enemy_visits[key] = visits + 1
             if self._campaign_enemy_path is not None and events and self._enemy_visits:
                 save_campaign_counts(self._campaign_enemy_path, self._enemy_visits, self.config.lifelong_archive_max)
-        if self.config.reward_version == "explore_v3":
+        if self.config.reward_version in {"explore_v3", "explore_v4"}:
             components["confirmed_enemy_kills"] = min(components["confirmed_enemy_kills"], max(0.0, self.config.enemy_kill_reward_budget-self._kills_paid))
+        if self.config.reward_version == "explore_v4" and not base_done and combat["player_death"] >= 0 and combat["gameplay_run_failed"] >= 0:
+            events = base.get("milestone_events_since_last_frame", [])
+            if not isinstance(events, list) or len(events) > 128:
+                raise InvalidTrainingTransition("invalid milestone event list")
+            remaining = max(0.0, 20.0 - self._milestone_paid)
+            for event in events:
+                if not isinstance(event, dict) or event.get("confirmed") is not True:
+                    continue
+                category, identity = event.get("category"), event.get("key")
+                if category not in {"grub", "boss", "item"} or not isinstance(identity, str) or not identity:
+                    continue
+                key = f"{category}:{identity}"[:512]
+                visits = self._milestone_counts.get(key, 0)
+                if self._milestone_path is not None:
+                    visits = increment_campaign_count(self._milestone_path, key, limit=self.config.lifelong_archive_max)
+                base_reward, minimum = {"grub": (3.0, 0.5), "boss": (15.0, 2.0), "item": (5.0, 1.0)}[category]
+                requested = max(minimum, base_reward / float(np.sqrt(1 + visits)))
+                award = min(requested, remaining)
+                if award <= 0:
+                    continue
+                components["milestone_novelty"] += award
+                self._milestone_paid += award
+                remaining -= award
+                self._milestone_counts[key] = visits + 1
         self._kills_paid += components["confirmed_enemy_kills"]
         components["shade_recovered"] = 0.0 if self._shade_paid else combat["shade_recovered"]
         self._shade_paid |= components["shade_recovered"] > 0
         if components["shade_recovered"] > 0:
             self._episode_shade_recovered += 1
-        if self.config.reward_version in {"explore_v2", "explore_v3"}:
+        if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             hits = int(base.get("shade_hits_since_last_frame", 0))
             if hits < 0:
                 raise InvalidTrainingTransition("invalid Shade hit delta")
-            hit_budget = self.config.shade_hit_budget if self.config.reward_version == "explore_v3" else float("inf")
+            hit_budget = self.config.shade_hit_budget if self.config.reward_version in {"explore_v3", "explore_v4"} else float("inf")
             components["shade_hits"] = min(min(hits, 4) * self.config.shade_hit_reward,
                                            max(0.0, hit_budget - self._shade_hits_paid))
             self._shade_hits_paid += components["shade_hits"]
             restored = int(base.get("hp_restored_since_last_frame", 0))
             if restored < 0:
                 raise InvalidTrainingTransition("invalid restored health delta")
-            hp_budget = self.config.hp_restored_budget if self.config.reward_version == "explore_v3" else float("inf")
+            hp_budget = self.config.hp_restored_budget if self.config.reward_version in {"explore_v3", "explore_v4"} else float("inf")
             components["hp_restored"] = min(restored * self.config.hp_restored_reward, max(0.0, hp_budget - self._hp_restored_paid))
             self._hp_restored_paid += components["hp_restored"]
             distance = base.get("shade_distance")
@@ -570,7 +631,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 current_distance = float(distance)
                 if np.isfinite(current_distance) and self._shade_distance is not None and self._shade_distance[0] == scene:
                     approach = float(np.clip(0.05 * (self._shade_distance[1] - current_distance), -0.05, 0.05))
-                    if self.config.reward_version == "explore_v3":
+                    if self.config.reward_version in {"explore_v3", "explore_v4"}:
                         if approach > 0:
                             approach = min(approach, max(0.0, self.config.shade_approach_budget - self._shade_approach_positive_paid))
                             self._shade_approach_positive_paid += approach
@@ -583,7 +644,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._shade_distance = None
             if base.get("shade_pending") is True:
                 components["time_cost"] -= 0.001 * (lease / 1000.0)
-        if self.config.reward_version == "explore_v3":
+        if self.config.reward_version in {"explore_v3", "explore_v4"}:
             payable_time_cost = min(abs(components["time_cost"]),
                                     max(0.0, self.config.time_cost_budget - self._time_cost_paid))
             components["time_cost"] = -payable_time_cost
@@ -596,7 +657,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             components["confirmed_geo_spent"] = combat["confirmed_geo_spent"] * scale
             self._geo_paid += geo_award
         components["damage_taken"] = combat["confirmed_hp_lost"]
-        if self.config.reward_version == "explore_v3":
+        if self.config.reward_version in {"explore_v3", "explore_v4"}:
             raw_damage = int(base.get("hp_lost_since_last_frame", 0))
             if raw_damage < 0:
                 raise InvalidTrainingTransition("invalid confirmed damage delta")
@@ -612,7 +673,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         # Death/run-failure and any base terminal/truncation suppress all positive rewards on this transition.
         terminal_penalty = components["death"] < 0 or components["run_failed"] < 0
         if base_done or terminal_penalty:
-            for name in ("novelty", "scene_change", "confirmed_enemy_kills", "confirmed_geo_gained", "confirmed_geo_spent", "shade_recovered", "shade_hits", "shade_approach", "hp_restored"):
+            for name in ("novelty", "scene_change", "confirmed_enemy_kills", "confirmed_geo_gained", "confirmed_geo_spent", "shade_recovered", "shade_hits", "shade_approach", "hp_restored", "milestone_novelty"):
                 components[name] = 0.0
         reward = float(sum(components.values()))
         self._episode_total_reward += reward
@@ -620,7 +681,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._progress_elapsed_seconds = 0.0
         else:
             self._progress_elapsed_seconds += lease / 1000.0
-        stuck = self.config.reward_version == "explore_v3" and self._progress_elapsed_seconds > self.config.stuck_seconds and not base_done and not terminal_penalty
+        stuck = self.config.reward_version in {"explore_v3", "explore_v4"} and self._progress_elapsed_seconds > self.config.stuck_seconds and not base_done and not terminal_penalty
         horizon = self._steps >= self.config.horizon_steps
         task_terminated = terminated or terminal_penalty
         task_truncated = truncated or ((horizon or stuck) and not task_terminated)
@@ -634,11 +695,15 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         elif termination_reason is None and horizon:
             termination_reason = "time_limit"
         self._done = task_terminated or task_truncated
+        if self._done and self._diary is not None and self._journey_root is not None:
+            self._diary.finish(termination_reason, deaths=[{"scene": current_scene}] * self._episode_deaths,
+                               shade={"recovered": self._episode_shade_recovered, "lost": self._episode_shade_lost})
+            rebuild_progress(self._journey_root)
         if self._done:
             self.environment.backend.release_all()
         farm_alerts = self._record_farm_window(components, current_scene, template.name)
         episode_progress: dict[str, Any] | None = None
-        if self._done and self.config.reward_version == "explore_v3":
+        if self._done and self.config.reward_version in {"explore_v3", "explore_v4"}:
             episode_progress = {
                 "episode": self._episode_number,
                 "steps": self._steps,
@@ -688,14 +753,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.environment.close()
 
     def task_contract(self) -> dict[str, Any]:
-        schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3}[self.config.reward_version]
+        schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3, "explore_v4": 4}[self.config.reward_version]
         return {"task_contract_schema_version": schema_version,
                 "reward_version": self.config.reward_version,
                 "legal_action_mask":{"version":"action_availability_v1","source":"frame_action_availability"},
                 "action_names":list(SCENE_CHANGE_ACTION_NAMES),
                 "actions":action_contract(SCENE_CHANGE_ACTION_TEMPLATES,base_lease_ms=self.environment.lease_ms),
                 "config":{key:value for key,value in asdict(self.config).items() if key != "reward_version"},"information_boundary":["pixels","applied_action_history"],
-                "reward_only_signals":["enemy_kills_since_last_frame","hp_lost_since_last_frame","geo_gained_since_last_frame","geo_spent_since_last_frame","shade_recovered","death","run_failed"] + (["hp_restored_since_last_frame","shade_hits_since_last_frame","shade_distance","scene_name"] if self.config.reward_version in {"explore_v2", "explore_v3"} else []) + (["enemy_events_since_last_frame"] if self.config.reward_version == "explore_v3" else []),
+                "reward_only_signals":["enemy_kills_since_last_frame","hp_lost_since_last_frame","geo_gained_since_last_frame","geo_spent_since_last_frame","shade_recovered","death","run_failed"] + (["hp_restored_since_last_frame","shade_hits_since_last_frame","shade_distance","scene_name"] if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else []) + (["enemy_events_since_last_frame"] if self.config.reward_version in {"explore_v3", "explore_v4"} else []) + (["milestone_events_since_last_frame"] if self.config.reward_version == "explore_v4" else []),
                 "detector_inputs":["cropped_rgb_pixels","temporal_pixel_descriptors"],"privileged_state":[],
                 "diagnostic_training":False,"claim":"pixel-only exploration with bounded reward-only bridge signals",
                 "ppo_hyperparameters": {"ent_coef":self.config.ent_coef,"gamma":self.config.gamma,
@@ -723,7 +788,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         return grid
 
     def _record_farm_window(self, components: dict[str, float], scene: object, action: str) -> list[str]:
-        if self.config.reward_version != "explore_v3":
+        if self.config.reward_version not in {"explore_v3", "explore_v4"}:
             return []
         self._recent_reward_window.append({name: value for name, value in components.items() if value > 0})
         novelty_seen = components.get("novelty", 0.0) > 0 or components.get("scene_change", 0.0) > 0

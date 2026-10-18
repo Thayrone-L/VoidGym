@@ -26,6 +26,7 @@ internal sealed class BridgeClient : IDisposable
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
     private readonly Func<string, CancellationToken, Task<CapturedFrame>> _captureOnce;
     private readonly Func<EpisodeLifecycleSnapshot> _lifecycleSnapshot;
+    private readonly Func<Dictionary<string, object?>> _operatorTelemetrySnapshot;
     private readonly Action _beginEpisodeLifecycle;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -45,6 +46,7 @@ internal sealed class BridgeClient : IDisposable
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
         Func<string, CancellationToken, Task<CapturedFrame>> captureOnce,
         Func<EpisodeLifecycleSnapshot> lifecycleSnapshot,
+        Func<Dictionary<string, object?>> operatorTelemetrySnapshot,
         Action beginEpisodeLifecycle
     )
     {
@@ -56,6 +58,7 @@ internal sealed class BridgeClient : IDisposable
         _applyMenuAction = applyMenuAction;
         _captureOnce = captureOnce;
         _lifecycleSnapshot = lifecycleSnapshot;
+        _operatorTelemetrySnapshot = operatorTelemetrySnapshot;
         _beginEpisodeLifecycle = beginEpisodeLifecycle;
     }
 
@@ -382,6 +385,9 @@ internal sealed class BridgeClient : IDisposable
                                 captureCancellation.Token
                             ).ConfigureAwait(false);
                             EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot();
+                            Dictionary<string, object?> operatorTelemetry = _operatorTelemetrySnapshot();
+                            operatorTelemetry["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame;
+                            operatorTelemetry["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame;
                             responseType = "FRAME";
                             var framePayload = new Dictionary<string, object?>
                             {
@@ -429,6 +435,7 @@ internal sealed class BridgeClient : IDisposable
                                 ["shade_hits_since_last_frame"] = lifecycle.ShadeHitsSinceLastFrame,
                                 ["shade_distance"] = lifecycle.ShadeDistance,
                                 ["scene_name"] = lifecycle.SceneName,
+                                ["operator_telemetry"] = operatorTelemetry,
                                 ["enemy_events_since_last_frame"] = lifecycle.EnemyEventsSinceLastFrame.Select(item => new Dictionary<string, string>
                                 {
                                     ["enemy_type"] = item.EnemyType,

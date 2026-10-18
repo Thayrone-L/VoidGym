@@ -65,6 +65,22 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             )
         elif path == "/api/session":
             self._json(HTTPStatus.OK, {"csrf_token": self.server.control_plane.csrf_token})
+        elif path == "/api/journey/capture":
+            query = parse_qs(urlsplit(self.path).query)
+            campaign = query.get("campaign", [""])[0]
+            capture = query.get("path", [""])[0]
+            try:
+                content = self.server.control_plane.read_journey_capture(campaign, capture)
+            except (OSError, ValueError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
         else:
             self._static(path)
 
@@ -72,6 +88,24 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         if not self._mutation_is_allowed():
             return
         path = urlsplit(self.path).path
+        if path == "/api/journey/map/download":
+            try:
+                payload = self._payload()
+                if payload:
+                    raise ValueError("map download takes no settings")
+                self._json(HTTPStatus.OK, self.server.control_plane.download_operator_map_art())
+            except (OSError, RuntimeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if path == "/api/journey/map/import":
+            try:
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "image/png":
+                    raise ValueError("Content-Type must be image/png")
+                length = int(self.headers.get("Content-Length", "0"))
+                self._json(HTTPStatus.CREATED, self.server.control_plane.import_operator_map_art(self.rfile, length))
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         try:
             payload = self._payload()
             if path == "/api/operator/start":

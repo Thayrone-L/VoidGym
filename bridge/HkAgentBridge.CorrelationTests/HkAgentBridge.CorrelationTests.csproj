@@ -11,5 +11,6 @@
     <Compile Include="..\HkAgentBridge.Mod\EpisodeCorrelationState.cs" Link="EpisodeCorrelationState.cs" />
     <Compile Include="..\HkAgentBridge.Mod\EpisodeLifecycleState.cs" Link="EpisodeLifecycleState.cs" />
     <Compile Include="..\HkAgentBridge.Mod\BridgeConfiguration.cs" Link="BridgeConfiguration.cs" />
+    <Compile Include="..\HkAgentBridge.Mod\OperatorTelemetryState.cs" Link="OperatorTelemetryState.cs" />
   </ItemGroup>
 </Project>
