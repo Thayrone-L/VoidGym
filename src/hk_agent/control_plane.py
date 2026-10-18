@@ -1214,7 +1214,7 @@ class ControlPlane:
             if metadata is None:
                 update(status="schematic_only", stage="complete", message="Libvips não está disponível; o esquema da jornada continua disponível.")
                 return
-            from hk_agent.map_art import auto_register_capture
+            from hk_agent.map_art import auto_register_captures
             from hk_agent.run_journey import load_json
 
             candidates_by_scene: dict[str, list[tuple[Path, object, int]]] = {}
@@ -1234,23 +1234,26 @@ class ControlPlane:
                         )
             current_calibrations = self.map_art_status().get("calibrations", {})
             existing = current_calibrations if isinstance(current_calibrations, Mapping) else {}
-            pending: list[tuple[Path, str, object]] = []
+            pending: list[tuple[list[tuple[Path, Mapping[str, Any]]], str]] = []
             for scene, rows in candidates_by_scene.items():
                 prior = existing.get(scene)
                 if isinstance(prior, Mapping) and prior.get("positioned") is True:
                     continue
 
-                frame, map_view, _timestamp = _preferred_map_capture(rows)
-                pending.append((frame, scene, map_view))
+                captures: list[tuple[Path, Mapping[str, Any]]] = []
+                for frame, map_view, _timestamp in rows:
+                    if not isinstance(map_view, Mapping) or not _map_view_has_valid_bounds(map_view):
+                        continue
+                    captures.append((frame, map_view))
+                if captures:
+                    pending.append((captures, scene))
             auto_results: list[dict[str, object]] = []
-            for match_index, (frame, scene, map_view) in enumerate(pending):
+            for match_index, (captures, scene) in enumerate(pending):
                 update(status="running", stage="matching", percent=100,
                        match_index=match_index + 1, match_count=len(pending),
                        message=f"Posicionando capturas de cenas ({match_index + 1}/{len(pending)}).")
-                bounds = map_view.get("scene_bounds") if isinstance(map_view, Mapping) else None
                 try:
-                    auto_results.append(auto_register_capture(cached, frame, cached.parent,
-                                                              scene=scene, scene_bounds=bounds))
+                    auto_results.append(auto_register_captures(cached, captures, cached.parent, scene=scene))
                 except (OSError, RuntimeError, ValueError, TypeError):
                     auto_results.append({"scene": scene, "positioned": False, "confidence": 0.0})
             positioned = sum(result.get("positioned") is True for result in auto_results)

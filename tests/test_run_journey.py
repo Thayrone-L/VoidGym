@@ -180,11 +180,15 @@ def test_scene_transform_is_versioned_by_map_sha_and_low_confidence_is_unplaced(
         confidence=0.92,
     )
     save_scene_calibration(
-        path, map_sha256=map_hash, scene="Town", transform=(1, 0, 0, 0, 1, 0), confidence=0.2
+        path, map_sha256=map_hash, scene="Town", transform=(1, 0, 0, 0, 1, 0), confidence=0.2,
+        candidate={"x": 100.0, "y": 200.0, "width": 300.0, "height": 150.0},
     )
     calibration = load_scene_calibration(path, map_sha256=map_hash)
     assert calibration["Crossroads_01"]["positioned"] is True
     assert calibration["Town"]["positioned"] is False
+    assert calibration["Town"]["candidate"] == {
+        "x": 100.0, "y": 200.0, "width": 300.0, "height": 150.0
+    }
     assert load_scene_calibration(path, map_sha256="b" * 64) == {}
 
 
@@ -252,7 +256,64 @@ def test_numpy_fft_template_match_finds_known_scaled_offset() -> None:
     assert result is not None
     assert (result["x"], result["y"]) == (54.0, 31.0)
     assert (result["width"], result["height"]) == (33.0, 27.0)
-    assert result["confidence"] > 0.99
+    assert result["similarity"] > 0.7
+    assert result["peak_margin"] > 0.1
+
+
+def test_robust_match_ignores_hud_and_brightness_and_searches_broad_scales() -> None:
+    import numpy as np
+
+    from hk_agent.map_art import scene_match_mask
+
+    rng = np.random.default_rng(42)
+    template = rng.uniform(0, 180, (40, 50)).astype(np.float32)
+    image = np.full((180, 240), 24, dtype=np.float32)
+    ys = (np.arange(24) * template.shape[0] / 24).astype(int)
+    xs = (np.arange(30) * template.shape[1] / 30).astype(int)
+    scaled = template[ys[:, None], xs[None, :]] * 0.6 + 80
+    image[75:99, 90:120] = scaled
+    # A stronger false copy in the HUD must be ignored by the viewport mask.
+    image[:10, :15] = template[:10, :15] * 2
+    result = template_match_ncc(
+        image, template, scales=(0.3, 0.45, 0.6, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0),
+        mask=scene_match_mask(template.shape[1], template.shape[0]),
+    )
+    assert result is not None
+    assert (result["x"], result["y"]) == (90.0, 75.0)
+
+
+def test_capture_consistency_rewards_agreement_and_rejects_outlier() -> None:
+    from hk_agent.map_art import capture_consistency
+
+    matches = [
+        {"x": float(i * 10), "y": float(i * 5), "width": 100.0, "height": 80.0,
+         "camera_x": float(i * 2), "camera_y": float(i)}
+        for i in range(4)
+    ]
+    consistent = capture_consistency(matches)
+    assert consistent > 0.99
+    matches[-1]["x"] += 80
+    assert capture_consistency(matches) < consistent
+
+
+def test_capture_consistency_requires_multiple_camera_views() -> None:
+    from hk_agent.map_art import capture_consistency
+
+    one = {"x": 0.0, "y": 0.0, "width": 100.0, "height": 80.0,
+           "camera_x": 1.0, "camera_y": 2.0}
+    assert capture_consistency([one]) == 0.65
+
+
+def test_robust_match_rejects_uniform_false_positive() -> None:
+    import numpy as np
+
+    from hk_agent.map_art import scene_match_mask
+
+    scene = np.zeros((32, 40), dtype=np.float32)
+    map_image = np.zeros((120, 160), dtype=np.float32)
+    result = template_match_ncc(map_image, scene, scales=(0.5, 1.0, 2.0),
+                                mask=scene_match_mask(40, 32))
+    assert result is None
 
 
 def test_deepzoom_tiles_are_streamed_and_restartable(tmp_path: Path) -> None:

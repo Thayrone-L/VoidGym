@@ -6,12 +6,13 @@ import math
 import re
 import shutil
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 MAP_ATTRIBUTION = "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DEFAULT_MATCH_SCALES = tuple(0.3 * (1.25**step) for step in range(11))
 
 
 def estimate_tile_bytes(width: int, height: int) -> int:
@@ -134,7 +135,13 @@ def free_disk_bytes(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def template_match_ncc(map_gray: Any, scene_gray: Any, *, scales: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)) -> dict[str, float] | None:
+def template_match_ncc(
+    map_gray: Any,
+    scene_gray: Any,
+    *,
+    scales: tuple[float, ...] = _DEFAULT_MATCH_SCALES,
+    mask: Any | None = None,
+) -> dict[str, float] | None:
     """Small-image normalized cross-correlation using NumPy FFTs only.
 
     Inputs must already be reduced grayscale arrays. Returns the best map pixel
@@ -142,19 +149,32 @@ def template_match_ncc(map_gray: Any, scene_gray: Any, *, scales: tuple[float, .
     """
     import numpy as np
 
-    image = np.asarray(map_gray, dtype=np.float32)
+    image = _edge_image(np.asarray(map_gray, dtype=np.float32))
     template = np.asarray(scene_gray, dtype=np.float32)
     if image.ndim != 2 or template.ndim != 2 or min(image.shape) < 2 or min(template.shape) < 2:
         raise ValueError("template matching requires non-empty grayscale images")
     best: tuple[float, int, int, int, int] | None = None
+    best_margin = 0.0
+    best_contrast = 0.0
     for scale in scales:
         tw, th = max(2, round(template.shape[1] * scale)), max(2, round(template.shape[0] * scale))
         if th > image.shape[0] or tw > image.shape[1]:
             continue
         ys = np.minimum((np.arange(th) * template.shape[0] / th).astype(int), template.shape[0] - 1)
         xs = np.minimum((np.arange(tw) * template.shape[1] / tw).astype(int), template.shape[1] - 1)
-        sample = template[ys[:, None], xs[None, :]]
-        centered = sample - float(sample.mean())
+        sample = _edge_image(template[ys[:, None], xs[None, :]])
+        if mask is None:
+            weights = np.ones(sample.shape, dtype=np.float32)
+        else:
+            source_mask = np.asarray(mask, dtype=np.float32)
+            if source_mask.shape != template.shape:
+                raise ValueError("template mask shape must match the scene image")
+            weights = source_mask[ys[:, None], xs[None, :]]
+        weight_sum = float(weights.sum())
+        if weight_sum <= 1:
+            continue
+        mean = float(np.sum(sample * weights) / weight_sum)
+        centered = (sample - mean) * weights
         template_energy = float(np.sum(centered * centered))
         if template_energy <= 1e-8:
             continue
@@ -164,23 +184,77 @@ def template_match_ncc(map_gray: Any, scene_gray: Any, *, scales: tuple[float, .
             * np.fft.rfft2(centered[::-1, ::-1], s=fft_shape),
             s=fft_shape,
         )[th - 1:image.shape[0], tw - 1:image.shape[1]]
-        integral = np.pad(image, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-        square = np.pad(image * image, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-        patch_sum = integral[th:, tw:] - integral[:-th, tw:] - integral[th:, :-tw] + integral[:-th, :-tw]
-        patch_sq = square[th:, tw:] - square[:-th, tw:] - square[th:, :-tw] + square[:-th, :-tw]
-        patch_energy = np.maximum(patch_sq - patch_sum * patch_sum / (tw * th), 1e-8)
+        mask_fft = np.fft.rfft2(weights[::-1, ::-1], s=fft_shape)
+        patch_sum = np.fft.irfft2(np.fft.rfft2(image, s=fft_shape) * mask_fft, s=fft_shape)[th - 1:image.shape[0], tw - 1:image.shape[1]]
+        patch_sq = np.fft.irfft2(np.fft.rfft2(image * image, s=fft_shape) * mask_fft, s=fft_shape)[th - 1:image.shape[0], tw - 1:image.shape[1]]
+        patch_energy = np.maximum(patch_sq - patch_sum * patch_sum / weight_sum, 1e-8)
         scores = correlation / np.sqrt(patch_energy * template_energy)
         index = int(np.argmax(scores))
         y_raw, x_raw = np.unravel_index(index, scores.shape)
         y, x = int(y_raw), int(x_raw)
         score = float(scores[y, x])
+        contrast = float(np.sqrt(patch_energy[y, x] / template_energy))
+        scores[max(0, y - th // 2):y + th // 2 + 1,
+               max(0, x - tw // 2):x + tw // 2 + 1] = -np.inf
+        second = float(np.max(scores)) if scores.size else -1.0
+        margin = max(0.0, score - second)
         if best is None or score > best[0]:
             best = (score, int(x), int(y), tw, th)
+            best_margin = margin
+            best_contrast = contrast
     if best is None:
         return None
     score, x, y, width, height = best
+    similarity = min(1.0, max(0.0, (score + 1.0) / 2.0))
+    distinctness = min(1.0, max(0.0, best_margin / 0.15))
+    contrast_consistency = min(1.0, max(0.0, min(best_contrast, 1.0 / max(best_contrast, 1e-8))))
     return {"x": float(x), "y": float(y), "width": float(width), "height": float(height),
-            "confidence": min(1.0, max(0.0, (score + 1.0) / 2.0))}
+            "similarity": similarity, "peak_margin": best_margin, "contrast_ratio": best_contrast,
+            "confidence": similarity * (0.65 + 0.35 * distinctness) * contrast_consistency}
+
+
+def _edge_image(image: Any) -> Any:
+    """Normalize brightness away and emphasize scene structure over color."""
+    import numpy as np
+
+    values = np.asarray(image, dtype=np.float32)
+    gy, gx = np.gradient(values)
+    magnitude = np.hypot(gx, gy)
+    scale = float(np.percentile(magnitude, 95))
+    if scale > 1e-6:
+        magnitude = np.clip(magnitude / scale, 0.0, 1.0)
+    return magnitude.astype(np.float32, copy=False)
+
+
+def scene_match_mask(width: int, height: int) -> Any:
+    """Ignore the top-left HUD and dark/vignetted image border."""
+    import numpy as np
+
+    mask = np.ones((height, width), dtype=np.float32)
+    border_x, border_y = max(2, round(width * 0.035)), max(2, round(height * 0.045))
+    mask[:border_y, :] = 0
+    mask[-border_y:, :] = 0
+    mask[:, :border_x] = 0
+    mask[:, -border_x:] = 0
+    mask[:round(height * 0.24), :round(width * 0.31)] = 0
+    return mask
+
+
+def capture_consistency(matches: Sequence[Mapping[str, float]]) -> float:
+    """Score how tightly independent captures agree on the room footprint."""
+    import numpy as np
+
+    if len(matches) < 4:
+        return 0.65 if matches else 0.0
+    centers = np.asarray([[m["x"] + m["width"] / 2, m["y"] + m["height"] / 2]
+                          for m in matches], dtype=np.float64)
+    cameras = np.asarray([[m["camera_x"], m["camera_y"]] for m in matches], dtype=np.float64)
+    # Camera motion should translate the observed map footprint consistently.
+    design = np.column_stack((cameras, np.ones(len(cameras))))
+    predicted = design @ np.linalg.lstsq(design, centers, rcond=None)[0]
+    residual = np.linalg.norm(centers - predicted, axis=1)
+    footprint = max(1.0, float(np.median([m["width"] for m in matches])))
+    return float(np.exp(-float(np.median(residual)) / max(2.0, footprint * 0.04)))
 
 
 def _small_gray(image: Any, max_width: int, max_height: int) -> Any:
@@ -216,12 +290,14 @@ def auto_register_capture(
     frame_image = pyvips.Image.new_from_file(str(capture_path), access="sequential", fail=True).autorot()
     map_small = _small_gray(map_image, 1500, 1100)
     frame_small = _small_gray(frame_image, 280, 200)
-    first = template_match_ncc(map_small, frame_small)
+    mask = scene_match_mask(frame_small.shape[1], frame_small.shape[0])
+    first = template_match_ncc(map_small, frame_small, mask=mask)
     bounds = scene_bounds
     if (first is None or not isinstance(bounds, (list, tuple)) or len(bounds) != 4
             or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in bounds)):
         save_scene_calibration(cache_dir / "calibration.json", map_sha256=cache_dir.name,
-                               scene=scene, transform=(0, 0, 0, 0, 0, 0), confidence=0.0)
+                               scene=scene, transform=(0, 0, 0, 0, 0, 0), confidence=0.0,
+                               candidate=first)
         return {"scene": scene, "positioned": False, "confidence": first["confidence"] if first else 0.0}
     scale_x, scale_y = map_image.width / map_small.shape[1], map_image.height / map_small.shape[0]
     # Refine the preview match on the corresponding full-resolution map crop.
@@ -239,7 +315,7 @@ def auto_register_capture(
         ).autorot()
         crop = crop_source.crop(crop_x, crop_y, crop_w, crop_h)
         crop_small = _small_gray(crop, 1500, 1100)
-        candidate = template_match_ncc(crop_small, frame_small)
+        candidate = template_match_ncc(crop_small, frame_small, mask=mask)
         if candidate is not None:
             refined = {**candidate,
                        "x": crop_x + candidate["x"] * crop_w / crop_small.shape[1],
@@ -258,6 +334,52 @@ def auto_register_capture(
                      0.0, -sy, refined["y"] + max_y * sy)
         confidence = min(1.0, max(0.0, refined_score))
     save_scene_calibration(cache_dir / "calibration.json", map_sha256=cache_dir.name,
-                           scene=scene, transform=transform, confidence=confidence)
+                           scene=scene, transform=transform, confidence=confidence,
+                           candidate=refined)
     return {"scene": scene, "positioned": confidence >= min_confidence, "confidence": confidence,
-            "affine": list(transform)}
+            "affine": list(transform), "candidate": refined}
+
+
+def auto_register_captures(
+    map_path: Path,
+    captures: Sequence[tuple[Path, Mapping[str, Any]]],
+    cache_dir: Path,
+    *,
+    scene: str,
+    min_confidence: float = 0.75,
+) -> dict[str, Any]:
+    """Register a scene only when independent camera views agree on its footprint."""
+    import numpy as np
+
+    from hk_agent.run_journey import save_scene_calibration
+
+    valid = [(path, meta) for path, meta in captures
+             if isinstance(meta.get("scene_bounds"), (list, tuple)) and len(meta["scene_bounds"]) == 4
+             and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+                     for v in meta["scene_bounds"])
+             and isinstance(meta.get("camera_x"), (int, float))
+             and isinstance(meta.get("camera_y"), (int, float))]
+    results = [auto_register_capture(map_path, path, cache_dir, scene=scene,
+                                     scene_bounds=meta["scene_bounds"], min_confidence=0.0)
+               for path, meta in valid]
+    matched = [(result, meta) for result, (_path, meta) in zip(results, valid, strict=True)
+               if isinstance(result.get("candidate"), Mapping) and isinstance(result.get("affine"), list)]
+    consistency_inputs = [{**result["candidate"], "camera_x": float(meta["camera_x"]),
+                           "camera_y": float(meta["camera_y"])} for result, meta in matched]
+    consistency = capture_consistency(consistency_inputs)
+    if matched:
+        transforms = np.asarray([result["affine"] for result, _ in matched], dtype=np.float64)
+        affine = np.median(transforms, axis=0).tolist()
+        confidence = float(np.median([float(result["confidence"]) for result, _ in matched]) * consistency)
+        candidates = np.asarray([[float(result["candidate"][key]) for key in ("x", "y", "width", "height")]
+                                 for result, _ in matched], dtype=np.float64)
+        candidate = dict(zip(("x", "y", "width", "height"), np.median(candidates, axis=0).tolist(), strict=True))
+    else:
+        affine = [0.0] * 6
+        confidence = 0.0
+        candidate = None
+    save_scene_calibration(cache_dir / "calibration.json", map_sha256=cache_dir.name,
+                           scene=scene, transform=tuple(affine), confidence=confidence,
+                           candidate=candidate)
+    return {"scene": scene, "positioned": confidence >= min_confidence, "confidence": confidence,
+            "capture_count": len(matched), "consistency": consistency, "affine": affine}

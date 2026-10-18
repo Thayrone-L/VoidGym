@@ -683,6 +683,7 @@ def save_scene_calibration(
     scene: str,
     transform: Sequence[float],
     confidence: float,
+    candidate: Mapping[str, float] | None = None,
 ) -> None:
     if len(map_sha256) != 64 or any(char not in "0123456789abcdef" for char in map_sha256):
         raise ValueError("map SHA-256 must be 64 lowercase hex characters")
@@ -701,11 +702,18 @@ def save_scene_calibration(
         ):
             payload = existing
     payload["map_sha256"] = map_sha256
-    payload["transforms"][scene] = {
+    record: dict[str, Any] = {
         "affine": [float(value) for value in transform],
         "confidence": float(confidence),
         "positioned": confidence >= 0.75,
     }
+    if candidate is not None:
+        keys = ("x", "y", "width", "height")
+        if any(key not in candidate or not math.isfinite(candidate[key]) or abs(candidate[key]) > 10_000_000
+               for key in keys):
+            raise ValueError("candidate region must contain finite bounded map coordinates")
+        record["candidate"] = {key: float(candidate[key]) for key in keys}
+    payload["transforms"][scene] = record
     atomic_json(path, payload)
 
 
@@ -745,6 +753,16 @@ def load_scene_calibration(path: Path, *, map_sha256: str) -> dict[str, dict[str
             "confidence": float(confidence),
             "positioned": record.get("positioned") is True and confidence >= 0.75,
         }
+        raw_candidate = record.get("candidate")
+        if isinstance(raw_candidate, dict) and all(
+            isinstance(raw_candidate.get(key), (int, float))
+            and not isinstance(raw_candidate.get(key), bool)
+            and math.isfinite(float(raw_candidate[key]))
+            and abs(float(raw_candidate[key])) <= 10_000_000
+            for key in ("x", "y", "width", "height")
+        ):
+            result[scene]["candidate"] = {key: float(raw_candidate[key])
+                                           for key in ("x", "y", "width", "height")}
     return result
 
 
