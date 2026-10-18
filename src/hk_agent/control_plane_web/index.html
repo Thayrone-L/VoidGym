@@ -58,7 +58,15 @@
       <article class="metric-card"><span>Passos para sair da primeira sala</span><strong id="first-room-time">—</strong><small>média dos episódios</small></article>
     </section>
 
-    <section class="panel journey-panel"><div class="panel-head"><div><p class="eyebrow">JORNADA</p><h2>Mapa da campanha</h2></div><label>Run<select id="journey-run"><option value="">Melhor run</option></select></label></div><div id="journey-map" class="journey-map"><p class="empty">O mapa vai se revelar durante a exploração.</p></div><div id="journey-records" class="journey-records"></div><h3>Marcos</h3><div id="journey-milestones"><p class="empty">Ainda sem marcos.</p></div><div class="map-art-controls"><p id="map-art-attribution">Mapa: The Embraced One — <a href="https://www.hallownest.net/downloads/" target="_blank" rel="noopener">hallownest.net</a>. Hollow Knight © Team Cherry.</p><p id="map-art-status" class="hint">A arte do mapa ainda não é exibida. O esquema da jornada continua disponível.</p></div><p class="hint">Mapa esquemático próprio. Antes de compartilhar o projeto, considere pedir autorização ao autor do mapa.</p></section>
+    <section class="panel journey-panel">
+      <div class="panel-head"><div><p class="eyebrow">JORNADA</p><h2>Mapa da campanha</h2></div><label>Run<select id="journey-run"><option value="">Melhor run</option></select></label></div>
+      <div id="journey-map" class="journey-map"><p class="empty">O mapa vai se revelar durante a exploração.</p></div>
+      <div id="journey-records" class="journey-records"></div><h3>Marcos</h3><div id="journey-milestones"><p class="empty">Ainda sem marcos.</p></div>
+      <div class="map-art-controls"><p id="map-art-attribution">Mapa: The Embraced One — <a href="https://www.hallownest.net/downloads/" target="_blank" rel="noopener">hallownest.net</a> · Hollow Knight © Team Cherry.</p>
+        <div class="map-art-actions"><button id="map-download" class="button secondary">Baixar mapa e gerar tiles</button><button id="map-import" class="button secondary">Importar PNG local</button><input id="map-file" type="file" accept="image/png" hidden><button id="map-view-toggle" class="button quiet" hidden>Arte ⇄ Esquemático</button></div>
+        <progress id="map-progress" max="100" value="0" hidden></progress><p id="map-art-status" class="hint" aria-live="polite">A arte fica no cache local do operador; o mapa esquemático segue disponível.</p>
+      </div><p class="hint">A arte permanece no cache local e não entra em relatórios. Antes de compartilhar o projeto, peça autorização ao autor do mapa.</p>
+    </section>
 
     <section class="charts-grid">
       <article class="panel"><div class="panel-head"><div><p class="eyebrow">PROGRESSO</p><h2>Salas por episódio</h2></div></div><div id="scene-chart" class="chart"><p class="empty">Ainda sem episódios registrados.</p></div></article>
@@ -72,7 +80,9 @@
 
     <section class="panel reports-panel"><div class="panel-head"><div><p class="eyebrow">HISTÓRICO</p><h2>Relatórios dos treinos</h2></div><button id="generate-report" class="button secondary" disabled>Gerar relatório</button></div><div id="reports"><p class="empty">Relatórios aparecem quando um treino termina.</p></div></section>
 
-    <details class="panel advanced"><summary>Avançado para desenvolvedor</summary><div class="advanced-grid"><div><h3>Detalhes do treino</h3><dl id="advanced-info"></dl></div><div><h3>Log bruto</h3><pre id="raw-log">Nenhum processo ativo.</pre></div></div></details>
+    <details class="panel advanced"><summary>Avançado para desenvolvedor</summary><div class="advanced-grid"><div><h3>Detalhes do treino</h3><dl id="advanced-info"></dl>
+      <section id="map-calibration"><h3>Posicionar uma sala manualmente</h3><label>Cena<select id="calibration-scene"></select></label><label>Captura do jogo<select id="calibration-capture"></select></label><img id="calibration-image" alt="Captura da cena escolhida" hidden><p id="calibration-help" class="hint">Selecione uma cena e uma captura. Clique em dois pontos na captura e, para cada um, no ponto correspondente da arte do mapa.</p><button id="calibration-save" class="button secondary" disabled>Salvar posicionamento</button></section>
+      </div><div><h3>Log bruto</h3><pre id="raw-log">Nenhum processo ativo.</pre></div></div></details>
   </main>
   <footer>Executa somente nesta máquina · servidor local 127.0.0.1</footer>
 </body>

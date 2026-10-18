@@ -114,14 +114,17 @@ def test_automatic_report_refreshes_after_a_later_campaign_completion(tmp_path: 
         generate.assert_called_once_with("shared-campaign")
 
 
-def test_journey_summary_wraps_on_narrow_panels_and_map_controls_stay_hidden() -> None:
+def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     web = Path(__file__).parents[1] / "src" / "hk_agent" / "control_plane_web"
     html = (web / "index.html").read_text("utf-8")
     app = (web / "app.js").read_text("utf-8")
     css = (web / "app.css").read_text("utf-8")
-    assert 'id="map-download"' not in html
-    assert 'id="map-import"' not in html
-    assert "ainda não é exibida" in html
+    assert 'id="map-download"' in html
+    assert 'id="map-import"' in html
+    assert 'id="map-progress"' in html
+    assert 'id="map-view-toggle"' in html
+    assert '/api/journey/map/tile?' in app
+    assert 'worldTile' in app
     assert 'class="journey-run-summary"' in app
     assert ".journey-run-summary{flex:1 1 100%" in css
     assert "appearance:none" in css and "data:image/svg+xml" in css

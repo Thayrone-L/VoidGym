@@ -81,6 +81,29 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(content)
+        elif path in {"/api/journey/map/tile", "/api/journey/map/thumbnail"}:
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                digest = query.get("sha256", [""])[0]
+                if path.endswith("/thumbnail"):
+                    content = self.server.control_plane.read_map_thumbnail(digest)
+                    content_type = "image/jpeg"
+                else:
+                    level = int(query.get("level", [""])[0])
+                    column = int(query.get("column", [""])[0])
+                    row = int(query.get("row", [""])[0])
+                    content = self.server.control_plane.read_map_tile(digest, level, column, row)
+                    content_type = "image/jpeg"
+            except (OSError, ValueError, TypeError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
         else:
             self._static(path)
 
@@ -95,6 +118,13 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     raise ValueError("map download takes no settings")
                 self._json(HTTPStatus.OK, self.server.control_plane.download_operator_map_art())
             except (OSError, RuntimeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if path == "/api/journey/map/calibration":
+            try:
+                result = self.server.control_plane.save_map_scene_calibration(self._payload())
+                self._json(HTTPStatus.CREATED, result)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         if path == "/api/journey/map/import":
@@ -179,6 +209,13 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                         "target_kl",
                         "learning_rate",
                         "clip_range",
+                        "duration_limit_seconds",
+                        "reward_version",
+                        "warm_start_checkpoint",
+                        "warm_start_source_campaign",
+                        "stuck_seconds",
+                        "evaluation_interval",
+                        "straggler_timeout_seconds",
                     ),
                 )
                 result = self.server.control_plane.create_campaign(payload)

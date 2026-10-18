@@ -1,6 +1,7 @@
 using System;
 using System.Reflection;
 using System.IO;
+using System.Globalization;
 using System.Threading;
 using Modding;
 using UnityEngine;
@@ -16,6 +17,7 @@ public sealed class HkAgentBridgeMod : Mod
     private readonly OperatorTelemetryState _operatorTelemetry = new();
     private int _lastObservedHealth = -1;
     private int _episodeActive;
+    private int _operatorTelemetryDiagnosticLogged;
     private int _boundsSceneHandle = int.MinValue;
     private float[]? _cachedSceneBounds;
     private bool? _shadePending;
@@ -191,6 +193,11 @@ public sealed class HkAgentBridgeMod : Mod
             catch (Exception) { }
         }
         _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags);
+        if (!scene.name.StartsWith("Menu_", StringComparison.Ordinal) && hero != null && camera != null &&
+            Interlocked.CompareExchange(ref _operatorTelemetryDiagnosticLogged, 1, 0) == 0)
+        {
+            Log($"Operator telemetry gameplay sample: scene={scene.name}; x={x?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; y={y?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; camera_x={cameraX?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; camera_y={cameraY?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; geo={geo}; bounds={(bounds != null)}");
+        }
     }
 
     private static bool IsProgressFlag(string name)

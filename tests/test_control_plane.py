@@ -67,6 +67,15 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert first["save_slot"] == 1
 
 
+def test_map_matching_prefers_capture_with_scene_bounds() -> None:
+    from hk_agent.control_plane import _preferred_map_capture
+
+    old = (Path("old.png"), {}, 100)
+    newest_without_bounds = (Path("newest.png"), {"camera_x": 5.0}, 300)
+    bounded = (Path("bounded.png"), {"scene_bounds": [0.0, 0.0, 20.0, 15.0]}, 200)
+    assert _preferred_map_capture([old, newest_without_bounds, bounded]) == bounded
+
+
 def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Path) -> None:
     payload = _payload("exploration_training")
     payload["reward_version"] = "explore_v2"
@@ -1457,7 +1466,21 @@ def test_http_api_is_local_and_requires_token_for_mutations(tmp_path: Path) -> N
         token = json.loads(response.read())["csrf_token"]
         assert response.status == 200
 
-        body = json.dumps(_payload())
+        payload = _payload("exploration_training")
+        payload.update({
+            "reward_version": "explore_v4",
+            "shared_learner": True,
+            "actors": 1,
+            "rollout_steps": 256,
+            "batch_size": 256,
+            "checkpoint_interval": 256,
+            "duration_mode": "continuous",
+            "duration_limit_seconds": 0,
+            "weights": {},
+            "warm_start_checkpoint": "C:/checkpoints/v3.zip",
+            "warm_start_source_campaign": "prior-v3",
+        })
+        body = json.dumps(payload)
         connection.request("POST", "/api/campaigns", body, {"Content-Type": "application/json"})
         denied = connection.getresponse()
         denied.read()
@@ -1477,6 +1500,8 @@ def test_http_api_is_local_and_requires_token_for_mutations(tmp_path: Path) -> N
         result = json.loads(created.read())
         assert created.status == 201
         assert result["version"] == 1
+        assert result["warm_start_source_campaign"] == "prior-v3"
+        assert result["actors"] == 1
     finally:
         connection.close()
         server.shutdown()

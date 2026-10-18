@@ -1,0 +1,45 @@
+52b — mapa de Hallownest e jornada
+Data: 2026-10-18
+
+Implementação
+- Visualizador Deep Zoom com tiles JPEG 256 px, zoom/arraste, carregamento apenas dos tiles visíveis, névoa, rotas e ícones SVG próprios; alternância Arte/Esquemático.
+- Importação em cache local por SHA-256 e geração retomável, com progresso e verificação prévia de espaço.
+- Matching automático e calibração manual por duas âncoras; cenas abaixo da confiança mínima permanecem não posicionadas.
+- Captura do marco inicial no reset de exploração e preservação da telemetria de operador ao validar o PixelFrame.
+- Correção adicional: captura com bounds de cena válidos tem preferência sobre captura duplicada sem bounds ao registrar marcos para matching.
+- Fonte e tiles permanecem fora do repositório, em %LOCALAPPDATA%\VoidLab\cache\map-art.
+
+Arte local
+- SHA-256: 4be590338ee9696a12f5f7d4db3a1c18b02ed41042694565f4445d85cd063245
+- PNG: 72.622 × 48.128 px (875.486.291 bytes).
+- Deep Zoom: nível máximo 17, tiles 256 px, estimativa 5.941.757.748 bytes. Geração concluída; espaço livre observado antes da geração: 40.895.737.856 bytes.
+- Atribuição exibida: “Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry”.
+
+Adendo de telemetria
+- Caminho rastreado: HkAgentBridgeMod → FRAME.operator_telemetry → supervisor/CapturedFrame → PixelFrame → GymEnv.info → ExplorationTask/RunDiary.
+- Causa raiz: GymEnv._validate_frame reconstruía o PixelFrame sem copiar operator_telemetry. O teste anterior com bridge falso não atravessava esse validador. O campo agora é validado (JSON limitado e números finitos) e preservado.
+- Integração ponta a ponta com bridge falso agora passa pelo validador do ambiente e confirma posição, geo e evento persistidos no diário. Testes C# verificam a montagem do payload.
+- Campanha real explore-52b-telemetry-final-r2-20261018: um ator, explore_v4, horizonte 3000, warm-start do checkpoint v3, 768 passos e 3 atualizações. Parada segura concluída; active_count=0, ator CANCELLED com final_save_status=captured, learner CANCELLED.
+- Diário real: 191 posições em aproximadamente 124,5 s, intervalo médio de 0,655 s (cerca de 1,53 posições/s); coordenadas reais do Hero e bounds/câmera presentes. A única cena foi Tutorial_01. geo_current=0, geo_collected=0 e events=[]: nenhum evento real de coleta/dano/morte foi observado, portanto esse critério do adendo continua pendente.
+- Frequências no rollout: ATTACK 406/768 (52,86%); movimento 566/768 (73,70%); NOOP 44/768 (5,73%). Categorias podem se sobrepor. Ataques ficaram cerca de 8,1 pontos percentuais abaixo da estimativa histórica v3 de ~61%.
+- Novidade por grupo de ação não é registrada nos rollouts desta campanha e não pôde ser calculada. A referência histórica anterior continua sendo mover 13/137 (9,5%), atacar 8/231 (3,5%) e NOOP 1/8.
+
+Posicionamento
+- Arte local e pirâmide de tiles foram geradas sem copiar imagem ou tiles ao repositório.
+- Matching automático terminou com 0 cenas posicionadas e 1 não posicionada. Tutorial_01 tem bounds válidos, mas confiança 0,5, abaixo do mínimo 0,75; a cena permanece explicitamente não posicionada.
+- Calibração manual não foi aplicada porque não foram estabelecidas correspondências visuais confiáveis entre a captura real e a arte. A interface de calibração está disponível.
+- O painel local exibiu o mapa, atribuição e marco “Passagem do Rei”. Uma captura visual foi mostrada durante a validação, mas não foi salva em arquivo no relatório. O mapa continua privado no cache local.
+
+Validação
+- ruff check src tests: passou.
+- mypy src: passou (45 arquivos).
+- pytest -q: 560 passed, 2 skipped, 8 subtests passed.
+- dotnet build HkAgentBridge.Mod Release: passou, 0 avisos e 0 erros.
+- HkAgentBridge.CorrelationTests: passou.
+- node --check src/hk_agent/control_plane_web/app.js: passou.
+- DLL implantada nas instâncias gerenciadas 1 e 2 com SHA-256 a0e25b29a7c88a1a20df6779ea07ba045647cd201b5cbb18c70fae22bde08e0e.
+- git diff --check: corrigido o espaço em branco extra no fim de app.js; repetir antes do commit.
+
+Limitações abertas
+- O critério de pelo menos um evento real no diário não foi satisfeito nesta campanha, embora posição e geo numérico tenham sido confirmados. Não declarar validação completa de gameplay.
+- Tutorial_01 ainda não está posicionada no mapa por não alcançar a confiança mínima. Nenhuma posição foi inventada.

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.Json;
 using HkAgentBridge;
 
 var state = new EpisodeCorrelationState();
@@ -110,6 +111,15 @@ Assert(milestoneEvents.Length == 2, "grub count and false-to-true item flag must
 Assert((string)milestoneEvents[0]["category"]! == "grub", "grub delta category must be typed");
 Assert((string)milestoneEvents[1]["category"]! == "item", "item flag transition must be typed");
 Assert((string)telemetry.Snapshot()["scene_name"]! == "Crossroads_01", "scene telemetry remains available after deltas are consumed");
+var framePayload = new Dictionary<string, object?> { ["operator_telemetry"] = telemetryDelta };
+using (JsonDocument serializedFrame = JsonDocument.Parse(JsonSerializer.Serialize(framePayload)))
+{
+    JsonElement payloadTelemetry = serializedFrame.RootElement.GetProperty("operator_telemetry");
+    Assert(payloadTelemetry.GetProperty("x").GetSingle() == 3, "FRAME payload must preserve the hero x position");
+    Assert(payloadTelemetry.GetProperty("geo_current").GetInt32() == 22, "FRAME payload must preserve current Geo");
+    Assert(payloadTelemetry.GetProperty("milestone_events_since_last_frame").GetArrayLength() == 2,
+        "FRAME payload must preserve confirmed milestone events");
+}
 
 string saveRoot = Path.Combine(Path.GetTempPath(), $"hk-agent-save-{Guid.NewGuid():N}");
 Directory.CreateDirectory(saveRoot);

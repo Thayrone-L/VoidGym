@@ -283,7 +283,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         return self._observation(), self._info(frame_ids=self._frame_ids())
 
     def step(
-        self, action: int, *, lease_ms: int | None = None, action_audit: Mapping[str, Any] | None = None
+        self,
+        action: int,
+        *,
+        lease_ms: int | None = None,
+        action_audit: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, NDArray[np.generic]], float, bool, bool, dict[str, Any]]:
         self._ensure_open()
         if self._episode_id is None or self._episode_done:
@@ -477,6 +481,18 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 raise FrameValidationError("capture timestamp moved backwards")
         if expected_action_id is not None and frame.last_applied_action_id != expected_action_id:
             raise FrameValidationError("frame is not correlated with the requested action")
+        operator_telemetry = frame.operator_telemetry
+        if operator_telemetry is not None:
+            if not isinstance(operator_telemetry, dict) or len(operator_telemetry) > 32:
+                raise FrameValidationError("operator_telemetry must be a bounded object")
+            try:
+                telemetry_bytes = json.dumps(operator_telemetry, allow_nan=False).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise FrameValidationError(
+                    "operator_telemetry must contain finite JSON values"
+                ) from error
+            if len(telemetry_bytes) > 16_384:
+                raise FrameValidationError("operator_telemetry exceeds its size limit")
         return PixelFrame(
             episode_id=frame.episode_id,
             frame_id=frame.frame_id,
@@ -499,6 +515,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
             shade_distance=frame.shade_distance,
             scene_name=frame.scene_name,
+            operator_telemetry=dict(operator_telemetry) if operator_telemetry is not None else None,
             enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
@@ -603,20 +620,24 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                     {"scene_name": scene, "enemy_type": enemy_type}
                     for scene, enemy_type in frame.enemy_events_since_last_frame
                 ],
-                "gameplay_run_index": (
-                    lifecycle.logical_run_index if lifecycle is not None else 1
-                ),
+                "gameplay_run_index": (lifecycle.logical_run_index if lifecycle is not None else 1),
                 "recovery_required": (
                     lifecycle.recovery_required if lifecycle is not None else False
                 ),
-                "failed_gameplay_runs": (
-                    lifecycle.failed_runs if lifecycle is not None else 0
-                ),
-            }
+                "failed_gameplay_runs": (lifecycle.failed_runs if lifecycle is not None else 0),
+            },
         }
         if frame.operator_telemetry:
             result["operator_telemetry"] = dict(frame.operator_telemetry)
-            for name in ("map_zone", "x", "y", "camera_x", "camera_y", "scene_bounds", "milestone_events_since_last_frame"):
+            for name in (
+                "map_zone",
+                "x",
+                "y",
+                "camera_x",
+                "camera_y",
+                "scene_bounds",
+                "milestone_events_since_last_frame",
+            ):
                 if name in frame.operator_telemetry:
                     result[name] = frame.operator_telemetry[name]
         return result

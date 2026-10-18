@@ -26,10 +26,12 @@ class _Backend:
 
 class _Environment(gym.Env):
     def __init__(self) -> None:
-        self.observation_space = gym.spaces.Dict({
-            "pixels": gym.spaces.Box(0, 255, (4, 90, 160, 3), dtype=np.uint8),
-            "action_history": gym.spaces.MultiDiscrete(np.full((8,), 27, dtype=np.int64)),
-        })
+        self.observation_space = gym.spaces.Dict(
+            {
+                "pixels": gym.spaces.Box(0, 255, (4, 90, 160, 3), dtype=np.uint8),
+                "action_history": gym.spaces.MultiDiscrete(np.full((8,), 27, dtype=np.int64)),
+            }
+        )
         self.action_space = gym.spaces.Discrete(30)
         self.lease_ms = 80
         self.latest_action_availability = None
@@ -38,6 +40,7 @@ class _Environment(gym.Env):
         self.terminal = False
         self.truncated = False
         self.extra = {}
+        self.initial_extra = {}
         self.initial_scene = "Room-A"
 
     @staticmethod
@@ -47,15 +50,17 @@ class _Environment(gym.Env):
         return np.stack((pattern, np.roll(pattern, shift * 10, axis=1), 180 - pattern), axis=-1)
 
     def _obs(self) -> dict[str, NDArray[np.generic]]:
-        return {"pixels": np.repeat(self.frame[None, ...], 4, axis=0),
-                "action_history": np.zeros((8,), dtype=np.int64)}
+        return {
+            "pixels": np.repeat(self.frame[None, ...], 4, axis=0),
+            "action_history": np.zeros((8,), dtype=np.int64),
+        }
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
         self.frame = self._frame(0)
         self.terminal = False
         self.truncated = False
-        return self._obs(), {"scene_name": self.initial_scene}
+        return self._obs(), {"scene_name": self.initial_scene, **self.initial_extra}
 
     def step(self, action: int, *, lease_ms: int):
         if action == 1:
@@ -63,13 +68,18 @@ class _Environment(gym.Env):
         elif action == 2:
             self.frame = self._frame(3)
         terminal = self.terminal
-        info = {"valid": True, "termination_reason": "player_dead" if terminal else None,
-                "enemy_kills_since_last_frame": 1 if terminal else 0,
-                "hp_lost_since_last_frame": 0, "geo_gained_since_last_frame": 10,
-                "geo_spent_since_last_frame": 0,
-                "shade_hits_since_last_frame": 0,
-                "hp_restored_since_last_frame": 0,
-                "supervisor": {"player_dead": terminal}, **self.extra}
+        info = {
+            "valid": True,
+            "termination_reason": "player_dead" if terminal else None,
+            "enemy_kills_since_last_frame": 1 if terminal else 0,
+            "hp_lost_since_last_frame": 0,
+            "geo_gained_since_last_frame": 10,
+            "geo_spent_since_last_frame": 0,
+            "shade_hits_since_last_frame": 0,
+            "hp_restored_since_last_frame": 0,
+            "supervisor": {"player_dead": terminal},
+            **self.extra,
+        }
         return self._obs(), 0.0, terminal, self.truncated, info
 
 
@@ -98,7 +108,9 @@ def test_novelty_budget_and_archive_are_bounded() -> None:
 
 def test_fifo_archive_forgets_old_descriptors() -> None:
     environment = _Environment()
-    task = ExplorationTask(environment, config=ExplorationTaskConfig(horizon_steps=20, archive_max=1))
+    task = ExplorationTask(
+        environment, config=ExplorationTaskConfig(horizon_steps=20, archive_max=1)
+    )
     task.reset()
     _, _, _, _, first = task.step(1)
     _, _, _, _, second = task.step(2)
@@ -165,12 +177,22 @@ def test_black_and_white_frames_do_not_pay_novelty() -> None:
 def test_unavailable_action_is_masked_and_audited() -> None:
     environment = _Environment()
     environment.latest_action_availability = ActionAvailability(
-        mp_charge=0, spell_cost=33, focus_cost=33, fireball_level=0, quake_level=0,
-        scream_level=0, has_nail_art=False, has_cyclone=False, has_dash_slash=False, has_upward_slash=False,
+        mp_charge=0,
+        spell_cost=33,
+        focus_cost=33,
+        fireball_level=0,
+        quake_level=0,
+        scream_level=0,
+        has_nail_art=False,
+        has_cyclone=False,
+        has_dash_slash=False,
+        has_upward_slash=False,
     )
     task = ExplorationTask(environment)
     task.reset()
-    index = __import__("hk_agent.scene_change_task", fromlist=["SCENE_CHANGE_ACTION_NAMES"]).SCENE_CHANGE_ACTION_NAMES.index("FOCUS_HOLD")
+    index = __import__(
+        "hk_agent.scene_change_task", fromlist=["SCENE_CHANGE_ACTION_NAMES"]
+    ).SCENE_CHANGE_ACTION_NAMES.index("FOCUS_HOLD")
     _, _, _, _, info = task.step(index)
     assert info["masked_action_substituted"] is True
     assert info["executed_task_action"] == 0
@@ -200,23 +222,45 @@ def test_exploration_contract_is_pixel_only_and_fingerprint_stable() -> None:
     assert contract["information_boundary"] == ["pixels", "applied_action_history"]
     assert contract["privileged_state"] == []
     assert _public_task_contract(contract, from_manifest=False)["reward_version"] == "explore_v1"
-    assert portable_compatibility_fingerprint(contract, {}) == portable_compatibility_fingerprint(contract, {})
-    assert scene_descriptor(_Environment._frame(0), __import__("hk_agent.scene_change_task", fromlist=["SceneChangeTaskConfig"]).SceneChangeTaskConfig()).shape == (144, 3)
+    assert portable_compatibility_fingerprint(contract, {}) == portable_compatibility_fingerprint(
+        contract, {}
+    )
+    assert scene_descriptor(
+        _Environment._frame(0),
+        __import__(
+            "hk_agent.scene_change_task", fromlist=["SceneChangeTaskConfig"]
+        ).SceneChangeTaskConfig(),
+    ).shape == (144, 3)
 
 
 def _v2_config(**kwargs):
-    return ExplorationTaskConfig(reward_version="explore_v2", geo_gain_reward=0, geo_spend_reward=0,
-        shade_recovery_reward=4.0, **kwargs)
+    return ExplorationTaskConfig(
+        reward_version="explore_v2",
+        geo_gain_reward=0,
+        geo_spend_reward=0,
+        shade_recovery_reward=4.0,
+        **kwargs,
+    )
 
 
 def _v3_config(**kwargs):
-    return ExplorationTaskConfig(reward_version="explore_v3", geo_gain_reward=0, geo_spend_reward=0,
-        shade_recovery_reward=4.0, **kwargs)
+    return ExplorationTaskConfig(
+        reward_version="explore_v3",
+        geo_gain_reward=0,
+        geo_spend_reward=0,
+        shade_recovery_reward=4.0,
+        **kwargs,
+    )
 
 
 def _v4_config(**kwargs):
-    return ExplorationTaskConfig(reward_version="explore_v4", geo_gain_reward=0, geo_spend_reward=0,
-        shade_recovery_reward=4.0, **kwargs)
+    return ExplorationTaskConfig(
+        reward_version="explore_v4",
+        geo_gain_reward=0,
+        geo_spend_reward=0,
+        shade_recovery_reward=4.0,
+        **kwargs,
+    )
 
 
 def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> None:
@@ -224,10 +268,12 @@ def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> Non
 
     memory = tmp_path / "campaign-memory"
     environment = _Environment()
-    environment.extra = {"milestone_events_since_last_frame": [
-        {"category": "boss", "key": "False_Knight", "confirmed": True},
-        {"category": "grub", "key": "grub_1", "confirmed": True},
-    ]}
+    environment.extra = {
+        "milestone_events_since_last_frame": [
+            {"category": "boss", "key": "False_Knight", "confirmed": True},
+            {"category": "grub", "key": "grub_1", "confirmed": True},
+        ]
+    }
     task = ExplorationTask(environment, config=_v4_config(), lifelong_memory_root=memory)
     task.reset()
     _, reward_first, _, _, info_first = task.step(0)
@@ -241,7 +287,7 @@ def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> Non
     task2 = ExplorationTask(repeated, config=_v4_config(), lifelong_memory_root=memory)
     task2.reset()
     _, _, _, _, info_repeated = task2.step(0)
-    expected = 15 / (2 ** 0.5) + 3 / (2 ** 0.5)
+    expected = 15 / (2**0.5) + 3 / (2**0.5)
     assert info_repeated["reward_components"]["milestone_novelty"] == pytest.approx(expected)
 
 
@@ -262,6 +308,52 @@ def test_v4_contract_keeps_telemetry_out_of_observation_and_bounds_return() -> N
     assert set(observation) == {"pixels", "action_history"}
 
 
+def test_initial_scene_is_captured_for_map_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    journey_root = tmp_path / "journey"
+    monkeypatch.setenv("HK_AGENT_JOURNEY_ROOT", str(journey_root))
+    environment = _Environment()
+    environment.backend.capture_png = lambda: b"\x89PNG\r\n\x1a\nsynthetic"
+    environment.initial_extra = {
+        "operator_telemetry": {
+            "scene_name": "Room-A",
+            "x": 4.0,
+            "y": 8.0,
+            "camera_x": 3.0,
+            "camera_y": 7.0,
+            "scene_bounds": [0.0, 0.0, 20.0, 15.0],
+        }
+    }
+    task = ExplorationTask(environment, config=_v4_config())
+    task.reset()
+    progress = json.loads((journey_root / "campaign-progress.json").read_text("utf-8"))
+    initial = next(row for row in progress["milestones"] if row["category"] == "scene")
+    assert initial["scene"] == "Room-A"
+    assert initial["map_view"]["scene_bounds"] == [0.0, 0.0, 20.0, 15.0]
+    episode = json.loads((journey_root / "actor-0" / "episode-1.json").read_text("utf-8"))
+    assert episode["positions"][0]["x"] == 4.0
+    assert Path(initial["capture"]).name.endswith("scene_Room-A.png")
+    assert (journey_root / initial["capture"]).is_file()
+
+
+def test_diary_records_confirmed_damage_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    journey_root = tmp_path / "journey"
+    monkeypatch.setenv("HK_AGENT_JOURNEY_ROOT", str(journey_root))
+    environment = _Environment()
+    environment.extra = {"hp_lost_since_last_frame": 1}
+    task = ExplorationTask(environment, config=_v4_config())
+    task.reset()
+    task.step(0)
+    episode = json.loads((journey_root / "actor-0" / "episode-1.json").read_text("utf-8"))
+    assert episode["events"][0]["category"] == "damage"
+    assert episode["events"][0]["confirmed"] is True
+
+
 def test_v3_scene_and_enemy_rewards_decay_and_persist(tmp_path: Path) -> None:
     from hk_agent.exploration_task import load_campaign_counts
 
@@ -270,8 +362,10 @@ def test_v3_scene_and_enemy_rewards_decay_and_persist(tmp_path: Path) -> None:
     expected_enemy = (1.0, 1.0 / np.sqrt(2))
     for scene_reward, enemy_reward in zip(expected_scene, expected_enemy, strict=True):
         env = _Environment()
-        env.extra = {"scene_name": "Room-B", "enemy_events_since_last_frame": [
-            {"scene_name": "Room-B", "enemy_type": "Crawler"}]}
+        env.extra = {
+            "scene_name": "Room-B",
+            "enemy_events_since_last_frame": [{"scene_name": "Room-B", "enemy_type": "Crawler"}],
+        }
         task = ExplorationTask(env, config=_v3_config(), lifelong_memory_root=memory)
         task.reset()
         _, _, _, _, info = task.step(0)
@@ -284,8 +378,11 @@ def test_v3_scene_and_enemy_rewards_decay_and_persist(tmp_path: Path) -> None:
 
 def test_v3_stuck_truncates_after_threshold_but_progress_resets_timer(tmp_path: Path) -> None:
     env = _Environment()
-    task = ExplorationTask(env, config=_v3_config(stuck_seconds=0.12, horizon_steps=30),
-                           lifelong_memory_root=tmp_path / "memory")
+    task = ExplorationTask(
+        env,
+        config=_v3_config(stuck_seconds=0.12, horizon_steps=30),
+        lifelong_memory_root=tmp_path / "memory",
+    )
     task.reset()
     _, _, _, truncated, _first = task.step(0)
     assert not truncated
@@ -320,14 +417,26 @@ def test_v3_alert_thresholds_and_return_bounds() -> None:
 
 def test_v3_caps_damage_and_shade_components_per_episode(tmp_path: Path) -> None:
     env = _Environment()
-    env.extra = {"scene_name": "Room-A", "shade_pending": True, "shade_distance": 100.0,
-                 "shade_hits_since_last_frame": 4, "hp_lost_since_last_frame": 9}
-    task = ExplorationTask(env, config=_v3_config(horizon_steps=40), lifelong_memory_root=tmp_path / "memory")
+    env.extra = {
+        "scene_name": "Room-A",
+        "shade_pending": True,
+        "shade_distance": 100.0,
+        "shade_hits_since_last_frame": 4,
+        "hp_lost_since_last_frame": 9,
+    }
+    task = ExplorationTask(
+        env, config=_v3_config(horizon_steps=40), lifelong_memory_root=tmp_path / "memory"
+    )
     task.reset()
     components = []
     for distance in list(range(99, 79, -1)) + list(range(80, 100)):
-        env.extra = {"scene_name": "Room-A", "shade_pending": True, "shade_distance": float(distance),
-                     "shade_hits_since_last_frame": 4, "hp_lost_since_last_frame": 9}
+        env.extra = {
+            "scene_name": "Room-A",
+            "shade_pending": True,
+            "shade_distance": float(distance),
+            "shade_hits_since_last_frame": 4,
+            "hp_lost_since_last_frame": 9,
+        }
         components.append(task.step(0)[4]["reward_components"])
     assert sum(item["shade_hits"] for item in components) == pytest.approx(1.2)
     assert sum(item["damage_taken"] for item in components) == pytest.approx(-4.5)
@@ -343,8 +452,11 @@ def test_v3_rejects_reward_budgets_that_break_theoretical_bound() -> None:
 
 
 def test_v3_time_cost_has_an_episode_cap(tmp_path: Path) -> None:
-    task = ExplorationTask(_Environment(), config=_v3_config(time_cost_budget=0.02, horizon_steps=50),
-                           lifelong_memory_root=tmp_path / "memory")
+    task = ExplorationTask(
+        _Environment(),
+        config=_v3_config(time_cost_budget=0.02, horizon_steps=50),
+        lifelong_memory_root=tmp_path / "memory",
+    )
     task.reset()
     paid = sum(task.step(0)[4]["reward_components"]["time_cost"] for _ in range(50))
     assert paid == pytest.approx(-0.02)
@@ -353,7 +465,9 @@ def test_v3_time_cost_has_an_episode_cap(tmp_path: Path) -> None:
 def test_v3_contract_exposes_progress_signals_only_to_reward(tmp_path: Path) -> None:
     from hk_agent.distributed_knowledge import _public_task_contract
 
-    task = ExplorationTask(_Environment(), config=_v3_config(), lifelong_memory_root=tmp_path / "memory")
+    task = ExplorationTask(
+        _Environment(), config=_v3_config(), lifelong_memory_root=tmp_path / "memory"
+    )
     observation, _ = task.reset()
     contract = task.task_contract()
     assert contract["task_contract_schema_version"] == 3
@@ -365,7 +479,9 @@ def test_v3_contract_exposes_progress_signals_only_to_reward(tmp_path: Path) -> 
 
 def test_v2_masks_hud_and_requires_persistent_scene_change(tmp_path: Path) -> None:
     env = _Environment()
-    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task = ExplorationTask(
+        env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl"
+    )
     task.reset()
     base = env.frame.copy()
     hud = base.copy()
@@ -381,7 +497,9 @@ def test_v2_masks_hud_and_requires_persistent_scene_change(tmp_path: Path) -> No
     env.frame = _Environment._frame(3)
     task.step(0)
     slightly_changed = _Environment._frame(3).copy()
-    slightly_changed[60:62, 100:102] = np.clip(slightly_changed[60:62, 100:102].astype(np.int16) + 4, 0, 255).astype(np.uint8)
+    slightly_changed[60:62, 100:102] = np.clip(
+        slightly_changed[60:62, 100:102].astype(np.int16) + 4, 0, 255
+    ).astype(np.uint8)
     env.frame = slightly_changed
     _, _, _, _, persistent = task.step(0)
     assert persistent["reward_components"]["novelty"] == 0.05
@@ -417,6 +535,7 @@ def test_v2_contract_and_policy_observation_preserve_full_hud(tmp_path: Path) ->
     assert c1["task_contract_schema_version"] == 1 and c2["task_contract_schema_version"] == 2
     assert c2["information_boundary"] == c1["information_boundary"]
     from hk_agent.distributed_knowledge import _public_task_contract
+
     assert _public_task_contract(c2, from_manifest=False)["reward_version"] == "explore_v2"
     assert portable_compatibility_fingerprint(c1, {}) != portable_compatibility_fingerprint(c2, {})
     assert c2["config"]["geo_gain_reward"] == c2["config"]["geo_spend_reward"] == 0
@@ -424,9 +543,16 @@ def test_v2_contract_and_policy_observation_preserve_full_hud(tmp_path: Path) ->
 
 def test_v2_geo_hp_shade_rewards_are_bounded_and_reward_only(tmp_path: Path) -> None:
     env = _Environment()
-    env.extra = {"hp_restored_since_last_frame": 2, "shade_hits_since_last_frame": 9,
-        "shade_distance": 9.0, "scene_name": "Room", "shade_pending": True}
-    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    env.extra = {
+        "hp_restored_since_last_frame": 2,
+        "shade_hits_since_last_frame": 9,
+        "shade_distance": 9.0,
+        "scene_name": "Room",
+        "shade_pending": True,
+    }
+    task = ExplorationTask(
+        env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl"
+    )
     task.reset()
     observation, _, _, _, info = task.step(0)
     components = info["reward_components"]
@@ -440,7 +566,9 @@ def test_v2_geo_hp_shade_rewards_are_bounded_and_reward_only(tmp_path: Path) -> 
 def test_v2_shade_potential_is_capped_and_requires_same_scene(tmp_path: Path) -> None:
     env = _Environment()
     env.extra = {"shade_distance": 10.0, "scene_name": "Room", "shade_pending": True}
-    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task = ExplorationTask(
+        env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl"
+    )
     task.reset()
     _, _, _, _, first = task.step(0)
     assert first["reward_components"]["shade_approach"] == 0
@@ -457,7 +585,9 @@ def test_v2_stationary_attack_cannot_farm_novelty_but_movement_can(tmp_path: Pat
     from hk_agent.scene_change_task import SCENE_CHANGE_ACTION_NAMES
 
     env = _Environment()
-    task = ExplorationTask(env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl")
+    task = ExplorationTask(
+        env, config=_v2_config(), task_log_path=tmp_path / "phase" / "task.jsonl"
+    )
     task.reset()
     env.frame = _Environment._frame(1)
     attack = SCENE_CHANGE_ACTION_NAMES.index("ATTACK")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -69,6 +70,26 @@ def _bounded_float(value: object, name: str, minimum: float, maximum: float) -> 
     if not minimum <= result <= maximum:
         raise ValueError(f"{name} must be in [{minimum}, {maximum}]")
     return result
+
+
+def _map_view_has_valid_bounds(map_view: object) -> bool:
+    bounds = map_view.get("scene_bounds") if isinstance(map_view, Mapping) else None
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+        return False
+    values: list[float] = []
+    for value in bounds:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        converted = float(value)
+        if not math.isfinite(converted):
+            return False
+        values.append(converted)
+    return values[2] > values[0] and values[3] > values[1]
+
+
+def _preferred_map_capture(rows: Sequence[tuple[Path, object, int]]) -> tuple[Path, object, int]:
+    bounded = [row for row in rows if _map_view_has_valid_bounds(row[1])]
+    return max(bounded or rows, key=lambda row: row[2])
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +424,8 @@ class ControlPlane:
         self._slot_fences: dict[int, str] = {}
         self.observer = observer
         self._system_cpu_previous: tuple[int, int] | None = None
+        self._map_art_lock = threading.Lock()
+        self._map_art_thread: threading.Thread | None = None
         self._owner_lock_path = self.control_root / OWNER_LOCK_NAME
         if observer:
             # Read-only view: never recovers, rewrites, captures or reserves anything.
@@ -1085,19 +1108,204 @@ class ControlPlane:
         return Path(local) / "VoidLab"
 
     def map_art_status(self) -> dict[str, object]:
-        reference = self.map_art_runtime_root() / "cache" / "map-art" / "reference.json"
+        root = self.map_art_runtime_root() / "cache" / "map-art"
+        reference = root / "reference.json"
         value = self._read_json(reference)
-        return {"cached": bool(value.get("latest_sha256")), "sha256": value.get("latest_sha256"),
-                "reference_changed": value.get("sha256") != value.get("latest_sha256") if value else False,
-                "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
+        digest = value.get("latest_sha256")
+        progress = self._read_json(root / "progress.json")
+        from hk_agent.map_art import validate_map_hash
+
+        if isinstance(digest, str):
+            try:
+                digest = validate_map_hash(digest)
+            except ValueError:
+                digest = None
+        metadata = self._read_json(root / digest / "tiles.json") if digest else {}
+        calibrations: Mapping[str, object] = {}
+        if digest:
+            from hk_agent.run_journey import load_scene_calibration
+
+            calibrations = load_scene_calibration(root / str(digest) / "calibration.json", map_sha256=digest)
+        return {"cached": bool(digest), "sha256": digest,
+                "reference_changed": value.get("sha256") != digest if value else False,
+                "tiles_ready": metadata.get("complete") is True,
+                "tiles": metadata if metadata.get("complete") is True else None,
+                "progress": progress,
+                "calibrations": calibrations,
+                "attribution": "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry"}
 
     def download_operator_map_art(self) -> dict[str, object]:
-        from hk_agent.run_journey import download_mediafire_map
+        root = self.map_art_runtime_root() / "cache" / "map-art"
+        reference = self._read_json(root / "reference.json")
+        digest = reference.get("latest_sha256")
+        if isinstance(digest, str):
+            cached = root / digest / "map.png"
+            if cached.is_file():
+                return self._start_map_art_job(source=cached)
+        return self._start_map_art_job()
 
-        _path, digest, dimensions, changed = download_mediafire_map(self.map_art_runtime_root())
-        return {"cached": True, "sha256": digest, "dimensions": list(dimensions),
-                "reference_changed": changed, "bytes_notice": "O arquivo de resolução cheia tem cerca de 836 MB.",
-                "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
+    def _start_map_art_job(self, *, source: Path | None = None) -> dict[str, object]:
+        root = self.map_art_runtime_root() / "cache" / "map-art"
+        root.mkdir(parents=True, exist_ok=True)
+        with self._map_art_lock:
+            if self._map_art_thread is not None and self._map_art_thread.is_alive():
+                return self.map_art_status()
+            from hk_agent.map_art import load_pyvips
+
+            pyvips_available = load_pyvips() is not None
+            if not pyvips_available:
+                return {"cached": False, "status": "schematic_only",
+                        "message": "Instale o extra opcional map para gerar tiles; o mapa esquemático segue disponível."}
+            from hk_agent.run_journey import atomic_json
+
+            atomic_json(root / "progress.json", {"status": "starting", "stage": "starting", "percent": 0,
+                                                   "completed_bytes": 0, "total_bytes": None})
+            self._map_art_thread = threading.Thread(
+                target=self._prepare_map_art, args=(root, source), name="operator-map-art", daemon=True,
+            )
+            self._map_art_thread.start()
+        return {"status": "preparing", "message": "Preparação do mapa iniciada; o progresso aparece aqui."}
+
+    def _prepare_map_art(self, root: Path, source: Path | None) -> None:
+        from hk_agent.map_art import estimate_tile_bytes, free_disk_bytes, generate_map_tiles
+        from hk_agent.run_journey import atomic_json, cache_map_file, download_mediafire_map
+
+        def update(**values: object) -> None:
+            current = self._read_json(root / "progress.json")
+            current.update(values)
+            current["updated_unix_ms"] = int(time.time() * 1000)
+            atomic_json(root / "progress.json", current)
+
+        try:
+            update(status="running", stage="downloading" if source is None else "validating",
+                   percent=0, message="Baixando a arte em cache local." if source is None else "Validando o PNG importado.")
+            if source is None:
+                def download_progress(done: int, total: int | None) -> None:
+                    update(stage="downloading", completed_bytes=done, total_bytes=total,
+                           percent=round(done * 100 / total, 1) if total else None,
+                           message="Baixando em blocos; um download interrompido pode ser retomado.")
+
+                cached, digest, dimensions, changed = download_mediafire_map(
+                    self.map_art_runtime_root(), progress=download_progress, disk_free=free_disk_bytes,
+                )
+            else:
+                cached, digest, dimensions = cache_map_file(source, self.map_art_runtime_root())
+                reference = root / "reference.json"
+                previous = self._read_json(reference)
+                changed = bool(previous.get("sha256") and previous.get("sha256") != digest)
+                atomic_json(reference, {"schema_version": 1, "sha256": previous.get("sha256", digest),
+                                        "latest_sha256": digest, "source_page": "importado pelo operador",
+                                        "attribution": "The Embraced One — hallownest.net; Hollow Knight © Team Cherry"})
+            tile_bytes = estimate_tile_bytes(*dimensions)
+            available = free_disk_bytes(cached.parent)
+            if available < tile_bytes:
+                raise OSError(f"espaço insuficiente para tiles: ~{tile_bytes // (1024*1024)} MiB estimados; {available // (1024*1024)} MiB livres")
+            update(status="running", stage="tiling", percent=0, sha256=digest,
+                   dimensions=list(dimensions), estimated_tile_bytes=tile_bytes,
+                   available_bytes=available, reference_changed=changed,
+                   message=f"Gerando tiles e miniatura; estimativa de tiles: {tile_bytes // (1024*1024)} MiB.")
+
+            def tile_progress(percent: float) -> None:
+                update(stage="tiling", percent=round(percent, 1), sha256=digest,
+                       dimensions=list(dimensions), estimated_tile_bytes=tile_bytes,
+                       message="Gerando pirâmide Deep Zoom em streaming.")
+
+            metadata = generate_map_tiles(cached, cached.parent, progress=tile_progress)
+            if metadata is None:
+                update(status="schematic_only", stage="complete", message="Libvips não está disponível; o esquema da jornada continua disponível.")
+                return
+            from hk_agent.map_art import auto_register_capture
+            from hk_agent.run_journey import load_json
+
+            candidates_by_scene: dict[str, list[tuple[Path, object, int]]] = {}
+            for progress_file in (self.runtime_root / "shared").glob("*/journey/campaign-progress.json"):
+                index = load_json(progress_file)
+                for milestone in index.get("milestones", []):
+                    if not isinstance(milestone, Mapping) or not isinstance(milestone.get("capture"), str):
+                        continue
+                    scene = milestone.get("scene")
+                    if not isinstance(scene, str) or not scene:
+                        continue
+                    frame = (progress_file.parent / milestone["capture"]).resolve()
+                    if frame.is_file():
+                        timestamp = milestone.get("unix_ms", 0)
+                        candidates_by_scene.setdefault(scene, []).append(
+                            (frame, milestone.get("map_view", {}), timestamp if isinstance(timestamp, int) else 0)
+                        )
+            current_calibrations = self.map_art_status().get("calibrations", {})
+            existing = current_calibrations if isinstance(current_calibrations, Mapping) else {}
+            pending: list[tuple[Path, str, object]] = []
+            for scene, rows in candidates_by_scene.items():
+                prior = existing.get(scene)
+                if isinstance(prior, Mapping) and prior.get("positioned") is True:
+                    continue
+
+                frame, map_view, _timestamp = _preferred_map_capture(rows)
+                pending.append((frame, scene, map_view))
+            auto_results: list[dict[str, object]] = []
+            for match_index, (frame, scene, map_view) in enumerate(pending):
+                update(status="running", stage="matching", percent=100,
+                       match_index=match_index + 1, match_count=len(pending),
+                       message=f"Posicionando capturas de cenas ({match_index + 1}/{len(pending)}).")
+                bounds = map_view.get("scene_bounds") if isinstance(map_view, Mapping) else None
+                try:
+                    auto_results.append(auto_register_capture(cached, frame, cached.parent,
+                                                              scene=scene, scene_bounds=bounds))
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    auto_results.append({"scene": scene, "positioned": False, "confidence": 0.0})
+            positioned = sum(result.get("positioned") is True for result in auto_results)
+            not_positioned = len(auto_results) - positioned
+            update(status="complete", stage="complete", percent=100, sha256=digest,
+                   dimensions=list(dimensions), estimated_tile_bytes=tile_bytes,
+                   match_count=len(auto_results), positioned=positioned, unpositioned=not_positioned,
+                   message=f"Arte pronta no cache local. Cenas posicionadas automaticamente: {positioned}; não posicionadas: {not_positioned}.")
+        except Exception as error:  # noqa: BLE001 - worker boundary reports libvips/runtime failures to the panel
+            update(status="failed", stage="failed", message=str(error)[:1000])
+
+    def read_map_tile(self, digest: str, level: int, column: int, row: int) -> bytes:
+        from hk_agent.map_art import map_cache_directory, read_map_tile
+
+        root = self.map_art_runtime_root() / "cache" / "map-art"
+        return read_map_tile(map_cache_directory(root, digest), level, column, row)
+
+    def read_map_thumbnail(self, digest: str) -> bytes:
+        from hk_agent.map_art import map_cache_directory, validate_map_hash
+
+        root = (self.map_art_runtime_root() / "cache" / "map-art").resolve(strict=True)
+        cache = map_cache_directory(root, validate_map_hash(digest)).resolve(strict=True)
+        try:
+            cache.relative_to(root)
+        except ValueError as error:
+            raise ValueError("map path escaped its local cache") from error
+        if self._read_json(cache / "tiles.json").get("complete") is not True:
+            raise ValueError("map thumbnail is not ready")
+        path = cache / "thumbnail.jpg"
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("map thumbnail is missing or exceeds its limit")
+        return path.read_bytes()
+
+    def save_map_scene_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
+        from hk_agent.run_journey import fit_two_point_calibration, save_scene_calibration
+
+        digest = str(self.map_art_status().get("sha256") or "")
+        if not digest or self.map_art_status().get("tiles_ready") is not True:
+            raise ValueError("map tiles must be ready before calibration")
+        scene = payload.get("scene")
+        first, second = payload.get("first"), payload.get("second")
+        if not isinstance(scene, str) or not scene or len(scene) > 256:
+            raise ValueError("choose a valid scene")
+        def anchor(value: object) -> tuple[float, float, float, float]:
+            if not isinstance(value, Mapping):
+                raise TypeError("each calibration anchor must include screenshot and map coordinates")
+            keys = ("frame_x", "frame_y", "map_x", "map_y")
+            numbers = tuple(value.get(key) for key in keys)
+            if any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)) for number in numbers):
+                raise ValueError("calibration anchor coordinates must be finite numbers")
+            return tuple(float(number) for number in numbers)  # type: ignore[arg-type,return-value]
+        transform = fit_two_point_calibration(anchor(first), anchor(second))
+        path = self.map_art_runtime_root() / "cache" / "map-art" / digest / "calibration.json"
+        save_scene_calibration(path, map_sha256=digest, scene=scene, transform=transform, confidence=1.0)
+        return {"scene": scene, "map_sha256": digest, "transform": list(transform), "positioned": True}
 
     def import_operator_map_art(self, body: Any, length: int) -> dict[str, object]:
         if length < 24 or length > 1_073_741_824:
@@ -1107,6 +1315,10 @@ class ControlPlane:
         runtime = self.map_art_runtime_root()
         temporary_root = runtime / "cache" / "map-art"
         temporary_root.mkdir(parents=True, exist_ok=True)
+        required = length * 6 + 512 * 1024 * 1024
+        available = shutil.disk_usage(temporary_root).free
+        if available < required:
+            raise OSError(f"espaço insuficiente: precisa de ~{required // (1024*1024)} MiB, há {available // (1024*1024)} MiB livres")
         fd, name = tempfile.mkstemp(prefix=".import-", suffix=".tmp", dir=temporary_root)
         target = Path(name)
         received = 0
@@ -1127,6 +1339,7 @@ class ControlPlane:
             atomic_json(reference, {"schema_version": 1, "sha256": previous.get("sha256", digest),
                                     "latest_sha256": digest, "source_page": "importado pelo operador",
                                     "attribution": "The Embraced One — hallownest.net; Hollow Knight © Team Cherry"})
+            self._start_map_art_job(source=cached)
             return {"cached": cached.exists(), "sha256": digest, "dimensions": list(dimensions),
                     "reference_changed": changed}
         finally:
