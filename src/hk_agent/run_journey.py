@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import html
+import io
 import itertools
 import json
 import math
@@ -25,6 +26,9 @@ MAX_CAPTURE_COUNT = 32
 MAX_CAPTURE_BYTES = 24 * 1024 * 1024
 MAX_RUNS = 5000
 MAX_DIARY_BYTES = 2 * 1024 * 1024
+MAX_CALIBRATION_THUMBNAILS = 12
+MAX_CALIBRATION_THUMBNAIL_BYTES = 2 * 1024 * 1024
+CALIBRATION_THUMBNAIL_MAX_BYTES = 192 * 1024
 MEDIAFIRE_STABLE_PAGE = "https://www.mediafire.com/file/mo42xgq0f4dw8nx/"
 MAP_USER_AGENT = "VoidLabJourney/1.0 (local operator dashboard; map cache downloader)"
 SCENE_NAMES = {
@@ -214,6 +218,10 @@ class RunDiary:
     _capture_bytes: int = 0
     _new_keys: set[str] = field(default_factory=set)
     _last_map_view: dict[str, Any] = field(default_factory=dict)
+    _scene_spawns: dict[str, tuple[float, float]] = field(default_factory=dict)
+    _scene_farthest: dict[str, float] = field(default_factory=dict)
+    _last_thumbnail_seconds: dict[str, float] = field(default_factory=dict)
+    _exit_capture_scenes: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not 0 < self.sample_interval_seconds:
@@ -226,6 +234,7 @@ class RunDiary:
             "started_unix_ms": self.started_unix_ms,
             "route": [],
             "positions": [],
+            "calibration_points": [],
             "events": [],
             "termination_reason": None,
             "geo_current": None,
@@ -262,6 +271,7 @@ class RunDiary:
         }
         if isinstance(scene, str) and scene:
             if scene != self._last_scene:
+                self._last_sample = -math.inf
                 transition = {"from": self._last_scene, "to": scene, "unix_ms": ts}
                 if isinstance(source_events, list):
                     evidence = next((event for event in source_events
@@ -350,6 +360,7 @@ class RunDiary:
                     for key, value in self._last_map_view.items():
                         self.data["positions"][-1][key] = value
                     self._last_sample = now
+                    self._capture_calibration_point(scene, x, y, now, ts)
         raw_events = source_events
         if isinstance(geo_delta, int) and not isinstance(geo_delta, bool) and geo_delta > 0:
             raw_events = list(raw_events) if isinstance(raw_events, list) else []
@@ -376,6 +387,94 @@ class RunDiary:
                     self._new_keys.add(key)
         self._persist()
         return confirmed
+
+    def _capture_calibration_point(
+        self, scene: str, x: float, y: float, now: float, timestamp_ms: int,
+        *, force_kind: str | None = None,
+    ) -> None:
+        if self.capture_png is None:
+            return
+        points = self.data["calibration_points"]
+        if len(points) >= MAX_CALIBRATION_THUMBNAILS:
+            return
+        spawn = self._scene_spawns.setdefault(scene, (x, y))
+        distance = math.hypot(x - spawn[0], y - spawn[1])
+        prior_farthest = self._scene_farthest.get(scene, -1.0)
+        kind = force_kind or ("spawn" if prior_farthest < 0 else "farthest")
+        if kind == "farthest" and (
+            distance <= prior_farthest
+            or now - self._last_thumbnail_seconds.get(scene, -math.inf) < 30.0
+        ):
+            return
+        self._last_thumbnail_seconds[scene] = now
+        try:
+            payload = self.capture_png()
+            from PIL import Image
+
+            validate_png_header(io.BytesIO(payload))
+            with Image.open(io.BytesIO(payload)) as source:
+                source.load()
+                source.thumbnail((320, 180), Image.Resampling.LANCZOS)
+                output = io.BytesIO()
+                source.convert("RGB").save(output, format="PNG", optimize=True)
+            thumbnail = output.getvalue()
+        except (ImportError, OSError, ValueError, RuntimeError):
+            return
+        current_size = sum(int(point.get("bytes", 0)) for point in points)
+        if len(thumbnail) > CALIBRATION_THUMBNAIL_MAX_BYTES or current_size + len(thumbnail) > MAX_CALIBRATION_THUMBNAIL_BYTES:
+            return
+        if kind == "farthest":
+            old_points = [point for point in points
+                          if point.get("scene") == scene and point.get("kind") == "farthest"]
+            for point in old_points:
+                old_path = (self.campaign_root / str(point.get("capture", ""))).resolve()
+                try:
+                    old_path.relative_to((self.path.parent / f"{self.path.stem}-calibration").resolve())
+                except ValueError:
+                    continue
+                old_path.unlink(missing_ok=True)
+            points[:] = [point for point in points
+                         if not (point.get("scene") == scene and point.get("kind") in {"farthest", "exit"})]
+        directory = self.path.parent / f"{self.path.stem}-calibration"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_scene = "".join(char if char.isalnum() or char in "-_" else "_" for char in scene)[:80]
+        name = f"{safe_scene}-{kind}-{timestamp_ms}.png"
+        target = directory / name
+        target.write_bytes(thumbnail)
+        points.append({"scene": scene, "kind": kind, "x": x, "y": y,
+                       "distance_from_spawn": distance, "unix_ms": timestamp_ms,
+                       "bytes": len(thumbnail),
+                       "capture": target.relative_to(self.campaign_root).as_posix()})
+        self._scene_farthest[scene] = distance
+        self._last_thumbnail_seconds[scene] = now
+
+    def capture_before_exit(self, buttons: Sequence[str], *, monotonic_seconds: float | None = None) -> None:
+        """Save a local reference before an action likely to cross a room boundary."""
+        if self.capture_png is None or not self.data["positions"]:
+            return
+        position = self.data["positions"][-1]
+        scene = position.get("scene")
+        bounds = position.get("scene_bounds")
+        if not isinstance(scene, str) or scene in self._exit_capture_scenes:
+            return
+        if (not isinstance(bounds, (list, tuple)) or len(bounds) != 4
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(float(value)) for value in bounds)):
+            return
+        x, y = position.get("x"), position.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+        left, bottom, right, top = (float(value) for value in bounds)
+        near_exit = any((button == "LEFT" and x <= left + 8)
+                        or (button == "RIGHT" and x >= right - 8)
+                        or (button == "DOWN" and y <= bottom + 8)
+                        or (button == "UP" and y >= top - 8) for button in buttons)
+        if not near_exit:
+            return
+        self._exit_capture_scenes.add(scene)
+        now = time.monotonic() if monotonic_seconds is None else monotonic_seconds
+        self._capture_calibration_point(scene, float(x), float(y), now,
+                                        int(time.time() * 1000), force_kind="exit")
 
     def finish(
         self,
@@ -519,6 +618,7 @@ def _rebuild_progress_locked(campaign_root: Path) -> dict[str, Any]:
                 "termination_reason": run.get("termination_reason"),
                 "route": run.get("route", []),
                 "positions": run.get("positions", [])[-200:],
+                "calibration_points": run.get("calibration_points", [])[-MAX_CALIBRATION_THUMBNAILS:],
                 "events": run.get("events", [])[-200:],
                 "ended_unix_ms": run.get("ended_unix_ms"),
             }

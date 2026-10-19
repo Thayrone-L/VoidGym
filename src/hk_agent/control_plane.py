@@ -1087,14 +1087,14 @@ class ControlPlane:
     def read_journey_capture(self, campaign_id: str, relative_path: str) -> bytes:
         if not _IDENTIFIER.fullmatch(campaign_id):
             raise ValueError("invalid campaign_id")
-        root = (self.runtime_root / "shared" / campaign_id / "journey" / "marcos").resolve(strict=True)
+        root = (self.runtime_root / "shared" / campaign_id / "journey").resolve(strict=True)
         target = (root / relative_path).resolve(strict=True)
         try:
             target.relative_to(root)
         except ValueError as error:
             raise ValueError("capture path is outside the milestone directory") from error
         if target.suffix.lower() != ".png" or not target.is_file() or target.stat().st_size > 24 * 1024 * 1024:
-            raise ValueError("milestone capture is missing or exceeds its limit")
+            raise ValueError("journey capture is missing or exceeds its limit")
         from hk_agent.run_journey import validate_png_header
 
         with target.open("rb") as stream:

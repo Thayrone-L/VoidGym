@@ -137,7 +137,7 @@ internal sealed class OperatorTelemetryState
         if (_recentDeathUnixMs > 0 && now - _recentDeathUnixMs <= 8_000) return "death_respawn";
         string pair = (from + " " + to).ToLowerInvariant();
         foreach (string token in new[] { "dream", "stag", "elevator", "station", "menu", "title" })
-            if (pair.Contains(token, StringComparison.Ordinal)) return token;
+            if (pair.IndexOf(token, StringComparison.Ordinal) >= 0) return token;
         return null;
     }
 

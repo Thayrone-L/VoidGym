@@ -195,6 +195,41 @@ def test_passage_graph_filters_nonspatial_and_fits_cycles_with_median() -> None:
     assert apply_affine(calibrations["C"]["affine"], 0, 0) == pytest.approx((160, 200))
 
 
+def test_calibration_thumbnails_are_small_local_and_count_bounded(tmp_path: Path) -> None:
+    from PIL import Image
+
+    source = io.BytesIO()
+    Image.new("RGB", (640, 360), (20, 80, 120)).save(source, format="PNG")
+    png = source.getvalue()
+    capture_count = 0
+
+    def capture() -> bytes:
+        nonlocal capture_count
+        capture_count += 1
+        return png
+
+    root = tmp_path / "campaign" / "journey"
+    diary = RunDiary(root / "actor-a" / "episode-1", root, "actor-a", 1, capture_png=capture)
+    diary.observe({"scene_name": "Tutorial_01", "x": 0, "y": 0,
+                   "scene_bounds": [0, 0, 30, 20]}, monotonic_seconds=0)
+    diary.observe({"scene_name": "Tutorial_01", "x": 25, "y": 0,
+                   "scene_bounds": [0, 0, 30, 20]}, monotonic_seconds=30)
+    diary.capture_before_exit(("RIGHT",), monotonic_seconds=31)
+    for index in range(20):
+        diary.observe({"scene_name": f"Room_{index}", "x": index, "y": 0}, monotonic_seconds=31 + index)
+    points = diary.data["calibration_points"]
+    assert len(points) <= 12
+    assert {point["kind"] for point in points if point["scene"] == "Tutorial_01"} == {
+        "spawn", "farthest", "exit"
+    }
+    for point in points:
+        image_path = root / point["capture"]
+        assert image_path.is_file() and image_path.stat().st_size <= 192 * 1024
+        with Image.open(image_path) as image:
+            assert image.width <= 320 and image.height <= 180
+    assert capture_count <= 12
+
+
 def test_scene_transform_is_versioned_by_map_sha_and_low_confidence_is_unplaced(
     tmp_path: Path,
 ) -> None:

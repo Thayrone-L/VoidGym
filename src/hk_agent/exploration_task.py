@@ -604,6 +604,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         audit = action_mask_audit(decision, self.mask_unavailable_count)
         template = SCENE_CHANGE_ACTION_TEMPLATES[action]
         lease = template.resolve_lease_ms(self.environment.lease_ms)
+        if self._diary is not None:
+            self._diary.capture_before_exit(template.buttons)
         if isinstance(self.environment, HollowKnightEnv):
             observation, _, terminated, truncated, base = self.environment.step(
                 template.raw_action_index, lease_ms=lease, action_audit=audit

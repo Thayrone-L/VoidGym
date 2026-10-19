@@ -173,6 +173,7 @@ class SupervisorEnvironmentBackend:
             raise RuntimeError("supervisor event loop did not start")
         self._bridge: AcceptedBridge | None = None
         self._episode_id: str | None = None
+        self._spawn_candidate_png: bytes | None = None
         self._closed = False
         try:
             self._submit(self._supervisor.start(), timeout=self._command_timeout)
@@ -217,6 +218,7 @@ class SupervisorEnvironmentBackend:
             self._episode_id = None
 
             episode_id = str(uuid.uuid4())
+            self._spawn_candidate_png = None
             if self._reset_process is not None:
                 try:
                     self._invoke_process_callback(
@@ -260,7 +262,7 @@ class SupervisorEnvironmentBackend:
                         if self._menu_bootstrap_plan_provider is None
                         else build_readiness_verifier(menu_plan)
                     )
-                    self._submit(
+                    bootstrap_report = self._submit(
                         run_menu_bootstrap(
                             menu_plan,
                             supervisor=self._supervisor,
@@ -272,6 +274,15 @@ class SupervisorEnvironmentBackend:
                         ),
                         timeout=menu_plan.timeout_seconds + 0.5,
                     )
+                    captures = getattr(bootstrap_report, "captures", ())
+                    candidate = next((row for row in captures
+                                      if isinstance(row, dict) and row.get("label") == "ready-candidate"), None)
+                    candidate_path = candidate.get("path") if isinstance(candidate, dict) else None
+                    if isinstance(candidate_path, str):
+                        candidate_file = Path(candidate_path).resolve(strict=True)
+                        artifact_root = self._menu_bootstrap_artifact_root.resolve(strict=True)
+                        candidate_file.relative_to(artifact_root)
+                        self._spawn_candidate_png = candidate_file.read_bytes()
                 self._submit(
                     self._supervisor.begin_episode(
                         episode_id,
@@ -315,6 +326,9 @@ class SupervisorEnvironmentBackend:
     def capture_png(self) -> bytes:
         """Capture an on-demand operator milestone, validating the PNG artifact path."""
         with self._operation_lock:
+            if self._spawn_candidate_png is not None:
+                payload, self._spawn_candidate_png = self._spawn_candidate_png, None
+                return payload
             bridge, episode_id = self._require_episode()
             frame = self._submit(
                 self._supervisor.capture_once(timeout=self._command_timeout, bridge=bridge,

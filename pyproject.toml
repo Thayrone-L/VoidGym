@@ -9,7 +9,7 @@ description = "Local, experience-driven Hollow Knight agent environment"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = ["Pillow>=10,<13"]
 
 [project.urls]
 Homepage = "https://github.com/Thayrone-L/VoidGym"
