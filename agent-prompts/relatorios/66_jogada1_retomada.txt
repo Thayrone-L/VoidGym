@@ -1,0 +1,37 @@
+Relatório 66 — retomada da jogada-1
+Data: 2026-10-19 (horários UTC)
+
+Diagnóstico e correções
+- O defeito de retenção removia artefatos de política ainda apontados por manifests de geração. A limpeza agora remove ponteiro e artefato juntos e protege a geração atual, as duas anteriores e a geração referenciada pelo último checkpoint.
+- Publicação de política tornou-se transacional: falhas deixam erro claro e não mantêm estado inconsistente. A retomada valida checkpoints, escolhe o último válido, publica geração nova e rejeita rollouts de IDs de ator aposentados.
+- O ControlPlane agora supervisiona/reinicia atores perdidos (limite de 3/h persistido) e o painel informa os reinícios automáticos. A ordem de inicialização foi ajustada para iniciar atores antes do learner.
+- A revisão encontrou falhas operacionais dos processos de ator por desconexão do Bridge. O relançamento automático recuperou os slots. Não há evidência nos logs dessa janela de erro novo da DLL/Mod; os registros do worker apontaram ConnectionError: Bridge disconnected e encerramento seguro.
+
+Validação e publicação
+- `ruff check src tests`: passou.
+- `mypy src`: passou.
+- Suíte pytest completa: 632 passed, 2 skipped, 3 warnings, 8 subtests em 100,30 s.
+- Commit exigido: `e2be1e9` — `Fix shared policy retention and resume; relaunch lost actors`.
+- Commit adicional do alerta de reinício: `686e237` — `Show supervised actor restarts in panel`.
+- Push realizado para `codex/parallel-instances-isolation`; PR #8 permanece OPEN: https://github.com/Thayrone-L/VoidGym/pull/8. HEAD verificado antes deste relatório: `686e23733267c4d29bdadc7d841864c13e2233b9`.
+
+Proteção e retomada
+- Cópia da política anterior preservada em `C:\Users\thayr\Games\HollowKnight-AI\runtime\shared\policy-backup-66-20261019-191719`.
+- O checkpoint inválido/extra da rodada 16 foi preservado em `C:\Users\thayr\Games\HollowKnight-AI\runtime\shared\jogada-1\checkpoint-backup-66\round-00000016.zip`.
+- A primeira retomada usou o checkpoint válido `round-00000015.zip`, mesma campanha `jogada-1`, saves persistentes e dois atores. A tentativa intermediária v8 teve timeout de straggler 45 s, insuficiente para rollouts que levam mais de 100 s; foi parada cooperativamente com `saves_restored:true`. O spec original foi salvo em `C:\VoidGym\artifacts\control-plane\campaign-backups-66\jogada-1-v0008-before-straggler-300.json`.
+- A v9 retomou a mesma campanha/saves do checkpoint válido da rodada 24, elevando `straggler_timeout_seconds` para 300. O início v9 foi 2026-10-19 23:11:42 UTC; a janela de soak com os dois atores disponíveis começou 23:15:30 UTC e excedeu 15 minutos.
+
+Soak observada
+- Rodadas 24–33: 10 rodadas consecutivas com `actors_received=[0,1]`, sem restart novo de ator e sem erro novo de política. Timesteps de 18.432 para 28.672 (+10.240). Checkpoint 34 foi gravado durante a coleta seguinte.
+- IDs mantidos durante a janela: slot 0 `launch-20261019T231141-d474fa`; slot 1 `launch-20261019T231142-098917`; learner `launch-20261019T231142-35f998`. No fim, os três processos estavam ativos (`active_count=3`), learner `WAITING` por rollouts, atores `WAITING_POLICY`, heartbeats atualizados e learner global `RUNNING`.
+- O learner contabilizava 4 rollouts rejeitados antigos, todos documentados em `rejected.jsonl` como pertencentes a IDs de atores aposentados das tentativas anteriores; o número permaneceu estável durante a v9. Não são falhas de política da v9.
+- O manifest conservava no campo `failure` o texto legado `TimeoutError: all shared actor slots are unavailable before the first rollout`, apesar do estado atual `RUNNING`, checkpoints novos, heartbeats atuais e rounds/timesteps avançando. Esse campo não foi apagado em runtime para evitar mutação manual enquanto a campanha está ativa; deve ser interpretado como histórico herdado, não como falha atual.
+- O painel permaneceu aberto em `http://127.0.0.1:8766/` e a campanha ficou rodando, conforme solicitado.
+
+Vazão e alerta de farm
+- Nas 10 rodadas pareadas 24–33: espera média por rollouts 127,4 s (mediana 119,9 s), treino médio 14,9 s, espera de straggler média 6,1 s.
+- Telemetria de ator nas mesmas 10 rodadas: coleta média 112,0 s no slot 0 e 111,5 s no slot 1; publicação ~3,6/3,8 s; espera por política ~16,9/16,3 s. A coleta/jogo no Bridge domina o tempo, não o treinamento da LSTM/PPO; o straggler timeout de 45 s não comportava essa latência.
+- O alerta agregado não registra o componente. Reconstrução das janelas de transições: o primeiro alerta observado foi exclusivamente `novelty` (100% da recompensa positiva na janela). Janelas posteriores também excederam 60% para `confirmed_enemy_kills` (entre ~60,6% e ~70,2% nos exemplos identificados). A pontuação não foi alterada.
+
+Estado final
+A campanha v9 continua ativa com o painel aberto. Não houve parada final nem restauração manual de saves; a última parada cooperativa foi a da v8 e confirmou saves restaurados.
