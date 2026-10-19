@@ -76,6 +76,54 @@ def test_map_matching_prefers_capture_with_scene_bounds() -> None:
     assert _preferred_map_capture([old, newest_without_bounds, bounded]) == bounded
 
 
+def test_operator_snapshot_surfaces_persisted_actor_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = ControlPlane(_project(tmp_path), runtime_root=tmp_path / "runtime")
+    shared = tmp_path / "runtime" / "shared" / "campaign"
+    (shared / "actors").mkdir(parents=True)
+    now = time.time_ns()
+    (shared / "manifest.json").write_text(json.dumps({"status": "RUNNING"}), "utf-8")
+    (shared / "actors" / "slot-1.json").write_text(
+        json.dumps({"slot": 1, "status": "STARTING", "restart_times_unix_ns": []}),
+        "utf-8",
+    )
+    (shared / "actor-restarts.jsonl").write_text(
+        json.dumps({
+            "time_unix_ns": now,
+            "shared_group": "campaign-v0001",
+            "old_launch_id": "actor-old",
+            "new_launch_id": "actor-new",
+            "restart_number_in_hour": 1,
+        }) + "\n",
+        "utf-8",
+    )
+    active = [
+        {"campaign_id": "campaign", "role": "learner", "shared_group": "campaign-v0001",
+         "shared_root": str(shared), "status": "RUNNING", "started_unix_ns": now},
+        {"campaign_id": "campaign", "role": "actor", "shared_group": "campaign-v0001",
+         "resources": {"slot_id": 1}, "status": "RUNNING", "started_unix_ns": now},
+    ]
+    monkeypatch.setattr(control, "status", lambda: {"active_launches": active, "capacity": 2})
+    monkeypatch.setattr(control, "_ensure_auto_reports", lambda _status: None)
+    monkeypatch.setattr(control, "list_campaigns", lambda: [{
+        "campaign_id": "campaign", "campaign_type": "exploration_training",
+        "reward_version": "explore_v4", "shared_learner": True,
+    }])
+    monkeypatch.setattr(control, "_campaign_scene_discoveries", lambda _campaign: [])
+    monkeypatch.setattr(control, "_campaign_launch_records", lambda _campaign: [
+        {"campaign_id": "campaign", "launch_id": "actor-old", "resources": {"slot_id": 1}},
+        {"campaign_id": "campaign", "launch_id": "actor-new", "resources": {"slot_id": 1}},
+    ])
+    monkeypatch.setattr(control, "map_art_status", lambda: {"cached": False})
+
+    snapshot = control.operator_snapshot()
+
+    assert "Instância 1 foi relançada automaticamente (1/3 nesta hora)" in snapshot["alerts"]
+    assert snapshot["instance_restarts_last_hour"] == 1
+    assert snapshot["instances"][0]["restarts_last_hour"] == 1
+
+
 def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Path) -> None:
     payload = _payload("exploration_training")
     payload["reward_version"] = "explore_v2"

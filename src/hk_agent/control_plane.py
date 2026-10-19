@@ -100,6 +100,22 @@ def _preferred_map_capture(rows: Sequence[tuple[Path, object, int]]) -> tuple[Pa
     return max(bounded or rows, key=lambda row: row[2])
 
 
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text("utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignSpec:
     campaign_id: str
@@ -958,6 +974,46 @@ class ControlPlane:
                     detail = actor.get("auto_relaunch_error")
                     suffix = f": {detail}" if isinstance(detail, str) and detail else ""
                     alerts.append(f"Instância {actor.get('slot')} falhou e precisa de atenção{suffix}")
+            current_group = next(
+                (str(row["shared_group"]) for row in active_records
+                 if isinstance(row.get("shared_group"), str)),
+                None,
+            )
+            if current_group is not None:
+                cutoff_ns = now_ns - 3_600_000_000_000
+                restart_records = [
+                    row for row in _read_jsonl_records(shared_root_for_slots / "actor-restarts.jsonl")
+                    if row.get("shared_group") == current_group
+                    and isinstance(row.get("time_unix_ns"), int)
+                    and row["time_unix_ns"] >= cutoff_ns
+                ]
+                launch_by_id = {
+                    str(row.get("launch_id")): row
+                    for row in self._campaign_launch_records(campaign_id or "")
+                    if isinstance(row.get("launch_id"), str)
+                }
+                slot_counts: dict[int, int] = {}
+                for restart in restart_records:
+                    old_id = restart.get("old_launch_id")
+                    old_launch = launch_by_id.get(old_id) if isinstance(old_id, str) else None
+                    resources = old_launch.get("resources") if isinstance(old_launch, Mapping) else None
+                    slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+                    if isinstance(slot, int) and not isinstance(slot, bool):
+                        slot_counts[slot] = slot_counts.get(slot, 0) + 1
+                if slot_counts:
+                    restart_count = max(restart_count, sum(slot_counts.values()))
+                    for slot, count in slot_counts.items():
+                        instance = next((row for row in instance_rows if row.get("slot") == slot), None)
+                        if instance is not None:
+                            existing_count = instance.get("restarts_last_hour", 0)
+                            previous_count = (
+                                existing_count if isinstance(existing_count, int)
+                                and not isinstance(existing_count, bool) else 0
+                            )
+                            instance["restarts_last_hour"] = max(previous_count, count)
+                        alert = f"Instância {slot} foi relançada automaticamente ({count}/3 nesta hora)"
+                        if alert not in alerts:
+                            alerts.append(alert)
         if "same_scene_action_over_40_percent_without_novelty" in alerts:
             alerts[alerts.index("same_scene_action_over_40_percent_without_novelty")] = "A IA parece estar repetindo o mesmo lugar"
         raw_capacity = status.get("capacity", 1)
