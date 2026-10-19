@@ -55,7 +55,7 @@ O fingerprint muda com a versão do contrato e a assinatura do espaço de observ
 
 ## Tutoriais, lugares e objetivos (explore_v4 schema 6)
 
-O bridge libera `INTERACT` (UP curto) em toda situação. `MENU_UP/DOWN/LEFT/RIGHT/SUBMIT/CANCEL` só ficam disponíveis com diálogo ou menu ativo; essas ações usam UP/DOWN/LEFT/RIGHT/JUMP/DASH. Durante diálogo/menu, ações de gameplay ficam mascaradas. O estado vem de `DialogueBox.currentConversation` e do pause/menu ativo do jogo.
+O bridge libera `INTERACT` (UP curto) em toda situação. `MENU_UP/DOWN/LEFT/RIGHT/SUBMIT/CANCEL` só ficam disponíveis com diálogo ou menu ativo; submit/cancel usam as bindings próprias do menu. Durante diálogo/menu, ações de gameplay ficam mascaradas. O estado vem de `DialogueBox.currentConversation` e do pause/menu ativo do jogo.
 
 A política guarda lugares especiais somente quando um componente está dentro da câmera e sua posição pode ser convertida para a grade já visitada: banco, estação de besouro, loja e cartógrafo. O descritor de cada tipo começa em zero e é preenchido no primeiro encontro; a grade inclui apenas coordenadas já vistas. Preços entram na memória só enquanto itens de loja estão ativos na tela. A lista não enumera pontos futuros.
 
@@ -69,4 +69,12 @@ Cada frame pode observar até seis inimigos dentro da câmera, ordenados pela di
 
 Os IDs são hashes estáveis de nomes internos normalizados e nunca incluem o nome no vetor. A tabela de nomes amigáveis é usada apenas pelo painel. Os preços permanecem limitados ao que foi visto em lojas abertas. O vetor bestiário tem seis slots de 13 valores; o espaço de observação e fingerprint mudam, com warm-start apenas dos tensores compatíveis da imagem.
 
-A persistência pessoal passou ao schema 3 e o contrato de exploração ao schema 7. O escritor usa arquivo temporário exclusivo, flush/fsync e retries curtos para colisões transitórias de substituição no Windows. Um learner antigo só pode fazer warm-start dos tensores visuais cujos nomes e formas coincidirem.
+A persistência pessoal está no schema 4 e o contrato de exploração no schema 8, mantendo leitura dos schemas anteriores. O escritor usa arquivo temporário exclusivo, flush/fsync e retries curtos para colisões transitórias de substituição no Windows. Um learner antigo só pode fazer warm-start dos tensores visuais cujos nomes e formas coincidirem.
+
+## Loadouts de amuletos no banco (explore_v4 schema 8)
+
+`OPEN_CHARMS` envia PAUSE e só fica disponível quando `at_bench` é verdadeiro e não há outro menu ou diálogo aberto. Com menu ativo, a máscara libera somente NOOP, INTERACT e os controles de menu. O bridge reporta `charm_menu_open`, `charm_cursor`, o bitmask de 40 amuletos equipados e entalhes usados/total; a observação de conhecimento guarda flags de equipados somente para itens adquiridos e acrescenta os entalhes normalizados.
+
+`PlayerKnowledge.owned_charm_loadouts()` gera candidatos a partir de `gotCharm_N` e custos de entalhe observados no save, limitado à capacidade atual e a 256 combinações. O macro `build_charm_menu_plan` aceita somente banco sentado e página de amuletos aberta; cada pulso requer uma captura PNG calibrada e o passo final exige a imagem de gameplay. A política escolhe a combinação; o macro só navega, confirma, verifica cada frame e sai com CANCEL. Se um frame não bater, o executor libera todos os botões e aborta.
+
+Trocar amuletos não gera recompensa. O diário guarda segmentos por sala e loadout, com frames, Geo, dano, inimigos derrotados e mortes observados; o painel os mostra como resultados ocorridos durante cada trecho, sem afirmar que o loadout causou o resultado.

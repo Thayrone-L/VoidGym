@@ -40,6 +40,25 @@ def test_charm_effect_descriptor_and_cost_are_visible_only_after_acquisition() -
     assert np.all(np.isfinite(block))
 
 
+def test_equipped_charm_observation_and_notches_require_acquisition() -> None:
+    knowledge = PlayerKnowledge()
+    knowledge.update({"operator_telemetry": {
+        "scene_name": "RoomA", "scene_bounds": [0, 0, 16, 9], "x": 8, "y": 4,
+        "progress_flags": {"gotCharm_1": True},
+        "charm_costs": {"gotCharm_1": 2, "gotCharm_2": 1},
+        "equipped_charms": {"gotCharm_1": True, "gotCharm_2": True},
+        "charm_notches_used": 2, "charm_notches_total": 3,
+    }})
+    assert knowledge.equipped_charms == {"gotCharm_1"}
+    assert knowledge.owned_charm_costs() == {"gotCharm_1": 2}
+    assert knowledge.owned_charm_loadouts() == ((), ("gotCharm_1",))
+    assert knowledge.charm_notches_used == 2 and knowledge.charm_notches_total == 3
+    assert np.allclose(knowledge.vector()[-42:-2].sum(), 1)
+    restored = PlayerKnowledge.from_payload(knowledge.to_payload())
+    assert restored.equipped_charms == knowledge.equipped_charms
+    assert restored.charm_notches_used == 2 and restored.charm_notches_total == 3
+
+
 def test_map_only_contains_cells_lived_and_exits_seen() -> None:
     knowledge = PlayerKnowledge()
     knowledge.update({"operator_telemetry": {

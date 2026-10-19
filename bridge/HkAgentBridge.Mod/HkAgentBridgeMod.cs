@@ -195,14 +195,20 @@ public sealed class HkAgentBridgeMod : Mod
             catch (Exception) { }
         }
         var charmCosts = new System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal);
+        var equippedCharms = new System.Collections.Generic.Dictionary<string, bool>(StringComparer.Ordinal);
         for (int charmId = 1; charmId <= 40; charmId++)
         {
             string flag = "gotCharm_" + charmId.ToString(CultureInfo.InvariantCulture);
             if (SafeProgressFlag(playerData, flag))
                 charmCosts[flag] = Math.Min(6, SafeGetInt(playerData, "charmCost_" + charmId.ToString(CultureInfo.InvariantCulture)));
+            equippedCharms["equippedCharm_" + charmId.ToString(CultureInfo.InvariantCulture)] =
+                SafeProgressFlag(playerData, "equippedCharm_" + charmId.ToString(CultureInfo.InvariantCulture));
         }
+        BridgeUiState ui = VisualCaptureBackend.ReadUiState();
         _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags,
-            playerData.GetBool("atBench"), charmCosts);
+            playerData.GetBool("atBench"), charmCosts, equippedCharms,
+            SafeGetInt(playerData, "charmSlotsFilled"), SafeGetInt(playerData, "charmSlots"),
+            ui.CharmMenuOpen, ui.CharmCursor);
         if (!scene.name.StartsWith("Menu_", StringComparison.Ordinal) && hero != null && camera != null &&
             Interlocked.CompareExchange(ref _operatorTelemetryDiagnosticLogged, 1, 0) == 0)
         {
@@ -279,6 +285,8 @@ public sealed class HkAgentBridgeMod : Mod
         BridgeUiState ui = VisualCaptureBackend.ReadUiState();
         snapshot["dialog_open"] = ui.DialogOpen;
         snapshot["menu_open"] = ui.MenuOpen;
+        snapshot["charm_menu_open"] = ui.CharmMenuOpen;
+        snapshot["charm_cursor"] = ui.CharmCursor;
         snapshot["dialogue_id"] = ui.DialogueId;
         snapshot["visible_places"] = ReadVisiblePlaces();
         snapshot["visible_enemies"] = ReadVisibleEnemies();

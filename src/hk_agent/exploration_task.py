@@ -676,6 +676,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             record = dict(telemetry) if isinstance(telemetry, dict) else {}
             record.setdefault("scene_name", base.get("scene_name"))
             record["geo_gained_since_last_frame"] = base.get("geo_gained_since_last_frame", 0)
+            record["enemy_kills_since_last_frame"] = base.get("enemy_kills_since_last_frame", 0)
+            record["hp_lost_since_last_frame"] = base.get("hp_lost_since_last_frame", 0)
             if "milestone_events_since_last_frame" in base:
                 raw_events = base["milestone_events_since_last_frame"]
                 record["events"] = list(raw_events) if isinstance(raw_events, list) else []
@@ -1274,12 +1276,12 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self.config.reward_version
         ]
         if self.config.reward_version == "explore_v4":
-            schema_version = 7
+            schema_version = 8
         return {
             "task_contract_schema_version": schema_version,
             "reward_version": self.config.reward_version,
             "legal_action_mask": {
-                "version": "action_availability_v3" if schema_version >= 6 else "action_availability_v2" if schema_version == 5 else "action_availability_v1",
+                "version": "action_availability_v4" if schema_version >= 8 else "action_availability_v3" if schema_version >= 6 else "action_availability_v2" if schema_version == 5 else "action_availability_v1",
                 "source": "frame_action_availability",
             },
             "action_names": list(self._action_names),
@@ -1291,8 +1293,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 if key != "reward_version"
                 and (key != "tutorial_hint_level" or self.config.reward_version == "explore_v4")
             },
-            "observation_version": "pixels_action_history_player_knowledge_bestiary_v1" if schema_version == 7 else "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
-            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6, 7} else ["pixels", "applied_action_history"],
+            "observation_version": "pixels_action_history_player_knowledge_charms_v1" if schema_version >= 8 else "pixels_action_history_player_knowledge_bestiary_v1" if schema_version == 7 else "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6, 7, 8} else ["pixels", "applied_action_history"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

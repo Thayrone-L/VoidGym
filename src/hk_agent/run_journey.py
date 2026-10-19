@@ -239,6 +239,7 @@ class RunDiary:
             "termination_reason": None,
             "geo_current": None,
             "geo_collected": 0,
+            "charm_loadouts": [],
         }
         self.path = self.path.with_suffix(".json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +265,44 @@ class RunDiary:
         geo_current = telemetry.get("geo_current")
         if isinstance(geo_current, int) and not isinstance(geo_current, bool) and geo_current >= 0:
             self.data["geo_current"] = geo_current
+        loadout_mask = telemetry.get("equipped_charm_mask")
+        notch_used = telemetry.get("charm_notches_used")
+        notch_total = telemetry.get("charm_notches_total")
+        if (isinstance(loadout_mask, int) and not isinstance(loadout_mask, bool)
+                and 0 <= loadout_mask < (1 << 40)
+                and isinstance(notch_used, int) and not isinstance(notch_used, bool)
+                and isinstance(notch_total, int) and not isinstance(notch_total, bool)
+                and 0 <= notch_used <= 12 and 0 <= notch_total <= 12):
+            loadouts = self.data["charm_loadouts"]
+            loadout = {"scene": scene if isinstance(scene, str) else None,
+                       "equipped_mask": loadout_mask, "notches_used": notch_used,
+                       "notches_total": notch_total}
+            changed = not loadouts or any(
+                loadouts[-1][key] != loadout[key]
+                for key in ("scene", "equipped_mask", "notches_used", "notches_total")
+            )
+            active_segment = not changed
+            if changed and len(loadouts) < 256:
+                loadouts.append({**loadout, "unix_ms": ts, "frames": 0,
+                                 "geo_gained": 0, "damage_taken": 0,
+                                 "enemy_kills": 0, "deaths": 0})
+                active_segment = True
+            if loadouts and active_segment:
+                segment = loadouts[-1]
+                segment["frames"] = min(1_000_000, int(segment["frames"]) + 1)
+                for field_name, telemetry_name in (
+                    ("geo_gained", "geo_gained_since_last_frame"),
+                    ("damage_taken", "hp_lost_since_last_frame"),
+                    ("enemy_kills", "enemy_kills_since_last_frame"),
+                ):
+                    amount = telemetry.get(telemetry_name, 0)
+                    if isinstance(amount, int) and not isinstance(amount, bool) and amount > 0:
+                        segment[field_name] = min(1_000_000, int(segment[field_name]) + amount)
+                if isinstance(source_events, list) and any(
+                    isinstance(event, Mapping) and event.get("category") == "death"
+                    for event in source_events[:64]
+                ):
+                    segment["deaths"] = min(1_000_000, int(segment["deaths"]) + 1)
         self._last_map_view = {
             key: telemetry[key]
             for key in ("camera_x", "camera_y", "scene_bounds")
@@ -611,6 +650,10 @@ def _rebuild_progress_locked(campaign_root: Path) -> dict[str, Any]:
                 "deaths": run_deaths,
                 "geo_current": run.get("geo_current"),
                 "geo_collected": run.get("geo_collected", 0),
+                "charm_loadouts": (
+                    run.get("charm_loadouts", [])[-256:]
+                    if isinstance(run.get("charm_loadouts", []), list) else []
+                ),
                 "grubs": categories["grub"],
                 "bosses": categories["boss"],
                 "items": categories["item"],

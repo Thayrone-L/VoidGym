@@ -88,8 +88,9 @@ PLAYER_INTERACTION_ACTIONS: tuple[TemporalActionTemplate, ...] = (
     TemporalActionTemplate("MENU_DOWN", ("DOWN",), "tap"),
     TemporalActionTemplate("MENU_LEFT", ("LEFT",), "tap"),
     TemporalActionTemplate("MENU_RIGHT", ("RIGHT",), "tap"),
-    TemporalActionTemplate("MENU_SUBMIT", ("JUMP",), "tap"),
-    TemporalActionTemplate("MENU_CANCEL", ("DASH",), "tap"),
+    TemporalActionTemplate("MENU_SUBMIT", ("MENU_SUBMIT",), "tap"),
+    TemporalActionTemplate("MENU_CANCEL", ("MENU_CANCEL",), "tap"),
+    TemporalActionTemplate("OPEN_CHARMS", ("PAUSE",), "tap"),
 )
 
 

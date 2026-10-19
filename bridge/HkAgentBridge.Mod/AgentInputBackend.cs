@@ -26,6 +26,9 @@ internal sealed class AgentInputBackend : IDisposable
             ["CAST"] = 1 << 7,
             ["SUPER_DASH"] = 1 << 8,
             ["DREAM_NAIL"] = 1 << 9,
+            ["PAUSE"] = 1 << 10,
+            ["MENU_SUBMIT"] = 1 << 11,
+            ["MENU_CANCEL"] = 1 << 12,
         };
 
     private readonly Action<string> _log;
@@ -342,7 +345,7 @@ internal sealed class AgentInputBackend : IDisposable
             // Hollow Knight handles that promotion by resetting/remapping inputActions,
             // which would remove the agent's menu bindings before EventSystem reads them.
             Passive = true;
-            int controlCount = ButtonMasks.Count + MenuActionPolicy.ButtonCount;
+            int controlCount = Math.Max(ButtonMasks.Count, 10 + MenuActionPolicy.ButtonCount);
             for (int index = 0; index < controlCount; index++)
             {
                 InputControlType control =
@@ -364,8 +367,15 @@ internal sealed class AgentInputBackend : IDisposable
             }
             for (int index = 0; index < ButtonMasks.Count; index++)
             {
-                InputControlType control =
-                    (InputControlType)((int)InputControlType.Button0 + index);
+                // The gameplay pause token shares bit 10 in the wire mask, but
+                // must target Hollow Knight's dedicated pause binding at Button16.
+                InputControlType control = index switch
+                {
+                    10 => InputControlType.Button16,
+                    11 => InputControlType.Button14,
+                    12 => InputControlType.Button15,
+                    _ => (InputControlType)((int)InputControlType.Button0 + index),
+                };
                 UpdateWithState(
                     control,
                     (state.GameplayMask & (1 << index)) != 0,

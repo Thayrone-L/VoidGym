@@ -87,6 +87,35 @@ def test_diary_uses_camera_when_hero_is_outside_scene_bounds_and_records_geo_eve
     assert diary.data["events"][0]["confirmed"] is True
 
 
+def test_charm_loadout_segments_accumulate_observed_run_metrics_and_reach_panel_summary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "campaign"
+    diary = RunDiary(root / "actor-1" / "episode-1", root, "actor-1", 1)
+    common = {
+        "scene_name": "Tutorial_01",
+        "equipped_charm_mask": 5,
+        "charm_notches_used": 2,
+        "charm_notches_total": 3,
+    }
+    diary.observe({**common, "geo_gained_since_last_frame": 2,
+                   "hp_lost_since_last_frame": 1, "enemy_kills_since_last_frame": 1},
+                  monotonic_seconds=0)
+    diary.observe({**common, "geo_gained_since_last_frame": 3},
+                  monotonic_seconds=0.5)
+    diary.observe({**common, "equipped_charm_mask": 8,
+                   "charm_notches_used": 1, "geo_gained_since_last_frame": 1},
+                  monotonic_seconds=1)
+    diary.finish("time_limit")
+    index = rebuild_progress(root)
+    rows = index["runs"][0]["charm_loadouts"]
+    assert len(rows) == 2
+    assert rows[0]["equipped_mask"] == 5
+    assert rows[0]["frames"] == 2 and rows[0]["geo_gained"] == 5
+    assert rows[0]["damage_taken"] == 1 and rows[0]["enemy_kills"] == 1
+    assert rows[1]["equipped_mask"] == 8 and rows[1]["geo_gained"] == 1
+
+
 def test_atomic_json_retries_transient_windows_replace_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

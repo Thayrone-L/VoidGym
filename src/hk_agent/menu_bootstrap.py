@@ -102,8 +102,8 @@ class MenuBootstrapPlan:
         raw_steps = value.get("steps")
         if not isinstance(plan_id, str) or not plan_id or len(plan_id) > 128:
             raise ValueError("plan_id must be a short non-empty string")
-        if not isinstance(raw_steps, list) or not 1 <= len(raw_steps) <= 16:
-            raise ValueError("steps must contain between 1 and 16 menu actions")
+        if not isinstance(raw_steps, list) or not 1 <= len(raw_steps) <= 128:
+            raise ValueError("steps must contain between 1 and 128 menu actions")
         steps = tuple(MenuBootstrapStep.from_mapping(item, i, path.parent) for i, item in enumerate(raw_steps))
         initial = _bounded_number(value.get("initial_wait_seconds", 5.0), "initial_wait_seconds", 30)
         final = _bounded_number(value.get("final_wait_seconds", 5.0), "final_wait_seconds", 180)

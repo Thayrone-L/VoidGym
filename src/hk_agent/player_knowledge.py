@@ -85,6 +85,9 @@ class PlayerKnowledge:
     last_cell: tuple[int, int] | None = None
     known_flags: dict[str, bool] = field(default_factory=dict)
     charm_costs: dict[str, int] = field(default_factory=dict)
+    equipped_charms: set[str] = field(default_factory=set)
+    charm_notches_used: int = 0
+    charm_notches_total: int = 0
     skill_epoch: int = 0
     shop_prices: dict[str, int] = field(default_factory=dict)
     special_places: dict[str, dict[str, set[tuple[int, int]]]] = field(default_factory=dict)
@@ -98,10 +101,28 @@ class PlayerKnowledge:
     new_events: list[dict[str, Any]] = field(default_factory=list)
     bestiary: BestiaryMemory = field(default_factory=BestiaryMemory)
 
+    def owned_charm_costs(self) -> dict[str, int]:
+        """Return only acquired charms whose cost has been observed from the game."""
+        return {
+            flag: self.charm_costs[flag]
+            for flag in sorted(CHARM_FLAG_NAMES)
+            if self.known_flags.get(flag, False) and flag in self.charm_costs
+        }
+
+    def owned_charm_loadouts(self, *, max_loadouts: int = 256) -> tuple[tuple[str, ...], ...]:
+        """Policy candidates constrained to acquired charms and current slot capacity."""
+        from hk_agent.charm_build_planner import enumerate_owned_loadouts
+
+        return enumerate_owned_loadouts(
+            self.owned_charm_costs(),
+            notch_capacity=self.charm_notches_total,
+            max_loadouts=max_loadouts,
+        )
+
     @classmethod
     def from_payload(cls, value: object) -> PlayerKnowledge:
         memory = cls()
-        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3, 4}:
             return memory
         memory.bestiary = BestiaryMemory.from_payload(value)
         flags, visited, exits, points = (value.get(key) for key in ("flags", "visited", "exits", "points"))
@@ -116,6 +137,12 @@ class PlayerKnowledge:
                 key: cost for key, cost in costs.items()
                 if key in CHARM_FLAG_NAMES and isinstance(cost, int) and not isinstance(cost, bool) and 0 <= cost <= 6
             }
+        equipped = value.get("equipped_charms")
+        if isinstance(equipped, list):
+            memory.equipped_charms = {name for name in equipped if isinstance(name, str) and name in CHARM_FLAG_NAMES}
+        used, total = value.get("charm_notches_used", 0), value.get("charm_notches_total", 0)
+        if isinstance(used, int) and not isinstance(used, bool) and isinstance(total, int) and not isinstance(total, bool) and 0 <= used <= total <= 12:
+            memory.charm_notches_used, memory.charm_notches_total = used, total
         epoch = value.get("skill_epoch", 0)
         memory.skill_epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
         for field_name, allowed in (
@@ -193,9 +220,12 @@ class PlayerKnowledge:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "flags": dict(self.known_flags),
             "charm_costs": dict(self.charm_costs),
+            "equipped_charms": sorted(self.equipped_charms),
+            "charm_notches_used": self.charm_notches_used,
+            "charm_notches_total": self.charm_notches_total,
             "visited": {room: [list(cell) for cell in sorted(cells)[:144]] for room, cells in sorted(self.visited.items())[:256]},
             "exits": {room: [list(cell) for cell in sorted(cells)[:8]] for room, cells in sorted(self.exits.items())[:256]},
             "points": {room: [list(event) for event in sorted(events)[:8]] for room, events in sorted(self.points.items())[:256]},
@@ -285,6 +315,17 @@ class PlayerKnowledge:
                 flag = f"gotCharm_{key}" if isinstance(key, int) and not isinstance(key, bool) else key
                 if flag in CHARM_FLAG_NAMES and isinstance(cost, int) and not isinstance(cost, bool) and 0 <= cost <= 6:
                     self.charm_costs[flag] = cost
+        equipped = telemetry.get("equipped_charms")
+        if isinstance(equipped, dict):
+            self.equipped_charms = {
+                name for name, active in equipped.items()
+                if name in CHARM_FLAG_NAMES and active is True and self.known_flags.get(name, False)
+            }
+        used, total = telemetry.get("charm_notches_used"), telemetry.get("charm_notches_total")
+        if (isinstance(used, int) and not isinstance(used, bool)
+                and isinstance(total, int) and not isinstance(total, bool)
+                and 0 <= used <= 12 and 0 <= total <= 12):
+            self.charm_notches_used, self.charm_notches_total = used, total
         if previous_scene is not None and scene != previous_scene and previous_cell is not None:
             self.exits.setdefault(previous_scene, set()).add(previous_cell)
             col0, row0 = previous_cell
@@ -431,6 +472,8 @@ class PlayerKnowledge:
             )
         values.extend([0.0] * (2 * (64 - min(64, len(self.shop_prices)))))
         values.extend(self.bestiary.vector())
+        values.extend(float(name in self.equipped_charms) for name, _descriptor in CHARM_FLAGS)
+        values.extend((min(self.charm_notches_used, 12) / 12.0, min(self.charm_notches_total, 12) / 12.0))
         return np.asarray(values, dtype=np.float32)
 
     @staticmethod
@@ -440,6 +483,6 @@ class PlayerKnowledge:
             0.0, 1.0,
             (item_size + GRID_WIDTH * GRID_HEIGHT * 2 + 8 * 6 + 8 * 5
              + len(PLACE_DESCRIPTORS) * (4 + GRID_WIDTH * GRID_HEIGHT) + 8 + 128 + 1
-             + MAX_ENEMY_SLOTS * ENEMY_VECTOR_SIZE,),
+             + MAX_ENEMY_SLOTS * ENEMY_VECTOR_SIZE + len(CHARM_FLAGS) + 2,),
             dtype=np.float32,
         )

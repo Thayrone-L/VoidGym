@@ -162,9 +162,18 @@ Assert(!(bool)respawnTransition["spatial"]! && (string)respawnTransition["transi
 
 var checkpointTelemetry = new OperatorTelemetryState();
 checkpointTelemetry.Observe("Room_Bench", "Zone_B", 1, 4, 1, 4,
-    new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags, atBench: true);
+    new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags, atBench: true,
+    equippedCharms: new Dictionary<string, bool> { ["equippedCharm_40"] = true },
+    charmNotchesUsed: 3, charmNotchesTotal: 4, charmMenuOpen: true, charmCursor: 39);
 var checkpointFrame = checkpointTelemetry.Snapshot();
 Assert((bool)checkpointFrame["at_bench"]!, "operator telemetry must expose the current bench state");
+Assert((long)checkpointFrame["equipped_charm_mask"]! == (1L << 39),
+    "equipped charm bitmask must include charm 40 without truncation");
+Assert((int)checkpointFrame["charm_notches_used"]! == 3 &&
+       (int)checkpointFrame["charm_notches_total"]! == 4,
+    "operator telemetry must expose used and total charm notches");
+Assert((bool)checkpointFrame["charm_menu_open"]! && (int)checkpointFrame["charm_cursor"]! == 39,
+    "operator telemetry must expose charm menu state and cursor");
 var checkpointEvents = (Dictionary<string, object?>[])checkpointFrame["milestone_events_since_last_frame"]!;
 Assert(checkpointEvents.Length == 1 && (string)checkpointEvents[0]["category"]! == "checkpoint",
     "first observation at a bench must emit a checkpoint milestone");

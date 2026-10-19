@@ -194,13 +194,20 @@ internal sealed class VisualCaptureBackend : IDisposable
         HeroController? hero = HeroController.instance;
         if (data == null || hero == null) return null;
         BridgeUiState ui = ReadUiState();
+        long equippedMask = 0;
+        int notchUsed = SafeGetInt(data, "charmSlotsFilled");
+        int notchTotal = SafeGetInt(data, "charmSlots");
+        for (int charmId = 1; charmId <= 40; charmId++)
+            if (SafeProgressFlag(data, "equippedCharm_" + charmId.ToString(System.Globalization.CultureInfo.InvariantCulture)))
+                equippedMask |= 1L << (charmId - 1);
         return new ActionAvailability(data.MPCharge, data.equippedCharm_33 ? 24 : 33, 33,
             data.fireballLevel, data.quakeLevel, data.screamLevel, data.hasNailArt,
             data.hasCyclone, data.hasDashSlash, data.hasUpwardSlash,
             SafeProgressFlag(data, "hasDash"), SafeProgressFlag(data, "hasWallJump"),
             SafeProgressFlag(data, "hasDoubleJump"), SafeProgressFlag(data, "hasSuperDash"),
             SafeProgressFlag(data, "hasDreamNail"), SafeProgressFlag(data, "gotCharm_31"),
-            ui.DialogOpen, ui.MenuOpen);
+            ui.DialogOpen, ui.MenuOpen, SafeProgressFlag(data, "atBench"), ui.CharmMenuOpen,
+            ui.CharmCursor, equippedMask, notchUsed, notchTotal);
     }
 
     internal static BridgeUiState ReadUiState()
@@ -220,13 +227,22 @@ internal sealed class VisualCaptureBackend : IDisposable
         }
         catch (Exception) { }
         bool menuOpen = false;
+        bool charmMenuOpen = false;
+        int charmCursor = 0;
         try
         {
             GameManager? manager = GameManager.instance;
-            menuOpen = manager != null && (manager.isPaused || manager.ui?.currentDynamicMenu != null);
+            object? dynamicMenu = manager?.ui?.currentDynamicMenu;
+            menuOpen = manager != null && (manager.isPaused || dynamicMenu != null);
+            if (dynamicMenu != null)
+            {
+                string menuType = dynamicMenu.GetType().Name;
+                charmMenuOpen = menuType.IndexOf("charm", StringComparison.OrdinalIgnoreCase) >= 0;
+                charmCursor = ReadNonNegativeIntMember(dynamicMenu, "currentIndex", "cursor", "selectedIndex");
+            }
         }
         catch (Exception) { }
-        return new BridgeUiState(dialogOpen, menuOpen, dialogueId);
+        return new BridgeUiState(dialogOpen, menuOpen, dialogueId, charmMenuOpen, charmCursor);
     }
 
     private static bool IsDialogueHidden(DialogueBox box)
@@ -243,6 +259,28 @@ internal sealed class VisualCaptureBackend : IDisposable
     {
         try { return data.GetBool(name); }
         catch (Exception) { return false; }
+    }
+
+    private static int ReadNonNegativeIntMember(object source, params string[] names)
+    {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        foreach (string name in names)
+        {
+            try
+            {
+                object? value = source.GetType().GetField(name, members)?.GetValue(source)
+                    ?? source.GetType().GetProperty(name, members)?.GetValue(source, null);
+                if (value is int index && index >= 0) return index;
+            }
+            catch (Exception) { }
+        }
+        return 0;
+    }
+
+    private static int SafeGetInt(PlayerData data, string name)
+    {
+        try { return Math.Max(0, data.GetInt(name)); }
+        catch (Exception) { return 0; }
     }
 
     private static void CalculateOutputSize(
@@ -411,10 +449,13 @@ internal sealed class CapturedFrame
     public ActionAvailability? ActionAvailability { get; }
 }
 
-internal sealed record BridgeUiState(bool DialogOpen, bool MenuOpen, string? DialogueId);
+internal sealed record BridgeUiState(bool DialogOpen, bool MenuOpen, string? DialogueId,
+    bool CharmMenuOpen, int CharmCursor);
 
 internal sealed record ActionAvailability(int mp_charge, int spell_cost, int focus_cost,
     int fireball_level, int quake_level, int scream_level, bool has_nail_art,
     bool has_cyclone, bool has_dash_slash, bool has_upward_slash, bool has_dash,
     bool has_walljump, bool has_double_jump, bool has_super_dash, bool has_dream_nail,
-    bool has_dashmaster, bool dialog_open, bool menu_open);
+    bool has_dashmaster, bool dialog_open, bool menu_open, bool at_bench,
+    bool charm_menu_open, int charm_cursor, long equipped_charm_mask,
+    int charm_notches_used, int charm_notches_total);

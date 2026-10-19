@@ -65,6 +65,23 @@ def test_interaction_is_always_available_and_menu_actions_are_contextual() -> No
     assert not open_mask[names.index("LEFT")]
     assert not open_mask[names.index("ATTACK")]
     assert open_mask[names.index("NOOP")]
+    assert not closed_mask[names.index("OPEN_CHARMS")]
+
+
+def test_open_charms_requires_a_seated_bench_and_menu_actions_require_menu_state() -> None:
+    names = SCENE_CHANGE_INTERACTION_ACTION_NAMES
+    away = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True)
+    seated = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True, at_bench=True)
+    assert not build_action_mask(names, away)[names.index("OPEN_CHARMS")]
+    assert build_action_mask(names, seated)[names.index("OPEN_CHARMS")]
+    on_menu = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True,
+                                 at_bench=True, menu_open=True, charm_menu_open=True,
+                                 charm_cursor=3, equipped_charm_mask=5,
+                                 charm_notches_used=2, charm_notches_total=3)
+    mask = build_action_mask(names, on_menu)
+    assert not mask[names.index("OPEN_CHARMS")]
+    assert mask[names.index("MENU_UP")]
+    assert not mask[names.index("ATTACK")]
 
 
 def test_legacy_action_availability_defaults_menu_flags_closed() -> None:
@@ -76,6 +93,7 @@ def test_legacy_action_availability_defaults_menu_flags_closed() -> None:
     }
     parsed = parse_action_availability(values)
     assert parsed is not None and not parsed.dialog_open and not parsed.menu_open
+    assert not parsed.at_bench and parsed.equipped_charm_mask == 0
 
 
 @pytest.mark.parametrize(

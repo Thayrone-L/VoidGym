@@ -29,10 +29,16 @@ class ActionAvailability:
     has_dashmaster: bool = False
     dialog_open: bool = False
     menu_open: bool = False
+    at_bench: bool = False
+    charm_menu_open: bool = False
+    charm_cursor: int = 0
+    equipped_charm_mask: int = 0
+    charm_notches_used: int = 0
+    charm_notches_total: int = 0
 
 
-_INT_FIELDS = ("mp_charge", "spell_cost", "focus_cost", "fireball_level", "quake_level", "scream_level")
-_BOOL_FIELDS = ("has_nail_art", "has_cyclone", "has_dash_slash", "has_upward_slash", "has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster", "dialog_open", "menu_open")
+_INT_FIELDS = ("mp_charge", "spell_cost", "focus_cost", "fireball_level", "quake_level", "scream_level", "charm_cursor", "equipped_charm_mask", "charm_notches_used", "charm_notches_total")
+_BOOL_FIELDS = ("has_nail_art", "has_cyclone", "has_dash_slash", "has_upward_slash", "has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster", "dialog_open", "menu_open", "at_bench", "charm_menu_open")
 
 
 def parse_action_availability(value: object) -> ActionAvailability | None:
@@ -42,13 +48,15 @@ def parse_action_availability(value: object) -> ActionAvailability | None:
         raise ProtocolError("FRAME action_availability must be an object")
     expected = set(_INT_FIELDS + _BOOL_FIELDS)
     # Accept v1 bridge frames without the newer progression fields.
-    previous = expected - {"dialog_open", "menu_open"}
-    legacy = previous - {"has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster"}
-    if frozenset(value) not in {frozenset(expected), frozenset(previous), frozenset(legacy)}:
+    new_fields = {"at_bench", "charm_menu_open", "charm_cursor", "equipped_charm_mask", "charm_notches_used", "charm_notches_total"}
+    previous = expected - new_fields
+    previous_without_ui = previous - {"dialog_open", "menu_open"}
+    legacy = previous_without_ui - {"has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster"}
+    if frozenset(value) not in {frozenset(expected), frozenset(previous), frozenset(previous_without_ui), frozenset(legacy)}:
         raise ProtocolError("FRAME action_availability has invalid fields")
     normalized = dict(value)
     for name in expected - set(normalized):
-        normalized[name] = False
+        normalized[name] = 0 if name in _INT_FIELDS else False
     for name in _INT_FIELDS:
         item = normalized[name]
         if isinstance(item, bool) or not isinstance(item, int) or item < 0:
@@ -56,6 +64,10 @@ def parse_action_availability(value: object) -> ActionAvailability | None:
     for name in _BOOL_FIELDS:
         if not isinstance(normalized[name], bool):
             raise ProtocolError(f"FRAME action_availability.{name} must be boolean")
+    if normalized["charm_notches_used"] > 12 or normalized["charm_notches_total"] > 12:
+        raise ProtocolError("FRAME action_availability charm notch values exceed the game bound")
+    if normalized["equipped_charm_mask"] >= (1 << 40):
+        raise ProtocolError("FRAME action_availability equipped charm mask exceeds 40 charms")
     return ActionAvailability(**normalized)
 
 
@@ -65,14 +77,18 @@ def build_action_mask(names: tuple[str, ...], availability: ActionAvailability |
         for index, name in enumerate(names):
             if "DASH" in name or name in {"SUPER_DASH_HOLD", "DREAM_NAIL"} or name.startswith("MENU_"):
                 mask[index] = False
+            if name == "OPEN_CHARMS":
+                mask[index] = False
         return mask
     for index, name in enumerate(names):
         if name == "INTERACT":
             mask[index] = True
+        elif name == "OPEN_CHARMS":
+            mask[index] = availability.at_bench and not availability.menu_open and not availability.dialog_open
         elif name.startswith("MENU_"):
-            mask[index] = availability.menu_open or availability.dialog_open
+            mask[index] = availability.charm_menu_open or availability.menu_open or availability.dialog_open
             continue
-        elif (availability.menu_open or availability.dialog_open) and name not in {"NOOP", "INTERACT"}:
+        elif (availability.menu_open or availability.dialog_open or availability.charm_menu_open) and name not in {"NOOP", "INTERACT"}:
             mask[index] = False
         if name == "FOCUS_HOLD":
             mask[index] = mask[index] and availability.mp_charge >= availability.focus_cost

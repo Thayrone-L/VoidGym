@@ -10,6 +10,7 @@ internal sealed class OperatorTelemetryState
     private readonly object _gate = new();
     private readonly Dictionary<string, bool> _flags = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _charmCosts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, bool> _equippedCharms = new(StringComparer.Ordinal);
     private readonly List<Dictionary<string, object?>> _events = new();
     private string? _scene;
     private string? _zone;
@@ -22,10 +23,15 @@ internal sealed class OperatorTelemetryState
     private float? _entryCandidateX, _entryCandidateY;
     private long _recentDeathUnixMs;
     private bool? _atBench;
+    private long _equippedCharmMask;
+    private int _charmNotchesUsed, _charmNotchesTotal, _charmCursor;
+    private bool _charmMenuOpen;
 
     public void Observe(string? scene, string? zone, float? x, float? y, float? cameraX, float? cameraY,
         float[]? bounds, int? grubs, int? geo, IEnumerable<KeyValuePair<string, bool>> flags,
-        bool atBench = false, IReadOnlyDictionary<string, int>? charmCosts = null)
+        bool atBench = false, IReadOnlyDictionary<string, int>? charmCosts = null,
+        IReadOnlyDictionary<string, bool>? equippedCharms = null, int charmNotchesUsed = 0,
+        int charmNotchesTotal = 0, bool charmMenuOpen = false, int charmCursor = 0)
     {
         lock (_gate)
         {
@@ -89,6 +95,21 @@ internal sealed class OperatorTelemetryState
             if (atBench && _atBench != true)
                 _events.Add(Event("checkpoint", "bench_" + (scene ?? "unknown")));
             _atBench = atBench;
+            _equippedCharms.Clear();
+            _equippedCharmMask = 0;
+            if (equippedCharms != null)
+                foreach (KeyValuePair<string, bool> charm in equippedCharms)
+                {
+                    if (!charm.Key.StartsWith("equippedCharm_", StringComparison.Ordinal) || charm.Key.Length > 32) continue;
+                    _equippedCharms[charm.Key] = charm.Value;
+                    if (charm.Value && int.TryParse(charm.Key.Substring("equippedCharm_".Length), NumberStyles.None,
+                        CultureInfo.InvariantCulture, out int charmId) && charmId >= 1 && charmId <= 40)
+                        _equippedCharmMask |= 1L << (charmId - 1);
+                }
+            _charmNotchesUsed = Math.Max(0, Math.Min(12, charmNotchesUsed));
+            _charmNotchesTotal = Math.Max(0, Math.Min(12, charmNotchesTotal));
+            _charmMenuOpen = charmMenuOpen;
+            _charmCursor = Math.Max(0, Math.Min(39, charmCursor));
             _charmCosts.Clear();
             if (charmCosts != null)
                 foreach (KeyValuePair<string, int> charm in charmCosts)
@@ -117,6 +138,12 @@ internal sealed class OperatorTelemetryState
                 ["at_bench"] = _atBench == true,
                 ["progress_flags"] = new Dictionary<string, bool>(_flags, StringComparer.Ordinal),
                 ["charm_costs"] = new Dictionary<string, int>(_charmCosts, StringComparer.Ordinal),
+                ["equipped_charms"] = new Dictionary<string, bool>(_equippedCharms, StringComparer.Ordinal),
+                ["equipped_charm_mask"] = _equippedCharmMask,
+                ["charm_notches_used"] = _charmNotchesUsed,
+                ["charm_notches_total"] = _charmNotchesTotal,
+                ["charm_menu_open"] = _charmMenuOpen,
+                ["charm_cursor"] = _charmCursor,
                 ["milestone_events_since_last_frame"] = events,
             };
         }

@@ -321,8 +321,8 @@ def test_v4_contract_adds_player_knowledge_and_keeps_raw_telemetry_out() -> None
     task = ExplorationTask(environment, config=_v4_config())
     contract = task.task_contract()
     assert contract["reward_version"] == "explore_v4"
-    assert contract["task_contract_schema_version"] == 7
-    assert contract["observation_version"] == "pixels_action_history_player_knowledge_bestiary_v1"
+    assert contract["task_contract_schema_version"] == 8
+    assert contract["observation_version"] == "pixels_action_history_player_knowledge_charms_v1"
     assert contract["information_boundary"] == ["pixels", "applied_action_history", "player_knowledge"]
     assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
     assert task.config.maximum_positive_episode_reward() <= 75.2

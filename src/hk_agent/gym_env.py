@@ -27,6 +27,9 @@ BUTTON_ORDER: tuple[str, ...] = (
     "CAST",
     "SUPER_DASH",
     "DREAM_NAIL",
+    "PAUSE",
+    "MENU_SUBMIT",
+    "MENU_CANCEL",
 )
 RAW_ACTIONS: tuple[tuple[str, ...], ...] = tuple(
     tuple(button for bit, button in enumerate(BUTTON_ORDER) if mask & (1 << bit))

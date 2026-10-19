@@ -19,8 +19,8 @@ Etapa 60 — VERDE; validações e teste scriptado com jogo concluídos; commit 
 - DLL implantada em hk-ai-1 e hk-ai-2 com SHA-256 igual: 3E9BADFEE4B3B38CFB34C1BEF3BEFF8E96F0539961C99A091F34D7B46E5490D2.
 - Capturas e rota: artifacts\scripted-validation\60\final; relatório: agent-prompts\relatorios\60_bestiario.txt.
 
-Etapas 61-64: ainda não iniciadas; seguir em ordem depois do commit/push da etapa 60, conforme a regra revisada em 65c.
+Etapa 61 - AMARELO — validação em jogo pendente de alcance; implementação, validações offline, smoke de 5 min sem erros e implantação dupla concluídos. Commit ba84b58 (Let the agent manage charms at benches), enviado ao PR #8. Relatório: agent-prompts\\relatorios\\61_amuletos.txt. Pendência: roteiro até o banco de Dirtmouth no save disponível. Etapas 62-64 ainda pendentes.
 
-Estado geral: 57-59 publicados; 60 verde com publicação pendente.
+Estado geral: 57-60 publicados; 61 amarelo, aguardando commit/push.
 - Campanha final jogada-1 não iniciada. Jogo, painel de teste, ator e learner parados; saves pessoais, baseline e saves originais de hk-ai-1 preservados.
 - Próximo passo: commit/push da etapa 60 e depois executar 61–64 em sequência, aceitando verde/amarelo conforme 65c.
