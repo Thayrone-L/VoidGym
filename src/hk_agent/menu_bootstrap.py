@@ -19,7 +19,7 @@ from hk_agent.supervisor import (
     require_png_frame,
 )
 
-MENU_BUTTONS = frozenset({"UP", "DOWN", "LEFT", "RIGHT", "SUBMIT", "CANCEL"})
+MENU_BUTTONS = frozenset({"UP", "DOWN", "LEFT", "RIGHT", "SUBMIT", "CANCEL", "PAUSE"})
 
 
 class MenuBootstrapError(RuntimeError):
@@ -50,9 +50,10 @@ class MenuBootstrapStep:
     lease_ms: int = 50
     settle_seconds: float = 2.0
     label: str = "menu-step"
+    readiness: ReferenceReadinessSpec | None = None
 
     @classmethod
-    def from_mapping(cls, value: object, index: int) -> MenuBootstrapStep:
+    def from_mapping(cls, value: object, index: int, base_path: Path) -> MenuBootstrapStep:
         if not isinstance(value, dict):
             raise TypeError(f"steps[{index}] must be an object")
         button = value.get("button")
@@ -67,7 +68,16 @@ class MenuBootstrapStep:
             raise ValueError(f"steps[{index}].settle_seconds must be between 0 and 30")
         if not isinstance(label, str) or not label or len(label) > 64:
             raise ValueError(f"steps[{index}].label must be a short non-empty string")
-        return cls(button=button, lease_ms=lease_ms, settle_seconds=float(settle), label=label)
+        readiness = _parse_reference_readiness(
+            value.get("readiness"), base_path, f"steps[{index}].readiness"
+        )
+        return cls(
+            button=button,
+            lease_ms=lease_ms,
+            settle_seconds=float(settle),
+            label=label,
+            readiness=readiness,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +104,7 @@ class MenuBootstrapPlan:
             raise ValueError("plan_id must be a short non-empty string")
         if not isinstance(raw_steps, list) or not 1 <= len(raw_steps) <= 16:
             raise ValueError("steps must contain between 1 and 16 menu actions")
-        steps = tuple(MenuBootstrapStep.from_mapping(item, i) for i, item in enumerate(raw_steps))
+        steps = tuple(MenuBootstrapStep.from_mapping(item, i, path.parent) for i, item in enumerate(raw_steps))
         initial = _bounded_number(value.get("initial_wait_seconds", 5.0), "initial_wait_seconds", 30)
         final = _bounded_number(value.get("final_wait_seconds", 5.0), "final_wait_seconds", 180)
         timeout = _bounded_number(value.get("timeout_seconds", 180.0), "timeout_seconds", 300, positive=True)
@@ -104,26 +114,9 @@ class MenuBootstrapPlan:
         planned_seconds = initial + final + sum(step.settle_seconds for step in steps)
         if planned_seconds >= timeout:
             raise ValueError("planned waits must leave time for commands and captures")
-        raw_readiness = value.get("readiness")
-        if not isinstance(raw_readiness, dict):
-            raise TypeError("an explicit versioned readiness verifier is required")
-        verifier_id = raw_readiness.get("verifier_id")
-        reference_value = raw_readiness.get("reference_image")
-        maximum_error = raw_readiness.get("maximum_mean_absolute_error")
-        if verifier_id != "reference-rgb-mae-v1":
-            raise ValueError("unsupported readiness verifier")
-        if not isinstance(reference_value, str) or not reference_value:
-            raise ValueError("readiness.reference_image must be a path")
-        reference = (path.parent / reference_value).resolve(strict=True)
-        if not reference.is_file():
-            raise ValueError("readiness reference image is not a file")
-        if (
-            isinstance(maximum_error, bool)
-            or not isinstance(maximum_error, (int, float))
-            or not 0 <= float(maximum_error) <= 255
-        ):
-            raise ValueError("maximum_mean_absolute_error must be between 0 and 255")
-        readiness = ReferenceReadinessSpec(verifier_id, reference, float(maximum_error))
+        readiness = _parse_reference_readiness(
+            value.get("readiness"), path.parent, "readiness", required=True
+        )
         return cls(plan_id, steps, initial, final, timeout, distinct, readiness)
 
 
@@ -165,10 +158,44 @@ def _write_bytes_atomic(path: Path, value: bytes) -> None:
     os.replace(temporary, path)
 
 
+def _parse_reference_readiness(
+    value: object,
+    base_path: Path,
+    label: str,
+    *,
+    required: bool = False,
+) -> ReferenceReadinessSpec | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be an object")
+    verifier_id = value.get("verifier_id")
+    reference_value = value.get("reference_image")
+    maximum_error = value.get("maximum_mean_absolute_error")
+    if verifier_id != "reference-rgb-mae-v1":
+        raise ValueError(f"{label} has an unsupported readiness verifier")
+    if not isinstance(reference_value, str) or not reference_value:
+        raise ValueError(f"{label}.reference_image must be a path")
+    reference = (base_path / reference_value).resolve(strict=True)
+    if not reference.is_file():
+        raise ValueError(f"{label} reference image is not a file")
+    if (
+        isinstance(maximum_error, bool)
+        or not isinstance(maximum_error, (int, float))
+        or not 0 <= float(maximum_error) <= 255
+    ):
+        raise ValueError(f"{label}.maximum_mean_absolute_error must be between 0 and 255")
+    return ReferenceReadinessSpec(verifier_id, reference, float(maximum_error))
+
+
 def build_readiness_verifier(plan: MenuBootstrapPlan) -> ReadinessVerifier:
     spec = plan.readiness
     if spec is None:
         raise ValueError("menu bootstrap plan has no explicit readiness verifier")
+    return _build_reference_readiness_verifier(spec)
+
+
+def _build_reference_readiness_verifier(spec: ReferenceReadinessSpec) -> ReadinessVerifier:
     if spec.verifier_id != "reference-rgb-mae-v1":
         raise ValueError(f"unsupported readiness verifier: {spec.verifier_id}")
     reference_bytes = spec.reference_image.read_bytes()
@@ -310,7 +337,26 @@ async def run_menu_bootstrap(
                     await asyncio.sleep(step.settle_seconds)
                 finally:
                     await release_all()
-                await capture(index, step.label)
+                step_frame = await capture(index, step.label)
+                if step.readiness is not None:
+                    step_verdict = _build_reference_readiness_verifier(step.readiness)(step_frame)
+                    report.events.append(
+                        {
+                            "index": index,
+                            "label": step.label,
+                            "kind": "step-readiness",
+                            "ready": step_verdict.ready,
+                            "verifier_id": step_verdict.verifier_id,
+                            "detail": step_verdict.detail,
+                            "metrics": step_verdict.metrics,
+                        }
+                    )
+                    persist()
+                    if not step_verdict.ready:
+                        raise MenuBootstrapError(
+                            f"readiness verifier {step_verdict.verifier_id} rejected step "
+                            f"{step.label}: {step_verdict.detail}"
+                        )
                 report.steps_completed = index
                 persist()
             if plan.final_wait_seconds:

@@ -270,6 +270,8 @@ class RunDiary:
             if key in telemetry and isinstance(telemetry[key], (int, float, list, tuple))
         }
         if isinstance(scene, str) and scene:
+            if not self.data.get("started_from"):
+                self.data["started_from"] = scene
             if scene != self._last_scene:
                 self._last_sample = -math.inf
                 transition = {"from": self._last_scene, "to": scene, "unix_ms": ts}

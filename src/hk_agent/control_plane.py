@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any
 
 from hk_agent.bridge_environment import clean_bridge_environment
+from hk_agent.playthrough import (
+    backup_playthrough,
+    initialize_playthrough,
+    persist_playthrough,
+    playthrough_status,
+    save_signature,
+)
+from hk_agent.playthrough import playthrough_root as resolve_playthrough_root
 from hk_agent.runtime_paths import (
     capture_instance_saves,
     ensure_inside_runtime,
@@ -248,12 +256,16 @@ class CampaignSpec:
             "enemy_kill_reward", 0.0
         ):
             raise ValueError("success_reward must dominate combat shaping")
-        save_source = payload.get("save_source", "existing_save")
+        save_source = payload.get(
+            "save_source",
+            "continuous_playthrough" if campaign_type == "exploration_training" else "existing_save",
+        )
         if not isinstance(save_source, str) or save_source not in {
             "existing_save",
             "new_game",
+            "continuous_playthrough",
         }:
-            raise ValueError("save_source must be existing_save or new_game")
+            raise ValueError("save_source must be existing_save, new_game or continuous_playthrough")
         duration_mode = payload.get("duration_mode", "limited")
         if not isinstance(duration_mode, str) or duration_mode not in {
             "limited",
@@ -935,6 +947,7 @@ class ControlPlane:
             "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
             "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-100:], "evaluation_trend": manifest.get("evaluation_trend", []),
             "journey": journey,
+            "playthroughs": self._operator_playthroughs(campaign_id, campaigns, active_records, journey),
             "alerts": sorted(set(alerts)), "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
             "max_instances": min(3, capacity),
@@ -945,6 +958,116 @@ class ControlPlane:
                          "artifact_path": str(shared_root) if shared_root else None},
             "system": self._operator_system_resources(), "reports": self.list_reports()[:10],
         }
+
+    def _operator_playthroughs(
+        self,
+        campaign_id: str | None,
+        campaigns: Sequence[Mapping[str, Any]],
+        active_records: Sequence[Mapping[str, Any]],
+        journey: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        campaign = next((row for row in campaigns if row.get("campaign_id") == campaign_id), None)
+        if not campaign or campaign.get("save_source") != "continuous_playthrough" or not campaign_id:
+            return []
+        from hk_agent.config import load_config
+
+        config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
+        active_slots = {
+            resources.get("slot_id")
+            for row in active_records
+            if isinstance((resources := row.get("resources")), Mapping)
+        }
+        last_scenes: dict[int, str] = {}
+        runs = journey.get("runs", [])
+        if isinstance(runs, list):
+            for run in runs:
+                if not isinstance(run, Mapping):
+                    continue
+                try:
+                    slot = int(str(run.get("actor", "")).removeprefix("actor-"))
+                except ValueError:
+                    continue
+                route = run.get("route", [])
+                for edge in reversed(route if isinstance(route, list) else []):
+                    if isinstance(edge, Mapping) and isinstance(edge.get("to"), str):
+                        last_scenes.setdefault(slot, str(edge["to"]))
+                        break
+        rows: list[dict[str, Any]] = []
+        for slot_id in range(min(config.instance_count, 3)):
+            root = resolve_playthrough_root(self.runtime_root, campaign_id, slot_id + 1)
+            state = playthrough_status(root) or {"last_scene": None, "progress": {}, "backup_count": 0}
+            if not state.get("last_scene"):
+                state["last_scene"] = last_scenes.get(slot_id)
+            state.update({"slot": slot_id + 1, "active": slot_id in active_slots,
+                          "can_manage": slot_id not in active_slots})
+            rows.append(state)
+        return rows
+
+    def _require_idle_playthrough_slot(self, campaign_id: object, slot: object) -> tuple[str, int, Any, Path]:
+        if not isinstance(campaign_id, str) or not _IDENTIFIER.fullmatch(campaign_id):
+            raise ValueError("campaign_id is invalid")
+        slot_number = _bounded_int(slot, "slot", 1, 4)
+        campaign = next((row for row in self.list_campaigns() if row.get("campaign_id") == campaign_id), None)
+        if campaign is None or campaign.get("save_source") != "continuous_playthrough":
+            raise ValueError("campaign has no continuous playthrough")
+        slot_id = slot_number - 1
+        with self._lock:
+            if slot_id in self._slot_owners:
+                raise ControlPlaneBusyError("this playthrough slot is active")
+        active_value = self.status().get("active_launches", [])
+        active_rows = active_value if isinstance(active_value, list) else []
+        for row in active_rows:
+            if isinstance(row, Mapping):
+                resources = row.get("resources")
+                if isinstance(resources, Mapping) and resources.get("slot_id") == slot_id:
+                    raise ControlPlaneBusyError("this instance is active")
+        from hk_agent.config import load_config
+
+        config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
+        if slot_id >= config.instance_count:
+            raise ValueError("slot is not configured on this computer")
+        return campaign_id, slot_id, config, resolve_playthrough_root(self.runtime_root, campaign_id, slot_number)
+
+    def start_new_playthrough(self, payload: Mapping[str, object]) -> dict[str, object]:
+        campaign_id, slot_id, config, root = self._require_idle_playthrough_slot(
+            payload.get("campaign_id"), payload.get("slot")
+        )
+        campaign = next(row for row in self.list_campaigns() if row.get("campaign_id") == campaign_id)
+        prior = self._read_json(root / "playthrough.json") if root.exists() else {}
+        source = prior.get("seed_source", "existing_save")
+        if source not in {"existing_save", "new_game"}:
+            source = "existing_save"
+        archive = ensure_inside_runtime(
+            self.runtime_root / "playthrough-archives" / campaign_id / f"slot-{slot_id + 1}" / str(time.time_ns()),
+            self.runtime_root,
+        )
+        if root.exists():
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            root.rename(archive)
+        try:
+            initialize_playthrough(
+                root, config.experimental_save_root, runtime_root=self.runtime_root,
+                personal_root=config.personal_save_root, backup_root=config.backup_root,
+                game_install=config.game_executable.parent, source=str(source),
+                save_slot=_bounded_int(campaign.get("save_slot", 1), "save_slot", 1, 4),
+            )
+        except BaseException:
+            if root.exists():
+                shutil.rmtree(root)
+            if archive.exists():
+                archive.rename(root)
+            raise
+        return {"campaign_id": campaign_id, "slot": slot_id + 1, "playthrough": playthrough_status(root)}
+
+    def restore_playthrough_backup(self, payload: Mapping[str, object]) -> dict[str, object]:
+        campaign_id, slot_id, config, root = self._require_idle_playthrough_slot(
+            payload.get("campaign_id"), payload.get("slot")
+        )
+        from hk_agent.playthrough import restore_last_backup
+
+        restored = restore_last_backup(root, instance_root=config.instance_data_roots[slot_id])
+        return {"campaign_id": campaign_id, "slot": slot_id + 1,
+                "restored_backup": restored.name, "playthrough": playthrough_status(root)}
 
     def _campaign_launch_records(self, campaign_id: str) -> list[dict[str, Any]]:
         records = []
@@ -1454,7 +1577,7 @@ class ControlPlane:
             "duration_mode": "continuous",
             "duration_limit_seconds": limit_seconds,
             "seed": seed,
-            "save_source": "existing_save",
+            "save_source": "continuous_playthrough",
             "save_slot": 1,
             "weights": {},
         }
@@ -1935,6 +2058,11 @@ class ControlPlane:
             save_root = (
                 self.runtime_root / "launches" / launch_id / "save-root" if execute else None
             )
+            playthrough = (
+                resolve_playthrough_root(self.runtime_root, spec.campaign_id, (slot_id or 0) + 1)
+                if execute and spec.save_source == "continuous_playthrough" and slot_id is not None
+                else None
+            )
             route_memory = self._route_memory_path(spec, slot_id, launch_id)
             command = self.build_command(
                 spec,
@@ -1974,6 +2102,7 @@ class ControlPlane:
                     "route_memory": str(route_memory) if route_memory is not None else None,
                     "game_install": str(install_root) if install_root is not None else None,
                     "instance_data_root": str(data_root) if data_root is not None else None,
+                    "playthrough_root": str(playthrough) if playthrough is not None else None,
                     "product_name": project_config.instance_product_names[slot_id] if project_config is not None and slot_id is not None else None,
                     "log_file": str(player_log_path) if player_log_path is not None else None,
                 },
@@ -2037,14 +2166,32 @@ class ControlPlane:
                     raise RuntimeError("instance marker data root changed after configuration load")
                 self._reject_baseline_links(project_config.experimental_save_root)
                 assert slot_id is not None and fence_token is not None
+                seed_root = project_config.experimental_save_root
+                if playthrough is not None:
+                    playthrough, _ = initialize_playthrough(
+                        playthrough,
+                        project_config.experimental_save_root,
+                        runtime_root=validated_runtime,
+                        personal_root=project_config.personal_save_root,
+                        backup_root=project_config.backup_root,
+                        game_install=project_config.game_executable.parent,
+                        source=spec.save_source,
+                        save_slot=spec.save_slot,
+                    )
+                    seed_root = playthrough
+                    resources_record = record["resources"]
+                    if not isinstance(resources_record, dict):
+                        raise RuntimeError("launch resources record is invalid")
+                    resources_record["playthrough_root"] = str(playthrough)
+                    atomic_json(launch_root / "launch.json", record)
                 prepare_instance_saves(
                     data_root,
-                    project_config.experimental_save_root,
+                    seed_root,
                     runtime_launch_root,
                     fence_token=fence_token,
                     is_fence_current=lambda token: self._is_fence_current(slot_id, token),
                 )
-                shutil.copytree(project_config.experimental_save_root, save_root, symlinks=False)
+                shutil.copytree(seed_root, save_root, symlinks=False)
                 with self._lock:
                     self._check_preparation(launch_id, record, launch_root, runtime_launch_root, "starting")
                 if route_memory is not None:
@@ -2103,6 +2250,8 @@ class ControlPlane:
                 environment["HK_AGENT_INSTANCE_DATA_ROOT"] = str(data_root)
                 environment["HK_AGENT_PERSONAL_ROOT"] = str(project_config.personal_save_root)
                 environment["HK_AGENT_PRODUCT_NAME"] = project_config.instance_product_names[slot_id]
+                if playthrough is not None:
+                    environment["HK_AGENT_PLAYTHROUGH_ROOT"] = str(playthrough)
                 environment["HK_AGENT_LOG_FILE"] = str(player_log_path)
                 environment["HK_AGENT_OTHER_INSTANCE_DATA_ROOTS"] = os.pathsep.join(str(root) for index, root in enumerate(project_config.instance_data_roots) if index != slot_id)
                 if spec.campaign_type == "parallel_smoke":
@@ -2175,6 +2324,8 @@ class ControlPlane:
                         )
                     record["final_save"] = str(runtime_launch_root / "final-save")
                     record["final_save_status"] = "captured"
+                    if playthrough is not None:
+                        persist_playthrough(playthrough, data_root, force_backup=True)
                     atomic_json(launch_root / "launch.json", record)
                 except (OSError, ValueError, InterruptedError) as capture_error:
                     record["final_save_status"] = "failed"
@@ -2274,6 +2425,38 @@ class ControlPlane:
         log_handle: Any,
         launch_root: Path,
     ) -> None:
+        resources_before_wait = self._launches.get(launch_id, {}).get("resources")
+        playthrough_value = resources_before_wait.get("playthrough_root") if isinstance(resources_before_wait, Mapping) else None
+        data_value = resources_before_wait.get("instance_data_root") if isinstance(resources_before_wait, Mapping) else None
+        playthrough = Path(playthrough_value) if isinstance(playthrough_value, str) else None
+        data_root = Path(data_value) if isinstance(data_value, str) else None
+        last_signature = save_signature(data_root) if data_root is not None else {}
+        last_persisted = save_signature(playthrough) if playthrough is not None and playthrough.is_dir() else {}
+        stable_observations = 0
+        last_periodic_backup = time.monotonic()
+        while process.poll() is None:
+            time.sleep(1.0)
+            if playthrough is None or data_root is None or not data_root.is_dir():
+                continue
+            signature = save_signature(data_root)
+            if signature and signature == last_signature:
+                stable_observations += 1
+            else:
+                stable_observations = 0
+                last_signature = signature
+            if stable_observations >= 2 and signature and signature != last_persisted:
+                try:
+                    persist_playthrough(playthrough, data_root)
+                    last_persisted = signature
+                except (OSError, ValueError, RuntimeError):
+                    # Keep the previous good playthrough; final shutdown retries.
+                    pass
+            if time.monotonic() - last_periodic_backup >= 300.0:
+                try:
+                    backup_playthrough(playthrough, reason="periodic")
+                except OSError:
+                    pass
+                last_periodic_backup = time.monotonic()
         return_code = process.wait()
         log_handle.close()
         # Captured before any draining bookkeeping rewrites the status, so a
@@ -2386,6 +2569,9 @@ class ControlPlane:
                         else None
                     ),
                 )
+                playthrough_value = resources.get("playthrough_root") if isinstance(resources, Mapping) else None
+                if isinstance(playthrough_value, str):
+                    persist_playthrough(Path(playthrough_value), Path(data_root_value), force_backup=True)
                 record["final_save"] = str(self.runtime_root / "launches" / launch_id / "final-save")
                 record["final_save_status"] = "captured"
             except (OSError, ValueError, InterruptedError) as error:

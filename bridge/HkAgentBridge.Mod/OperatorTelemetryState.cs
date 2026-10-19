@@ -20,9 +20,11 @@ internal sealed class OperatorTelemetryState
     private int _stableEntryFrames;
     private float? _entryCandidateX, _entryCandidateY;
     private long _recentDeathUnixMs;
+    private bool? _atBench;
 
     public void Observe(string? scene, string? zone, float? x, float? y, float? cameraX, float? cameraY,
-        float[]? bounds, int? grubs, int? geo, IEnumerable<KeyValuePair<string, bool>> flags)
+        float[]? bounds, int? grubs, int? geo, IEnumerable<KeyValuePair<string, bool>> flags,
+        bool atBench = false)
     {
         lock (_gate)
         {
@@ -83,6 +85,9 @@ internal sealed class OperatorTelemetryState
                 _grubs = grubs;
             }
             _geo = geo;
+            if (atBench && _atBench != true)
+                _events.Add(Event("checkpoint", "bench_" + (scene ?? "unknown")));
+            _atBench = atBench;
             foreach (KeyValuePair<string, bool> flag in flags)
             {
                 bool prior;
@@ -104,6 +109,7 @@ internal sealed class OperatorTelemetryState
                 ["timestamp_unix_ms"] = UtcNow(), ["scene_name"] = _scene, ["map_zone"] = _zone,
                 ["x"] = _x, ["y"] = _y, ["camera_x"] = _cameraX, ["camera_y"] = _cameraY,
                 ["scene_bounds"] = _bounds, ["geo_current"] = _geo,
+                ["at_bench"] = _atBench == true,
                 ["milestone_events_since_last_frame"] = events,
             };
         }

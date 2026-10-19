@@ -68,7 +68,12 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "configs" / "menu-bootstrap" / "new-game-kings-pass-v1.json",
     )
     parser.add_argument(
-        "--save-source", choices=("existing_save", "new_game"), default="existing_save"
+        "--checkpoint-reload-plan",
+        type=Path,
+        default=PROJECT_ROOT / "configs" / "menu-bootstrap" / "checkpoint-reload-kings-pass-v1.json",
+    )
+    parser.add_argument(
+        "--save-source", choices=("existing_save", "new_game", "continuous_playthrough"), default="existing_save"
     )
     parser.add_argument("--save-slot", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--experimental-save-root", type=Path)
@@ -144,6 +149,10 @@ def build_task(
     phase: str,
 ) -> tuple[VisualMotionTask, IsolatedEpisodeProcessOwner]:
     phase_root = output_root / phase
+    checkpoint_reload_plan_provider = None
+    if args.save_source == "continuous_playthrough":
+        checkpoint_plan_path = args.checkpoint_reload_plan
+        checkpoint_reload_plan_provider = lambda: MenuBootstrapPlan.load(checkpoint_plan_path)
     owner = IsolatedEpisodeProcessOwner(
         ProcessOwnerConfig(
             game_executable=(args.game_install / project_config.game_executable.name) if args.game_install else project_config.game_executable,
@@ -164,6 +173,14 @@ def build_task(
         backend = SupervisorEnvironmentBackend(
             game_profile=project_config.game_profile,
             reset_process=owner.start_episode,
+            reuse_game_on_reset=args.save_source == "continuous_playthrough",
+            checkpoint_reload_plan_provider=checkpoint_reload_plan_provider,
+            playthrough_root=(
+                Path(os.environ["HK_AGENT_PLAYTHROUGH_ROOT"])
+                if args.save_source == "continuous_playthrough"
+                and os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
+                else None
+            ),
             shutdown_process=owner.shutdown,
             menu_bootstrap_plan=(bootstrap_plan if bootstrap_plan_provider is None else None),
             menu_bootstrap_plan_provider=bootstrap_plan_provider,

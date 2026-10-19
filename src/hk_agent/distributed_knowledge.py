@@ -333,7 +333,7 @@ def _public_route_memory(value: object, *, from_manifest: bool) -> dict[str, Any
                     raise KnowledgeValidationError("route memory save_slot must be in [1, 4]")
                 clean_scope[name] = raw
             elif name == "save_source":
-                if raw not in {"new_game", "existing_save"}:
+                if raw not in {"new_game", "existing_save", "continuous_playthrough"}:
                     raise KnowledgeValidationError("route memory save_source is not supported")
                 clean_scope[name] = raw
             elif name == "game_profile":
@@ -493,7 +493,7 @@ def _portable_origin(provenance: Mapping[str, Any], *, from_manifest: bool) -> d
             raise KnowledgeValidationError("campaign_origin.schema_version must be 1")
         result["schema_version"] = 1
     if "save_source" in raw:
-        if raw["save_source"] not in {"new_game", "existing_save"}:
+        if raw["save_source"] not in {"new_game", "existing_save", "continuous_playthrough"}:
             raise KnowledgeValidationError("campaign_origin.save_source is not supported")
         result["save_source"] = raw["save_source"]
     # Plan identifiers and step labels are local, human-authored strings. Their

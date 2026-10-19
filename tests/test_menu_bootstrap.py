@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,29 +15,34 @@ from hk_agent.menu_bootstrap import (
     MenuBootstrapPlan,
     MenuBootstrapStep,
     ReadinessVerdict,
+    ReferenceReadinessSpec,
     run_menu_bootstrap,
 )
 from hk_agent.protocol import ProtocolError
 
 
 class FakeSupervisor:
-    def __init__(self, *, distinct: bool = True, encoding: str = "png") -> None:
+    def __init__(self, *, distinct: bool = True, encoding: str = "png", frame_data: tuple[bytes, ...] = (), width: int = 600, height: int = 338) -> None:
         self.events: list[str] = []
         self.capture_index = 0
         self.distinct = distinct
         self.encoding = encoding
+        self.frame_data = frame_data
+        self.width = width
+        self.height = height
 
     async def capture_once(self, **_: Any) -> Any:
         self.events.append("capture")
         self.capture_index += 1
         suffix = bytes([self.capture_index]) if self.distinct else b"same"
+        data = self.frame_data[min(self.capture_index - 1, len(self.frame_data) - 1)] if self.frame_data else b"\x89PNG\r\n\x1a\n" + suffix
         return SimpleNamespace(
             encoding=self.encoding,
-            data=b"\x89PNG\r\n\x1a\n" + suffix,
+            data=data,
             frame_id=self.capture_index,
             capture_monotonic_ns=self.capture_index,
-            width=600,
-            height=338,
+            width=self.width,
+            height=self.height,
             scene_transition=False,
             duplicate_of=None,
         )
@@ -51,6 +58,17 @@ class FakeSupervisor:
         self.events.append("release")
         return SimpleNamespace(message_type="ACK", payload={})
 
+
+
+def _png_rgb(red: int, green: int, blue: int) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(
+        b"IDAT", zlib.compress(b"\x00" + bytes((red, green, blue)))
+    ) + chunk(b"IEND", b"")
 
 def _plan(*, minimum_distinct: int = 2) -> MenuBootstrapPlan:
     return MenuBootstrapPlan(
@@ -89,6 +107,32 @@ def test_plan_loader_rejects_gameplay_buttons_and_unbounded_plan(tmp_path: Path)
         MenuBootstrapPlan.load(path)
 
 
+
+def test_checkpoint_reload_plan_guards_pause_and_quit_to_menu_by_reference() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    plan = MenuBootstrapPlan.load(
+        project_root / "configs" / "menu-bootstrap" / "checkpoint-reload-kings-pass-v1.json"
+    )
+
+    assert plan.steps[0].button == "PAUSE"
+    assert plan.steps[0].readiness is not None
+    quit_index = next(i for i, step in enumerate(plan.steps) if step.label == "select-save-and-quit")
+    assert plan.steps[quit_index].button == "DOWN"
+    assert plan.steps[quit_index].readiness is not None
+    assert plan.steps[quit_index].readiness.reference_image.is_file()
+    guarded_labels = {
+        "pause-game",
+        "select-save-and-quit",
+        "save-and-quit-to-main-menu",
+        "select-yes-save-and-quit",
+        "return-to-main-menu",
+        "reopen-continue-profile-selection",
+    }
+    for step in plan.steps:
+        if step.label in guarded_labels:
+            assert step.readiness is not None
+            assert step.readiness.reference_image.is_file()
+
 def test_bootstrap_is_pre_episode_menu_only_and_persists_evidence(tmp_path: Path) -> None:
     supervisor = FakeSupervisor()
     report = asyncio.run(
@@ -114,6 +158,56 @@ def test_bootstrap_is_pre_episode_menu_only_and_persists_evidence(tmp_path: Path
     assert saved["status"] == "READY"
     assert len(saved["captures"]) == 3
 
+
+
+def test_step_readiness_rejects_a_frame_that_is_not_the_expected_menu(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "expected-pause.png"
+    reference.write_bytes(_png_rgb(0, 0, 0))
+    plan = MenuBootstrapPlan(
+        plan_id="step-readiness",
+        steps=(
+            MenuBootstrapStep(
+                "PAUSE",
+                50,
+                0,
+                "pause",
+                ReferenceReadinessSpec("reference-rgb-mae-v1", reference, 0.0),
+            ),
+        ),
+        initial_wait_seconds=0,
+        final_wait_seconds=0,
+        timeout_seconds=1,
+        minimum_distinct_captures=2,
+    )
+    supervisor = FakeSupervisor(
+        frame_data=(_png_rgb(0, 0, 0), _png_rgb(255, 255, 255), _png_rgb(0, 0, 0)),
+        width=1,
+        height=1,
+    )
+
+    with pytest.raises(MenuBootstrapError, match="rejected step pause"):
+        asyncio.run(
+            run_menu_bootstrap(
+                plan,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                bridge=object(),  # type: ignore[arg-type]
+                episode_id="wrong-pause-screen",
+                artifact_root=tmp_path,
+                command_timeout_seconds=0.5,
+                readiness_verifier=lambda _: _verdict(True),
+            )
+        )
+
+    report = json.loads(
+        (tmp_path / "wrong-pause-screen" / "menu-bootstrap" / "report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["status"] == "FAILED"
+    assert report["events"][-1]["kind"] == "step-readiness"
+    assert report["events"][-1]["ready"] is False
 
 def test_bootstrap_refuses_raw_frame_for_png_artifacts(tmp_path: Path) -> None:
     supervisor = FakeSupervisor(encoding="raw_rgb8")

@@ -119,9 +119,13 @@ class SupervisorEnvironmentBackend:
         settle_seconds: float = 0.0,
         menu_bootstrap_plan: MenuBootstrapPlan | None = None,
         menu_bootstrap_plan_provider: MenuBootstrapPlanProvider | None = None,
+        checkpoint_reload_plan_provider: MenuBootstrapPlanProvider | None = None,
+        checkpoint_reload_readiness_verifier: ReadinessVerifier | None = None,
         menu_bootstrap_artifact_root: Path | None = None,
         menu_readiness_verifier: ReadinessVerifier | None = None,
         expected_save_root: Path | None = None,
+        reuse_game_on_reset: bool = False,
+        playthrough_root: Path | None = None,
     ) -> None:
         if (
             bridge_timeout_seconds <= 0
@@ -133,8 +137,12 @@ class SupervisorEnvironmentBackend:
             raise ValueError("settle_seconds must be non-negative")
         if menu_bootstrap_plan is not None and menu_bootstrap_plan_provider is not None:
             raise ValueError("provide either a menu bootstrap plan or a provider")
+        if checkpoint_reload_readiness_verifier is not None and checkpoint_reload_plan_provider is None:
+            raise ValueError("checkpoint reload readiness verifier requires a plan provider")
         has_bootstrap = menu_bootstrap_plan is not None or menu_bootstrap_plan_provider is not None
-        if has_bootstrap != (menu_bootstrap_artifact_root is not None):
+        if (has_bootstrap or checkpoint_reload_plan_provider is not None) != (
+            menu_bootstrap_artifact_root is not None
+        ):
             raise ValueError("menu bootstrap plan and artifact root must be provided together")
         if expected_save_root is None and reset_process is not None:
             owner = getattr(reset_process, "__self__", None)
@@ -147,6 +155,8 @@ class SupervisorEnvironmentBackend:
             expected_save_root=expected_save_root,
         )
         self._reset_process = reset_process
+        self._reuse_game_on_reset = reuse_game_on_reset
+        self._playthrough_root = playthrough_root.resolve(strict=False) if playthrough_root else None
         self._shutdown_process = shutdown_process
         self._bridge_timeout = bridge_timeout_seconds
         self._command_timeout = command_timeout_seconds
@@ -154,6 +164,8 @@ class SupervisorEnvironmentBackend:
         self._settle_seconds = settle_seconds
         self._menu_bootstrap_plan = menu_bootstrap_plan
         self._menu_bootstrap_plan_provider = menu_bootstrap_plan_provider
+        self._checkpoint_reload_plan_provider = checkpoint_reload_plan_provider
+        self._checkpoint_reload_readiness_verifier = checkpoint_reload_readiness_verifier
         self._menu_bootstrap_artifact_root = menu_bootstrap_artifact_root
         if menu_readiness_verifier is not None and menu_bootstrap_plan is None:
             raise ValueError("menu readiness verifier requires a bootstrap plan")
@@ -174,6 +186,7 @@ class SupervisorEnvironmentBackend:
         self._bridge: AcceptedBridge | None = None
         self._episode_id: str | None = None
         self._spawn_candidate_png: bytes | None = None
+        self._last_reset_recovery: dict[str, object] = {"method": "none"}
         self._closed = False
         try:
             self._submit(self._supervisor.start(), timeout=self._command_timeout)
@@ -206,51 +219,88 @@ class SupervisorEnvironmentBackend:
     def reset(
         self, *, seed: int | None, options: Mapping[str, Any] | None
     ) -> ResetResult:
-        del seed, options
+        del seed
         with self._operation_lock:
             self._ensure_open()
             previous_session = self._bridge.session_id if self._bridge is not None else None
             had_bridge = self._bridge is not None
-            if self._bridge is not None:
+            previous_bridge = self._bridge
+            if previous_bridge is not None:
                 self._release_locked(best_effort=True)
-            # A failed reset must never leave the previous episode usable.
-            self._bridge = None
+            reload_checkpoint = bool(options and options.get("reload_checkpoint") is True)
+            reuse_bridge = self._reuse_game_on_reset and previous_bridge is not None and not reload_checkpoint
+            recovered_by_menu = False
+            bridge: AcceptedBridge
+            episode_id = str(uuid.uuid4())
+            if (
+                reload_checkpoint
+                and self._reuse_game_on_reset
+                and previous_bridge is not None
+                and self._checkpoint_reload_plan_provider is not None
+            ):
+                self._episode_id = None
+                self._spawn_candidate_png = None
+                try:
+                    plan = self._checkpoint_reload_plan_provider()
+                    verifier = self._checkpoint_reload_readiness_verifier or build_readiness_verifier(plan)
+                    assert self._menu_bootstrap_artifact_root is not None
+                    self._run_menu_plan(
+                        plan,
+                        bridge=previous_bridge,
+                        episode_id=episode_id,
+                        readiness_verifier=verifier,
+                        artifact_root=self._menu_bootstrap_artifact_root / "checkpoint-reloads",
+                    )
+                    bridge = previous_bridge
+                    recovered_by_menu = True
+                    self._last_reset_recovery = {
+                        "requested": True,
+                        "method": "menu",
+                        "plan_id": plan.plan_id,
+                        "status": "READY",
+                    }
+                except Exception as menu_error:  # noqa: BLE001 - any failed checkpoint navigation uses the safe process-reopen fallback
+                    self._last_reset_recovery = {
+                        "requested": True,
+                        "method": "save-reopen-fallback",
+                        "error": f"{type(menu_error).__name__}: {menu_error}",
+                    }
+                    self._bridge = previous_bridge
+                    self._release_locked(best_effort=True)
+                    self._bridge = None
+                    if self._shutdown_process is not None:
+                        self._invoke_process_callback(
+                            self._shutdown_process,
+                            label="checkpoint_menu_reload_fallback_shutdown",
+                        )
+                else:
+                    # Menu recovery is a real discontinuity for recurrent state,
+                    # even though it keeps the same game process and bridge.
+                    reuse_bridge = False
+            else:
+                self._last_reset_recovery = {
+                    "requested": reload_checkpoint,
+                    "method": "continuous_episode" if not reload_checkpoint and reuse_bridge else "save-reopen-fallback" if reload_checkpoint else "bootstrap",
+                }
+
+            if not recovered_by_menu and not reuse_bridge:
+                self._bridge = None
             self._episode_id = None
 
-            episode_id = str(uuid.uuid4())
             self._spawn_candidate_png = None
-            if self._reset_process is not None:
-                try:
-                    self._invoke_process_callback(
-                        self._reset_process,
-                        self.endpoint,
-                        episode_id,
-                        label="reset_process",
-                        cancellation=ProcessLaunchCancellation(),
+            if not recovered_by_menu:
+                if reuse_bridge:
+                    assert previous_bridge is not None
+                    bridge = previous_bridge
+                else:
+                    bridge = self._start_new_bridge(
+                        episode_id=episode_id,
+                        previous_session=previous_session,
+                        had_bridge=had_bridge,
                     )
-                except TimeoutError:
-                    # The timed-out daemon thread cannot be forcibly stopped.
-                    # Permanently close this backend so a late process cannot
-                    # connect and be mistaken for a later reset generation.
-                    self._fault_close_listener()
-                    raise
-                bridge = self._submit(
-                    self._supervisor.wait_for_new_bridge(
-                        after_session_id=previous_session,
-                        timeout=self._bridge_timeout,
-                    ),
-                    timeout=self._bridge_timeout + 0.5,
-                )
-            elif not had_bridge:
-                bridge = self._submit(
-                    self._supervisor.wait_for_bridge(self._bridge_timeout),
-                    timeout=self._bridge_timeout + 0.5,
-                )
-            else:
-                raise RuntimeError("a reset_process callback is required for another episode")
 
             try:
-                menu_plan = (
+                menu_plan = None if reuse_bridge or recovered_by_menu else (
                     self._menu_bootstrap_plan_provider()
                     if self._menu_bootstrap_plan_provider is not None
                     else self._menu_bootstrap_plan
@@ -262,17 +312,13 @@ class SupervisorEnvironmentBackend:
                         if self._menu_bootstrap_plan_provider is None
                         else build_readiness_verifier(menu_plan)
                     )
-                    bootstrap_report = self._submit(
-                        run_menu_bootstrap(
-                            menu_plan,
-                            supervisor=self._supervisor,
-                            bridge=bridge,
-                            episode_id=episode_id,
-                            artifact_root=self._menu_bootstrap_artifact_root,
-                            command_timeout_seconds=self._command_timeout,
-                            readiness_verifier=readiness_verifier,
-                        ),
-                        timeout=menu_plan.timeout_seconds + 0.5,
+                    assert readiness_verifier is not None
+                    bootstrap_report = self._run_menu_plan(
+                        menu_plan,
+                        bridge=bridge,
+                        episode_id=episode_id,
+                        readiness_verifier=readiness_verifier,
+                        artifact_root=self._menu_bootstrap_artifact_root,
                     )
                     captures = getattr(bootstrap_report, "captures", ())
                     candidate = next((row for row in captures
@@ -303,6 +349,10 @@ class SupervisorEnvironmentBackend:
                 if frame.last_applied_action_id is not None:
                     raise ProtocolError("initial FRAME retained a previous action")
                 captured = _to_pixel_frame(frame, episode_id)
+                if not reuse_bridge and self._playthrough_root is not None:
+                    from hk_agent.playthrough import backup_playthrough
+
+                    backup_playthrough(self._playthrough_root, reason="loaded-successfully")
             except Exception as error:
                 self._bridge = bridge
                 self._release_locked(best_effort=True)
@@ -322,6 +372,67 @@ class SupervisorEnvironmentBackend:
             self._bridge = bridge
             self._episode_id = episode_id
             return ResetResult(episode_id=episode_id, frame=captured)
+
+    def _start_new_bridge(
+        self,
+        *,
+        episode_id: str,
+        previous_session: str | None,
+        had_bridge: bool,
+    ) -> AcceptedBridge:
+        if self._reset_process is not None:
+            try:
+                self._invoke_process_callback(
+                    self._reset_process,
+                    self.endpoint,
+                    episode_id,
+                    label="reset_process",
+                    cancellation=ProcessLaunchCancellation(),
+                )
+            except TimeoutError:
+                self._fault_close_listener()
+                raise
+            return self._submit(
+                self._supervisor.wait_for_new_bridge(
+                    after_session_id=previous_session,
+                    timeout=self._bridge_timeout,
+                ),
+                timeout=self._bridge_timeout + 0.5,
+            )
+        if had_bridge:
+            raise RuntimeError("a reset_process callback is required for another episode")
+        return self._submit(
+            self._supervisor.wait_for_bridge(self._bridge_timeout),
+            timeout=self._bridge_timeout + 0.5,
+        )
+
+    def _run_menu_plan(
+        self,
+        plan: MenuBootstrapPlan,
+        *,
+        bridge: AcceptedBridge,
+        episode_id: str,
+        readiness_verifier: ReadinessVerifier,
+        artifact_root: Path,
+    ) -> object:
+        return self._submit(
+            run_menu_bootstrap(
+                plan,
+                supervisor=self._supervisor,
+                bridge=bridge,
+                episode_id=episode_id,
+                artifact_root=artifact_root,
+                command_timeout_seconds=self._command_timeout,
+                readiness_verifier=readiness_verifier,
+            ),
+            timeout=plan.timeout_seconds + 0.5,
+        )
+
+
+    @property
+    def last_reset_recovery(self) -> dict[str, object]:
+        return dict(self._last_reset_recovery)
+
 
     def capture_png(self) -> bytes:
         """Capture an on-demand operator milestone, validating the PNG artifact path."""

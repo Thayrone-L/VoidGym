@@ -112,6 +112,7 @@ internal sealed class AgentInputBackend : IDisposable
         restored += EnsureBinding(actions.down, InputControlType.Button13);
         restored += EnsureBinding(actions.menuSubmit, InputControlType.Button14);
         restored += EnsureBinding(actions.menuCancel, InputControlType.Button15);
+        restored += EnsureBinding(actions.pause, InputControlType.Button16);
         return restored;
     }
 
@@ -199,6 +200,7 @@ internal sealed class AgentInputBackend : IDisposable
             case "DOWN": return actions.down;
             case "SUBMIT": return actions.menuSubmit;
             case "CANCEL": return actions.menuCancel;
+            case "PAUSE": return actions.pause;
             default: throw new ArgumentOutOfRangeException(nameof(button));
         }
     }

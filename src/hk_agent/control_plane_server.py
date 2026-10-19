@@ -171,6 +171,15 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 actor = next((row for row in active if isinstance(row, Mapping) and row.get("role") == "actor"), active[0])
                 launch_id = actor.get("launch_id") if isinstance(actor, Mapping) else None
                 self._json(HTTPStatus.ACCEPTED, self.server.control_plane.stop(str(launch_id)))
+            elif path in {"/api/playthrough/new", "/api/playthrough/restore"}:
+                require_keys(payload, ("campaign_id", "slot"))
+                if set(payload) != {"campaign_id", "slot"}:
+                    raise ValueError("playthrough action accepts campaign_id and slot")
+                if path.endswith("/new"):
+                    result = self.server.control_plane.start_new_playthrough(payload)
+                else:
+                    result = self.server.control_plane.restore_playthrough_backup(payload)
+                self._json(HTTPStatus.OK, result)
             elif path == "/api/reports/generate":
                 require_keys(payload, ("campaign_id",))
                 campaign_id = payload.get("campaign_id")

@@ -481,12 +481,17 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._journey_root = Path(journey_value) if journey_value else None
         self._journey_actor = os.environ.get("HK_AGENT_SLOT_ID", "0")
         self._diary: RunDiary | None = None
+        self._reload_checkpoint_next_reset = False
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, NDArray[np.generic]], dict[str, Any]]:
         super().reset(seed=seed)
-        observation, reset_info = self.environment.reset(seed=seed, options=options)
+        reset_options = dict(options or {})
+        if self._reload_checkpoint_next_reset:
+            reset_options["reload_checkpoint"] = True
+            self._reload_checkpoint_next_reset = False
+        observation, reset_info = self.environment.reset(seed=seed, options=reset_options)
         descriptor = self._descriptor(observation["pixels"][-1])
         if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             run_root = (
@@ -581,6 +586,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             initial_events = self._diary.observe(initial_record, monotonic_seconds=time.monotonic())
             self._diary.capture_firsts(initial_events)
+            self._update_playthrough(scene=self._previous_scene_name, step=0, events=initial_events)
         self._done = False
         self.mask_unavailable_count = 0
         self._history.reset()
@@ -646,6 +652,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 )
             journey_events = self._diary.observe(record)
             self._diary.capture_firsts(journey_events)
+            self._update_playthrough(scene=str(record.get("scene_name") or "") or None,
+                                     step=self._steps + 1, events=journey_events)
         if base.get("valid") is not True:
             self._done = True
             self.environment.backend.release_all()
@@ -1031,6 +1039,11 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             and not base_done
             and not terminal_penalty
         )
+        if stuck:
+            # The next PPO slice reopens through the validated Continue plan,
+            # loading the game's last committed checkpoint instead of replaying
+            # the campaign seed. The owner closes the current process safely.
+            self._reload_checkpoint_next_reset = True
         horizon = self._steps >= self.config.horizon_steps
         task_terminated = terminated or terminal_penalty
         task_truncated = truncated or ((horizon or stuck) and not task_terminated)
@@ -1117,6 +1130,22 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             }
         )
         return observation, reward, task_terminated, task_truncated, info
+
+    @staticmethod
+    def _update_playthrough(*, scene: str | None, step: int, events: list[dict[str, Any]]) -> None:
+        root_value = os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
+        if not root_value:
+            return
+        checkpoint = next((event.get("key") for event in events
+                           if event.get("category") == "checkpoint" and isinstance(event.get("key"), str)), None)
+        try:
+            from hk_agent.playthrough import update_playthrough_progress
+
+            update_playthrough_progress(Path(root_value), scene=scene,
+                                        progress={"step": step, "checkpoint": checkpoint})
+        except (OSError, ValueError, RuntimeError):
+            # Progress display is best-effort; the save transaction remains authoritative.
+            return
 
     def action_masks(self) -> NDArray[np.bool_]:
         return build_action_mask(

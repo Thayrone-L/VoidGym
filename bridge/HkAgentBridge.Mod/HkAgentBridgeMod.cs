@@ -192,7 +192,8 @@ public sealed class HkAgentBridgeMod : Mod
             }
             catch (Exception) { }
         }
-        _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags);
+        _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags,
+            playerData.GetBool("atBench"));
         if (!scene.name.StartsWith("Menu_", StringComparison.Ordinal) && hero != null && camera != null &&
             Interlocked.CompareExchange(ref _operatorTelemetryDiagnosticLogged, 1, 0) == 0)
         {

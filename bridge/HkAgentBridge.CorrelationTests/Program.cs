@@ -4,6 +4,11 @@ using System.IO;
 using System.Text.Json;
 using HkAgentBridge;
 
+MenuActionSelection pauseAction = MenuActionPolicy.Validate(new[] { "PAUSE" }, 50);
+Assert(pauseAction.Button == "PAUSE" && pauseAction.Mask == (1 << 6),
+    "PAUSE must have a dedicated virtual-controller control distinct from menu cancel");
+MenuActionSelection cancelAction = MenuActionPolicy.Validate(new[] { "CANCEL" }, 50);
+Assert(cancelAction.Mask == (1 << 5), "CANCEL must remain separate from PAUSE");
 var state = new EpisodeCorrelationState();
 string firstEpisode = Guid.NewGuid().ToString();
 string secondEpisode = Guid.NewGuid().ToString();
@@ -147,6 +152,15 @@ var respawnEvents = (Dictionary<string, object?>[])respawnTelemetry.Snapshot()["
 var respawnTransition = Array.Find(respawnEvents, item => (string)item["category"]! == "scene_transition")!;
 Assert(!(bool)respawnTransition["spatial"]! && (string)respawnTransition["transition_kind"]! == "death_respawn",
     "death/respawn scene changes must not become spatial passage edges");
+
+var checkpointTelemetry = new OperatorTelemetryState();
+checkpointTelemetry.Observe("Room_Bench", "Zone_B", 1, 4, 1, 4,
+    new[] { -5f, 0f, 15f, 10f }, 0, 0, noFlags, atBench: true);
+var checkpointFrame = checkpointTelemetry.Snapshot();
+Assert((bool)checkpointFrame["at_bench"]!, "operator telemetry must expose the current bench state");
+var checkpointEvents = (Dictionary<string, object?>[])checkpointFrame["milestone_events_since_last_frame"]!;
+Assert(checkpointEvents.Length == 1 && (string)checkpointEvents[0]["category"]! == "checkpoint",
+    "first observation at a bench must emit a checkpoint milestone");
 
 string saveRoot = Path.Combine(Path.GetTempPath(), $"hk-agent-save-{Guid.NewGuid():N}");
 Directory.CreateDirectory(saveRoot);
