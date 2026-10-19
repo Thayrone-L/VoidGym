@@ -9,6 +9,7 @@ internal sealed class OperatorTelemetryState
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, bool> _flags = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _charmCosts = new(StringComparer.Ordinal);
     private readonly List<Dictionary<string, object?>> _events = new();
     private string? _scene;
     private string? _zone;
@@ -24,7 +25,7 @@ internal sealed class OperatorTelemetryState
 
     public void Observe(string? scene, string? zone, float? x, float? y, float? cameraX, float? cameraY,
         float[]? bounds, int? grubs, int? geo, IEnumerable<KeyValuePair<string, bool>> flags,
-        bool atBench = false)
+        bool atBench = false, IReadOnlyDictionary<string, int>? charmCosts = null)
     {
         lock (_gate)
         {
@@ -88,6 +89,10 @@ internal sealed class OperatorTelemetryState
             if (atBench && _atBench != true)
                 _events.Add(Event("checkpoint", "bench_" + (scene ?? "unknown")));
             _atBench = atBench;
+            _charmCosts.Clear();
+            if (charmCosts != null)
+                foreach (KeyValuePair<string, int> charm in charmCosts)
+                    if (charm.Value >= 0 && charm.Value <= 6) _charmCosts[charm.Key] = charm.Value;
             foreach (KeyValuePair<string, bool> flag in flags)
             {
                 bool prior;
@@ -110,6 +115,8 @@ internal sealed class OperatorTelemetryState
                 ["x"] = _x, ["y"] = _y, ["camera_x"] = _cameraX, ["camera_y"] = _cameraY,
                 ["scene_bounds"] = _bounds, ["geo_current"] = _geo,
                 ["at_bench"] = _atBench == true,
+                ["progress_flags"] = new Dictionary<string, bool>(_flags, StringComparer.Ordinal),
+                ["charm_costs"] = new Dictionary<string, int>(_charmCosts, StringComparer.Ordinal),
                 ["milestone_events_since_last_frame"] = events,
             };
         }

@@ -384,3 +384,17 @@ def test_v3_to_v4_warm_start_accepts_equal_spaces_and_rejects_mismatch():
     different_actions = gym.spaces.Discrete(29)
     with pytest.raises(SharedLearnerError, match="spaces differ"):
         shared.validate_warm_start_spaces(observation, actions, observation, different_actions)
+
+
+def test_partial_warm_start_copies_compatible_visual_tensors_only():
+    source = {
+        "features_extractor.image.cnn.weight": np.ones((4, 3)),
+        "action_net.weight": np.ones((8, 16)),
+    }
+    target = {
+        "features_extractor.image.cnn.weight": np.zeros((4, 3)),
+        "action_net.weight": np.zeros((10, 16)),
+        "new_observation_projection.weight": np.zeros((16, 4)),
+    }
+    copied = shared.compatible_warm_start_state(source, target)
+    assert list(copied) == ["features_extractor.image.cnn.weight"]

@@ -194,7 +194,16 @@ internal sealed class VisualCaptureBackend : IDisposable
         if (data == null || hero == null) return null;
         return new ActionAvailability(data.MPCharge, data.equippedCharm_33 ? 24 : 33, 33,
             data.fireballLevel, data.quakeLevel, data.screamLevel, data.hasNailArt,
-            data.hasCyclone, data.hasDashSlash, data.hasUpwardSlash);
+            data.hasCyclone, data.hasDashSlash, data.hasUpwardSlash,
+            SafeProgressFlag(data, "hasDash"), SafeProgressFlag(data, "hasWallJump"),
+            SafeProgressFlag(data, "hasDoubleJump"), SafeProgressFlag(data, "hasSuperDash"),
+            SafeProgressFlag(data, "hasDreamNail"), SafeProgressFlag(data, "gotCharm_31"));
+    }
+
+    private static bool SafeProgressFlag(PlayerData data, string name)
+    {
+        try { return data.GetBool(name); }
+        catch (Exception) { return false; }
     }
 
     private static void CalculateOutputSize(
@@ -365,4 +374,6 @@ internal sealed class CapturedFrame
 
 internal sealed record ActionAvailability(int mp_charge, int spell_cost, int focus_cost,
     int fireball_level, int quake_level, int scream_level, bool has_nail_art,
-    bool has_cyclone, bool has_dash_slash, bool has_upward_slash);
+    bool has_cyclone, bool has_dash_slash, bool has_upward_slash, bool has_dash,
+    bool has_walljump, bool has_double_jump, bool has_super_dash, bool has_dream_nail,
+    bool has_dashmaster);

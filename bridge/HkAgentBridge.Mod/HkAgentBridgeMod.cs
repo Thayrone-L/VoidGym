@@ -192,8 +192,15 @@ public sealed class HkAgentBridgeMod : Mod
             }
             catch (Exception) { }
         }
+        var charmCosts = new System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal);
+        for (int charmId = 1; charmId <= 40; charmId++)
+        {
+            string flag = "gotCharm_" + charmId.ToString(CultureInfo.InvariantCulture);
+            if (SafeProgressFlag(playerData, flag))
+                charmCosts[flag] = Math.Min(6, SafeGetInt(playerData, "charmCost_" + charmId.ToString(CultureInfo.InvariantCulture)));
+        }
         _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags,
-            playerData.GetBool("atBench"));
+            playerData.GetBool("atBench"), charmCosts);
         if (!scene.name.StartsWith("Menu_", StringComparison.Ordinal) && hero != null && camera != null &&
             Interlocked.CompareExchange(ref _operatorTelemetryDiagnosticLogged, 1, 0) == 0)
         {
@@ -235,6 +242,12 @@ public sealed class HkAgentBridgeMod : Mod
     {
         try { return Math.Max(0, playerData.GetInt(name)); }
         catch (Exception) { return 0; }
+    }
+
+    private static bool SafeProgressFlag(PlayerData playerData, string name)
+    {
+        try { return playerData.GetBool(name); }
+        catch (Exception) { return false; }
     }
 
     private static float[]? ReadSceneBounds(UnityEngine.SceneManagement.Scene scene)

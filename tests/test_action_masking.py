@@ -23,10 +23,30 @@ def test_mask_covers_spell_focus_and_nail_art_availability() -> None:
 
 
 def test_mask_allows_available_actions_and_unknown_bridge() -> None:
-    available = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True)
+    available = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True,
+                                   has_dash=True, has_super_dash=True, has_dream_nail=True,
+                                   has_dashmaster=True)
     mask = build_action_mask(TASK_ACTION_NAMES, available)
     assert mask.all()
-    assert build_action_mask(TASK_ACTION_NAMES, None).all()
+    unknown_mask = build_action_mask(TASK_ACTION_NAMES, None)
+    assert unknown_mask[TASK_ACTION_NAMES.index("LEFT")]
+    assert not unknown_mask[TASK_ACTION_NAMES.index("DASH")]
+
+
+def test_new_ability_actions_remain_masked_until_owned() -> None:
+    unavailable = ActionAvailability(33, 33, 33, 0, 0, 0, False, False, False, False)
+    mask = build_action_mask(TASK_ACTION_NAMES, unavailable)
+    assert not mask[TASK_ACTION_NAMES.index("DASH")]
+    assert not mask[TASK_ACTION_NAMES.index("SUPER_DASH_HOLD")]
+    assert not mask[TASK_ACTION_NAMES.index("DREAM_NAIL")]
+    assert not mask[TASK_ACTION_NAMES.index("LEFT+DASH")]
+    owned = ActionAvailability(33, 33, 33, 0, 0, 0, False, False, False, False,
+                               has_dash=True, has_super_dash=True, has_dream_nail=True,
+                               has_dashmaster=True)
+    owned_mask = build_action_mask(TASK_ACTION_NAMES, owned)
+    assert owned_mask[TASK_ACTION_NAMES.index("DASH")]
+    assert owned_mask[TASK_ACTION_NAMES.index("SUPER_DASH_HOLD")]
+    assert owned_mask[TASK_ACTION_NAMES.index("DREAM_NAIL")]
 
 
 @pytest.mark.parametrize(

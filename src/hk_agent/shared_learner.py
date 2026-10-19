@@ -92,6 +92,19 @@ def validate_warm_start_spaces(
         raise SharedLearnerError("warm-start observation or action spaces differ from the new campaign")
 
 
+def compatible_warm_start_state(
+    source_state: Mapping[str, Any], target_state: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return only identically named, identically shaped source policy tensors."""
+    compatible = {
+        name: tensor for name, tensor in source_state.items()
+        if name in target_state and getattr(target_state[name], "shape", None) == getattr(tensor, "shape", None)
+    }
+    if not compatible or not any("features_extractor" in name for name in compatible):
+        raise SharedLearnerError("warm-start has no compatible visual feature extractor tensors")
+    return compatible
+
+
 def _space_to_payload(space: gym.Space[Any]) -> dict[str, Any]:
     if isinstance(space, gym.spaces.Dict):
         return {
@@ -1234,10 +1247,12 @@ def run_shared_learner(
     if warm_start_checkpoint is not None:
         if previous:
             raise SharedLearnerError("warm-start campaigns must use a new shared checkpoint directory")
-        source_model = contrib.MaskablePPO.load(str(warm_start_checkpoint), env=environment, device="cpu")
-        validate_warm_start_spaces(source_model.observation_space, source_model.action_space,
-                                   observation_space, action_space)
-        model = source_model
+        source_model = contrib.MaskablePPO.load(str(warm_start_checkpoint), device="cpu")
+        source_state = source_model.policy.state_dict()
+        target_state = model.policy.state_dict()
+        compatible = compatible_warm_start_state(source_state, target_state)
+        target_state.update(compatible)
+        model.policy.load_state_dict(target_state, strict=True)
         model.policy.optimizer.state.clear()
         model.num_timesteps = 0
         model._n_updates = 0
@@ -1279,6 +1294,7 @@ def run_shared_learner(
             "source_campaign": warm_start_source_campaign,
             "checkpoint": str(warm_start_checkpoint),
             "checkpoint_sha256": _sha256_file(warm_start_checkpoint),
+            "mode": "compatible_tensors_only",
             "optimizer_reset": True,
             "source_reward_version": "explore_v3",
         }

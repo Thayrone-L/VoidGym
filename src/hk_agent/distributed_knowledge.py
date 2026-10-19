@@ -17,11 +17,12 @@ _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
-_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3", "explore_v4"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "visual_motion_player_knowledge_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3", "explore_v4"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
         "reward_version",
         "task_contract_schema_version",
+        "observation_version",
         "action_names",
         "raw_action_indices",
         "actions",
@@ -85,7 +86,7 @@ _TASK_CONFIG_KEYS = frozenset(
         "n_epochs", "target_kl", "learning_rate", "clip_range",
     }
 )
-_BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST"})
+_BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST", "DASH", "SUPER_DASH", "DREAM_NAIL"})
 _DURATIONS = frozenset({"base", "tap", "hold", "focus", "charge"})
 _ACTION_NAMES = frozenset(
     {
@@ -113,6 +114,7 @@ _ACTION_NAMES = frozenset(
         "NAIL_ART_CHARGE",
         "LEFT+NAIL_ART_CHARGE",
         "RIGHT+NAIL_ART_CHARGE",
+        "DASH", "LEFT+DASH", "RIGHT+DASH", "DOWN+DASH", "SUPER_DASH_HOLD", "DREAM_NAIL",
         "UP+NAIL_ART_CHARGE",
         "DOWN+NAIL_ART_CHARGE",
     }
@@ -360,14 +362,22 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     if "legal_action_mask" in contract:
         mask = _expect_dict(contract["legal_action_mask"], "task_contract.legal_action_mask")
         _expect_allowed_keys(mask, {"version", "source"}, "task_contract.legal_action_mask")
-        if mask != {"version": "action_availability_v1", "source": "frame_action_availability"}:
+        if mask not in (
+            {"version": "action_availability_v1", "source": "frame_action_availability"},
+            {"version": "action_availability_v2", "source": "frame_action_availability"},
+        ):
             raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     schema_version = contract.get("task_contract_schema_version", 1)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3}:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5}:
         raise KnowledgeValidationError("task_contract_schema_version is unsupported")
     result["task_contract_schema_version"] = schema_version
+    if "observation_version" in contract:
+        observation_version = contract["observation_version"]
+        if not isinstance(observation_version, str) or len(observation_version) > 80:
+            raise KnowledgeValidationError("task_contract.observation_version is invalid")
+        result["observation_version"] = observation_version
     action_names = contract["action_names"]
     if not isinstance(action_names, list) or not all(
         name in _ACTION_NAMES for name in action_names
@@ -377,7 +387,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     if "raw_action_indices" in contract:
         indices = contract["raw_action_indices"]
         if not isinstance(indices, list) or not all(
-            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 511
+            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 1023
             for index in indices
         ):
             raise KnowledgeValidationError("task_contract.raw_action_indices is invalid")
@@ -403,7 +413,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
             if (
                 not isinstance(raw_index, int)
                 or isinstance(raw_index, bool)
-                or not 0 <= raw_index <= 511
+                or not 0 <= raw_index <= 1023
             ):
                 raise KnowledgeValidationError("task_contract action index is invalid")
             if (

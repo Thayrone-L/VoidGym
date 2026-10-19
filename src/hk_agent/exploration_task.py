@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 
 from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.gym_env import HollowKnightEnv
+from hk_agent.player_knowledge import ITEM_FLAGS, PlayerKnowledge
 from hk_agent.run_journey import RunDiary, increment_campaign_count, rebuild_progress
 from hk_agent.scene_change_task import (
     SCENE_CHANGE_ACTION_NAMES,
@@ -48,6 +49,13 @@ def descriptor_hash(descriptor: NDArray[np.generic]) -> str:
         np.uint8
     )
     return hashlib.sha256(quantized.tobytes()).hexdigest()
+
+
+def _ability_aware_novelty_hash(
+    descriptor: NDArray[np.generic], knowledge: PlayerKnowledge
+) -> str:
+    acquired = bytes(int(knowledge.known_flags.get(flag, False)) for flag, _ in ITEM_FLAGS)
+    return hashlib.sha256(bytes.fromhex(descriptor_hash(descriptor)) + acquired).hexdigest()
 
 
 def load_lifelong_visits(path: Path, limit: int) -> dict[str, int]:
@@ -416,10 +424,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.lifelong_memory_root = lifelong_memory_root
         self.action_space = gym.spaces.Discrete(len(SCENE_CHANGE_ACTION_TEMPLATES))  # type: ignore[assignment]
         source = cast(gym.spaces.Dict, environment.observation_space)
-        self.observation_space = temporal_observation_space(
+        task_observation_space = temporal_observation_space(
             source,  # type: ignore[arg-type]
             number_of_actions=len(SCENE_CHANGE_ACTION_TEMPLATES),
-        )  # type: ignore[assignment]
+        )
+        if self.config.reward_version == "explore_v4":
+            task_observation_space.spaces["player_knowledge"] = PlayerKnowledge.space()
+        self.observation_space = task_observation_space  # type: ignore[assignment]
         history = source["action_history"]
         if history.shape is None:
             raise TypeError("action_history must declare a shape")
@@ -482,6 +493,21 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._journey_actor = os.environ.get("HK_AGENT_SLOT_ID", "0")
         self._diary: RunDiary | None = None
         self._reload_checkpoint_next_reset = False
+        self._player_knowledge = PlayerKnowledge()
+        playthrough_root = os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
+        self._knowledge_path = (
+            Path(playthrough_root) / "player-knowledge.json"
+            if playthrough_root
+            else task_log_path.with_name("player-knowledge.json") if task_log_path else None
+        )
+        if self._knowledge_path is not None:
+            try:
+                if self._knowledge_path.stat().st_size <= 1_048_576:
+                    self._player_knowledge = PlayerKnowledge.from_payload(
+                        json.loads(self._knowledge_path.read_text("utf-8"))
+                    )
+            except (OSError, json.JSONDecodeError):
+                pass
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -492,6 +518,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             reset_options["reload_checkpoint"] = True
             self._reload_checkpoint_next_reset = False
         observation, reset_info = self.environment.reset(seed=seed, options=reset_options)
+        self._player_knowledge.update(reset_info)
+        self._persist_player_knowledge()
         descriptor = self._descriptor(observation["pixels"][-1])
         if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             run_root = (
@@ -590,7 +618,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._done = False
         self.mask_unavailable_count = 0
         self._history.reset()
-        return self._history.apply(observation), {}
+        return self._apply_player_knowledge(self._history.apply(observation)), {}
 
     def step(
         self, action: int
@@ -620,6 +648,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             observation, _, terminated, truncated, base = self.environment.step(
                 template.raw_action_index, lease_ms=lease
             )
+        previous_skill_epoch = self._player_knowledge.skill_epoch
+        self._player_knowledge.update(base)
+        self._persist_player_knowledge()
+        ability_reexploration = self._player_knowledge.skill_epoch > previous_skill_epoch
         if self._diary is not None:
             telemetry = base.get("operator_telemetry", {})
             record = dict(telemetry) if isinstance(telemetry, dict) else {}
@@ -698,7 +730,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             if stationary_attack:
                 eligible = False
         novelty_hash = (
-            descriptor_hash(descriptor)
+            _ability_aware_novelty_hash(descriptor, self._player_knowledge)
+            if self.config.reward_version == "explore_v4"
+            else descriptor_hash(descriptor)
             if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}
             else None
         )
@@ -1110,6 +1144,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             {
                 "schema_version": 1,
                 "reward_version": self.config.reward_version,
+                "ability_reexploration": ability_reexploration,
                 "step": self._steps,
                 "task_action": template.name,
                 "raw_action_index": template.raw_action_index,
@@ -1129,7 +1164,23 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 **audit,
             }
         )
-        return observation, reward, task_terminated, task_truncated, info
+        return self._apply_player_knowledge(observation), reward, task_terminated, task_truncated, info
+
+    def _apply_player_knowledge(
+        self, observation: dict[str, NDArray[np.generic]]
+    ) -> dict[str, NDArray[np.generic]]:
+        result = dict(observation)
+        if self.config.reward_version == "explore_v4":
+            result["player_knowledge"] = self._player_knowledge.vector()
+        return result
+
+    def _persist_player_knowledge(self) -> None:
+        if self._knowledge_path is None:
+            return
+        self._knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+        pending = self._knowledge_path.with_name(f".{self._knowledge_path.name}.{os.getpid()}.tmp")
+        pending.write_text(json.dumps(self._player_knowledge.to_payload(), separators=(",", ":"), allow_nan=False), encoding="utf-8", newline="\n")
+        os.replace(pending, self._knowledge_path)
 
     @staticmethod
     def _update_playthrough(*, scene: str | None, step: int, events: list[dict[str, Any]]) -> None:
@@ -1159,14 +1210,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.environment.close()
 
     def task_contract(self) -> dict[str, Any]:
-        schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3, "explore_v4": 4}[
+        schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3, "explore_v4": 5}[
             self.config.reward_version
         ]
         return {
             "task_contract_schema_version": schema_version,
             "reward_version": self.config.reward_version,
             "legal_action_mask": {
-                "version": "action_availability_v1",
+                "version": "action_availability_v2" if schema_version == 5 else "action_availability_v1",
                 "source": "frame_action_availability",
             },
             "action_names": list(SCENE_CHANGE_ACTION_NAMES),
@@ -1176,7 +1227,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "config": {
                 key: value for key, value in asdict(self.config).items() if key != "reward_version"
             },
-            "information_boundary": ["pixels", "applied_action_history"],
+            "observation_version": "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version == 5 else ["pixels", "applied_action_history"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

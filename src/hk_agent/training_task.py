@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 
 from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.gym_env import HollowKnightEnv
+from hk_agent.player_knowledge import PlayerKnowledge
 from hk_agent.temporal_actions import (
     TEMPORAL_COMBAT_ACTIONS,
     TemporalActionHistory,
@@ -20,7 +21,7 @@ from hk_agent.temporal_actions import (
     temporal_observation_space,
 )
 
-VISUAL_MOTION_REWARD_VERSION = "visual_motion_v1"
+VISUAL_MOTION_REWARD_VERSION = "visual_motion_player_knowledge_v1"
 
 
 class InvalidTrainingTransition(RuntimeError):
@@ -113,6 +114,7 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         *,
         config: VisualMotionTaskConfig | None = None,
         task_log_path: Path | None = None,
+        lifelong_memory_root: Path | None = None,
     ) -> None:
         super().__init__()
         self.environment = environment
@@ -121,10 +123,12 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.task_log_path = task_log_path
         self.action_space = gym.spaces.Discrete(len(TASK_ACTION_TEMPLATES))  # type: ignore[assignment]
         source_space = cast(gym.spaces.Dict, environment.observation_space)
-        self.observation_space = temporal_observation_space(  # type: ignore[assignment]
+        task_observation_space = temporal_observation_space(
             environment.observation_space,
             number_of_actions=len(TASK_ACTION_TEMPLATES),
         )
+        task_observation_space.spaces["player_knowledge"] = PlayerKnowledge.space()
+        self.observation_space = task_observation_space  # type: ignore[assignment]
         history_space = source_space["action_history"]
         if history_space.shape is None:
             raise TypeError("action_history must declare a shape")
@@ -139,12 +143,28 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._shade_recovery_reward_paid = False
         self._done = True
         self.mask_unavailable_count = 0
+        self._player_knowledge = PlayerKnowledge()
+        self._knowledge_path = (
+            task_log_path.with_name("player-knowledge.json") if task_log_path is not None else None
+        )
+        if lifelong_memory_root is not None:
+            self._knowledge_path = lifelong_memory_root / "player-knowledge.json"
+        if self._knowledge_path is not None:
+            try:
+                if self._knowledge_path.stat().st_size <= 1_048_576:
+                    self._player_knowledge = PlayerKnowledge.from_payload(
+                        json.loads(self._knowledge_path.read_text("utf-8"))
+                    )
+            except (OSError, json.JSONDecodeError):
+                pass
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, NDArray[np.generic]], dict[str, Any]]:
         super().reset(seed=seed)
-        observation, _ = self.environment.reset(seed=seed, options=options)
+        observation, reset_info = self.environment.reset(seed=seed, options=options)
+        self._player_knowledge.update(reset_info)
+        self._persist_player_knowledge()
         self._previous_pixels = observation["pixels"][-1].copy()
         self._recent_motion.clear()
         self._target_bonus_paid = False
@@ -155,7 +175,7 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._done = False
         self.mask_unavailable_count = 0
         self._action_history.reset()
-        return self._action_history.apply(observation), {}
+        return self._apply_knowledge(self._action_history.apply(observation)), {}
 
     def step(
         self, action: int
@@ -286,6 +306,8 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "mask_unavailable_count": self.mask_unavailable_count,
         }
         _copy_lifecycle_info(base_info, info)
+        self._player_knowledge.update(base_info)
+        self._persist_player_knowledge()
         self._append_task_log(
             {
                 "schema_version": 1,
@@ -306,7 +328,23 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "valid": True,
             }
         )
-        return observation, reward, task_terminated, task_truncated, info
+        return self._apply_knowledge(observation), reward, task_terminated, task_truncated, info
+
+    def _apply_knowledge(
+        self, observation: dict[str, NDArray[np.generic]]
+    ) -> dict[str, NDArray[np.generic]]:
+        result = dict(observation)
+        result["player_knowledge"] = self._player_knowledge.vector()
+        return result
+
+    def _persist_player_knowledge(self) -> None:
+        if self._knowledge_path is None:
+            return
+        self._knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+        pending = self._knowledge_path.with_name(f".{self._knowledge_path.name}.{os.getpid()}.tmp")
+        payload = json.dumps(self._player_knowledge.to_payload(), separators=(",", ":"), allow_nan=False)
+        pending.write_text(payload, encoding="utf-8", newline="\n")
+        os.replace(pending, self._knowledge_path)
 
     def action_masks(self) -> NDArray[np.bool_]:
         return build_action_mask(
@@ -318,14 +356,16 @@ class VisualMotionTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     def task_contract(self) -> dict[str, Any]:
         return {
             "reward_version": VISUAL_MOTION_REWARD_VERSION,
-            "legal_action_mask": {"version": "action_availability_v1", "source": "frame_action_availability"},
+            "legal_action_mask": {"version": "action_availability_v2", "source": "frame_action_availability"},
             "action_names": list(TASK_ACTION_NAMES),
             "raw_action_indices": list(TASK_ACTIONS),
             "actions": action_contract(
                 TASK_ACTION_TEMPLATES, base_lease_ms=self.environment.lease_ms
             ),
             "config": asdict(self.config),
-            "information_boundary": ["pixels", "applied_action_history"],
+            "task_contract_schema_version": 4,
+            "observation_version": "pixels_action_history_player_knowledge_v1",
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

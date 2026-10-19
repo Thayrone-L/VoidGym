@@ -291,21 +291,34 @@ def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> Non
     assert info_repeated["reward_components"]["milestone_novelty"] == pytest.approx(expected)
 
 
-def test_v4_contract_keeps_telemetry_out_of_observation_and_bounds_return() -> None:
+def test_v4_contract_adds_player_knowledge_and_keeps_raw_telemetry_out() -> None:
     environment = _Environment()
     environment.extra = {"operator_telemetry": {"scene_name": "Room-A", "x": 4.0, "y": 8.0}}
     task = ExplorationTask(environment, config=_v4_config())
     contract = task.task_contract()
     assert contract["reward_version"] == "explore_v4"
-    assert contract["task_contract_schema_version"] == 4
-    assert contract["information_boundary"] == ["pixels", "applied_action_history"]
+    assert contract["task_contract_schema_version"] == 5
+    assert contract["observation_version"] == "pixels_action_history_player_knowledge_v1"
+    assert contract["information_boundary"] == ["pixels", "applied_action_history", "player_knowledge"]
     assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
     assert task.config.maximum_positive_episode_reward() <= 75.2
     observation, _ = task.reset()
     observation, _, _, _, info = task.step(0)
     assert "operator_telemetry" in info
     assert task.observation_space.contains(observation)
-    assert set(observation) == {"pixels", "action_history"}
+    assert set(observation) == {"pixels", "action_history", "player_knowledge"}
+
+
+def test_v4_novelty_key_changes_when_player_learns_an_ability() -> None:
+    from hk_agent.exploration_task import _ability_aware_novelty_hash
+    from hk_agent.player_knowledge import PlayerKnowledge
+
+    descriptor = np.zeros(16, dtype=np.float32)
+    player = PlayerKnowledge()
+    before = _ability_aware_novelty_hash(descriptor, player)
+    player.known_flags["hasDash"] = True
+    after = _ability_aware_novelty_hash(descriptor, player)
+    assert before != after
 
 
 def test_initial_scene_is_captured_for_map_registration(

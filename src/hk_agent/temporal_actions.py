@@ -74,6 +74,12 @@ TEMPORAL_COMBAT_ACTIONS: tuple[TemporalActionTemplate, ...] = (
     TemporalActionTemplate(
         "DOWN+NAIL_ART_CHARGE", ("DOWN", "ATTACK"), "charge"
     ),
+    TemporalActionTemplate("DASH", ("DASH",), "tap"),
+    TemporalActionTemplate("LEFT+DASH", ("LEFT", "DASH"), "tap"),
+    TemporalActionTemplate("RIGHT+DASH", ("RIGHT", "DASH"), "tap"),
+    TemporalActionTemplate("DOWN+DASH", ("DOWN", "DASH"), "tap"),
+    TemporalActionTemplate("SUPER_DASH_HOLD", ("SUPER_DASH",), "charge"),
+    TemporalActionTemplate("DREAM_NAIL", ("DREAM_NAIL",), "hold"),
 )
 
 
