@@ -15,6 +15,7 @@ from hk_agent.shared_learner import (
     SharedRoundStore,
     _atomic_json,
     _canonical_json,
+    _restore_latest_checkpoint,
     _shared_ppo_parameters,
     _space_from_payload,
     _space_to_payload,
@@ -42,6 +43,74 @@ def test_shared_policy_is_immutable_and_resume_reuses_pointer(tmp_path):
         store.publish_policy(4, policy, FINGERPRINT)
     assert store.publish_policy(4, policy, FINGERPRINT, reuse_existing=True) == published
     assert pointer_path.read_bytes() == before
+
+
+def test_policy_retention_keeps_checkpoint_generation_and_cleans_pairs(tmp_path):
+    policy = _tiny_torch_policy()
+    store = SharedRoundStore(tmp_path)
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    protected_checkpoint = checkpoints / "round-00000003.zip"
+    protected_checkpoint.write_bytes(b"checkpoint")
+    _atomic_json(tmp_path / "manifest.json", {"latest_checkpoint": str(protected_checkpoint)})
+
+    for round_number in range(9):
+        store.publish_policy(round_number, policy, FINGERPRINT)
+
+    pointers = {path.stem for path in store.policy_root.glob("round-*.json")}
+    assert "round-00000003" in pointers
+    assert {"round-00000006", "round-00000007", "round-00000008"} <= pointers
+    assert "round-00000002" not in pointers
+    for round_number in (3, 6, 7, 8):
+        pointer = json.loads((store.policy_root / f"round-{round_number:08d}.json").read_text("utf-8"))
+        assert (store.policy_root / pointer["artifact"]).is_file()
+        assert (store.policy_root / pointer["manifest"]).is_file()
+
+
+def test_policy_publication_cleans_generation_after_pointer_failure(tmp_path, monkeypatch):
+    policy = _tiny_torch_policy()
+    store = SharedRoundStore(tmp_path)
+    original_link = shared.os.link
+
+    def fail_pointer_link(_source, _target):
+        raise OSError("injected pointer publication failure")
+
+    monkeypatch.setattr(shared.os, "link", fail_pointer_link)
+    with pytest.raises(SharedLearnerError, match="new generation .* was cleaned"):
+        store.publish_policy(2, policy, FINGERPRINT)
+    assert list(store.policy_root.glob("round-00000002-*.safetensors")) == []
+    assert list(store.policy_root.glob("round-00000002-*.policy.manifest.json")) == []
+    assert not (store.policy_root / "round-00000002.json").exists()
+
+    monkeypatch.setattr(shared.os, "link", original_link)
+    published = store.publish_policy(2, policy, FINGERPRINT)
+    assert (store.policy_root / published["artifact"]).is_file()
+    assert (store.policy_root / "round-00000002.json").is_file()
+
+
+def test_resume_uses_latest_valid_checkpoint_round_not_stale_learner_status(tmp_path):
+    class FakeModel:
+        num_timesteps = 12_288
+
+    class FakeModelClass:
+        @staticmethod
+        def load(path, *, env, device):
+            assert env == "fake-env"
+            assert device == "cpu"
+            assert path.endswith("round-00000015.zip")
+            return FakeModel()
+
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "round-00000015.zip").write_bytes(b"valid model")
+    _atomic_json(tmp_path / "learner.json", {"round": 0, "completed_timesteps": 0})
+
+    restored = _restore_latest_checkpoint(FakeModelClass, checkpoints, "fake-env")
+    assert restored is not None
+    model, round_number, completed = restored
+    assert isinstance(model, FakeModel)
+    assert round_number == 15
+    assert completed == 12_288
 
 
 def test_actor_imports_while_policy_is_published(tmp_path):
@@ -227,6 +296,29 @@ def test_rollout_rejects_empty_mask_and_unavailable_action(tmp_path):
             round_number=1, slot=0, fingerprint=FINGERPRINT, n_steps=2,
             observation_space=observation_space, action_count=action_count,
         )
+
+
+def test_wait_rollouts_rejects_rollout_from_retired_actor_launch(tmp_path):
+    store = _publish_arrays(tmp_path)
+    store.publish_actor_status(slot=0, launch_id="actor-current", status="COLLECTING")
+    observation_space, action_count = _spaces()
+
+    with pytest.raises(TimeoutError, match="no valid actor rollouts"):
+        store.wait_rollouts(
+            round_number=1, actors=1, fingerprint=FINGERPRINT, n_steps=2,
+            observation_space=observation_space, action_count=action_count, timeout=0.01,
+        )
+
+    rejected = (tmp_path / "rejected.jsonl").read_text("utf-8")
+    assert "retired actor launch" in rejected
+
+
+def test_new_actor_starting_status_replaces_terminal_slot_owner(tmp_path):
+    store = SharedRoundStore(tmp_path)
+    store.publish_actor_status(slot=0, launch_id="actor-old", status="FAILED")
+    assert store.publish_actor_status(slot=0, launch_id="actor-new", status="STARTING")
+    assert store._read_actor_status(0)["launch_id"] == "actor-new"
+    assert store.actor_available(0) is True
 
 
 def test_one_actor_satisfies_quorum_after_timeout(tmp_path):

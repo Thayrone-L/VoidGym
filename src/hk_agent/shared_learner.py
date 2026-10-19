@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import secrets
 import time
 import zipfile
@@ -270,6 +272,13 @@ class SharedRoundStore:
         })
         return True
 
+    def _read_actor_status(self, slot: int) -> dict[str, Any]:
+        try:
+            value = json.loads(self.actor_status_path(slot).read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def actor_available(self, slot: int, *, now_unix_ns: int | None = None) -> bool | None:
         """Return None until known, then whether the current slot heartbeat is live."""
         try:
@@ -387,16 +396,25 @@ class SharedRoundStore:
         )
 
     def publish_policy(
-        self, round_number: int, policy: Any, fingerprint: str, *, reuse_existing: bool = False
+        self, round_number: int, policy: Any, fingerprint: str, *,
+        reuse_existing: bool = False, replace_existing: bool = False,
     ) -> dict[str, Any]:
         fingerprint = _safe_fingerprint(fingerprint)
         stem = f"round-{round_number:08d}"
         pointer_path = self.policy_root / f"{stem}.json"
-        if pointer_path.exists():
+        if pointer_path.exists() and not replace_existing:
             if reuse_existing:
-                self.import_policy(round_number, policy, fingerprint)
-                return cast(dict[str, Any], json.loads(pointer_path.read_text("utf-8")))
-            raise SharedLearnerError(f"policy round {round_number} was already published")
+                try:
+                    self.import_policy(round_number, policy, fingerprint)
+                except (OSError, ValueError, SharedLearnerError) as error:
+                    logging.getLogger(__name__).warning(
+                        "ignoring invalid policy pointer for round %s: %s", round_number, error
+                    )
+                    pointer_path.unlink(missing_ok=True)
+                else:
+                    return cast(dict[str, Any], json.loads(pointer_path.read_text("utf-8")))
+            else:
+                raise SharedLearnerError(f"policy round {round_number} was already published")
         generation = secrets.token_hex(8)
         artifact = self.policy_root / f"{stem}-{generation}.safetensors"
         sidecar = self.policy_root / f"{stem}-{generation}.policy.manifest.json"
@@ -419,26 +437,102 @@ class SharedRoundStore:
                 stream.write(_canonical_json(pointer) + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            try:
-                os.link(pending_pointer, pointer_path)
-            except FileExistsError as error:
-                raise SharedLearnerError(
-                    f"policy round {round_number} was already published"
-                ) from error
+            if replace_existing and pointer_path.exists():
+                os.replace(pending_pointer, pointer_path)
+            else:
+                try:
+                    os.link(pending_pointer, pointer_path)
+                except FileExistsError as error:
+                    raise SharedLearnerError(
+                        f"policy round {round_number} was already published"
+                    ) from error
+        except BaseException as error:
+            if not pointer_path.exists() or replace_existing:
+                artifact.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+            raise SharedLearnerError(
+                f"policy round {round_number} publication failed before pointer commit; "
+                f"new generation {generation} was cleaned: {error}"
+            ) from error
         finally:
             pending_pointer.unlink(missing_ok=True)
-        for old_artifact in self.policy_root.glob("round-*.safetensors"):
-            try:
-                old_round = int(old_artifact.name[6:14])
-            except ValueError:
-                continue
-            if old_round < round_number - 2:
-                old_artifact.unlink(missing_ok=True)
-                old_manifest = old_artifact.with_name(
-                    old_artifact.name.removesuffix(".safetensors") + ".policy.manifest.json"
-                )
-                old_manifest.unlink(missing_ok=True)
+        self._cleanup_policy_generations(round_number)
         return pointer
+
+    def _latest_checkpoint_round(self) -> int | None:
+        shared_root = self.policy_root.parent
+        manifest_path = shared_root / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        candidate = manifest.get("latest_checkpoint") if isinstance(manifest, dict) else None
+        paths = [Path(candidate)] if isinstance(candidate, str) else []
+        paths.extend((shared_root / "checkpoints").glob("round-*.zip"))
+        valid: list[int] = []
+        for path in paths:
+            match = re.fullmatch(r"round-(\d{8})\.zip", path.name)
+            if match and path.is_file():
+                valid.append(int(match.group(1)))
+        return max(valid) if valid else None
+
+    def _cleanup_policy_generations(self, current_round: int) -> None:
+        checkpoint_round = self._latest_checkpoint_round()
+        protected_rounds = {current_round, current_round - 1, current_round - 2}
+        if checkpoint_round is not None:
+            protected_rounds.add(checkpoint_round)
+        pointers: list[tuple[int, Path, dict[str, Any]]] = []
+        for path in self.policy_root.glob("round-*.json"):
+            match = re.fullmatch(r"round-(\d{8})\.json", path.name)
+            if match is None:
+                continue
+            try:
+                value = json.loads(path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logging.getLogger(__name__).warning("removing unreadable policy pointer %s", path)
+                path.unlink(missing_ok=True)
+                continue
+            if not isinstance(value, dict):
+                path.unlink(missing_ok=True)
+                continue
+            artifact_name, manifest_name = value.get("artifact"), value.get("manifest")
+            if not isinstance(artifact_name, str) or Path(artifact_name).name != artifact_name:
+                logging.getLogger(__name__).warning("removing unsafe policy pointer %s", path)
+                path.unlink(missing_ok=True)
+                continue
+            artifact = self.policy_root / artifact_name
+            sidecar = self.policy_root / manifest_name if isinstance(manifest_name, str) and Path(manifest_name).name == manifest_name else None
+            policy_round = int(match.group(1))
+            if not artifact.is_file() or (sidecar is not None and not sidecar.is_file()):
+                logging.getLogger(__name__).warning("removing policy pointer with missing artifact: %s", path)
+                path.unlink(missing_ok=True)
+                if policy_round not in protected_rounds:
+                    artifact.unlink(missing_ok=True)
+                    if sidecar is not None:
+                        sidecar.unlink(missing_ok=True)
+                continue
+            pointers.append((policy_round, path, value))
+        retained_references = {
+            name for policy_round, _path, value in pointers if policy_round in protected_rounds
+            for name in (value.get("artifact"), value.get("manifest")) if isinstance(name, str)
+        }
+        for policy_round, pointer_path, value in pointers:
+            if policy_round in protected_rounds:
+                continue
+            pointer_path.unlink(missing_ok=True)
+            for key in ("artifact", "manifest"):
+                name = value.get(key)
+                if isinstance(name, str) and name not in retained_references and Path(name).name == name:
+                    (self.policy_root / name).unlink(missing_ok=True)
+        referenced = {
+            name for _round, _path, value in pointers
+            for name in (value.get("artifact"), value.get("manifest")) if isinstance(name, str)
+        }
+        for artifact in self.policy_root.glob("round-*.safetensors"):
+            match = re.match(r"round-(\d{8})-", artifact.name)
+            if match and int(match.group(1)) not in protected_rounds and artifact.name not in referenced:
+                artifact.unlink(missing_ok=True)
+                artifact.with_name(artifact.name.removesuffix(".safetensors") + ".policy.manifest.json").unlink(missing_ok=True)
 
     def import_policy(self, round_number: int, policy: Any, fingerprint: str) -> dict[str, Any]:
         stem = f"round-{round_number:08d}"
@@ -447,8 +541,20 @@ class SharedRoundStore:
             raise SharedLearnerError("policy round does not match request")
         if pointer.get("task_contract_fingerprint") != _safe_fingerprint(fingerprint):
             raise SharedLearnerError("policy task contract fingerprint differs")
-        artifact = self.policy_root / str(pointer.get("artifact"))
-        manifest = self.policy_root / str(pointer.get("manifest"))
+        artifact_name, manifest_name = pointer.get("artifact"), pointer.get("manifest")
+        if (not isinstance(artifact_name, str) or Path(artifact_name).name != artifact_name
+                or not isinstance(manifest_name, str) or Path(manifest_name).name != manifest_name):
+            raise SharedLearnerError(f"policy pointer for round {round_number} has unsafe artifact paths")
+        artifact = self.policy_root / artifact_name
+        manifest = self.policy_root / manifest_name
+        if not artifact.is_file() or not manifest.is_file():
+            logging.getLogger(__name__).warning(
+                "policy round %s points to missing files (artifact=%s, manifest=%s)",
+                round_number, artifact.is_file(), manifest.is_file(),
+            )
+            raise SharedLearnerError(
+                f"policy pointer for round {round_number} references a missing artifact or manifest"
+            )
         return import_policy_artifact(
             policy,
             artifact,
@@ -675,6 +781,18 @@ class SharedRoundStore:
                     marker = (sidecar.stat().st_size, sidecar.stat().st_mtime_ns)
                     if inspected.get(slot) == marker:
                         continue
+                    try:
+                        rollout_metadata = json.loads(sidecar.read_text("utf-8"))
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise SharedLearnerError("rollout metadata is missing or malformed") from error
+                    actor_status = self._read_actor_status(slot)
+                    current_launch_id = actor_status.get("launch_id")
+                    rollout_launch_id = rollout_metadata.get("launch_id") if isinstance(rollout_metadata, Mapping) else None
+                    if (isinstance(current_launch_id, str) and current_launch_id
+                            and rollout_launch_id != current_launch_id):
+                        raise SharedLearnerError(
+                            "rollout belongs to a retired actor launch, not the current slot owner"
+                        )
                     data = self.read_rollout(
                         round_number=round_number,
                         slot=slot,
@@ -1387,6 +1505,28 @@ def _append_actor_telemetry(shared_root: Path, slot: int, row: Mapping[str, Any]
         os.close(descriptor)
 
 
+def _restore_latest_checkpoint(
+    model_class: Any, checkpoints: Path, environment: gym.Env[Any, Any]
+) -> tuple[Any, int, int] | None:
+    candidates = [
+        path for path in checkpoints.glob("round-*.zip")
+        if path.is_file() and re.fullmatch(r"round-\d{8}\.zip", path.name)
+    ]
+    for path in sorted(candidates, key=lambda item: item.name, reverse=True):
+        round_text = path.stem.removeprefix("round-")
+        try:
+            model = model_class.load(str(path), env=environment, device="cpu")
+        except Exception as error:  # noqa: BLE001 - corrupted checkpoint archives may raise library-specific errors
+            logging.getLogger(__name__).warning("ignoring invalid checkpoint %s: %s", path, error)
+            continue
+        completed = getattr(model, "num_timesteps", None)
+        if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
+            logging.getLogger(__name__).warning("ignoring checkpoint with invalid timestep count: %s", path)
+            continue
+        return model, int(round_text), completed
+    return None
+
+
 def run_shared_learner(
     *,
     shared_root: Path,
@@ -1477,7 +1617,11 @@ def run_shared_learner(
         model_class = contrib.MaskablePPO
     checkpoints = shared_root / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
-    previous = sorted(checkpoints.glob("round-*.zip"))
+    previous = sorted(
+        (path for path in checkpoints.glob("round-*.zip") if path.is_file()),
+        key=lambda path: int(path.stem.removeprefix("round-"))
+        if path.stem.removeprefix("round-").isdigit() else -1,
+    )
     if warm_start_checkpoint is not None:
         if previous:
             raise SharedLearnerError("warm-start campaigns must use a new shared checkpoint directory")
@@ -1490,17 +1634,13 @@ def run_shared_learner(
         model.policy.optimizer.state.clear()
         model.num_timesteps = 0
         model._n_updates = 0
-    status_path = store.learner_status_path
     completed = 0
     current_round = 0
     if previous:
-        model = model_class.load(str(previous[-1]), env=environment, device="cpu")
-        try:
-            prior = json.loads(status_path.read_text("utf-8"))
-            completed = int(prior.get("completed_timesteps", 0))
-            current_round = int(prior.get("round", 0))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
+        restored = _restore_latest_checkpoint(model_class, checkpoints, environment)
+        if restored is None:
+            raise SharedLearnerError("no valid shared-learner checkpoint is available to resume")
+        model, current_round, completed = restored
     model._setup_learn(
         total_timesteps=max(1, total_timesteps),
         callback=lambda _locals, _globals: True,
@@ -1554,7 +1694,7 @@ def run_shared_learner(
         next_checkpoint = ((completed // checkpoint_interval) + 1) * checkpoint_interval
 
     try:
-        store.publish_policy(current_round, model.policy, fingerprint, reuse_existing=True)
+        store.publish_policy(current_round, model.policy, fingerprint, replace_existing=bool(previous))
         while True:
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"
@@ -1675,5 +1815,3 @@ def run_shared_learner(
         store.heartbeat(status=manifest["status"], round=current_round, completed_timesteps=completed)
         environment.close()
     return cast(dict[str, Any], manifest)
-
-

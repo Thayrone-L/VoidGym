@@ -1939,6 +1939,46 @@ def test_reused_owner_pid_with_different_creation_time_is_stale(
     ControlPlane(root)  # PID reused by an unrelated process: not a live owner
 
 
+def test_status_supervises_failed_shared_actor_while_learner_runs(tmp_path: Path) -> None:
+    from hk_agent.shared_learner import _atomic_json
+
+    control = ControlPlane.__new__(ControlPlane)
+    control.observer = False
+    control._lock = threading.RLock()
+    control._refresh_locked = lambda: None
+    shared_root = tmp_path / "shared"
+    (shared_root / "actors").mkdir(parents=True)
+    control._launches = {
+        "learner-live": {"role": "learner", "shared_group": "campaign-v0001", "status": "RUNNING"},
+        "actor-lost": {
+            "role": "actor", "shared_group": "campaign-v0001", "shared_root": str(shared_root),
+            "shared_actor_count": 2, "campaign_id": "campaign", "campaign_version": 1,
+            "status": "FAILED", "resources": {"slot_id": 1},
+        },
+    }
+    control._shared_actor_restarts = {}
+    control._shared_actor_supervision = set()
+    control.control_root = tmp_path / "control"
+    _atomic_json(shared_root / "actors" / "slot-1.json", {"slot": 1, "launch_id": "actor-lost", "status": "FAILED"})
+    started = []
+
+    def launch(campaign_id: str, **kwargs: object) -> dict[str, object]:
+        started.append((campaign_id, kwargs))
+        launch_id = "actor-replacement"
+        launch_dir = control.control_root / "launches" / launch_id
+        launch_dir.mkdir(parents=True)
+        return {"launch_id": launch_id, "status": "RUNNING"}
+
+    control._launch_single = launch
+    control._supervise_failed_shared_actors()
+    control._supervise_failed_shared_actors()
+
+    assert len(started) == 1
+    assert started[0][0] == "campaign"
+    assert started[0][1]["shared_restart_of"] == "actor-lost"
+    assert control._launches["actor-lost"]["auto_replacement_launch_id"] == "actor-replacement"
+
+
 def test_shared_actor_restart_is_bounded_and_recorded(tmp_path: Path) -> None:
     control = ControlPlane.__new__(ControlPlane)
     control.observer = False

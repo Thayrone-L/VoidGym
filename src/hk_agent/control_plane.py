@@ -445,6 +445,7 @@ class ControlPlane:
         self._preparing_watchdogs: dict[str, threading.Event] = {}
         self._slot_owners: dict[int, str] = {}
         self._shared_actor_restarts: dict[str, list[float]] = {}
+        self._shared_actor_supervision: set[str] = set()
         self._slot_fences: dict[int, str] = {}
         self.observer = observer
         self._system_cpu_previous: tuple[int, int] | None = None
@@ -948,6 +949,15 @@ class ControlPlane:
                 instance_rows.append({"slot": actor.get("slot"), "status": actor.get("status", "unknown"), "restarts_last_hour": len(recent_restarts), "problem": actor.get("status") == "FAILED"})
                 if len(recent_restarts) >= 3:
                     alerts.append(f"Instância {actor.get('slot')} reiniciou {len(recent_restarts)} vezes na última hora")
+                if recent_restarts:
+                    alerts.append(
+                        f"Instância {actor.get('slot')} foi relançada automaticamente "
+                        f"({len(recent_restarts)}/3 nesta hora)"
+                    )
+                if actor.get("status") == "FAILED":
+                    detail = actor.get("auto_relaunch_error")
+                    suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+                    alerts.append(f"Instância {actor.get('slot')} falhou e precisa de atenção{suffix}")
         if "same_scene_action_over_40_percent_without_novelty" in alerts:
             alerts[alerts.index("same_scene_action_over_40_percent_without_novelty")] = "A IA parece estar repetindo o mesmo lugar"
         raw_capacity = status.get("capacity", 1)
@@ -1963,13 +1973,8 @@ class ControlPlane:
         version_number = int(spec_path.stem[1:])
         group_id = f"{campaign_id}-v{version_number:04d}"
         shared_root = self.runtime_root / "shared" / campaign_id
-        learner = self._launch_shared_learner(
-            spec,
-            version=version_number,
-            group_id=group_id,
-            shared_root=shared_root,
-        )
         actors: list[dict[str, object]] = []
+        learner: dict[str, object] | None = None
         try:
             for _ in range(spec.actors):
                 actors.append(
@@ -1983,8 +1988,17 @@ class ControlPlane:
                         shared_actor_count=spec.actors,
                     )
                 )
+            # Actors wait for the shared task contract. Start them first so their
+            # fresh launch identities replace terminal slot state before the
+            # learner begins polling old rollout/status files on resume.
+            learner = self._launch_shared_learner(
+                spec,
+                version=version_number,
+                group_id=group_id,
+                shared_root=shared_root,
+            )
         except BaseException:
-            for record in [learner, *actors]:
+            for record in [*actors, *([learner] if learner is not None else [])]:
                 try:
                     self.stop(str(record["launch_id"]), _shared_member=True)
                 except (RuntimeError, ValueError):
@@ -2398,6 +2412,15 @@ class ControlPlane:
                     "role": "actor", "shared_group": shared_group,
                     "shared_root": str(shared_root), "shared_actor_count": shared_actor_count,
                 })
+            if shared_role == "actor":
+                if shared_root is None or slot_id is None:
+                    raise RuntimeError("shared actor launch has no slot status path")
+                from hk_agent.shared_learner import SharedRoundStore
+
+                SharedRoundStore(shared_root).publish_actor_status(
+                    slot=slot_id, launch_id=launch_id, status="STARTING",
+                    started_unix_ns=record["started_unix_ns"],
+                )
             if slot_id is not None:
                 assert project_config is not None
                 environment["HK_AGENT_SLOT_ID"] = str(slot_id)
@@ -2476,6 +2499,18 @@ class ControlPlane:
                     watchdog.set()
                 atomic_json(launch_root / "launch.json", record)
                 self._cancel_preparing.discard(launch_id)
+            if shared_role == "actor" and shared_root is not None and slot_id is not None:
+                try:
+                    from hk_agent.shared_learner import SharedRoundStore
+
+                    SharedRoundStore(shared_root).publish_actor_status(
+                        slot=slot_id, launch_id=launch_id,
+                        status=str(record.get("status", "FAILED")),
+                        failure=str(record.get("failure", error)),
+                        finished_unix_ns=time.time_ns(),
+                    )
+                except (OSError, ValueError):
+                    pass
             if execute and data_root is not None and runtime_launch_root.is_dir():
                 try:
                     if slot_id is not None and fence_token is not None:
@@ -2523,7 +2558,24 @@ class ControlPlane:
             if not isinstance(group, str):
                 raise TypeError("shared actor group is missing")
             now = time.monotonic()
-            recent = [value for value in self._shared_actor_restarts.get(group, []) if now - value < 3600]
+            now_ns = time.time_ns()
+            restart_log = Path(str(record.get("shared_root", ""))) / "actor-restarts.jsonl"
+            persisted: list[int] = []
+            try:
+                for line in restart_log.read_text("utf-8").splitlines():
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    stamp = item.get("time_unix_ns") if isinstance(item, Mapping) else None
+                    if (isinstance(item, Mapping) and item.get("shared_group") == group
+                            and isinstance(stamp, int) and stamp >= now_ns - 3_600_000_000_000):
+                        persisted.append(stamp)
+            except OSError:
+                pass
+            recent = [now - max(0.0, (now_ns - stamp) / 1_000_000_000) for stamp in persisted]
+            if not persisted:
+                recent = [value for value in self._shared_actor_restarts.get(group, []) if now - value < 3600]
             if len(recent) >= 3:
                 raise RuntimeError("shared actor restart limit reached (3 per hour)")
             recent.append(now)
@@ -3149,6 +3201,65 @@ class ControlPlane:
                     if failed_record is not None:
                         failed_record["challenge_return_started"] = False
 
+    def _supervise_failed_shared_actors(self) -> None:
+        """Replace failed actors while their shared learner remains live."""
+        candidates: list[str] = []
+        with self._lock:
+            self._refresh_locked()
+            learners = {
+                str(row.get("shared_group")): row
+                for row in self._launches.values()
+                if row.get("role") == "learner" and row.get("status") == "RUNNING"
+                and isinstance(row.get("shared_group"), str)
+            }
+            for launch_id, row in self._launches.items():
+                group = row.get("shared_group")
+                retry_after = row.get("auto_relaunch_after_unix_ns", 0)
+                if (row.get("role") != "actor" or row.get("status") != "FAILED"
+                        or not isinstance(group, str) or group not in learners
+                        or launch_id in self._shared_actor_supervision
+                        or row.get("auto_relaunch_attempted") is True
+                        or (isinstance(retry_after, int) and not isinstance(retry_after, bool)
+                            and retry_after > time.time_ns())):
+                    continue
+                shared_value = row.get("shared_root")
+                resources = row.get("resources")
+                slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+                if not isinstance(shared_value, str) or isinstance(slot, bool) or not isinstance(slot, int):
+                    continue
+                actor_status = self._read_json(Path(shared_value) / "actors" / f"slot-{slot}.json")
+                if actor_status.get("launch_id") != launch_id or actor_status.get("status") != "FAILED":
+                    continue
+                row["auto_relaunch_in_progress"] = True
+                launch_path = self.control_root / "launches" / launch_id / "launch.json"
+                atomic_json(launch_path, row)
+                self._shared_actor_supervision.add(launch_id)
+                candidates.append(launch_id)
+        for launch_id in candidates:
+            try:
+                replacement = self.restart_shared_actor(
+                    launch_id, reason="actor process failed while shared learner was running"
+                )
+                with self._lock:
+                    old = self._launches.get(launch_id)
+                    if old is not None:
+                        old["auto_relaunch_in_progress"] = False
+                        old["auto_relaunch_attempted"] = True
+                        old["auto_replacement_launch_id"] = replacement.get("launch_id")
+                        atomic_json(self.control_root / "launches" / launch_id / "launch.json", old)
+            except (OSError, RuntimeError, TypeError, ValueError, TimeoutError) as error:
+                with self._lock:
+                    old = self._launches.get(launch_id)
+                    if old is not None:
+                        old["auto_relaunch_in_progress"] = False
+                        old["auto_relaunch_error"] = str(error)[:500]
+                        delay_ns = 3_600_000_000_000 if "3 per hour" in str(error) else 15_000_000_000
+                        old["auto_relaunch_after_unix_ns"] = time.time_ns() + delay_ns
+                        atomic_json(self.control_root / "launches" / launch_id / "launch.json", old)
+            finally:
+                with self._lock:
+                    self._shared_actor_supervision.discard(launch_id)
+
     def status(self) -> dict[str, object]:
         if self.observer:
             observed = self._observer_snapshot()
@@ -3161,6 +3272,7 @@ class ControlPlane:
                 "active_launches": observed,
                 "active": observed[0] if observed else None,
             }
+        self._supervise_failed_shared_actors()
         self._resume_finished_challenge_practices()
         with self._lock:
             self._refresh_locked()
