@@ -137,8 +137,9 @@ class CampaignSpec:
     warm_start_source_campaign: str | None = None
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
+    tutorial_hint_level: int = 0
     straggler_timeout_seconds: float = 45.0
-    schema_version: int = 9
+    schema_version: int = 10
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -341,6 +342,7 @@ class CampaignSpec:
             warm_start_source_campaign=warm_start_source_campaign,
             stuck_seconds=_bounded_float(payload.get("stuck_seconds", 120.0), "stuck_seconds", 1.0, 3600.0) if campaign_type == "exploration_training" else 120.0,
             evaluation_interval=_bounded_int(payload.get("evaluation_interval", 20), "evaluation_interval", 1, 10_000) if campaign_type == "exploration_training" else 20,
+            tutorial_hint_level=_bounded_int(payload.get("tutorial_hint_level", 0), "tutorial_hint_level", 0, 1) if campaign_type == "exploration_training" else 0,
             straggler_timeout_seconds=_bounded_float(
                 payload.get("straggler_timeout_seconds", 45.0),
                 "straggler_timeout_seconds", 1.0, 300.0,
@@ -1734,6 +1736,7 @@ class ControlPlane:
                             "--geo-spend-reward", str(0.0 if spec.reward_version in {"explore_v2", "explore_v3", "explore_v4"} else spec.weights.get("geo_spend_reward", 0.02)),
                             "--time-cost", str(spec.weights.get("time_cost", -0.001)),
                             "--stuck-seconds", str(spec.stuck_seconds), "--evaluation-interval", str(spec.evaluation_interval),
+                            "--tutorial-hint-level", str(spec.tutorial_hint_level),
                             "--lifelong-memory-root", str(
                                 self.runtime_root / "campaign-memory" / spec.campaign_id
                                 if spec.reward_version == "explore_v4"

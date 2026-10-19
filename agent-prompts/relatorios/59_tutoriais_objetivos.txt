@@ -1,0 +1,29 @@
+Etapa 59 — Tutoriais, interação e objetivos
+Data: 2026-10-19
+Workspace: C:\VoidGym
+Estado: VERDE; validações completas, teste curto em jogo e implantação concluídos.
+
+Implementado
+- Novas ações contextuais no explore_v4: INTERACT (UP curto) sempre permitido; SUBMIT/CANCEL e direções de menu apenas com diálogo/menu aberto. Ações de gameplay são mascaradas quando o jogo não as aceita. Contratos anteriores e índices preservados.
+- Bridge Release expõe menu/diálogo, lugares especiais visíveis na câmera e preços vistos em lojas. A memória por jogada guarda bancos, estações, lojas/cartógrafo e preços vistos; nada fora da câmera é adicionado.
+- Tabela ordenada de objetivos: entrada no tutorial revela alcançar Encruzilhada; falar com Elderbug revela derrotar Falso Cavaleiro; derrota revela alcançar Caminho Verde. Progresso/objetivo só aparece após flags oficiais observadas; estrutura pronta para expandir.
+- Recompensas sem repetição: objetivo concluído, primeira chegada, primeiro descanso por célula de banco, estação aberta e primeira viagem rápida, com teto cumulativo documentado. Nível de dica 0 é padrão; nível 1 é configurável no contrato de campanha.
+- O vetor de preços mantém slots estáveis por IDs já vistos, normaliza custo e deixa vazios zerados. Schema da campanha avançou para 10.
+- Corrigida integração detectada no teste real: `tutorial_hint_level` era rejeitado pelo endpoint e faltava no schema da campanha; agora a API aceita, persiste e transmite a opção ao runner.
+
+Validações
+- Ruff: passou. mypy src: passou, 48 arquivos.
+- Pytest completo final: 588 passed, 2 skipped, 8 subtests passed (67,97 s), com TEMP curto e `faulthandler_timeout=90`.
+- Testes C# de correlação: passaram. Bridge Release: 0 avisos/0 erros.
+- `git diff --check`: passou (apenas avisos informativos de conversão CRLF→LF do Git para arquivos históricos).
+- DLL implantada somente em `hk-ai-1` após cópia de segurança da DLL anterior. SHA-256 build e instalada: 6c9035a93bfb49aa946390d7504d3a4d489b2eacb2e5b23b9ce137c087977f00.
+
+Teste curto com jogo
+- ControlPlane atualizado iniciou campanha `stage59-tutorial-live-20261019`, 1 ator, learner compartilhado, explore_v4, dica nível 0, continuous_playthrough e slot isolado.
+- Jogo iniciou em `Tutorial_01`; bridge confirmou a máscara de menu durante bootstrap e depois capturou gameplay. A execução publicou 2 rodadas; a jogada avançou 185 passos no manifesto final. A memória persistida revela `reach_crossroads` por `enteredTutorialFirstTime` e ainda não lista lugares especiais, pois nenhum foi visto nessa sessão.
+- Parada cooperativa concluída, ambos os processos de campanha encerrados com código 0, save final capturado. Nenhum Hollow Knight/runner restou; painel também foi encerrado. Saves pessoal/baseline não foram usados nem alterados.
+- Limitação da amostra ao vivo: a sessão ficou no tutorial e não chegou a banco/estação/loja ou a um chefe; esses eventos estão cobertos pelos testes sintéticos. A alternância do menu foi exercitada no bootstrap, não em uma interação manual com vendedor/banco.
+
+Conclusão
+- Etapa 59 VERDE; commit/push será registrado no relatório da fila após publicação.
+- Próxima: 60 — bestiário pessoal. 61–64 continuam pendentes até cada etapa ficar verde.

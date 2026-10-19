@@ -117,6 +117,7 @@ _ACTION_NAMES = frozenset(
         "DASH", "LEFT+DASH", "RIGHT+DASH", "DOWN+DASH", "SUPER_DASH_HOLD", "DREAM_NAIL",
         "UP+NAIL_ART_CHARGE",
         "DOWN+NAIL_ART_CHARGE",
+        "INTERACT", "MENU_UP", "MENU_DOWN", "MENU_LEFT", "MENU_RIGHT", "MENU_SUBMIT", "MENU_CANCEL",
     }
 )
 _INFORMATION_BOUNDARY = frozenset({"pixels", "applied_action_history"})
@@ -365,12 +366,13 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         if mask not in (
             {"version": "action_availability_v1", "source": "frame_action_availability"},
             {"version": "action_availability_v2", "source": "frame_action_availability"},
+            {"version": "action_availability_v3", "source": "frame_action_availability"},
         ):
             raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     schema_version = contract.get("task_contract_schema_version", 1)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5}:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6}:
         raise KnowledgeValidationError("task_contract_schema_version is unsupported")
     result["task_contract_schema_version"] = schema_version
     if "observation_version" in contract:

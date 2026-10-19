@@ -8,6 +8,7 @@ from hk_agent.action_masking import (
     parse_action_availability,
 )
 from hk_agent.protocol import ProtocolError
+from hk_agent.scene_change_task import SCENE_CHANGE_INTERACTION_ACTION_NAMES
 from hk_agent.training_task import TASK_ACTION_NAMES
 
 
@@ -27,7 +28,7 @@ def test_mask_allows_available_actions_and_unknown_bridge() -> None:
                                    has_dash=True, has_super_dash=True, has_dream_nail=True,
                                    has_dashmaster=True)
     mask = build_action_mask(TASK_ACTION_NAMES, available)
-    assert mask.all()
+    assert all(mask[index] for index, name in enumerate(TASK_ACTION_NAMES) if not name.startswith("MENU_"))
     unknown_mask = build_action_mask(TASK_ACTION_NAMES, None)
     assert unknown_mask[TASK_ACTION_NAMES.index("LEFT")]
     assert not unknown_mask[TASK_ACTION_NAMES.index("DASH")]
@@ -47,6 +48,34 @@ def test_new_ability_actions_remain_masked_until_owned() -> None:
     assert owned_mask[TASK_ACTION_NAMES.index("DASH")]
     assert owned_mask[TASK_ACTION_NAMES.index("SUPER_DASH_HOLD")]
     assert owned_mask[TASK_ACTION_NAMES.index("DREAM_NAIL")]
+
+
+def test_interaction_is_always_available_and_menu_actions_are_contextual() -> None:
+    names = SCENE_CHANGE_INTERACTION_ACTION_NAMES
+    closed = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True)
+    closed_mask = build_action_mask(names, closed)
+    assert closed_mask[names.index("INTERACT")]
+    for name in ("MENU_UP", "MENU_DOWN", "MENU_LEFT", "MENU_RIGHT", "MENU_SUBMIT", "MENU_CANCEL"):
+        assert not closed_mask[names.index(name)]
+    open_menu = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True, menu_open=True)
+    open_mask = build_action_mask(names, open_menu)
+    assert open_mask[names.index("MENU_UP")]
+    assert open_mask[names.index("MENU_SUBMIT")]
+    assert open_mask[names.index("MENU_CANCEL")]
+    assert not open_mask[names.index("LEFT")]
+    assert not open_mask[names.index("ATTACK")]
+    assert open_mask[names.index("NOOP")]
+
+
+def test_legacy_action_availability_defaults_menu_flags_closed() -> None:
+    values = {
+        "mp_charge": 0, "spell_cost": 33, "focus_cost": 33,
+        "fireball_level": 0, "quake_level": 0, "scream_level": 0,
+        "has_nail_art": False, "has_cyclone": False,
+        "has_dash_slash": False, "has_upward_slash": False,
+    }
+    parsed = parse_action_availability(values)
+    assert parsed is not None and not parsed.dialog_open and not parsed.menu_open
 
 
 @pytest.mark.parametrize(

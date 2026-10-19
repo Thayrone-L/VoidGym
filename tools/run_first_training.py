@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stuck-seconds", type=float, default=120.0)
     parser.add_argument("--evaluation-interval", type=int, default=20)
+    parser.add_argument("--tutorial-hint-level", type=int, choices=(0, 1), default=0)
     parser.add_argument("--lifelong-memory-root", type=Path)
     parser.add_argument(
         "--bootstrap-plan",
@@ -513,9 +514,10 @@ def main() -> int:
             novelty_threshold=args.novelty_threshold, novelty_budget=args.novelty_budget,
             scene_change_reward=args.scene_change_reward, enemy_kill_reward=args.enemy_kill_reward,
             enemy_kill_reward_budget=args.enemy_kill_reward_budget,
-            shade_recovery_reward=(4.0 if reward_version in {"explore_v2", "explore_v3"} else args.shade_recovery_reward), damage_penalty=args.damage_penalty,
-            geo_gain_reward=(0.0 if reward_version in {"explore_v2", "explore_v3"} else args.geo_gain_reward), geo_spend_reward=(0.0 if reward_version in {"explore_v2", "explore_v3"} else args.geo_spend_reward),
+            shade_recovery_reward=(4.0 if reward_version in {"explore_v2", "explore_v3", "explore_v4"} else args.shade_recovery_reward), damage_penalty=args.damage_penalty,
+            geo_gain_reward=(0.0 if reward_version in {"explore_v2", "explore_v3", "explore_v4"} else args.geo_gain_reward), geo_spend_reward=(0.0 if reward_version in {"explore_v2", "explore_v3", "explore_v4"} else args.geo_spend_reward),
             stuck_seconds=args.stuck_seconds, evaluation_interval=args.evaluation_interval,
+            tutorial_hint_level=args.tutorial_hint_level,
             death_penalty=args.death_penalty, run_failed_penalty=args.run_failed_penalty,
             time_cost=args.time_cost, lease_base_ms=args.lease_ms,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.01,

@@ -84,3 +84,66 @@ def test_exit_records_pois_and_memory_round_trip_are_bounded() -> None:
     assert restored.visited == memory.visited
     assert restored.exit_records == memory.exit_records
     assert restored.points == memory.points
+
+
+def test_special_places_are_zero_until_seen_and_remember_only_visible_positions() -> None:
+    memory = PlayerKnowledge()
+    place_block_start = len(ITEM_FLAGS) * 5 + GRID_WIDTH * GRID_HEIGHT * 2 + 8 * 6 + 8 * 5
+    assert np.all(memory.vector()[place_block_start:] == 0)
+    memory.update({"operator_telemetry": {
+        "scene_name": "RoomA", "scene_bounds": [0, 0, 16, 9], "x": 8, "y": 4,
+        "visible_places": [{"kind": "bench", "world_x": 4.0, "world_y": 3.0}],
+    }})
+    assert memory.seen_places == {"bench"}
+    assert memory.special_places["RoomA"]["bench"] == {(4, 3)}
+    block = memory.vector()[place_block_start : place_block_start + 4]
+    assert block[0] == 1
+    place_map_start = place_block_start + 4 * 4
+    assert memory.vector()[place_map_start + 3 * GRID_WIDTH + 4] == 1
+    assert "RoomB" not in memory.special_places
+    restored = PlayerKnowledge.from_payload(memory.to_payload())
+    assert restored.special_places == memory.special_places
+    assert restored.seen_places == memory.seen_places
+
+
+def test_story_objectives_wait_for_game_flags_and_pay_once() -> None:
+    memory = PlayerKnowledge()
+    base = {"scene_bounds": [0, 0, 16, 9], "x": 4, "y": 4}
+    memory.update({"operator_telemetry": {**base, "scene_name": "Tutorial_01", "progress_flags": {}}})
+    assert memory.current_objective is None
+    memory.update({"operator_telemetry": {**base, "scene_name": "Tutorial_01", "progress_flags": {"enteredTutorialFirstTime": True}}})
+    assert memory.current_objective == "reach_crossroads"
+    memory.update({"operator_telemetry": {**base, "scene_name": "Crossroads_01", "progress_flags": {"enteredTutorialFirstTime": True}}})
+    assert "reach_crossroads" in memory.completed_objectives
+    assert "objective_completed" in {event["type"] for event in memory.new_events}
+    assert "first_target_arrival" in {event["type"] for event in memory.new_events}
+    memory.update({"operator_telemetry": {**base, "scene_name": "Crossroads_01", "progress_flags": {"metElderbug": True}}})
+    assert memory.current_objective == "defeat_false_knight"
+    memory.update({"operator_telemetry": {**base, "scene_name": "Crossroads_10", "progress_flags": {"metElderbug": True, "falseKnightDefeated": True}}})
+    assert "defeat_false_knight" in memory.completed_objectives
+    memory.update({"operator_telemetry": {**base, "scene_name": "Crossroads_10", "progress_flags": {"metElderbug": True, "falseKnightDefeated": True}}})
+    assert memory.current_objective == "reach_greenpath"
+    memory.update({"operator_telemetry": {**base, "scene_name": "Fungus1_01", "progress_flags": {"falseKnightDefeated": True}}})
+    assert "reach_greenpath" in memory.completed_objectives
+    restored = PlayerKnowledge.from_payload(memory.to_payload())
+    assert restored.completed_objectives == memory.completed_objectives
+    assert len(restored.claimed_tutorial_rewards) == len(memory.claimed_tutorial_rewards)
+
+
+def test_tutorial_rewards_are_once_per_observed_bench_station_and_travel() -> None:
+    memory = PlayerKnowledge()
+    telemetry = {
+        "scene_name": "Crossroads_01", "scene_bounds": [0, 0, 16, 9], "x": 4, "y": 4,
+        "at_bench": True,
+        "milestone_events_since_last_frame": [
+            {"category": "flag", "key": "openedCrossroads"},
+            {"category": "scene_transition", "transition_kind": "stag"},
+        ],
+    }
+    memory.update({"operator_telemetry": telemetry})
+    first = [event["type"] for event in memory.new_events]
+    assert first.count("first_bench_rest") == 1
+    assert first.count("station_opened") == 1
+    assert first.count("first_fast_travel") == 1
+    memory.update({"operator_telemetry": telemetry})
+    assert memory.new_events == []

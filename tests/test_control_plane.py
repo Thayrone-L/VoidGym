@@ -62,7 +62,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 9
+    assert first["schema_version"] == 10
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 
@@ -85,6 +85,7 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     payload["horizon"] = 3000
     payload["checkpoint_interval"] = 1024
     payload["straggler_timeout_seconds"] = 30.0
+    payload["tutorial_hint_level"] = 1
     payload["weights"] = {
         "time_cost": -0.001, "novelty_reward": 0.05, "novelty_budget": 20.0,
         "scene_change_reward": 5.0, "enemy_kill_reward": 1.0,
@@ -102,11 +103,13 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert spec.target_kl == 0.03 and spec.learning_rate == 0.00025
     assert spec.clip_range == 0.2
     assert spec.straggler_timeout_seconds == 30.0
+    assert spec.tutorial_hint_level == 1
     assert "--task" in command and command[command.index("--task") + 1] == "exploration"
     assert command[command.index("--rollout-steps") + 1] == "512"
     assert command[command.index("--batch-size") + 1] == "256"
     assert command[command.index("--gamma") + 1] == "0.995"
     assert command[command.index("--reward-version") + 1] == "explore_v2"
+    assert command[command.index("--tutorial-hint-level") + 1] == "1"
     assert command[command.index("--geo-gain-reward") + 1] == "0.0"
     assert command[command.index("--shade-recovery-reward") + 1] == "4.0"
     assert "--lifelong-memory-root" in command

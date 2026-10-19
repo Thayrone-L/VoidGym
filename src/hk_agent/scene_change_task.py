@@ -16,6 +16,7 @@ from hk_agent.action_masking import action_mask_audit, build_action_mask, decide
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.route_memory import TopologicalRouteMemory
 from hk_agent.temporal_actions import (
+    PLAYER_INTERACTION_ACTIONS,
     TEMPORAL_COMBAT_ACTIONS,
     TemporalActionHistory,
     action_contract,
@@ -36,6 +37,10 @@ SCENE_CHANGE_ACTIONS: tuple[int, ...] = tuple(
 )
 SCENE_CHANGE_ACTION_NAMES: tuple[str, ...] = tuple(
     action.name for action in SCENE_CHANGE_ACTION_TEMPLATES
+)
+SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES = TEMPORAL_COMBAT_ACTIONS + PLAYER_INTERACTION_ACTIONS
+SCENE_CHANGE_INTERACTION_ACTION_NAMES: tuple[str, ...] = tuple(
+    action.name for action in SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES
 )
 
 

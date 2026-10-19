@@ -291,14 +291,36 @@ def test_v4_confirmed_milestone_rewards_decay_and_persist(tmp_path: Path) -> Non
     assert info_repeated["reward_components"]["milestone_novelty"] == pytest.approx(expected)
 
 
+def test_v4_first_contact_and_story_tutorial_rewards_are_one_time() -> None:
+    environment = _Environment()
+    environment.extra = {"operator_telemetry": {
+        "scene_name": "Crossroads_01", "scene_bounds": [0, 0, 16, 9], "x": 4, "y": 4,
+        "at_bench": True,
+        "progress_flags": {"enteredTutorialFirstTime": True},
+        "visible_places": [{"kind": "bench", "world_x": 4, "world_y": 4}],
+        "milestone_events_since_last_frame": [
+            {"category": "flag", "key": "openedCrossroads"},
+            {"category": "scene_transition", "transition_kind": "stag"},
+        ],
+    }}
+    task = ExplorationTask(environment, config=_v4_config())
+    task.reset()
+    observation, _, _, _, first = task.step(0)
+    assert first["reward_components"]["tutorial_reward"] == pytest.approx(4.0)
+    assert task.observation_space.contains(observation)
+    _, _, _, _, repeated = task.step(0)
+    assert repeated["reward_components"]["tutorial_reward"] == 0
+    assert repeated["player_knowledge_events"] == []
+
+
 def test_v4_contract_adds_player_knowledge_and_keeps_raw_telemetry_out() -> None:
     environment = _Environment()
     environment.extra = {"operator_telemetry": {"scene_name": "Room-A", "x": 4.0, "y": 8.0}}
     task = ExplorationTask(environment, config=_v4_config())
     contract = task.task_contract()
     assert contract["reward_version"] == "explore_v4"
-    assert contract["task_contract_schema_version"] == 5
-    assert contract["observation_version"] == "pixels_action_history_player_knowledge_v1"
+    assert contract["task_contract_schema_version"] == 6
+    assert contract["observation_version"] == "pixels_action_history_player_knowledge_tutorials_v2"
     assert contract["information_boundary"] == ["pixels", "applied_action_history", "player_knowledge"]
     assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
     assert task.config.maximum_positive_episode_reward() <= 75.2

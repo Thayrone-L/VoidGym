@@ -212,6 +212,8 @@ public sealed class HkAgentBridgeMod : Mod
     {
         string lower = name.ToLowerInvariant();
         return lower.StartsWith("has", StringComparison.Ordinal) || lower.StartsWith("got", StringComparison.Ordinal)
+            || lower.StartsWith("met", StringComparison.Ordinal) || lower.StartsWith("opened", StringComparison.Ordinal)
+            || lower.StartsWith("entered", StringComparison.Ordinal)
             || lower.Contains("boss") || lower.Contains("defeated") || lower.Contains("killed");
     }
 
@@ -269,7 +271,73 @@ public sealed class HkAgentBridgeMod : Mod
         catch (Exception) { return null; }
     }
 
-    private System.Collections.Generic.Dictionary<string, object?> SnapshotOperatorTelemetry() => _operatorTelemetry.Snapshot();
+    private System.Collections.Generic.Dictionary<string, object?> SnapshotOperatorTelemetry()
+    {
+        var snapshot = _operatorTelemetry.Snapshot();
+        BridgeUiState ui = VisualCaptureBackend.ReadUiState();
+        snapshot["dialog_open"] = ui.DialogOpen;
+        snapshot["menu_open"] = ui.MenuOpen;
+        snapshot["dialogue_id"] = ui.DialogueId;
+        snapshot["visible_places"] = ReadVisiblePlaces();
+        snapshot["shop_prices_visible"] = ReadVisibleShopPrices(ui.MenuOpen || ui.DialogOpen);
+        return snapshot;
+    }
+
+    private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisiblePlaces()
+    {
+        var places = new System.Collections.Generic.List<(float Distance, System.Collections.Generic.Dictionary<string, object?> Value)>();
+        Camera? camera = Camera.main;
+        if (camera == null) return new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        void AddPlace(string kind, Transform transform)
+        {
+            Vector3 point = camera.WorldToViewportPoint(transform.position);
+            if (point.z <= 0 || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
+            float dx = point.x - 0.5f, dy = point.y - 0.5f;
+            places.Add((dx * dx + dy * dy, new System.Collections.Generic.Dictionary<string, object?>
+            { ["kind"] = kind, ["x"] = point.x, ["y"] = point.y,
+              ["world_x"] = transform.position.x, ["world_y"] = transform.position.y }));
+        }
+        try
+        {
+            foreach (RestBench bench in UnityEngine.Object.FindObjectsOfType<RestBench>())
+                if (bench != null && bench.isActiveAndEnabled) AddPlace("bench", bench.transform);
+            foreach (SpawnStagMenu station in UnityEngine.Object.FindObjectsOfType<SpawnStagMenu>())
+                if (station != null && station.isActiveAndEnabled) AddPlace("stag_station", station.transform);
+            foreach (ShopMenuStock shop in UnityEngine.Object.FindObjectsOfType<ShopMenuStock>())
+                if (shop != null && shop.isActiveAndEnabled)
+                {
+                    bool mapShop = PlayerData.instance != null &&
+                        (SafeProgressFlag(PlayerData.instance, "metCornifer") || SafeProgressFlag(PlayerData.instance, "openedMapperShop"));
+                    AddPlace(mapShop ? "map_shop" : "shop", shop.transform);
+                }
+        }
+        catch (Exception) { }
+        places.Sort((left, right) => left.Distance.CompareTo(right.Distance));
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        foreach (var place in places)
+        {
+            if (result.Count >= 8) break;
+            result.Add(place.Value);
+        }
+        return result;
+    }
+
+    private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisibleShopPrices(bool menuOpen)
+    {
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        if (!menuOpen) return result;
+        try
+        {
+            foreach (ShopItemStats item in UnityEngine.Object.FindObjectsOfType<ShopItemStats>())
+            {
+                if (item == null || !item.isActiveAndEnabled || result.Count >= 64) continue;
+                result.Add(new System.Collections.Generic.Dictionary<string, object?>
+                { ["item_id"] = item.itemNumber.ToString(CultureInfo.InvariantCulture), ["geo"] = Math.Max(0, item.cost) });
+            }
+        }
+        catch (Exception) { }
+        return result;
+    }
 
     private void OnHealthManagerTakeDamage(
         On.HealthManager.orig_TakeDamage original,

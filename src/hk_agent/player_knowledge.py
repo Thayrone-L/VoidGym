@@ -7,6 +7,12 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.story_objectives import (
+    OBJECTIVE_BY_ID,
+    STORY_OBJECTIVES,
+    is_target_scene,
+)
+
 GRID_WIDTH = 16
 GRID_HEIGHT = 9
 ABILITY_FLAGS: tuple[tuple[str, tuple[float, ...]], ...] = (
@@ -52,6 +58,18 @@ CHARM_FLAGS = tuple(
 ITEM_FLAGS = ABILITY_FLAGS + KEY_ITEM_FLAGS + CHARM_FLAGS
 ITEM_FLAG_NAMES = frozenset(flag for flag, _ in ITEM_FLAGS)
 CHARM_FLAG_NAMES = frozenset(flag for flag, _ in CHARM_FLAGS)
+PLACE_DESCRIPTORS: tuple[tuple[str, tuple[float, float, float]], ...] = (
+    ("bench", (1 / 4, 1 / 4, 1 / 4)),
+    ("stag_station", (2 / 4, 2 / 4, 2 / 4)),
+    ("shop", (3 / 4, 3 / 4, 3 / 4)),
+    ("map_shop", (1.0, 1.0, 1.0)),
+)
+PLACE_TYPES = frozenset(name for name, _ in PLACE_DESCRIPTORS)
+STORY_TRIGGER_FLAGS = frozenset(item.reveal_flag for item in STORY_OBJECTIVES)
+STATION_OPEN_FLAGS = frozenset({
+    "openedCrossroads", "openedGreenpath", "openedRestingGrounds", "openedStagNest",
+    "openedHiddenStation", "openedGardensStagStation", "openedPalaceGrounds",
+})
 
 
 @dataclass(slots=True)
@@ -67,11 +85,21 @@ class PlayerKnowledge:
     known_flags: dict[str, bool] = field(default_factory=dict)
     charm_costs: dict[str, int] = field(default_factory=dict)
     skill_epoch: int = 0
+    shop_prices: dict[str, int] = field(default_factory=dict)
+    special_places: dict[str, dict[str, set[tuple[int, int]]]] = field(default_factory=dict)
+    seen_places: set[str] = field(default_factory=set)
+    current_objective: str | None = None
+    revealed_objectives: set[str] = field(default_factory=set)
+    completed_objectives: set[str] = field(default_factory=set)
+    arrived_targets: set[str] = field(default_factory=set)
+    claimed_tutorial_rewards: set[str] = field(default_factory=set)
+    game_flags: dict[str, bool] = field(default_factory=dict)
+    new_events: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, value: object) -> PlayerKnowledge:
         memory = cls()
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
             return memory
         flags, visited, exits, points = (value.get(key) for key in ("flags", "visited", "exits", "points"))
         if isinstance(flags, dict):
@@ -87,6 +115,34 @@ class PlayerKnowledge:
             }
         epoch = value.get("skill_epoch", 0)
         memory.skill_epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+        for field_name, allowed in (
+            ("seen_places", PLACE_TYPES),
+            ("revealed_objectives", frozenset(OBJECTIVE_BY_ID)),
+            ("completed_objectives", frozenset(OBJECTIVE_BY_ID)),
+            ("arrived_targets", frozenset(item.target for item in STORY_OBJECTIVES)),
+            ("claimed_tutorial_rewards", None),
+        ):
+            raw = value.get(field_name)
+            if isinstance(raw, list):
+                items = {item for item in raw if isinstance(item, str) and (allowed is None or item in allowed)}
+                setattr(memory, field_name, items)
+        current = value.get("current_objective")
+        if isinstance(current, str) and current in OBJECTIVE_BY_ID:
+            memory.current_objective = current
+        raw_flags = value.get("game_flags")
+        if isinstance(raw_flags, dict):
+            memory.game_flags = {
+                key: flag for key, flag in raw_flags.items()
+                if key in STORY_TRIGGER_FLAGS or key in STATION_OPEN_FLAGS
+                if isinstance(flag, bool)
+            }
+        raw_prices = value.get("shop_prices")
+        if isinstance(raw_prices, dict):
+            memory.shop_prices = {
+                key: cost for key, cost in list(raw_prices.items())[:64]
+                if isinstance(key, str) and len(key) <= 128
+                and isinstance(cost, int) and not isinstance(cost, bool) and 0 <= cost <= 999_999
+            }
         if isinstance(visited, dict):
             for room, cells in list(visited.items())[:256]:
                 if isinstance(room, str) and isinstance(cells, list):
@@ -103,6 +159,22 @@ class PlayerKnowledge:
             for room, records in list(value["exit_records"].items())[:256]:
                 if isinstance(room, str) and isinstance(records, list):
                     memory.exit_records[room] = [tuple(record) for record in records[-8:] if isinstance(record, list) and len(record) == 5 and all(isinstance(v, int) and not isinstance(v, bool) for v in record) and 0 <= record[0] < GRID_WIDTH and 0 <= record[1] < GRID_HEIGHT and 0 <= record[2] <= 3 and record[3] in (0, 1) and record[4] >= 0]
+        raw_places = value.get("special_places")
+        if isinstance(raw_places, dict):
+            for room, kinds in list(raw_places.items())[:256]:
+                if not isinstance(room, str) or not isinstance(kinds, dict):
+                    continue
+                clean: dict[str, set[tuple[int, int]]] = {}
+                for kind, cells in kinds.items():
+                    if kind in PLACE_TYPES and isinstance(cells, list):
+                        clean[kind] = {
+                            (cell[0], cell[1]) for cell in cells[:8]
+                            if isinstance(cell, list) and len(cell) == 2
+                            and all(isinstance(v, int) and not isinstance(v, bool) for v in cell)
+                            and 0 <= cell[0] < GRID_WIDTH and 0 <= cell[1] < GRID_HEIGHT
+                        }
+                if clean:
+                    memory.special_places[room] = clean
         last_scene, last_cell = value.get("last_scene"), value.get("last_cell")
         if (
             isinstance(last_scene, str)
@@ -118,7 +190,7 @@ class PlayerKnowledge:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "flags": dict(self.known_flags),
             "charm_costs": dict(self.charm_costs),
             "visited": {room: [list(cell) for cell in sorted(cells)[:144]] for room, cells in sorted(self.visited.items())[:256]},
@@ -126,32 +198,71 @@ class PlayerKnowledge:
             "points": {room: [list(event) for event in sorted(events)[:8]] for room, events in sorted(self.points.items())[:256]},
             "exit_records": {room: [list(record) for record in records[-8:]] for room, records in sorted(self.exit_records.items())[:256]},
             "skill_epoch": self.skill_epoch,
+            "shop_prices": dict(sorted(self.shop_prices.items())[:64]),
+            "special_places": {
+                room: {kind: [list(cell) for cell in sorted(cells)[:8]] for kind, cells in kinds.items()}
+                for room, kinds in sorted(self.special_places.items())[:256]
+            },
+            "seen_places": sorted(self.seen_places),
+            "current_objective": self.current_objective,
+            "revealed_objectives": sorted(self.revealed_objectives),
+            "completed_objectives": sorted(self.completed_objectives),
+            "arrived_targets": sorted(self.arrived_targets),
+            "claimed_tutorial_rewards": sorted(self.claimed_tutorial_rewards),
+            "game_flags": dict(self.game_flags),
             "last_scene": self.last_scene,
             "last_cell": list(self.last_cell) if self.last_cell else None,
         }
 
     def update(self, info: dict[str, Any]) -> None:
+        self.new_events = []
         telemetry = info.get("operator_telemetry")
         if not isinstance(telemetry, dict):
             return
         scene = telemetry.get("scene_name")
         bounds = telemetry.get("scene_bounds")
         x, y = telemetry.get("x"), telemetry.get("y")
-        if not isinstance(scene, str) or len(scene) > 256 or not isinstance(bounds, list) or len(bounds) != 4:
+        valid_position = (
+            isinstance(scene, str) and len(scene) <= 256
+            and isinstance(bounds, list) and len(bounds) == 4
+            and all(isinstance(v, (int, float)) and np.isfinite(v) for v in (*bounds, x, y))
+        )
+        col = row = 0
+        if valid_position:
+            assert isinstance(bounds, list) and len(bounds) == 4
+            x0, y0, x1, y1 = (float(v) for v in bounds)
+            assert isinstance(x, (int, float)) and isinstance(y, (int, float))
+            valid_position = x1 > x0 and y1 > y0
+            if valid_position:
+                col = int(np.clip((float(x) - x0) / (x1 - x0) * GRID_WIDTH, 0, GRID_WIDTH - 1))
+                row = int(np.clip((float(y) - y0) / (y1 - y0) * GRID_HEIGHT, 0, GRID_HEIGHT - 1))
+        flags = telemetry.get("progress_flags")
+        clean_game_flags: dict[str, bool] = {}
+        if isinstance(flags, dict):
+            clean_game_flags = {
+                key: value for key, value in flags.items()
+                if (key in STORY_TRIGGER_FLAGS or key in STATION_OPEN_FLAGS) and isinstance(value, bool)
+            }
+        self.game_flags.update(clean_game_flags)
+        self._observe_story(scene if isinstance(scene, str) else None, clean_game_flags)
+        transitions = telemetry.get("milestone_events_since_last_frame")
+        if isinstance(transitions, list):
+            for event in transitions:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("transition_kind") in {"stag", "station"}:
+                    self._claim_reward("first-fast-travel", "first_fast_travel")
+                if event.get("category") == "flag" and event.get("key") in STATION_OPEN_FLAGS:
+                    self._claim_reward(f"station-open:{event['key']}", "station_opened")
+        if valid_position and isinstance(scene, str):
+            self._observe_special_places(scene, telemetry.get("visible_places"), bounds)
+            if telemetry.get("at_bench") is True:
+                self._claim_reward(f"bench-rest:{scene}:{col}:{row}", "first_bench_rest")
+        if not valid_position or not isinstance(scene, str):
             return
-        samples = (*bounds, x, y)
-        if not all(isinstance(v, (int, float)) and np.isfinite(v) for v in samples):
-            return
-        x0, y0, x1, y1 = (float(v) for v in bounds)
-        assert isinstance(x, (int, float)) and isinstance(y, (int, float))
-        if x1 <= x0 or y1 <= y0:
-            return
-        col = int(np.clip((float(x) - x0) / (x1 - x0) * GRID_WIDTH, 0, GRID_WIDTH - 1))
-        row = int(np.clip((float(y) - y0) / (y1 - y0) * GRID_HEIGHT, 0, GRID_HEIGHT - 1))
         cell = (col, row)
         previous_scene, previous_cell = self.last_scene, self.last_cell
         previously_known = int(scene in self.visited)
-        flags = telemetry.get("progress_flags")
         if isinstance(flags, dict):
             clean_flags = {
                 key: value for key, value in flags.items()
@@ -179,8 +290,74 @@ class PlayerKnowledge:
             for event in events:
                 if isinstance(event, dict) and event.get("category") in {"death", "stuck", "novelty"}:
                     self.points.setdefault(scene, set()).add((col, row, {"death": 1, "stuck": 2, "novelty": 3}[event["category"]]))
+        prices = telemetry.get("shop_prices_visible")
+        if isinstance(prices, list):
+            for price in prices[:64]:
+                if not isinstance(price, dict):
+                    continue
+                item_id, geo = price.get("item_id"), price.get("geo")
+                if isinstance(item_id, str) and len(item_id) <= 128 and isinstance(geo, int) and not isinstance(geo, bool) and 0 <= geo <= 999_999:
+                    self.shop_prices[item_id] = geo
 
-    def vector(self) -> NDArray[np.float32]:
+    def _claim_reward(self, key: str, event_type: str) -> None:
+        if key in self.claimed_tutorial_rewards:
+            return
+        self.claimed_tutorial_rewards.add(key)
+        self.new_events.append({"type": event_type, "key": key})
+
+    def _observe_special_places(self, scene: str, visible: object, bounds: object) -> None:
+        if not isinstance(visible, list) or not isinstance(bounds, list) or len(bounds) != 4:
+            return
+        x0, y0, x1, y1 = (float(value) for value in bounds)
+        if x1 <= x0 or y1 <= y0:
+            return
+        for place in visible[:8]:
+            if not isinstance(place, dict):
+                continue
+            kind, px, py = place.get("kind"), place.get("world_x"), place.get("world_y")
+            if kind not in PLACE_TYPES or not isinstance(px, (int, float)) or not isinstance(py, (int, float)):
+                continue
+            if not np.isfinite(px) or not np.isfinite(py) or not x0 <= px <= x1 or not y0 <= py <= y1:
+                continue
+            place_col = int(np.clip((float(px) - x0) / (x1 - x0) * GRID_WIDTH, 0, GRID_WIDTH - 1))
+            place_row = int(np.clip((float(py) - y0) / (y1 - y0) * GRID_HEIGHT, 0, GRID_HEIGHT - 1))
+            self.seen_places.add(kind)
+            self.special_places.setdefault(scene, {}).setdefault(kind, set()).add((place_col, place_row))
+            if kind in {"shop", "map_shop"}:
+                prices = place.get("prices")
+                if isinstance(prices, list):
+                    for price in prices[:32]:
+                        if isinstance(price, dict):
+                            item, cost = price.get("item_id"), price.get("geo")
+                            if isinstance(item, str) and len(item) <= 128 and isinstance(cost, int) and not isinstance(cost, bool) and 0 <= cost <= 999_999:
+                                self.shop_prices[item] = cost
+
+    def _observe_story(self, scene: str | None, flags: dict[str, bool]) -> None:
+        if self.current_objective is None:
+            next_index = len(self.revealed_objectives)
+            if next_index < len(STORY_OBJECTIVES):
+                objective = STORY_OBJECTIVES[next_index]
+                if flags.get(objective.reveal_flag, self.game_flags.get(objective.reveal_flag, False)):
+                    self.current_objective = objective.objective_id
+                    self.revealed_objectives.add(objective.objective_id)
+                    self.new_events.append({"type": "objective_revealed", "key": objective.objective_id})
+        if self.current_objective is None:
+            return
+        objective = OBJECTIVE_BY_ID[self.current_objective]
+        reached = scene is not None and is_target_scene(objective, scene)
+        completed = reached if objective.kind == "reach_area" else bool(
+            objective.target_flag and self.game_flags.get(objective.target_flag, False)
+        )
+        if not completed:
+            return
+        self.completed_objectives.add(objective.objective_id)
+        self._claim_reward(f"objective:{objective.objective_id}", "objective_completed")
+        self.current_objective = None
+        if objective.kind == "reach_area" and objective.target not in self.arrived_targets:
+            self.arrived_targets.add(objective.target)
+            self._claim_reward(f"area-arrival:{objective.target}", "first_target_arrival")
+
+    def vector(self, *, hint_level: int = 0) -> NDArray[np.float32]:
         values: list[float] = []
         for flag, descriptor in ITEM_FLAGS:
             acquired = self.known_flags.get(flag, False)
@@ -217,9 +394,41 @@ class PlayerKnowledge:
         if self.last_cell is not None:
             col, row = self.last_cell
             values[len(values) - GRID_WIDTH * GRID_HEIGHT + row * GRID_WIDTH + col] = 1.0
+        for place_kind, descriptor in PLACE_DESCRIPTORS:
+            seen = place_kind in self.seen_places
+            values.extend((1.0, *descriptor) if seen else (0.0, 0.0, 0.0, 0.0))
+        for place_kind, _descriptor in PLACE_DESCRIPTORS:
+            values.extend([0.0] * (GRID_WIDTH * GRID_HEIGHT))
+            if self.last_scene is not None:
+                offset = len(values) - GRID_WIDTH * GRID_HEIGHT
+                for col, row in self.special_places.get(self.last_scene, {}).get(place_kind, set()):
+                    values[offset + row * GRID_WIDTH + col] = 1.0
+        objective = OBJECTIVE_BY_ID.get(self.current_objective or "")
+        values.extend([0.0] * 8)
+        if objective is not None:
+            values[-8] = 1.0
+            values[-7 + STORY_OBJECTIVES.index(objective)] = 1.0
+            values[-4 + {"reach_area": 0, "defeat_boss": 1, "obtain_ability": 2}.get(objective.kind, 0)] = 1.0
+            target_reached = objective.target in self.arrived_targets
+            if objective.target_flag:
+                target_reached = self.game_flags.get(objective.target_flag, False)
+            values[-1] = float(target_reached)
+        values.append(float(hint_level))
+        for item_id in sorted(self.shop_prices)[:64]:
+            price = self.shop_prices[item_id]
+            values.extend(
+                (1.0, float(np.log1p(price) / np.log1p(999_999)))
+                if 0 <= price <= 999_999 else (0.0, 0.0)
+            )
+        values.extend([0.0] * (2 * (64 - min(64, len(self.shop_prices)))))
         return np.asarray(values, dtype=np.float32)
 
     @staticmethod
     def space() -> gym.spaces.Box:
         item_size = sum(1 + len(descriptor) for _, descriptor in ITEM_FLAGS)
-        return gym.spaces.Box(0.0, 1.0, (item_size + GRID_WIDTH * GRID_HEIGHT * 2 + 8 * 6 + 8 * 5,), dtype=np.float32)
+        return gym.spaces.Box(
+            0.0, 1.0,
+            (item_size + GRID_WIDTH * GRID_HEIGHT * 2 + 8 * 6 + 8 * 5
+             + len(PLACE_DESCRIPTORS) * (4 + GRID_WIDTH * GRID_HEIGHT) + 8 + 128 + 1,),
+            dtype=np.float32,
+        )

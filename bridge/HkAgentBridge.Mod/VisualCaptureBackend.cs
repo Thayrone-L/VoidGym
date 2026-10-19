@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -192,12 +193,50 @@ internal sealed class VisualCaptureBackend : IDisposable
         PlayerData? data = PlayerData.instance;
         HeroController? hero = HeroController.instance;
         if (data == null || hero == null) return null;
+        BridgeUiState ui = ReadUiState();
         return new ActionAvailability(data.MPCharge, data.equippedCharm_33 ? 24 : 33, 33,
             data.fireballLevel, data.quakeLevel, data.screamLevel, data.hasNailArt,
             data.hasCyclone, data.hasDashSlash, data.hasUpwardSlash,
             SafeProgressFlag(data, "hasDash"), SafeProgressFlag(data, "hasWallJump"),
             SafeProgressFlag(data, "hasDoubleJump"), SafeProgressFlag(data, "hasSuperDash"),
-            SafeProgressFlag(data, "hasDreamNail"), SafeProgressFlag(data, "gotCharm_31"));
+            SafeProgressFlag(data, "hasDreamNail"), SafeProgressFlag(data, "gotCharm_31"),
+            ui.DialogOpen, ui.MenuOpen);
+    }
+
+    internal static BridgeUiState ReadUiState()
+    {
+        bool dialogOpen = false;
+        string? dialogueId = null;
+        try
+        {
+            foreach (DialogueBox box in UnityEngine.Object.FindObjectsOfType<DialogueBox>())
+                if (box != null && box.isActiveAndEnabled && !IsDialogueHidden(box) &&
+                    !string.IsNullOrWhiteSpace(box.currentConversation))
+                {
+                    dialogOpen = true;
+                    dialogueId = box.currentConversation;
+                    break;
+                }
+        }
+        catch (Exception) { }
+        bool menuOpen = false;
+        try
+        {
+            GameManager? manager = GameManager.instance;
+            menuOpen = manager != null && (manager.isPaused || manager.ui?.currentDynamicMenu != null);
+        }
+        catch (Exception) { }
+        return new BridgeUiState(dialogOpen, menuOpen, dialogueId);
+    }
+
+    private static bool IsDialogueHidden(DialogueBox box)
+    {
+        try
+        {
+            FieldInfo? hidden = typeof(DialogueBox).GetField("hidden", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            return hidden?.GetValue(box) is bool value && value;
+        }
+        catch (Exception) { return false; }
     }
 
     private static bool SafeProgressFlag(PlayerData data, string name)
@@ -372,8 +411,10 @@ internal sealed class CapturedFrame
     public ActionAvailability? ActionAvailability { get; }
 }
 
+internal sealed record BridgeUiState(bool DialogOpen, bool MenuOpen, string? DialogueId);
+
 internal sealed record ActionAvailability(int mp_charge, int spell_cost, int focus_cost,
     int fireball_level, int quake_level, int scream_level, bool has_nail_art,
     bool has_cyclone, bool has_dash_slash, bool has_upward_slash, bool has_dash,
     bool has_walljump, bool has_double_jump, bool has_super_dash, bool has_dream_nail,
-    bool has_dashmaster);
+    bool has_dashmaster, bool dialog_open, bool menu_open);

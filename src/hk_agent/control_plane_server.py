@@ -224,6 +224,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                         "warm_start_source_campaign",
                         "stuck_seconds",
                         "evaluation_interval",
+                        "tutorial_hint_level",
                         "straggler_timeout_seconds",
                     ),
                 )

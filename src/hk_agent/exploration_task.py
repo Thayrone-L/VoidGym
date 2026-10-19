@@ -21,6 +21,8 @@ from hk_agent.run_journey import RunDiary, increment_campaign_count, rebuild_pro
 from hk_agent.scene_change_task import (
     SCENE_CHANGE_ACTION_NAMES,
     SCENE_CHANGE_ACTION_TEMPLATES,
+    SCENE_CHANGE_INTERACTION_ACTION_NAMES,
+    SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES,
     SceneChangeTaskConfig,
     descriptor_distance,
     detect_scene_change,
@@ -240,6 +242,7 @@ class ExplorationTaskConfig:
     time_cost_budget: float = 20.0
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
+    tutorial_hint_level: int = 0
 
     def validate(self) -> None:
         if (
@@ -250,6 +253,8 @@ class ExplorationTaskConfig:
             raise ValueError("exploration horizon and archive must be positive and bounded")
         if self.reward_version not in SUPPORTED_EXPLORE_REWARD_VERSIONS:
             raise ValueError("unsupported exploration reward version")
+        if self.tutorial_hint_level not in {0, 1}:
+            raise ValueError("tutorial_hint_level must be 0 (official clues) or 1 (gentle guide)")
         if self.novelty_persistence_steps != 2:
             raise ValueError("novelty persistence must be two consecutive steps")
         if self.novelty_reward < 0 or self.novelty_threshold <= 0 or self.novelty_budget < 0:
@@ -422,11 +427,21 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.config.validate()
         self.task_log_path = task_log_path
         self.lifelong_memory_root = lifelong_memory_root
-        self.action_space = gym.spaces.Discrete(len(SCENE_CHANGE_ACTION_TEMPLATES))  # type: ignore[assignment]
+        self._action_templates = (
+            SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES
+            if self.config.reward_version == "explore_v4"
+            else SCENE_CHANGE_ACTION_TEMPLATES
+        )
+        self._action_names = (
+            SCENE_CHANGE_INTERACTION_ACTION_NAMES
+            if self.config.reward_version == "explore_v4"
+            else SCENE_CHANGE_ACTION_NAMES
+        )
+        self.action_space = gym.spaces.Discrete(len(self._action_templates))  # type: ignore[assignment]
         source = cast(gym.spaces.Dict, environment.observation_space)
         task_observation_space = temporal_observation_space(
             source,  # type: ignore[arg-type]
-            number_of_actions=len(SCENE_CHANGE_ACTION_TEMPLATES),
+            number_of_actions=len(self._action_templates),
         )
         if self.config.reward_version == "explore_v4":
             task_observation_space.spaces["player_knowledge"] = PlayerKnowledge.space()
@@ -494,6 +509,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._diary: RunDiary | None = None
         self._reload_checkpoint_next_reset = False
         self._player_knowledge = PlayerKnowledge()
+        self._pending_tutorial_events: list[dict[str, Any]] = []
         playthrough_root = os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
         self._knowledge_path = (
             Path(playthrough_root) / "player-knowledge.json"
@@ -519,6 +535,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._reload_checkpoint_next_reset = False
         observation, reset_info = self.environment.reset(seed=seed, options=reset_options)
         self._player_knowledge.update(reset_info)
+        self._pending_tutorial_events.extend(self._player_knowledge.new_events)
         self._persist_player_knowledge()
         descriptor = self._descriptor(observation["pixels"][-1])
         if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
@@ -629,14 +646,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             raise ValueError(f"invalid task action: {action!r}")
         decision = decide_masked_action(
             int(action),
-            SCENE_CHANGE_ACTION_NAMES,
+            self._action_names,
             getattr(self.environment, "latest_action_availability", None),
         )
         if decision.availability is None:
             self.mask_unavailable_count += 1
         action = decision.executed_index
         audit = action_mask_audit(decision, self.mask_unavailable_count)
-        template = SCENE_CHANGE_ACTION_TEMPLATES[action]
+        template = self._action_templates[action]
         lease = template.resolve_lease_ms(self.environment.lease_ms)
         if self._diary is not None:
             self._diary.capture_before_exit(template.buttons)
@@ -650,6 +667,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
         previous_skill_epoch = self._player_knowledge.skill_epoch
         self._player_knowledge.update(base)
+        tutorial_events = self._pending_tutorial_events + self._player_knowledge.new_events
+        self._pending_tutorial_events = []
         self._persist_player_knowledge()
         ability_reexploration = self._player_knowledge.skill_epoch > previous_skill_epoch
         if self._diary is not None:
@@ -715,6 +734,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "death": 0.0,
             "run_failed": 0.0,
             "milestone_novelty": 0.0,
+            "tutorial_reward": 0.0,
             "time_cost": self.config.time_cost * (lease / self.config.lease_base_ms),
         }
         base_done = terminated or truncated
@@ -941,6 +961,21 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._milestone_paid += award
                 remaining -= award
                 self._milestone_counts[key] = visits + 1
+        if self.config.reward_version == "explore_v4":
+            tutorial_values = {
+                "objective_completed": 2.0,
+                "first_target_arrival": 0.5,
+                "first_bench_rest": 0.25,
+                "station_opened": 0.5,
+                "first_fast_travel": 0.75,
+            }
+            for event in tutorial_events:
+                if not isinstance(event, dict):
+                    continue
+                requested = tutorial_values.get(str(event.get("type")), 0.0)
+                award = min(requested, max(0.0, 20.0 - self._milestone_paid))
+                components["tutorial_reward"] += award
+                self._milestone_paid += award
         self._kills_paid += components["confirmed_enemy_kills"]
         components["shade_recovered"] = 0.0 if self._shade_paid else combat["shade_recovered"]
         self._shade_paid |= components["shade_recovered"] > 0
@@ -1136,6 +1171,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "novelty_eligible": eligible,
             "scene_detector_audit": changed,
             "farm_alerts": farm_alerts,
+            "player_knowledge_events": tutorial_events,
         }
         if episode_progress is not None:
             info["episode_progress"] = episode_progress
@@ -1161,6 +1197,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "stuck_seconds": self._progress_elapsed_seconds,
                 "farm_alerts": farm_alerts,
                 "episode_progress": episode_progress,
+                "player_knowledge_events": tutorial_events,
                 **audit,
             }
         )
@@ -1171,7 +1208,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     ) -> dict[str, NDArray[np.generic]]:
         result = dict(observation)
         if self.config.reward_version == "explore_v4":
-            result["player_knowledge"] = self._player_knowledge.vector()
+            result["player_knowledge"] = self._player_knowledge.vector(
+                hint_level=self.config.tutorial_hint_level
+            )
         return result
 
     def _persist_player_knowledge(self) -> None:
@@ -1200,7 +1239,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
 
     def action_masks(self) -> NDArray[np.bool_]:
         return build_action_mask(
-            SCENE_CHANGE_ACTION_NAMES, getattr(self.environment, "latest_action_availability", None)
+            self._action_names, getattr(self.environment, "latest_action_availability", None)
         )
 
     def set_evaluation_mode(self, enabled: bool) -> None:
@@ -1213,22 +1252,26 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3, "explore_v4": 5}[
             self.config.reward_version
         ]
+        if self.config.reward_version == "explore_v4":
+            schema_version = 6
         return {
             "task_contract_schema_version": schema_version,
             "reward_version": self.config.reward_version,
             "legal_action_mask": {
-                "version": "action_availability_v2" if schema_version == 5 else "action_availability_v1",
+                "version": "action_availability_v3" if schema_version == 6 else "action_availability_v2" if schema_version == 5 else "action_availability_v1",
                 "source": "frame_action_availability",
             },
-            "action_names": list(SCENE_CHANGE_ACTION_NAMES),
+            "action_names": list(self._action_names),
             "actions": action_contract(
-                SCENE_CHANGE_ACTION_TEMPLATES, base_lease_ms=self.environment.lease_ms
+                self._action_templates, base_lease_ms=self.environment.lease_ms
             ),
             "config": {
-                key: value for key, value in asdict(self.config).items() if key != "reward_version"
+                key: value for key, value in asdict(self.config).items()
+                if key != "reward_version"
+                and (key != "tutorial_hint_level" or self.config.reward_version == "explore_v4")
             },
-            "observation_version": "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
-            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version == 5 else ["pixels", "applied_action_history"],
+            "observation_version": "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6} else ["pixels", "applied_action_history"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

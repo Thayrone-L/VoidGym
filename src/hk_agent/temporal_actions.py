@@ -82,6 +82,16 @@ TEMPORAL_COMBAT_ACTIONS: tuple[TemporalActionTemplate, ...] = (
     TemporalActionTemplate("DREAM_NAIL", ("DREAM_NAIL",), "hold"),
 )
 
+PLAYER_INTERACTION_ACTIONS: tuple[TemporalActionTemplate, ...] = (
+    TemporalActionTemplate("INTERACT", ("UP",), "tap"),
+    TemporalActionTemplate("MENU_UP", ("UP",), "tap"),
+    TemporalActionTemplate("MENU_DOWN", ("DOWN",), "tap"),
+    TemporalActionTemplate("MENU_LEFT", ("LEFT",), "tap"),
+    TemporalActionTemplate("MENU_RIGHT", ("RIGHT",), "tap"),
+    TemporalActionTemplate("MENU_SUBMIT", ("JUMP",), "tap"),
+    TemporalActionTemplate("MENU_CANCEL", ("DASH",), "tap"),
+)
+
 
 def temporal_observation_space(
     source: gym.Space[dict[str, NDArray[np.generic]]], *, number_of_actions: int

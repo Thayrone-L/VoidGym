@@ -27,10 +27,12 @@ class ActionAvailability:
     has_super_dash: bool = False
     has_dream_nail: bool = False
     has_dashmaster: bool = False
+    dialog_open: bool = False
+    menu_open: bool = False
 
 
 _INT_FIELDS = ("mp_charge", "spell_cost", "focus_cost", "fireball_level", "quake_level", "scream_level")
-_BOOL_FIELDS = ("has_nail_art", "has_cyclone", "has_dash_slash", "has_upward_slash", "has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster")
+_BOOL_FIELDS = ("has_nail_art", "has_cyclone", "has_dash_slash", "has_upward_slash", "has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster", "dialog_open", "menu_open")
 
 
 def parse_action_availability(value: object) -> ActionAvailability | None:
@@ -40,8 +42,9 @@ def parse_action_availability(value: object) -> ActionAvailability | None:
         raise ProtocolError("FRAME action_availability must be an object")
     expected = set(_INT_FIELDS + _BOOL_FIELDS)
     # Accept v1 bridge frames without the newer progression fields.
-    legacy = expected - {"has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster"}
-    if frozenset(value) not in {frozenset(expected), frozenset(legacy)}:
+    previous = expected - {"dialog_open", "menu_open"}
+    legacy = previous - {"has_dash", "has_walljump", "has_double_jump", "has_super_dash", "has_dream_nail", "has_dashmaster"}
+    if frozenset(value) not in {frozenset(expected), frozenset(previous), frozenset(legacy)}:
         raise ProtocolError("FRAME action_availability has invalid fields")
     normalized = dict(value)
     for name in expected - set(normalized):
@@ -60,28 +63,35 @@ def build_action_mask(names: tuple[str, ...], availability: ActionAvailability |
     mask = np.ones(len(names), dtype=np.bool_)
     if availability is None:
         for index, name in enumerate(names):
-            if "DASH" in name or name in {"SUPER_DASH_HOLD", "DREAM_NAIL"}:
+            if "DASH" in name or name in {"SUPER_DASH_HOLD", "DREAM_NAIL"} or name.startswith("MENU_"):
                 mask[index] = False
         return mask
     for index, name in enumerate(names):
+        if name == "INTERACT":
+            mask[index] = True
+        elif name.startswith("MENU_"):
+            mask[index] = availability.menu_open or availability.dialog_open
+            continue
+        elif (availability.menu_open or availability.dialog_open) and name not in {"NOOP", "INTERACT"}:
+            mask[index] = False
         if name == "FOCUS_HOLD":
-            mask[index] = availability.mp_charge >= availability.focus_cost
+            mask[index] = mask[index] and availability.mp_charge >= availability.focus_cost
         elif name == "CAST":
-            mask[index] = availability.fireball_level > 0 and availability.mp_charge >= availability.spell_cost
+            mask[index] = mask[index] and availability.fireball_level > 0 and availability.mp_charge >= availability.spell_cost
         elif name == "UP+CAST":
-            mask[index] = availability.scream_level > 0 and availability.mp_charge >= availability.spell_cost
+            mask[index] = mask[index] and availability.scream_level > 0 and availability.mp_charge >= availability.spell_cost
         elif name == "DOWN+CAST":
-            mask[index] = availability.quake_level > 0 and availability.mp_charge >= availability.spell_cost
+            mask[index] = mask[index] and availability.quake_level > 0 and availability.mp_charge >= availability.spell_cost
         elif "NAIL_ART_CHARGE" in name:
-            mask[index] = availability.has_nail_art
+            mask[index] = mask[index] and availability.has_nail_art
         elif "DASH" in name and "SUPER_DASH" not in name:
-            mask[index] = availability.has_dash and (
+            mask[index] = mask[index] and availability.has_dash and (
                 name != "DOWN+DASH" or availability.has_dashmaster
             )
         elif name == "SUPER_DASH_HOLD":
-            mask[index] = availability.has_super_dash
+            mask[index] = mask[index] and availability.has_super_dash
         elif name == "DREAM_NAIL":
-            mask[index] = availability.has_dream_nail
+            mask[index] = mask[index] and availability.has_dream_nail
     return mask
 
 

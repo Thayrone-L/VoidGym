@@ -52,3 +52,15 @@ Categorias: `1` movimento, `2` combate, `3` cura/vida, `4` utilidade, `5` alma/m
 A grade atual tem 16×9 células. Ela é preenchida somente por posições amostradas durante a própria execução e só a grade da sala atual é observada. A troca de cena registra uma saída usada na célula de transição; salas não visitadas não são enumeradas. Eventos de morte, travamento e novidade podem gerar pontos de interesse quando a própria telemetria os registra.
 
 O fingerprint muda com a versão do contrato e a assinatura do espaço de observação. A novidade vitalícia combina a cena visual com o conjunto fixo de aquisições; aprender uma habilidade torna lugares antigos elegíveis de novo. O warm-start parcial copia somente tensores da política antiga cujos nomes e dimensões coincidam, preservando a CNN visual quando compatível; novas entradas, cabeças incompatíveis e novas saídas de ação mantêm a inicialização da política nova.
+
+## Tutoriais, lugares e objetivos (explore_v4 schema 6)
+
+O bridge libera `INTERACT` (UP curto) em toda situação. `MENU_UP/DOWN/LEFT/RIGHT/SUBMIT/CANCEL` só ficam disponíveis com diálogo ou menu ativo; essas ações usam UP/DOWN/LEFT/RIGHT/JUMP/DASH. Durante diálogo/menu, ações de gameplay ficam mascaradas. O estado vem de `DialogueBox.currentConversation` e do pause/menu ativo do jogo.
+
+A política guarda lugares especiais somente quando um componente está dentro da câmera e sua posição pode ser convertida para a grade já visitada: banco, estação de besouro, loja e cartógrafo. O descritor de cada tipo começa em zero e é preenchido no primeiro encontro; a grade inclui apenas coordenadas já vistas. Preços entram na memória só enquanto itens de loja estão ativos na tela. A lista não enumera pontos futuros.
+
+`src/hk_agent/story_objectives.py` mantém uma sequência curta e extensível: `enteredTutorialFirstTime` revela alcançar a Encruzilhada; `metElderbug` revela derrotar o Falso Cavaleiro; `falseKnightDefeated` revela alcançar o Caminho Verde (cenas `Fungus1*`). O estágio, tipo e progresso do objetivo são códigos anônimos no vetor. A conclusão e a primeira chegada pagam uma vez por jogada, dentro do teto compartilhado de recompensa de marcos (20 por episódio). Descansar num banco paga uma vez por célula de banco observada; a abertura de estação e a primeira viagem rápida pagam uma vez por evento confirmado.
+
+O parâmetro `tutorial_hint_level` aceita `0` (padrão: somente os gatilhos oficiais da tabela) e `1` (guia leve no vetor quando o mesmo objetivo oficial está ativo). O nível não revela objetivos futuros. A tabela usa flags de progresso do jogo que mudam durante a conversa/descoberta; não há direção codificada além do alvo que essa flag revela.
+
+O vetor e a persistência passaram ao schema 2; o contrato de exploração passou ao schema 6 e preserva os contratos anteriores. Um learner antigo só pode fazer warm-start dos tensores visuais cujos nomes e formas coincidirem.
