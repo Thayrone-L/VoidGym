@@ -998,6 +998,43 @@ class ControlPlane:
         for slot_id in range(min(config.instance_count, 3)):
             root = resolve_playthrough_root(self.runtime_root, campaign_id, slot_id + 1)
             state = playthrough_status(root) or {"last_scene": None, "progress": {}, "backup_count": 0}
+            knowledge = self._read_json(root / "player-knowledge.json")
+            raw_bestiary = knowledge.get("bestiary", {})
+            bestiary_rows: list[dict[str, Any]] = []
+            if isinstance(raw_bestiary, Mapping):
+                from hk_agent.bestiary import BESTIARY_DISPLAY_NAMES
+
+                for enemy_id, experience in raw_bestiary.items():
+                    if not isinstance(enemy_id, str) or not isinstance(experience, Mapping):
+                        continue
+                    encounters = experience.get("encounters", 0)
+                    defeated = experience.get("defeated", 0)
+                    geo_defeats = experience.get("geo_defeats", 0)
+                    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                               for value in (encounters, defeated, geo_defeats)):
+                        continue
+                    total_geo = experience.get("total_geo", 0)
+                    total_hits = experience.get("total_hits_to_defeat", 0)
+                    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                               for value in (total_geo, total_hits)):
+                        continue
+                    bestiary_rows.append({
+                        "enemy_type_id": enemy_id,
+                        "name": BESTIARY_DISPLAY_NAMES.get(enemy_id, "Inimigo ainda não identificado"),
+                        "encounters": encounters,
+                        "wins": defeated,
+                        "win_rate": defeated / encounters if encounters else 0.0,
+                        "average_hits_to_defeat": total_hits / defeated if defeated else None,
+                        "damage_per_encounter": (experience.get("damage_taken", 0) / encounters)
+                        if encounters else 0.0,
+                        "times_killed": experience.get("times_killed", 0),
+                        "average_geo": total_geo / geo_defeats if geo_defeats else None,
+                        "gave_item": experience.get("gave_item") is True,
+                        "fight_rate": (experience.get("fought_encounters", 0) / encounters)
+                        if encounters else 0.0,
+                    })
+            bestiary_rows.sort(key=lambda item: (-int(item["encounters"]), str(item["enemy_type_id"])))
+            state["bestiary"] = bestiary_rows[:64]
             if not state.get("last_scene"):
                 state["last_scene"] = last_scenes.get(slot_id)
             state.update({"slot": slot_id + 1, "active": slot_id in active_slots,

@@ -147,3 +147,66 @@ def test_tutorial_rewards_are_once_per_observed_bench_station_and_travel() -> No
     assert first.count("first_fast_travel") == 1
     memory.update({"operator_telemetry": telemetry})
     assert memory.new_events == []
+
+
+def test_bestiary_learns_only_from_visible_enemy_experience_and_round_trips() -> None:
+    memory = PlayerKnowledge()
+    enemy_id = "e_0123456789"
+    telemetry = {
+        "scene_name": "RoomA", "scene_bounds": [0, 0, 16, 9], "x": 4, "y": 4,
+        "visible_enemies": [{
+            "enemy_type_id": enemy_id, "instance_id": 41, "screen_x": 0.6,
+            "screen_y": 0.5, "struck_this_encounter": 1,
+        }],
+    }
+    memory.update({"operator_telemetry": telemetry, "hp_lost_since_last_frame": 1})
+    experience = memory.bestiary.experience[enemy_id]
+    assert experience.encounters == 1
+    assert experience.damage_taken == 1
+    assert experience.defeated == 0
+    assert memory.bestiary.slots[0][0] == enemy_id
+    memory.update({
+        "operator_telemetry": {**telemetry, "visible_enemies": []},
+        "bestiary_events_since_last_frame": [{
+            "enemy_type_id": enemy_id, "hits_dealt": 3, "geo_awarded": 5,
+        }],
+    })
+    assert experience.defeated == 1
+    assert experience.total_hits_to_defeat == 3
+    assert experience.total_geo == 5
+    restored = PlayerKnowledge.from_payload(memory.to_payload())
+    assert restored.bestiary.to_payload() == memory.bestiary.to_payload()
+    assert len(restored.bestiary.vector()) == 6 * 13
+    assert np.all(np.isfinite(restored.vector()))
+
+
+def test_bestiary_rejects_unseen_or_malformed_enemy_slots() -> None:
+    memory = PlayerKnowledge()
+    memory.update({"operator_telemetry": {
+        "scene_name": "RoomA", "visible_enemies": [
+            {"enemy_type_id": "Crawler", "instance_id": 1, "screen_x": 0.5,
+             "screen_y": 0.5, "struck_this_encounter": 0},
+            {"enemy_type_id": "e_0123456789", "instance_id": 2, "screen_x": 1.5,
+             "screen_y": 0.5, "struck_this_encounter": 0},
+        ],
+    }})
+    assert memory.bestiary.slots == []
+    assert memory.bestiary.experience == {}
+
+
+def test_bestiary_expires_fought_instance_after_ten_missing_frames() -> None:
+    memory = PlayerKnowledge()
+    enemy_id = "e_0123456789"
+    visible = {
+        "visible_enemies": [{
+            "enemy_type_id": enemy_id, "instance_id": 41, "screen_x": 0.6,
+            "screen_y": 0.5, "struck_this_encounter": 1,
+        }],
+    }
+    memory.update({"operator_telemetry": visible})
+    for _ in range(10):
+        memory.update({"operator_telemetry": {"visible_enemies": []}})
+    experience = memory.bestiary.experience[enemy_id]
+    assert experience.encounters == 1
+    assert experience.fought_encounters == 1
+    assert memory.bestiary.slots == []

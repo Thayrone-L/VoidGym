@@ -21,6 +21,7 @@ class FakeSupervisor:
         self, message_type: str, payload: dict[str, object], **_: Any
     ) -> Any:
         if message_type == "APPLY_ACTION":
+            self.last_action_payload = dict(payload)
             self.events.append(f"action:{','.join(payload['buttons'])}")  # type: ignore[arg-type]
         elif message_type == "RELEASE_ALL":
             self.events.append("release")
@@ -66,6 +67,7 @@ def test_action_is_bounded_released_and_captured(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         try:
@@ -80,6 +82,7 @@ def test_action_is_bounded_released_and_captured(tmp_path: Path) -> None:
             )
             assert response["ok"] is True
             assert response["released"] is True
+            assert supervisor.last_action_payload["episode_id"] == "test-episode"
             assert supervisor.events == ["action:RIGHT,JUMP", "release", "capture"]
             assert Path(response["capture"]["path"]).is_file()
         finally:
@@ -110,6 +113,7 @@ def test_rejects_wrong_token_and_unsafe_action(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         try:
@@ -154,6 +158,7 @@ def test_close_releases_and_finishes_waiter(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         waiter = asyncio.create_task(server.wait_until_closed())
@@ -186,6 +191,7 @@ def test_close_wakes_waiter_after_delayed_release(tmp_path: Path) -> None:
             idle_timeout_seconds=2,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         waiter = asyncio.create_task(server.wait_until_closed())

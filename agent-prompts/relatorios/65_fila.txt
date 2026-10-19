@@ -5,18 +5,22 @@ Workspace: C:\VoidGym
 Etapa 57 - VERDE; commit 3e5ed9693728fe8edbacb768587ae574254a409d enviado ao PR #8.
 Etapa 58 - VERDE; commit a452f4fefb9abbc288b049ee65f31f653bf6ab95 enviado ao PR #8.
 
-Etapa 59 - início/fim: 2026-10-19
-Estado: VERDE, validação e teste em jogo concluídos; commit/push em preparação.
-Resumo:
-- Memória de bancos/estações/lojas e preços observados, objetivos revelados por flags e recompensas únicas; interações contextuais com máscara no explore_v4.
+Etapa 59 - VERDE; commit 6a88c05 enviado ao PR #8.
+- Interação contextual, tutoriais de lugares, objetivos revelados por flags e recompensas únicas implementados.
 - Ruff/mypy verdes; pytest completo 588 passed, 2 skipped, 8 subtests; bridge Release e CorrelationTests verdes.
-- DLL em hk-ai-1 com hash confirmado; campanha de 1 ator/learner compartilhado executou 185 passos em Tutorial_01. Objetivo inicial foi persistido. Parada cooperativa, final-save capturado, jogo/painel encerrados.
-Relatório: agent-prompts\\relatorios\\59_tutoriais_objetivos.txt
-Pendências: não ocorreu encontro ao vivo com banco, loja ou chefe; lógica coberta sinteticamente.
+- Smoke test em campanha isolada: 185 passos em Tutorial_01 e objetivo inicial persistido. Parada cooperativa e saves restaurados.
+Relatório: agent-prompts\relatorios\59_tutoriais_objetivos.txt
+Limite observado: não houve encontro ao vivo com banco, loja ou chefe; lógica coberta sinteticamente.
 
-Etapas 60-64: NÃO INICIADAS; começam depois de publicar o 59.
+Etapa 60 — VERDE; validações e teste scriptado com jogo concluídos; commit pendente de publicação.
+- Bestiário persistente, slots anônimos na tela, painel e contrato schema 7.
+- Roteiro fixo matou um Crawlid; memória final: encontrado 1, derrotado 1, 2 golpes, 0 dano, 0 mortes, 0 geo, 0 item, encontro lutado 1.
+- Ruff/mypy verdes; pytest completo 592 passed, 2 skipped, 8 subtests; bridge Release/correlation tests verdes.
+- DLL implantada em hk-ai-1 e hk-ai-2 com SHA-256 igual: 3E9BADFEE4B3B38CFB34C1BEF3BEFF8E96F0539961C99A091F34D7B46E5490D2.
+- Capturas e rota: artifacts\scripted-validation\60\final; relatório: agent-prompts\relatorios\60_bestiario.txt.
 
-Estado geral:
-- 57 e 58 publicados; 59 passa validações e aguarda publicação nesta retomada.
-- Nenhuma campanha final jogada-1 iniciada; saves pessoal/baseline intocados e Steam não aberto.
-- Se a fila não chegar a todas as etapas verdes, não deixar campanha ativa.
+Etapas 61-64: ainda não iniciadas; seguir em ordem depois do commit/push da etapa 60, conforme a regra revisada em 65c.
+
+Estado geral: 57-59 publicados; 60 verde com publicação pendente.
+- Campanha final jogada-1 não iniciada. Jogo, painel de teste, ator e learner parados; saves pessoais, baseline e saves originais de hk-ai-1 preservados.
+- Próximo passo: commit/push da etapa 60 e depois executar 61–64 em sequência, aceitando verde/amarelo conforme 65c.

@@ -6,13 +6,15 @@ namespace HkAgentBridge;
 
 internal readonly struct EnemyKillEvent
 {
-    public EnemyKillEvent(string enemyType, string sceneName)
+    public EnemyKillEvent(string enemyType, string sceneName, int hitsDealt)
     {
         EnemyType = enemyType;
         SceneName = sceneName;
+        HitsDealt = hitsDealt;
     }
     public string EnemyType { get; }
     public string SceneName { get; }
+    public int HitsDealt { get; }
 }
 
 internal readonly struct EpisodeLifecycleSnapshot
@@ -140,14 +142,14 @@ internal sealed class EpisodeLifecycleState
         }
     }
 
-    public void RecordConfirmedEnemyKill(string enemyType = "Unknown", string sceneName = "Unknown")
+    public void RecordConfirmedEnemyKill(string enemyType = "Unknown", string sceneName = "Unknown", int hitsDealt = 0)
     {
         Interlocked.Increment(ref _enemyKillsSinceLastFrame);
         lock (_enemyEventLock)
         {
             if (_enemyEventsSinceLastFrame.Count < 128)
             {
-                _enemyEventsSinceLastFrame.Add(new EnemyKillEvent(enemyType, sceneName));
+                _enemyEventsSinceLastFrame.Add(new EnemyKillEvent(enemyType, sceneName, Math.Max(0, hitsDealt)));
             }
         }
     }

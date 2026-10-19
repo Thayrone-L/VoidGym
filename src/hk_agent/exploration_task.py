@@ -1217,9 +1217,30 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         if self._knowledge_path is None:
             return
         self._knowledge_path.parent.mkdir(parents=True, exist_ok=True)
-        pending = self._knowledge_path.with_name(f".{self._knowledge_path.name}.{os.getpid()}.tmp")
-        pending.write_text(json.dumps(self._player_knowledge.to_payload(), separators=(",", ":"), allow_nan=False), encoding="utf-8", newline="\n")
-        os.replace(pending, self._knowledge_path)
+        pending = self._knowledge_path.with_name(
+            f".{self._knowledge_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        try:
+            with pending.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(
+                    json.dumps(
+                        self._player_knowledge.to_payload(),
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            for attempt in range(20):
+                try:
+                    os.replace(pending, self._knowledge_path)
+                    break
+                except PermissionError:
+                    if os.name != "nt" or attempt == 19:
+                        raise
+                    time.sleep(0.025)
+        finally:
+            pending.unlink(missing_ok=True)
 
     @staticmethod
     def _update_playthrough(*, scene: str | None, step: int, events: list[dict[str, Any]]) -> None:
@@ -1253,12 +1274,12 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self.config.reward_version
         ]
         if self.config.reward_version == "explore_v4":
-            schema_version = 6
+            schema_version = 7
         return {
             "task_contract_schema_version": schema_version,
             "reward_version": self.config.reward_version,
             "legal_action_mask": {
-                "version": "action_availability_v3" if schema_version == 6 else "action_availability_v2" if schema_version == 5 else "action_availability_v1",
+                "version": "action_availability_v3" if schema_version >= 6 else "action_availability_v2" if schema_version == 5 else "action_availability_v1",
                 "source": "frame_action_availability",
             },
             "action_names": list(self._action_names),
@@ -1270,8 +1291,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 if key != "reward_version"
                 and (key != "tutorial_hint_level" or self.config.reward_version == "explore_v4")
             },
-            "observation_version": "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
-            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6} else ["pixels", "applied_action_history"],
+            "observation_version": "pixels_action_history_player_knowledge_bestiary_v1" if schema_version == 7 else "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6, 7} else ["pixels", "applied_action_history"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

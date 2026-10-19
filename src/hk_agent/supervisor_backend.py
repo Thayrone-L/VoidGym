@@ -705,6 +705,7 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         scene_name=frame.scene_name,
         operator_telemetry=frame.operator_telemetry,
         enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
+        bestiary_events=frame.bestiary_events,
         decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
         bridge_timing=frame.bridge_timing,
         action_availability=frame.action_availability,

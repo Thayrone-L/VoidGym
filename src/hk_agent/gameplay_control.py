@@ -47,6 +47,7 @@ class GameplayControlServer:
         idle_timeout_seconds: float,
         settle_seconds: float,
         command_timeout_seconds: float,
+        episode_id: str,
     ) -> None:
         self._supervisor = supervisor
         self._bridge = bridge
@@ -54,6 +55,9 @@ class GameplayControlServer:
         self._idle_timeout_seconds = idle_timeout_seconds
         self._settle_seconds = settle_seconds
         self._command_timeout_seconds = command_timeout_seconds
+        if not episode_id:
+            raise ValueError("episode_id must not be empty")
+        self._episode_id = episode_id
         self._token = secrets.token_urlsafe(32)
         self._server: asyncio.Server | None = None
         self._command_lock = asyncio.Lock()
@@ -227,7 +231,7 @@ class GameplayControlServer:
         try:
             response = await self._supervisor.send_command(
                 "APPLY_ACTION",
-                {"action_id": self._action_id, "buttons": buttons, "lease_ms": lease_ms},
+                {"episode_id": self._episode_id, "action_id": self._action_id, "buttons": buttons, "lease_ms": lease_ms},
                 timeout=self._command_timeout_seconds,
                 bridge=self._bridge,
             )
@@ -272,11 +276,17 @@ class GameplayControlServer:
 
     async def _capture(self, label: str) -> dict[str, object]:
         frame = await self._supervisor.capture_once(
-            timeout=self._command_timeout_seconds, bridge=self._bridge
+            timeout=self._command_timeout_seconds, bridge=self._bridge, episode_id=self._episode_id
         )
         self._capture_index += 1
         path = self._output_dir / f"{self._capture_index:04d}-{label}.png"
         _write_frame_atomic(path, frame)
+        telemetry = getattr(frame, "operator_telemetry", None)
+        visible_enemies = (
+            telemetry.get("visible_enemies", [])[:6]
+            if isinstance(telemetry, dict) and isinstance(telemetry.get("visible_enemies", []), list)
+            else []
+        )
         record: dict[str, object] = {
             "index": self._capture_index,
             "path": str(path),
@@ -288,6 +298,10 @@ class GameplayControlServer:
             "scene_transition": frame.scene_transition,
             "duplicate_of": frame.duplicate_of,
             "last_applied_action_id": frame.last_applied_action_id,
+            "scene_name": getattr(frame, "scene_name", None),
+            "visible_enemies": visible_enemies,
+            "bestiary_events": list(getattr(frame, "bestiary_events", ())),
+            "hp_lost_since_last_frame": getattr(frame, "hp_lost_since_last_frame", 0),
         }
         self.captures.append(record)
         return record

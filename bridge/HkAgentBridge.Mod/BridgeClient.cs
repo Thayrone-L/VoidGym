@@ -442,10 +442,14 @@ internal sealed class BridgeClient : IDisposable
                                 ["shade_distance"] = lifecycle.ShadeDistance,
                                 ["scene_name"] = lifecycle.SceneName,
                                 ["operator_telemetry"] = operatorTelemetry,
-                                ["enemy_events_since_last_frame"] = lifecycle.EnemyEventsSinceLastFrame.Select(item => new Dictionary<string, string>
+                                ["enemy_events_since_last_frame"] = lifecycle.EnemyEventsSinceLastFrame.Select(item => new Dictionary<string, object?>
                                 {
                                     ["enemy_type"] = item.EnemyType,
+                                    ["enemy_type_id"] = EnemyObservationState.TypeId(item.EnemyType),
                                     ["scene_name"] = item.SceneName,
+                                    ["hits_dealt"] = item.HitsDealt,
+                                    ["geo_awarded"] = lifecycle.EnemyEventsSinceLastFrame.Count == 1
+                                        ? lifecycle.GeoGainedSinceLastFrame : 0,
                                 }).ToArray(),
                                 ["duplicate_of"] = (long?)null,
                                 ["last_applied_action_id"] = correlation.LastAppliedActionId,

@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -578,6 +579,10 @@ async def run_session(request: SessionRequest) -> SessionResult:
             if request.control_metadata_path is None or request.control_output_dir is None:
                 raise RuntimeError("Interactive control paths are unavailable")
             await _run_menu_sequence(request, result, supervisor, bridge)
+            interactive_episode_id = str(uuid.uuid4())
+            await supervisor.begin_episode(
+                interactive_episode_id, timeout=request.timeout_seconds, bridge=bridge
+            )
             control = GameplayControlServer(
                 supervisor,
                 bridge,
@@ -585,6 +590,7 @@ async def run_session(request: SessionRequest) -> SessionResult:
                 idle_timeout_seconds=request.control_idle_timeout_seconds,
                 settle_seconds=request.control_settle_seconds,
                 command_timeout_seconds=request.timeout_seconds,
+                episode_id=interactive_episode_id,
             )
             await control.start()
             address = control.address

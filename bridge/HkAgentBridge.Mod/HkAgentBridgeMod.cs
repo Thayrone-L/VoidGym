@@ -15,9 +15,11 @@ public sealed class HkAgentBridgeMod : Mod
     private VisualCaptureBackend? _capture;
     private readonly EpisodeLifecycleState _lifecycle = new();
     private readonly OperatorTelemetryState _operatorTelemetry = new();
+    private readonly EnemyObservationState _enemyObservations = new();
     private int _lastObservedHealth = -1;
     private int _episodeActive;
     private int _operatorTelemetryDiagnosticLogged;
+    private int _enemyObservationDiagnosticLogged;
     private int _boundsSceneHandle = int.MinValue;
     private float[]? _cachedSceneBounds;
     private bool? _shadePending;
@@ -279,8 +281,64 @@ public sealed class HkAgentBridgeMod : Mod
         snapshot["menu_open"] = ui.MenuOpen;
         snapshot["dialogue_id"] = ui.DialogueId;
         snapshot["visible_places"] = ReadVisiblePlaces();
+        snapshot["visible_enemies"] = ReadVisibleEnemies();
         snapshot["shop_prices_visible"] = ReadVisibleShopPrices(ui.MenuOpen || ui.DialogOpen);
         return snapshot;
+    }
+
+    private System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisibleEnemies()
+    {
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        Camera? camera = Camera.main;
+        HeroController? hero = HeroController.instance;
+        if (camera == null || hero == null) return result;
+        var seenRoots = new System.Collections.Generic.HashSet<int>();
+        HealthManager[] managers;
+        try { managers = UnityEngine.Object.FindObjectsOfType<HealthManager>(true); }
+        catch (Exception error)
+        {
+            if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+                LogDebug($"Enemy visibility scan failed: {error.GetType().Name}");
+            return result;
+        }
+        foreach (HealthManager manager in managers)
+        {
+            try
+            {
+                if (manager == null || !manager.gameObject.activeInHierarchy) continue;
+                Transform root = manager.transform;
+                if (root == null || root.root == hero.transform.root) continue;
+                string name = EpisodeLifecycleState.NormalizeEnemyType(manager.gameObject.name);
+                if (name.Length == 0 || string.Equals(name, "Hollow Shade", StringComparison.OrdinalIgnoreCase)) continue;
+                int instanceId = manager.gameObject.GetInstanceID();
+                if (!seenRoots.Add(instanceId)) continue;
+                Vector3 point = camera.WorldToViewportPoint(manager.transform.position);
+                if (point.z <= 0 || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) continue;
+                result.Add(new System.Collections.Generic.Dictionary<string, object?>
+                {
+                    ["enemy_type_id"] = EnemyObservationState.TypeId(name),
+                    ["instance_id"] = instanceId,
+                    ["screen_x"] = point.x,
+                    ["screen_y"] = point.y,
+                    ["struck_this_encounter"] = _enemyObservations.Hits(instanceId),
+                });
+            }
+            catch (Exception error)
+            {
+                if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+                    LogDebug($"Enemy visibility entry skipped: {error.GetType().Name}");
+            }
+        }
+        if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+            LogDebug($"Enemy visibility scan found {managers.Length} health managers and {result.Count} visible enemies");
+        result.Sort((left, right) =>
+        {
+            float lx = (float)left["screen_x"]! - 0.5f, ly = (float)left["screen_y"]! - 0.5f;
+            float rx = (float)right["screen_x"]! - 0.5f, ry = (float)right["screen_y"]! - 0.5f;
+            return (lx * lx + ly * ly).CompareTo(rx * rx + ry * ry);
+        });
+        if (result.Count > 6) result.RemoveRange(6, result.Count - 6);
+        return result;
     }
 
     private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisiblePlaces()
@@ -345,9 +403,18 @@ public sealed class HkAgentBridgeMod : Mod
         HitInstance hitInstance
     )
     {
+        if (self == null)
+        {
+            original(self, hitInstance);
+            return;
+        }
         GameObject? source = hitInstance.Source;
         HeroController? hero = HeroController.instance;
-        string objectName = self.gameObject.name.Replace("(Clone)", "").Trim();
+        if (hero != null && source != null && self != null &&
+            source.transform.root == hero.transform.root &&
+            self.transform.root != hero.transform.root)
+            _enemyObservations.RecordHit(self.gameObject.GetInstanceID());
+        string objectName = self!.gameObject!.name!.Replace("(Clone)", "").Trim();
         if (hero != null && source != null && objectName == "Hollow Shade" &&
             source.transform.root == hero.transform.root)
         {
@@ -415,9 +482,14 @@ public sealed class HkAgentBridgeMod : Mod
     {
         if (!eventAlreadyReceived && enemyDeathEffects != null)
         {
+            HealthManager? healthManager = enemyDeathEffects.gameObject.GetComponentInParent<HealthManager>();
+            string enemyType = EpisodeLifecycleState.NormalizeEnemyType(
+                healthManager == null ? enemyDeathEffects.gameObject.name : healthManager.gameObject.name
+            );
             _lifecycle.RecordConfirmedEnemyKill(
-                EpisodeLifecycleState.NormalizeEnemyType(enemyDeathEffects.gameObject.name),
-                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name
+                enemyType,
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
+                healthManager == null ? 0 : _enemyObservations.Hits(healthManager.gameObject.GetInstanceID())
             );
         }
     }

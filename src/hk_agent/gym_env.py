@@ -78,6 +78,7 @@ class PixelFrame:
     scene_name: str | None = None
     operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
+    bestiary_events: tuple[dict[str, Any], ...] = ()
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -603,6 +604,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 {"scene_name": scene, "enemy_type": enemy_type}
                 for scene, enemy_type in frame.enemy_events_since_last_frame
             ],
+            "bestiary_events_since_last_frame": list(frame.bestiary_events),
             "run_failed": lifecycle.run_failed if lifecycle is not None else frame.run_failed,
             "supervisor": {
                 "player_dead": frame.player_dead,
@@ -620,6 +622,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                     {"scene_name": scene, "enemy_type": enemy_type}
                     for scene, enemy_type in frame.enemy_events_since_last_frame
                 ],
+                "bestiary_events_since_last_frame": list(frame.bestiary_events),
                 "gameplay_run_index": (lifecycle.logical_run_index if lifecycle is not None else 1),
                 "recovery_required": (
                     lifecycle.recovery_required if lifecycle is not None else False

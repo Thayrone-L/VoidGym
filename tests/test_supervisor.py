@@ -253,7 +253,8 @@ class SupervisorTests(unittest.TestCase):
                             ],
                         },
                         "enemy_events_since_last_frame": [
-                            {"scene_name": "Room_Test", "enemy_type": "Crawler"}
+                            {"scene_name": "Room_Test", "enemy_type": "Crawler",
+                             "enemy_type_id": "e_0123456789", "hits_dealt": 2, "geo_awarded": 5}
                         ],
                         "duplicate_of": None,
                         "last_applied_action_id": None,
@@ -306,6 +307,10 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(
                     captured.enemy_events_since_last_frame, (("Room_Test", "Crawler"),)
                 )
+                self.assertEqual(captured.bestiary_events, ({
+                    "enemy_type_id": "e_0123456789", "hits_dealt": 2,
+                    "geo_awarded": 5, "item_awarded": False, "killed_player": False,
+                },))
 
                 fallback_task = asyncio.create_task(
                     supervisor.capture_once(bridge=accepted, encoding="raw_rgb8")

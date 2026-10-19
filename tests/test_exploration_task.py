@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+import hk_agent.exploration_task as exploration_task_module
 from hk_agent.action_masking import ActionAvailability
 from hk_agent.distributed_knowledge import portable_compatibility_fingerprint
 from hk_agent.exploration_task import (
@@ -16,6 +17,7 @@ from hk_agent.exploration_task import (
     calibrate_novelty,
     load_lifelong_visits,
 )
+from hk_agent.player_knowledge import PlayerKnowledge
 from hk_agent.scene_change_task import scene_descriptor
 
 
@@ -319,8 +321,8 @@ def test_v4_contract_adds_player_knowledge_and_keeps_raw_telemetry_out() -> None
     task = ExplorationTask(environment, config=_v4_config())
     contract = task.task_contract()
     assert contract["reward_version"] == "explore_v4"
-    assert contract["task_contract_schema_version"] == 6
-    assert contract["observation_version"] == "pixels_action_history_player_knowledge_tutorials_v2"
+    assert contract["task_contract_schema_version"] == 7
+    assert contract["observation_version"] == "pixels_action_history_player_knowledge_bestiary_v1"
     assert contract["information_boundary"] == ["pixels", "applied_action_history", "player_knowledge"]
     assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
     assert task.config.maximum_positive_episode_reward() <= 75.2
@@ -643,3 +645,29 @@ def test_v2_reward_safety_constraints_are_enforced() -> None:
         _v2_config(damage_penalty=-0.4).validate()
     with pytest.raises(ValueError, match="does not reward Geo"):
         ExplorationTaskConfig(reward_version="explore_v2", shade_recovery_reward=4.0).validate()
+
+
+@pytest.mark.skipif(exploration_task_module.os.name != "nt", reason="Windows can transiently lock replace targets")
+def test_player_knowledge_persistence_retries_transient_windows_replace_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = object.__new__(ExplorationTask)
+    target = tmp_path / "player-knowledge.json"
+    task._knowledge_path = target
+    task._player_knowledge = PlayerKnowledge()
+    original_replace = exploration_task_module.os.replace
+    attempts = 0
+
+    def transient_replace(source: object, destination: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 4:
+            raise PermissionError("transient sharing violation")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(exploration_task_module.os, "replace", transient_replace)
+    task._persist_player_knowledge()
+
+    assert attempts == 4
+    assert target.exists()
+    assert not list(tmp_path.glob(".player-knowledge.json.*.tmp"))

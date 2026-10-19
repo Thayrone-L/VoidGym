@@ -7,6 +7,7 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.bestiary import ENEMY_VECTOR_SIZE, MAX_ENEMY_SLOTS, BestiaryMemory
 from hk_agent.story_objectives import (
     OBJECTIVE_BY_ID,
     STORY_OBJECTIVES,
@@ -95,12 +96,14 @@ class PlayerKnowledge:
     claimed_tutorial_rewards: set[str] = field(default_factory=set)
     game_flags: dict[str, bool] = field(default_factory=dict)
     new_events: list[dict[str, Any]] = field(default_factory=list)
+    bestiary: BestiaryMemory = field(default_factory=BestiaryMemory)
 
     @classmethod
     def from_payload(cls, value: object) -> PlayerKnowledge:
         memory = cls()
-        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3}:
             return memory
+        memory.bestiary = BestiaryMemory.from_payload(value)
         flags, visited, exits, points = (value.get(key) for key in ("flags", "visited", "exits", "points"))
         if isinstance(flags, dict):
             memory.known_flags = {
@@ -190,7 +193,7 @@ class PlayerKnowledge:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "flags": dict(self.known_flags),
             "charm_costs": dict(self.charm_costs),
             "visited": {room: [list(cell) for cell in sorted(cells)[:144]] for room, cells in sorted(self.visited.items())[:256]},
@@ -210,6 +213,7 @@ class PlayerKnowledge:
             "arrived_targets": sorted(self.arrived_targets),
             "claimed_tutorial_rewards": sorted(self.claimed_tutorial_rewards),
             "game_flags": dict(self.game_flags),
+            "bestiary": self.bestiary.to_payload(),
             "last_scene": self.last_scene,
             "last_cell": list(self.last_cell) if self.last_cell else None,
         }
@@ -219,6 +223,11 @@ class PlayerKnowledge:
         telemetry = info.get("operator_telemetry")
         if not isinstance(telemetry, dict):
             return
+        self.bestiary.update(
+            telemetry,
+            hp_lost=info.get("hp_lost_since_last_frame", 0),
+            events=info.get("bestiary_events_since_last_frame"),
+        )
         scene = telemetry.get("scene_name")
         bounds = telemetry.get("scene_bounds")
         x, y = telemetry.get("x"), telemetry.get("y")
@@ -421,6 +430,7 @@ class PlayerKnowledge:
                 if 0 <= price <= 999_999 else (0.0, 0.0)
             )
         values.extend([0.0] * (2 * (64 - min(64, len(self.shop_prices)))))
+        values.extend(self.bestiary.vector())
         return np.asarray(values, dtype=np.float32)
 
     @staticmethod
@@ -429,6 +439,7 @@ class PlayerKnowledge:
         return gym.spaces.Box(
             0.0, 1.0,
             (item_size + GRID_WIDTH * GRID_HEIGHT * 2 + 8 * 6 + 8 * 5
-             + len(PLACE_DESCRIPTORS) * (4 + GRID_WIDTH * GRID_HEIGHT) + 8 + 128 + 1,),
+             + len(PLACE_DESCRIPTORS) * (4 + GRID_WIDTH * GRID_HEIGHT) + 8 + 128 + 1
+             + MAX_ENEMY_SLOTS * ENEMY_VECTOR_SIZE,),
             dtype=np.float32,
         )

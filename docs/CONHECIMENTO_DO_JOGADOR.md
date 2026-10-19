@@ -63,4 +63,10 @@ A política guarda lugares especiais somente quando um componente está dentro d
 
 O parâmetro `tutorial_hint_level` aceita `0` (padrão: somente os gatilhos oficiais da tabela) e `1` (guia leve no vetor quando o mesmo objetivo oficial está ativo). O nível não revela objetivos futuros. A tabela usa flags de progresso do jogo que mudam durante a conversa/descoberta; não há direção codificada além do alvo que essa flag revela.
 
-O vetor e a persistência passaram ao schema 2; o contrato de exploração passou ao schema 6 e preserva os contratos anteriores. Um learner antigo só pode fazer warm-start dos tensores visuais cujos nomes e formas coincidirem.
+## Bestiário pessoal (explore_v4 schema 7)
+
+Cada frame pode observar até seis inimigos dentro da câmera, ordenados pela distância ao centro. A política recebe posição normalizada, código de tipo opaco, golpes que já aplicou no encontro e nove valores de memória; os slots ausentes são zero. O bridge não transmite HP, dano do inimigo nem padrões. A memória persistida por jogada cresce a partir de aparições visíveis, dano recebido quando a atribuição é inequívoca e eventos de abate com golpes e Geo observados. A flag de item e a contagem de mortes por tipo só mudam quando a telemetria entrega esses eventos; sem sinal, continuam desconhecidas/zero. O indicador de combate estima encontros em que houve golpe antes do inimigo desaparecer, não prova intenção de fugir.
+
+Os IDs são hashes estáveis de nomes internos normalizados e nunca incluem o nome no vetor. A tabela de nomes amigáveis é usada apenas pelo painel. Os preços permanecem limitados ao que foi visto em lojas abertas. O vetor bestiário tem seis slots de 13 valores; o espaço de observação e fingerprint mudam, com warm-start apenas dos tensores compatíveis da imagem.
+
+A persistência pessoal passou ao schema 3 e o contrato de exploração ao schema 7. O escritor usa arquivo temporário exclusivo, flush/fsync e retries curtos para colisões transitórias de substituição no Windows. Um learner antigo só pode fazer warm-start dos tensores visuais cujos nomes e formas coincidirem.

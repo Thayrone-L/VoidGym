@@ -7,6 +7,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import secrets
 import time
 import uuid
@@ -67,6 +68,7 @@ class CapturedFrame:
     scene_name: str | None = None
     operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
+    bestiary_events: tuple[dict[str, Any], ...] = ()
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -362,6 +364,7 @@ class SupervisorServer:
         if not isinstance(raw_enemy_events, list) or len(raw_enemy_events) > 128:
             raise ProtocolError("Invalid FRAME field: enemy_events_since_last_frame")
         enemy_events: list[tuple[str, str]] = []
+        bestiary_events: list[dict[str, Any]] = []
         for event in raw_enemy_events:
             if not isinstance(event, dict):
                 raise ProtocolError("Invalid FRAME enemy event")
@@ -369,6 +372,19 @@ class SupervisorServer:
             if not isinstance(enemy_type, str) or not enemy_type or len(enemy_type) > 128 or not isinstance(event_scene, str) or not event_scene or len(event_scene) > 256:
                 raise ProtocolError("Invalid FRAME enemy event fields")
             enemy_events.append((event_scene, enemy_type))
+            enemy_type_id = event.get("enemy_type_id")
+            hits_dealt = event.get("hits_dealt", 0)
+            geo_awarded = event.get("geo_awarded", 0)
+            if enemy_type_id is not None:
+                if not isinstance(enemy_type_id, str) or not re.fullmatch(r"e_[0-9a-f]{10}", enemy_type_id):
+                    raise ProtocolError("Invalid FRAME enemy type id")
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (hits_dealt, geo_awarded)):
+                    raise ProtocolError("Invalid FRAME bestiary event metrics")
+                bestiary_events.append({
+                    "enemy_type_id": enemy_type_id, "hits_dealt": min(hits_dealt, 100_000),
+                    "geo_awarded": min(geo_awarded, 999_999), "item_awarded": event.get("item_awarded") is True,
+                    "killed_player": event.get("killed_player") is True,
+                })
         for name, value in (
             ("enemy_kills_since_last_frame", enemy_kills_since_last_frame),
             ("hp_lost_since_last_frame", hp_lost_since_last_frame),
@@ -472,6 +488,7 @@ class SupervisorServer:
             scene_name=scene_name,
             operator_telemetry=operator_telemetry,
             enemy_events_since_last_frame=tuple(enemy_events),
+            bestiary_events=tuple(bestiary_events),
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),
         )

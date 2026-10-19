@@ -372,7 +372,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     schema_version = contract.get("task_contract_schema_version", 1)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6}:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6, 7}:
         raise KnowledgeValidationError("task_contract_schema_version is unsupported")
     result["task_contract_schema_version"] = schema_version
     if "observation_version" in contract:
