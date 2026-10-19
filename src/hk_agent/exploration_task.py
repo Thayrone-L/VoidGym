@@ -1328,6 +1328,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "privileged_state": [],
             "diagnostic_training": False,
             "claim": "pixel-only exploration with bounded reward-only bridge signals",
+            **({"recurrent_policy": {"name": "maskable_recurrent_v1", "hidden_size": 256, "layers": 1, "sequence_length": 128}} if schema_version >= 8 else {}),
             "ppo_hyperparameters": {
                 "ent_coef": self.config.ent_coef,
                 "gamma": self.config.gamma,

@@ -24,8 +24,8 @@ environment = [
 ]
 training = [
     "safetensors>=0.8,<1",
-    "stable-baselines3>=2.7,<3",
-    "sb3-contrib>=2.9,<3",
+    "stable-baselines3==2.9.0",
+    "sb3-contrib==2.9.0",
 ]
 development = [
     "pytest>=8,<10",

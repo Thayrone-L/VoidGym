@@ -492,6 +492,18 @@ class SharedRoundStore:
             if name in {"values", "log_probs", "advantages", "returns", "rewards", "episode_starts"}:
                 array = array.reshape(steps)
             arrays[name] = array
+        recurrent_state_names = {
+            "lstm_hidden_pi": "hidden_states_pi",
+            "lstm_cell_pi": "cell_states_pi",
+            "lstm_hidden_vf": "hidden_states_vf",
+            "lstm_cell_vf": "cell_states_vf",
+        }
+        present_recurrent = {key: getattr(buffer, attr, None) for key, attr in recurrent_state_names.items()}
+        if any(value is not None for value in present_recurrent.values()):
+            if any(value is None for value in present_recurrent.values()):
+                raise SharedLearnerError("recurrent rollout is missing an LSTM state array")
+            for key, value in present_recurrent.items():
+                arrays[key] = np.asarray(cast(Any, value)[:steps, 0]).copy()
         pending = artifact.with_name(f".{artifact.name}.{secrets.token_hex(6)}.tmp")
         folder.mkdir(parents=True, exist_ok=True)
         try:
@@ -553,9 +565,10 @@ class SharedRoundStore:
             for name, space in observation_space.spaces.items()
         }
         required = set(expected_obs) | {"actions", "rewards", "episode_starts", "values", "log_probs", "advantages", "returns", "action_masks"}
+        recurrent_fields = {"lstm_hidden_pi", "lstm_cell_pi", "lstm_hidden_vf", "lstm_cell_vf"}
         try:
             with np.load(artifact, allow_pickle=False) as packed:
-                if set(packed.files) != required:
+                if set(packed.files) not in (required, required | recurrent_fields):
                     raise SharedLearnerError("rollout NPZ field inventory is invalid")
                 arrays = {name: packed[name].copy() for name in packed.files}
         except (ValueError, OSError, zipfile.BadZipFile) as error:
@@ -572,6 +585,13 @@ class SharedRoundStore:
             raise SharedLearnerError("rollout actions shape is invalid")
         if arrays["action_masks"].shape != (n_steps, action_count) or arrays["action_masks"].dtype != np.bool_:
             raise SharedLearnerError("rollout action_masks shape or dtype is invalid")
+        if recurrent_fields <= set(arrays):
+            reference_shape = arrays["lstm_hidden_pi"].shape
+            if len(reference_shape) != 3 or reference_shape[0] != n_steps or min(reference_shape[1:]) < 1:
+                raise SharedLearnerError("rollout LSTM state shape is invalid")
+            for name in recurrent_fields:
+                if arrays[name].shape != reference_shape or arrays[name].dtype != np.float32:
+                    raise SharedLearnerError(f"rollout {name} shape or dtype is invalid")
         if not np.all(arrays["action_masks"].any(axis=1)):
             raise SharedLearnerError("rollout contains an empty action mask")
         actions = arrays["actions"].reshape(n_steps).astype(np.int64)
@@ -707,25 +727,40 @@ class SharedRoundStore:
 
 
 def train_shared_round(model: Any, rollouts: Sequence[Mapping[str, np.ndarray]]) -> int:
-    """Load actor arrays into a fresh masked Dict rollout buffer and update PPO once."""
+    """Train one shared round from feed-forward or recurrent, mask-validated actor rollouts."""
     if not rollouts:
         raise SharedLearnerError("at least one actor rollout is required")
     import importlib
     torch = importlib.import_module("torch")
-    from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
-
     steps = len(rollouts[0]["rewards"])
     if any(len(data["rewards"]) != steps for data in rollouts):
         raise SharedLearnerError("actor rollout lengths differ")
-    buffer = MaskableDictRolloutBuffer(
-        buffer_size=steps,
-        observation_space=model.observation_space,
-        action_space=model.action_space,
-        device=model.device,
-        gae_lambda=model.gae_lambda,
-        gamma=model.gamma,
-        n_envs=len(rollouts),
-    )
+    state_fields = {"lstm_hidden_pi", "lstm_cell_pi", "lstm_hidden_vf", "lstm_cell_vf"}
+    recurrent_flags = [state_fields <= set(data) for data in rollouts]
+    if any(recurrent_flags) and not all(recurrent_flags):
+        raise SharedLearnerError("recurrent and feed-forward actor rollouts cannot be mixed")
+    recurrent = all(recurrent_flags)
+    buffer: Any
+    if recurrent:
+        from sb3_contrib.common.recurrent.type_aliases import RNNStates
+
+        from hk_agent.recurrent_sb3 import MaskableRecurrentDictRolloutBuffer
+        lstm = model.policy.lstm_actor
+        hidden_shape = (steps, lstm.num_layers, len(rollouts), lstm.hidden_size)
+        buffer = MaskableRecurrentDictRolloutBuffer(
+            buffer_size=steps, observation_space=model.observation_space,
+            action_space=model.action_space, hidden_state_shape=hidden_shape,
+            device=model.device, gae_lambda=model.gae_lambda, gamma=model.gamma,
+            n_envs=len(rollouts),
+        )
+        buffer.sequence_length = model.sequence_length
+    else:
+        from sb3_contrib.common.maskable.buffers import MaskableDictRolloutBuffer
+        buffer = MaskableDictRolloutBuffer(
+            buffer_size=steps, observation_space=model.observation_space,
+            action_space=model.action_space, device=model.device,
+            gae_lambda=model.gae_lambda, gamma=model.gamma, n_envs=len(rollouts),
+        )
     buffer.reset()
     obs_spaces = model.observation_space.spaces
     for row in range(steps):
@@ -736,7 +771,21 @@ def train_shared_round(model: Any, rollouts: Sequence[Mapping[str, np.ndarray]])
         values = torch.as_tensor([data["values"][row] for data in rollouts], device=model.device)
         log_probs = torch.as_tensor([data["log_probs"][row] for data in rollouts], device=model.device)
         action_masks = np.stack([data["action_masks"][row] for data in rollouts])
-        buffer.add(obs, actions, rewards, episode_starts, values, log_probs, action_masks=action_masks)
+        if recurrent:
+            state_values = {
+                name: torch.as_tensor(np.stack([data[name][row] for data in rollouts], axis=1), device=model.device)
+                for name in state_fields
+            }
+            states = RNNStates(
+                (state_values["lstm_hidden_pi"], state_values["lstm_cell_pi"]),
+                (state_values["lstm_hidden_vf"], state_values["lstm_cell_vf"]),
+            )
+            buffer.add(
+                obs, actions, rewards, episode_starts, values, log_probs,
+                lstm_states=states, action_masks=action_masks,
+            )
+        else:
+            buffer.add(obs, actions, rewards, episode_starts, values, log_probs, action_masks=action_masks)
     buffer.advantages[:] = np.stack([data["advantages"] for data in rollouts], axis=1)
     buffer.returns[:] = np.stack([data["returns"] for data in rollouts], axis=1)
     if not buffer.full:
@@ -802,7 +851,13 @@ def run_deterministic_evaluation(
         environment.env_method("set_evaluation_mode", True)
     except (AttributeError, NotImplementedError):
         pass
+    previous_obs = getattr(model, "_last_obs", None)
+    previous_starts = getattr(model, "_last_episode_starts", None)
     observation = environment.reset()
+    policy = getattr(model, "policy", None)
+    recurrent = hasattr(policy, "predict_masked") and hasattr(model, "sequence_length")
+    evaluation_state = None
+    evaluation_starts = np.ones((int(getattr(environment, "num_envs", 1)),), dtype=np.bool_)
     episode_return = 0.0
     episode_progress: dict[str, Any] = {}
     completed = False
@@ -813,8 +868,14 @@ def run_deterministic_evaluation(
             if stop_file is not None and stop_file.is_file():
                 break
             masks = get_action_masks(environment)
-            actions, _ = model.predict(observation, deterministic=True, action_masks=masks)
+            if recurrent and policy is not None:
+                actions, evaluation_state = policy.predict_masked(
+                    observation, evaluation_state, evaluation_starts, masks, deterministic=True
+                )
+            else:
+                actions, _ = model.predict(observation, deterministic=True, action_masks=masks)
             observation, rewards, dones, infos = environment.step(actions)
+            evaluation_starts = np.asarray(dones, dtype=np.bool_)
             episode_return += float(np.asarray(rewards).reshape(-1)[0])
             info = infos[0] if infos else {}
             if isinstance(info, Mapping) and isinstance(info.get("episode_progress"), Mapping):
@@ -830,8 +891,10 @@ def run_deterministic_evaluation(
             environment.env_method("set_evaluation_mode", False)
         except (AttributeError, NotImplementedError):
             pass
-    model._last_obs = observation
-    model._last_episode_starts = np.asarray([completed], dtype=np.bool_)
+    if previous_obs is not None:
+        model._last_obs = previous_obs
+    if previous_starts is not None:
+        model._last_episode_starts = previous_starts
     return {
         "schema_version": 1,
         "round": round_number,
@@ -884,16 +947,25 @@ def run_shared_actor(
     torch.set_num_interop_threads(config.torch_interop_threads)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    model = contrib.MaskablePPO(
-        "MultiInputPolicy",
-        environment,
-        seed=config.seed,
-        n_steps=config.rollout_steps,
-        batch_size=config.batch_size,
-        verbose=0,
-        device=config.training_device,
-        **_shared_ppo_parameters(task_contract),
-    )
+    recurrent_config = task_contract.get("recurrent_policy")
+    recurrent_enabled = isinstance(recurrent_config, Mapping) and recurrent_config.get("name") == "maskable_recurrent_v1"
+    if recurrent_enabled:
+        from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
+        recurrent_settings = cast(Mapping[str, Any], recurrent_config)
+        model = MaskableRecurrentPPO(
+            "MultiInputLstmPolicy", environment, seed=config.seed,
+            n_steps=config.rollout_steps, batch_size=config.batch_size,
+            sequence_length=int(recurrent_settings["sequence_length"]), verbose=0,
+            device=config.training_device,
+            policy_kwargs={"lstm_hidden_size": int(recurrent_settings["hidden_size"]), "n_lstm_layers": int(recurrent_settings["layers"])},
+            **_shared_ppo_parameters(task_contract),
+        )
+    else:
+        model = contrib.MaskablePPO(
+            "MultiInputPolicy", environment, seed=config.seed,
+            n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=0,
+            device=config.training_device, **_shared_ppo_parameters(task_contract),
+        )
     store = SharedRoundStore(shared_root)
 
     class ActorHeartbeatCallback(BaseCallback):
@@ -1236,11 +1308,28 @@ def run_shared_learner(
     observation_space = parsed_observation_space
     action_space = parsed_action_space
     environment = GhostDictEnv(observation_space, action_space)
-    model = contrib.MaskablePPO(
-        "MultiInputPolicy", environment, seed=seed, n_steps=rollout_steps,
-        batch_size=batch_size, verbose=0, device="cpu",
-        **_shared_ppo_parameters(contract.get("task_contract", {}) if isinstance(contract.get("task_contract"), Mapping) else {}),
-    )
+    task_contract = contract.get("task_contract", {})
+    task_contract = task_contract if isinstance(task_contract, Mapping) else {}
+    recurrent_config = task_contract.get("recurrent_policy")
+    recurrent_enabled = isinstance(recurrent_config, Mapping) and recurrent_config.get("name") == "maskable_recurrent_v1"
+    if recurrent_enabled:
+        from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
+        recurrent_settings = cast(Mapping[str, Any], recurrent_config)
+        model = MaskableRecurrentPPO(
+            "MultiInputLstmPolicy", environment, seed=seed, n_steps=rollout_steps,
+            batch_size=batch_size, sequence_length=int(recurrent_settings["sequence_length"]),
+            verbose=0, device="cpu",
+            policy_kwargs={"lstm_hidden_size": int(recurrent_settings["hidden_size"]), "n_lstm_layers": int(recurrent_settings["layers"])},
+            **_shared_ppo_parameters(task_contract),
+        )
+        model_class = MaskableRecurrentPPO
+    else:
+        model = contrib.MaskablePPO(
+            "MultiInputPolicy", environment, seed=seed, n_steps=rollout_steps,
+            batch_size=batch_size, verbose=0, device="cpu",
+            **_shared_ppo_parameters(task_contract),
+        )
+        model_class = contrib.MaskablePPO
     checkpoints = shared_root / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     previous = sorted(checkpoints.glob("round-*.zip"))
@@ -1260,7 +1349,7 @@ def run_shared_learner(
     completed = 0
     current_round = 0
     if previous:
-        model = contrib.MaskablePPO.load(str(previous[-1]), env=environment, device="cpu")
+        model = model_class.load(str(previous[-1]), env=environment, device="cpu")
         try:
             prior = json.loads(status_path.read_text("utf-8"))
             completed = int(prior.get("completed_timesteps", 0))
@@ -1277,12 +1366,12 @@ def run_shared_learner(
         manifest = json.loads(manifest_path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError):
         manifest = {
-            "schema_version": 1, "artifact_type": "shared_learner", "algorithm": "MaskablePPO",
+            "schema_version": 1, "artifact_type": "shared_learner", "algorithm": "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO",
             "rounds": [], "actors_per_round": {}, "rejected_rollouts": [],
             "task_contract_fingerprint": fingerprint, "started_unix_ns": time.time_ns(),
         }
     manifest["status"] = "RUNNING"
-    manifest["algorithm"] = "MaskablePPO"
+    manifest["algorithm"] = "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO"
     manifest["task_contract_fingerprint"] = fingerprint
     manifest["rollout_steps"] = rollout_steps
     manifest["batch_size"] = batch_size

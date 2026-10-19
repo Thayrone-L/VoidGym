@@ -36,6 +36,7 @@ _TASK_CONTRACT_KEYS = frozenset(
         "diagnostic_training",
         "claim",
         "ppo_hyperparameters",
+        "recurrent_policy",
     }
 )
 _TASK_CONFIG_KEYS = frozenset(
@@ -367,6 +368,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
             {"version": "action_availability_v1", "source": "frame_action_availability"},
             {"version": "action_availability_v2", "source": "frame_action_availability"},
             {"version": "action_availability_v3", "source": "frame_action_availability"},
+            {"version": "action_availability_v4", "source": "frame_action_availability"},
         ):
             raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
         result["legal_action_mask"] = dict(mask)
@@ -467,6 +469,16 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         if contract["claim"] not in _CLAIMS:
             raise KnowledgeValidationError("task_contract.claim is not an approved public claim")
         result["claim"] = contract["claim"]
+    if "recurrent_policy" in contract:
+        recurrent = _expect_dict(contract["recurrent_policy"], "task_contract.recurrent_policy")
+        _expect_exact_keys(recurrent, {"name", "hidden_size", "layers", "sequence_length"}, "task_contract.recurrent_policy")
+        if recurrent["name"] != "maskable_recurrent_v1":
+            raise KnowledgeValidationError("task_contract.recurrent_policy.name is unsupported")
+        for key, lower, upper in (("hidden_size", 32, 1024), ("layers", 1, 4), ("sequence_length", 1, 2048)):
+            value = recurrent[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+                raise KnowledgeValidationError(f"task_contract.recurrent_policy.{key} is outside safe bounds")
+        result["recurrent_policy"] = dict(recurrent)
     if "ppo_hyperparameters" in contract:
         ppo = _expect_dict(contract["ppo_hyperparameters"], "task_contract.ppo_hyperparameters")
         allowed_ppo = {"ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range"}

@@ -209,6 +209,8 @@ def run(args: argparse.Namespace) -> int:
             result = {
                 "ok": False,
                 "failure": "Session worker did not produce a result",
+                "transaction_stdout": completed.stdout.strip()[-4000:],
+                "transaction_stderr": completed.stderr.strip()[-4000:],
             }
         result["transaction_exit_code"] = completed.returncode
         if completed.returncode != 0:

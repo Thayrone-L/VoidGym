@@ -1,26 +1,11 @@
-Fila 65 - prompts 57 a 64
+Fila 65 — prompts 57 a 64
 Data: 2026-10-19
 Workspace: C:\VoidGym
 
-Etapa 57 - VERDE; commit 3e5ed9693728fe8edbacb768587ae574254a409d enviado ao PR #8.
-Etapa 58 - VERDE; commit a452f4fefb9abbc288b049ee65f31f653bf6ab95 enviado ao PR #8.
+Etapas 57–59 — VERDES; ver relatórios correspondentes.
+Etapa 60 — VERDE; commit 5f32aa7 publicado no PR #8.
+Etapa 61 — AMARELA (validação até banco pendente de alcance); commit 87dc60c publicado no PR #8.
+Etapa 62 — VERDE; política recorrente mascarada integrada, testes e smoke isolado aprovados. Commit a registrar após publicação.
+Etapas 63–64 — em execução sequencial após a 62.
 
-Etapa 59 - VERDE; commit 6a88c05 enviado ao PR #8.
-- Interação contextual, tutoriais de lugares, objetivos revelados por flags e recompensas únicas implementados.
-- Ruff/mypy verdes; pytest completo 588 passed, 2 skipped, 8 subtests; bridge Release e CorrelationTests verdes.
-- Smoke test em campanha isolada: 185 passos em Tutorial_01 e objetivo inicial persistido. Parada cooperativa e saves restaurados.
-Relatório: agent-prompts\relatorios\59_tutoriais_objetivos.txt
-Limite observado: não houve encontro ao vivo com banco, loja ou chefe; lógica coberta sinteticamente.
-
-Etapa 60 — VERDE; validações e teste scriptado com jogo concluídos; commit pendente de publicação.
-- Bestiário persistente, slots anônimos na tela, painel e contrato schema 7.
-- Roteiro fixo matou um Crawlid; memória final: encontrado 1, derrotado 1, 2 golpes, 0 dano, 0 mortes, 0 geo, 0 item, encontro lutado 1.
-- Ruff/mypy verdes; pytest completo 592 passed, 2 skipped, 8 subtests; bridge Release/correlation tests verdes.
-- DLL implantada em hk-ai-1 e hk-ai-2 com SHA-256 igual: 3E9BADFEE4B3B38CFB34C1BEF3BEFF8E96F0539961C99A091F34D7B46E5490D2.
-- Capturas e rota: artifacts\scripted-validation\60\final; relatório: agent-prompts\relatorios\60_bestiario.txt.
-
-Etapa 61 - AMARELO — validação em jogo pendente de alcance; implementação, validações offline, smoke de 5 min sem erros e implantação dupla concluídos. Commit ba84b58 (Let the agent manage charms at benches), enviado ao PR #8. Relatório: agent-prompts\\relatorios\\61_amuletos.txt. Pendência: roteiro até o banco de Dirtmouth no save disponível. Etapas 62-64 ainda pendentes.
-
-Estado geral: 57-60 publicados; 61 amarelo, aguardando commit/push.
-- Campanha final jogada-1 não iniciada. Jogo, painel de teste, ator e learner parados; saves pessoais, baseline e saves originais de hk-ai-1 preservados.
-- Próximo passo: commit/push da etapa 60 e depois executar 61–64 em sequência, aceitando verde/amarelo conforme 65c.
+A jogada-1 ainda não foi iniciada. Ao final, iniciar apenas se 63 e 64 forem verdes ou amarelas, sem etapa vermelha. Não desligar o PC. Saves pessoais/baseline ficam protegidos.

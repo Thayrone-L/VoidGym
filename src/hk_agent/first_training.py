@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import gymnasium as gym
 import numpy as np
@@ -55,6 +55,8 @@ class FirstTrainingConfig:
     learning_rate: float | None = None
     clip_range: float | None = None
     shared_actors: int = 1
+    lstm_hidden_size: int = 256
+    lstm_layers: int = 1
 
     def validate(self) -> None:
         if not 1 <= self.total_timesteps <= 10_000_000:
@@ -67,6 +69,8 @@ class FirstTrainingConfig:
             raise ValueError("total_timesteps must be a multiple of rollout_steps")
         if self.checkpoint_interval % self.rollout_steps != 0:
             raise ValueError("checkpoint_interval must be a multiple of rollout_steps")
+        if not 32 <= self.lstm_hidden_size <= 1024 or not 1 <= self.lstm_layers <= 4:
+            raise ValueError("recurrent architecture is outside the safe range")
         if not 1 <= self.shared_actors <= 3:
             raise ValueError("shared_actors must be in [1, 3]")
         if self.rollout_steps * self.shared_actors % self.batch_size != 0:
@@ -153,7 +157,7 @@ def _validated_resume_manifest(
         compatible_contract.pop("legal_action_mask", None)
         if dict(source_contract) != compatible_contract:
             raise ValueError("legacy PPO resume task contract differs from this campaign")
-    elif algorithm == "MaskablePPO":
+    elif algorithm in {"MaskablePPO", "MaskableRecurrentPPO"}:
         if source_contract != dict(task_contract):
             raise ValueError("resume checkpoint task contract differs from this campaign")
     else:
@@ -218,16 +222,19 @@ def train_ppo(
     claim = str(
         task_contract.get("claim", "motor-signal diagnostic; not game progress or task success")
     )
+    recurrent_config = task_contract.get("recurrent_policy")
+    recurrent_enabled = isinstance(recurrent_config, Mapping) and recurrent_config.get("name") == "maskable_recurrent_v1"
     manifest: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "RUNNING",
-        "algorithm": "MaskablePPO",
+        "algorithm": "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO",
         "seed": config.seed,
         "duration_mode": "continuous" if config.continuous else "limited",
         "total_timesteps": None if config.continuous else config.total_timesteps,
         "checkpoint_interval": config.checkpoint_interval,
         "rollout_steps": config.rollout_steps,
         "batch_size": config.batch_size,
+        "recurrent_architecture": dict(recurrent_config) if isinstance(recurrent_config, Mapping) else None,
         "ppo_hyperparameters": {name: getattr(config, name) for name in (
             "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
         ) if getattr(config, name) is not None},
@@ -260,6 +267,8 @@ def train_ppo(
             torch = importlib.import_module("torch")
             sb3_contrib = importlib.import_module("sb3_contrib")
             MaskablePPO = sb3_contrib.MaskablePPO
+            if recurrent_enabled:
+                from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
         except ImportError as error:
             raise RuntimeError(
                 "training dependencies are absent; install the project training extra"
@@ -288,6 +297,7 @@ def train_ppo(
             "numpy": np.__version__,
             "stable_baselines3": stable_baselines3.__version__,
             "sb3_contrib": sb3_contrib.__version__,
+            "recurrent_policy": "maskable_recurrent_v1" if recurrent_enabled else "feed_forward",
             "torch": torch.__version__,
         }
         atomic_json(manifest_path, manifest)
@@ -303,6 +313,8 @@ def train_ppo(
                 model = stable_baselines3.PPO.load(str(resume_path), env=environment, device=config.training_device)
             elif algorithm == "MaskablePPO":
                 model = MaskablePPO.load(str(resume_path), env=environment, device=config.training_device)
+            elif algorithm == "MaskableRecurrentPPO" and recurrent_enabled:
+                model = MaskableRecurrentPPO.load(str(resume_path), env=environment, device=config.training_device)
             else:
                 raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
             manifest["algorithm"] = algorithm
@@ -313,39 +325,60 @@ def train_ppo(
                 "completed_timesteps": source_manifest.get("completed_timesteps"),
             }
         else:
-            model = MaskablePPO(
-                "MultiInputPolicy",
-                environment,
-                seed=config.seed,
-                n_steps=config.rollout_steps,
-                batch_size=config.batch_size,
-                verbose=1,
-                device=config.training_device,
-                **{name: getattr(config, name) for name in (
-                    "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
-                ) if getattr(config, name) is not None},
-            )
+            if recurrent_enabled:
+                policy_cfg = cast(Mapping[str, Any], recurrent_config)
+                if policy_cfg.get("hidden_size") != config.lstm_hidden_size or policy_cfg.get("layers") != config.lstm_layers:
+                    raise ValueError("task recurrent architecture differs from runtime configuration")
+                model = MaskableRecurrentPPO(
+                    "MultiInputLstmPolicy", environment, seed=config.seed,
+                    n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=1,
+                    device=config.training_device,
+                    policy_kwargs={"lstm_hidden_size": config.lstm_hidden_size, "n_lstm_layers": config.lstm_layers},
+                    **{name: getattr(config, name) for name in (
+                        "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+                    ) if getattr(config, name) is not None},
+                )
+            else:
+                model = MaskablePPO(
+                    "MultiInputPolicy", environment, seed=config.seed,
+                    n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=1,
+                    device=config.training_device,
+                    **{name: getattr(config, name) for name in (
+                        "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+                    ) if getattr(config, name) is not None},
+                )
             if (
                 config.warm_start_policy is not None
                 and config.warm_start_policy_manifest is not None
             ):
                 policy_path = config.warm_start_policy.resolve(strict=True)
                 policy_manifest_path = config.warm_start_policy_manifest.resolve(strict=True)
-                imported = import_policy_artifact(
-                    model.policy,
-                    policy_path,
-                    expected_compatibility_fingerprint=manifest["compatibility_fingerprint"],
-                    manifest_path=policy_manifest_path,
-                    expected_artifact_sha256=config.warm_start_policy_sha256,
-                    expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
-                    expected_manifest_id=config.warm_start_policy_manifest_id,
-                )
+                if recurrent_enabled:
+                    from hk_agent.maskable_recurrent import import_recurrent_extractor_warm_start
+                    imported = import_recurrent_extractor_warm_start(
+                        model.policy, str(policy_path), str(policy_manifest_path),
+                        expected_fingerprint=manifest["compatibility_fingerprint"],
+                        expected_artifact_sha256=config.warm_start_policy_sha256,
+                        expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
+                        expected_manifest_id=config.warm_start_policy_manifest_id,
+                    )
+                else:
+                    imported = import_policy_artifact(
+                        model.policy, policy_path,
+                        expected_compatibility_fingerprint=manifest["compatibility_fingerprint"],
+                        manifest_path=policy_manifest_path,
+                        expected_artifact_sha256=config.warm_start_policy_sha256,
+                        expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
+                        expected_manifest_id=config.warm_start_policy_manifest_id,
+                    )
                 model.num_timesteps = 0
                 manifest["warm_started_from"] = {
-                    "sha256": imported["artifact"]["sha256"],
-                    "size_bytes": imported["artifact"]["size_bytes"],
+                    "sha256": imported.get("artifact", {}).get("sha256", imported.get("artifact_sha256")),
+                    "size_bytes": imported.get("artifact", {}).get("size_bytes", policy_path.stat().st_size),
                     "format": "safetensors",
                     "manifest_id": imported["manifest_id"],
+                    "copied_tensors": imported.get("copied_tensors"),
+                    "fresh_recurrent_and_heads": imported.get("fresh_recurrent_and_heads", False),
                     "manifest_sha256": sha256_file(policy_manifest_path),
                     "compatibility_fingerprint": imported["compatibility_fingerprint"],
                 }
