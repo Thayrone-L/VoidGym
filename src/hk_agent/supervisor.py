@@ -375,16 +375,28 @@ class SupervisorServer:
             enemy_type_id = event.get("enemy_type_id")
             hits_dealt = event.get("hits_dealt", 0)
             geo_awarded = event.get("geo_awarded", 0)
+            boss_confirmed = event.get("boss_confirmed", False)
+            boss_key, boss_version = event.get("boss_key"), event.get("boss_version")
             if enemy_type_id is not None:
                 if not isinstance(enemy_type_id, str) or not re.fullmatch(r"e_[0-9a-f]{10}", enemy_type_id):
                     raise ProtocolError("Invalid FRAME enemy type id")
                 if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (hits_dealt, geo_awarded)):
                     raise ProtocolError("Invalid FRAME bestiary event metrics")
-                bestiary_events.append({
+                if not isinstance(boss_confirmed, bool):
+                    raise ProtocolError("Invalid FRAME boss classification")
+                if boss_confirmed and (
+                    not isinstance(boss_key, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", boss_key)
+                    or not isinstance(boss_version, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", boss_version)
+                ):
+                    raise ProtocolError("Invalid FRAME boss identity")
+                event_payload = {
                     "enemy_type_id": enemy_type_id, "hits_dealt": min(hits_dealt, 100_000),
                     "geo_awarded": min(geo_awarded, 999_999), "item_awarded": event.get("item_awarded") is True,
-                    "killed_player": event.get("killed_player") is True,
-                })
+                    "killed_player": event.get("killed_player") is True, "boss_confirmed": boss_confirmed,
+                }
+                if boss_confirmed:
+                    event_payload.update({"boss_key": boss_key, "boss_version": boss_version})
+                bestiary_events.append(event_payload)
         for name, value in (
             ("enemy_kills_since_last_frame", enemy_kills_since_last_frame),
             ("hp_lost_since_last_frame", hp_lost_since_last_frame),

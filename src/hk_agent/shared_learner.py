@@ -797,6 +797,114 @@ def train_shared_round(model: Any, rollouts: Sequence[Mapping[str, np.ndarray]])
     return transitions
 
 
+def train_behavioral_cloning_batch(model: Any, batch: Mapping[str, np.ndarray], *, weight: float) -> float:
+    """Apply one masked supervised update to a context-matched human batch."""
+    if not 0 < weight <= 1:
+        raise ValueError("behavioral-cloning weight must be in (0, 1]")
+    import torch
+
+    device = model.device
+    observation_names = ("pixels", "action_history", "player_knowledge")
+    observations = {
+        name: torch.as_tensor(batch[name], device=device)
+        for name in observation_names
+    }
+    actions = torch.as_tensor(batch["actions"], dtype=torch.long, device=device).flatten()
+    masks = torch.as_tensor(batch["action_masks"], dtype=torch.bool, device=device)
+    if masks.shape != (len(actions), int(model.action_space.n)) or not masks.any(dim=1).all():
+        raise SharedLearnerError("demonstration action mask differs from the policy")
+    if not masks.gather(1, actions.view(-1, 1)).all():
+        raise SharedLearnerError("demonstration contains an unavailable action")
+    if hasattr(model.policy, "lstm_actor"):
+        from sb3_contrib.common.recurrent.type_aliases import RNNStates
+
+        lstm = model.policy.lstm_actor
+        shape = (lstm.num_layers, len(actions), lstm.hidden_size)
+        zero = torch.zeros(shape, dtype=torch.float32, device=device)
+        starts = torch.ones(len(actions), dtype=torch.float32, device=device)
+        _values, log_probability, _entropy = model.policy.evaluate_actions(
+            observations, actions, RNNStates((zero, zero), (zero, zero)), starts, masks,
+        )
+    else:
+        _values, log_probability, _entropy = model.policy.evaluate_actions(
+            observations, actions, action_masks=masks,
+        )
+    loss = -log_probability.mean()
+    model.policy.optimizer.zero_grad(set_to_none=True)
+    (weight * loss).backward()
+    torch.nn.utils.clip_grad_norm_(model.policy.parameters(), model.max_grad_norm)
+    model.policy.optimizer.step()
+    return float(loss.detach().cpu())
+
+
+def apply_context_demonstrations(
+    model: Any, shared_root: Path, store: SharedRoundStore, *,
+    actor_slots: Sequence[int], round_number: int, manifest: dict[str, Any],
+    enabled: bool = False, initial_weight: float = 0.25, decay_rounds: int = 20,
+) -> list[dict[str, Any]]:
+    """Train only on verified demonstrations matching a live actor's challenge and game version."""
+    if not enabled:
+        return []
+    from hk_agent.demonstrations import demonstration_batch, imitation_schedule
+
+    contexts: dict[str, set[str]] = {}
+    for slot in actor_slots:
+        try:
+            status = json.loads(store.actor_status_path(slot).read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        context, version = status.get("challenge_context"), status.get("game_version")
+        if isinstance(context, str) and isinstance(version, str) and context and version:
+            contexts.setdefault(context, set()).add(version)
+    used: list[dict[str, Any]] = []
+    history = manifest.setdefault("demonstration_training", [])
+    if not isinstance(history, list):
+        history = []
+        manifest["demonstration_training"] = history
+    for context, versions in contexts.items():
+        digest = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+        folder = shared_root / "demonstrations" / digest
+        for artifact in sorted(folder.glob("*.npz")) if folder.is_dir() else ():
+            try:
+                metadata = json.loads(artifact.with_suffix(".json").read_text("utf-8"))
+                version = metadata.get("game_version")
+                if not isinstance(version, str) or version not in versions:
+                    continue
+                first_used = metadata.get("first_used_round")
+                if not isinstance(first_used, int) or first_used < 0:
+                    first_used = round_number
+                    metadata["first_used_round"] = first_used
+                    artifact.with_suffix(".json").write_text(
+                        json.dumps(metadata, sort_keys=True), encoding="utf-8"
+                    )
+                weight = imitation_schedule(
+                    initial_weight=initial_weight, decay_rounds=decay_rounds,
+                    round_number=round_number - first_used,
+                )
+                if weight <= 0:
+                    continue
+                batch = demonstration_batch(
+                    artifact, expected_game_version=version, expected_context=context,
+                    observation_space=model.observation_space,
+                    action_count=int(model.action_space.n),
+                )
+                loss = train_behavioral_cloning_batch(model, batch, weight=weight)
+                row = {
+                    "round": round_number, "context": context, "artifact": artifact.name,
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    "weight": weight, "loss": loss, "samples": len(batch["actions"]),
+                    "game_version": version,
+                }
+                history.append(row)
+                used.append(row)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+                history.append({
+                    "round": round_number, "context": context, "artifact": artifact.name,
+                    "status": "rejected", "reason": f"{type(error).__name__}: {error}",
+                })
+    return used
+
+
 class GhostDictEnv(gym.Env[dict[str, np.ndarray], int]):
     def __init__(self, observation_space: gym.spaces.Dict, action_space: gym.spaces.Discrete) -> None:
         super().__init__()
@@ -829,6 +937,22 @@ def _shared_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
         "observation_dimensions": provenance.get("observation_dimensions"),
         "shared_learner_protocol": SHARED_SCHEMA_VERSION,
     }
+
+
+def _environment_game_version(environment: Any) -> str | None:
+    """Read the connected bridge version through the task and Gym wrappers."""
+    current = environment
+    for _ in range(6):
+        backend = getattr(current, "backend", None)
+        bridge = getattr(backend, "_bridge", None)
+        version = getattr(bridge, "game_version", None)
+        if isinstance(version, str) and version:
+            return version
+        nested = getattr(current, "environment", None)
+        if nested is None:
+            return None
+        current = nested
+    return None
 
 
 def actor_join_round(learner_status: Mapping[str, Any]) -> int:
@@ -976,6 +1100,8 @@ def run_shared_actor(
             self.resets = 0
             self.latest_episode_progress: dict[str, Any] = {}
             self.farm_alerts: set[str] = set()
+            self.challenge_practice_completed = False
+            self.challenge_practice_status: dict[str, Any] = {}
 
         def _on_step(self) -> bool:
             if stop_file is not None and stop_file.is_file():
@@ -988,6 +1114,11 @@ def run_shared_actor(
                 for info in infos:
                     if not isinstance(info, Mapping):
                         continue
+                    if info.get("challenge_practice_finished") is True:
+                        self.challenge_practice_completed = True
+                    practice_status = info.get("challenge_practice")
+                    if isinstance(practice_status, Mapping):
+                        self.challenge_practice_status = dict(practice_status)
                     progress = info.get("episode_progress")
                     if isinstance(progress, Mapping) and info.get("evaluation_only") is not True:
                         self.latest_episode_progress = dict(progress)
@@ -1001,6 +1132,9 @@ def run_shared_actor(
                     round=self.round_number, collected_steps=self.n_calls,
                     episode_progress=self.latest_episode_progress,
                     farm_alerts=sorted(self.farm_alerts),
+                    challenge_context=os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
+                    game_version=_environment_game_version(environment),
+                    challenge_practice=self.challenge_practice_status,
                 )
                 self.last_heartbeat = now
             return True
@@ -1035,6 +1169,8 @@ def run_shared_actor(
     store.publish_actor_status(
         slot=slot, launch_id=launch_id, status="STARTING",
         relaunches=len(restart_times), restart_times_unix_ns=restart_times,
+        challenge_context=os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
+        game_version=_environment_game_version(environment),
     )
     status: dict[str, Any] = {
         "schema_version": SHARED_SCHEMA_VERSION,
@@ -1215,6 +1351,12 @@ def run_shared_actor(
                 round=round_number, rounds_published=status["rounds_published"],
                 stale_rollouts=status["stale_rollouts"],
             )
+            if callback.challenge_practice_completed:
+                status["status"] = "CANCELLED"
+                status["challenge_practice_completed"] = True
+                status["challenge_context"] = os.environ.get("HK_AGENT_CHALLENGE_CONTEXT")
+                status["challenge_practice"] = callback.challenge_practice_status
+                break
     except BaseException as error:
         status.update({"status": "FAILED", "failure": f"{type(error).__name__}: {error}"})
         raise
@@ -1225,6 +1367,9 @@ def run_shared_actor(
             slot=slot, launch_id=launch_id,
             status=str(status.get("status", "FAILED")), round=round_number,
             rounds_published=status["rounds_published"], stale_rollouts=status["stale_rollouts"],
+            challenge_practice_completed=status.get("challenge_practice_completed", False),
+            challenge_context=status.get("challenge_context"),
+            challenge_practice=status.get("challenge_practice", {}),
         )
         environment.close()
     return status
@@ -1431,6 +1576,11 @@ def run_shared_learner(
                 break
             training_started = time.perf_counter()
             transitions = train_shared_round(model, rollouts)
+            demonstration_rows = apply_context_demonstrations(
+                model, shared_root, store, actor_slots=slots,
+                round_number=current_round, manifest=manifest,
+                enabled=os.environ.get("HK_AGENT_HELP_REQUESTS_ENABLED", "0") == "1",
+            )
             training_seconds = time.perf_counter() - training_started
             completed += transitions
             current_round += 1
@@ -1438,6 +1588,9 @@ def run_shared_learner(
             manifest_rounds = manifest.get("rounds")
             if isinstance(manifest_rounds, list):
                 manifest_rounds.append(current_round - 1)
+            if demonstration_rows:
+                for row in demonstration_rows:
+                    row["round"] = current_round - 1
             actor_rounds = manifest.get("actors_per_round")
             if isinstance(actor_rounds, dict):
                 actor_rounds[str(current_round - 1)] = slots

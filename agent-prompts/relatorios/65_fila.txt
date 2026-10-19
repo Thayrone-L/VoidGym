@@ -5,7 +5,12 @@ Workspace: C:\VoidGym
 Etapas 57–59 — VERDES; ver relatórios correspondentes.
 Etapa 60 — VERDE; commit 5f32aa7 publicado no PR #8.
 Etapa 61 — AMARELA (validação até banco pendente de alcance); commit 87dc60c publicado no PR #8.
-Etapa 62 — VERDE; política recorrente mascarada integrada, testes e smoke isolado aprovados. Commit a registrar após publicação.
-Etapas 63–64 — em execução sequencial após a 62.
+Etapa 62 — VERDE; política recorrente mascarada integrada, testes e smoke isolado aprovados. Commit 56c785f publicado no PR #8.
+Etapa 63 — AMARELA: opt-in `challenge_practice_enabled=false` bloqueia prática por padrão. Testes verificam ausência de snapshots/prática e contrato/observação inalterados. Faltam gatilhos genéricos completos + teste ponta a ponta do ciclo de prática.
+Etapa 64 — AMARELA: opt-in `help_requests_enabled=false` bloqueia pedidos e BC por padrão. Testes verificam ausência de treinamento por demonstração. Faltam sessão humana isolada pelo painel + gravação das ações humanas + fluxo colaborador.
 
-A jogada-1 ainda não foi iniciada. Ao final, iniciar apenas se 63 e 64 forem verdes ou amarelas, sem etapa vermelha. Não desligar o PC. Saves pessoais/baseline ficam protegidos.
+Validação 65d: ruff passou; mypy passou (54 arquivos); pytest completo: 625 passed, 2 skipped, 3 warnings, 8 subtests; build C# passou com 0 avisos/erros; harness de correlação C# passou. `git diff --check` passou.
+
+Smoke 65d aprovado em 190 s: bootstrap READY (5/5 passos), gameplay em Tutorial_01, ator gravou 670 transições e publicou 1 rollout; learner concluiu a rodada 0 (round 1) e checkpoint round-00000001.zip. As falhas de inicialização LSTM/shape e warm-start incompatível foram corrigidas e cobertas por testes. DLL Release implantada nas duas instâncias, SHA-256 5510d89d0c09a947f69662b8925c09e291f2c05d8cea3c4683d3c6867ce1b460. Smoke parado com encerramento seguro. JOGADA-1 aprovada e ativa: campanha ID jogada-1, versão 2 (a tentativa v1 foi parada com segurança após o painel antigo selecionar checkpoint recorrente incompatível). Campanha iniciada em 2026-10-19 17:21:58 America/Sao_Paulo. Confirmação observada até 17:32:10: 3 processos ativos (learner + 2 jogos); 4 rodadas concluídas (0–3), 4.096 transições, slots 0 e 1 recebidos em todas as rodadas, 0 rejeitadas. Os atores continuam coletando a rodada seguinte. Warm-start aplicado a partir de explore-20261019-141215-ba32; policy recorrente mascarada ativa; flags 63/64 false.
+
+Campanha jogada-1 ao final: 2 atores, duração até parar, política recorrente mascarada, reward/observação explore_v4 e 63/64 desligados. Painel mantido aberto em http://127.0.0.1:8766/; o painel mostra campanha, ator/learner e rodadas. Para parar, usar “Parar treino” no painel ou POST autenticado `/api/operator/stop`; aguardar status seguro/parado. Não desligar o PC enquanto a campanha roda.

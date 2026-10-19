@@ -671,3 +671,48 @@ def test_player_knowledge_persistence_retries_transient_windows_replace_denial(
     assert attempts == 4
     assert target.exists()
     assert not list(tmp_path.glob(".player-knowledge.json.*.tmp"))
+
+
+def test_challenge_features_disabled_by_default_without_snapshot_or_contract_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HK_AGENT_CHALLENGE_PRACTICE_ENABLED", raising=False)
+    monkeypatch.delenv("HK_AGENT_HELP_REQUESTS_ENABLED", raising=False)
+    disabled = ExplorationTask(_Environment())
+    live = tmp_path / "live"
+    snapshots = tmp_path / "snapshots"
+    personal = tmp_path / "personal"
+    live.mkdir()
+    personal.mkdir()
+    (live / "user1.dat").write_bytes(b"isolated")
+    disabled._challenge_save_root = live
+    disabled._challenge_snapshot_root = snapshots
+    disabled._personal_save_root = personal
+    disabled._capture_challenge_snapshots(
+        [{"event": "challenge_started", "challenge_id": "False_Knight",
+          "kind": "boss", "snapshot_requested": True}],
+        {},
+    )
+    disabled._player_knowledge.update({
+        "operator_telemetry": {"scene_name": "Room_Test", "visible_enemies": [{
+            "boss_confirmed": True, "boss_key": "False_Knight",
+            "boss_version": "normal", "struck_this_encounter": 0,
+        }]},
+    }, challenge_tracking_enabled=disabled._challenge_practice_enabled)
+    assert disabled._challenge_practice_enabled is False
+    assert disabled._player_knowledge.challenge_memory == {}
+    assert not snapshots.exists()
+
+    monkeypatch.setenv("HK_AGENT_CHALLENGE_PRACTICE_ENABLED", "1")
+    monkeypatch.setenv("HK_AGENT_HELP_REQUESTS_ENABLED", "1")
+    enabled = ExplorationTask(_Environment())
+    assert enabled._challenge_practice_enabled is True
+    assert enabled.task_contract() == disabled.task_contract()
+    assert enabled.observation_space.spaces.keys() == disabled.observation_space.spaces.keys()
+    assert {
+        name: (space.shape, space.dtype.str)
+        for name, space in enabled.observation_space.spaces.items()
+    } == {
+        name: (space.shape, space.dtype.str)
+        for name, space in disabled.observation_space.spaces.items()
+    }

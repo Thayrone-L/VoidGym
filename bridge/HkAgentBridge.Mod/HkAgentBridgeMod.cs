@@ -320,6 +320,7 @@ public sealed class HkAgentBridgeMod : Mod
                 if (name.Length == 0 || string.Equals(name, "Hollow Shade", StringComparison.OrdinalIgnoreCase)) continue;
                 int instanceId = manager.gameObject.GetInstanceID();
                 if (!seenRoots.Add(instanceId)) continue;
+                bool bossConfirmed = BossCatalog.TryGet(name, out ConfirmedBoss boss);
                 Vector3 point = camera.WorldToViewportPoint(manager.transform.position);
                 if (point.z <= 0 || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) continue;
                 result.Add(new System.Collections.Generic.Dictionary<string, object?>
@@ -329,6 +330,9 @@ public sealed class HkAgentBridgeMod : Mod
                     ["screen_x"] = point.x,
                     ["screen_y"] = point.y,
                     ["struck_this_encounter"] = _enemyObservations.Hits(instanceId),
+                    ["boss_confirmed"] = bossConfirmed,
+                    ["boss_key"] = bossConfirmed ? boss.Key : null,
+                    ["boss_version"] = bossConfirmed ? boss.Version : null,
                 });
             }
             catch (Exception error)

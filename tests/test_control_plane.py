@@ -62,7 +62,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 10
+    assert first["schema_version"] == 11
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 
@@ -103,6 +103,8 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert spec.target_kl == 0.03 and spec.learning_rate == 0.00025
     assert spec.clip_range == 0.2
     assert spec.straggler_timeout_seconds == 30.0
+    assert spec.challenge_practice_enabled is False
+    assert spec.help_requests_enabled is False
     assert spec.tutorial_hint_level == 1
     assert "--task" in command and command[command.index("--task") + 1] == "exploration"
     assert command[command.index("--rollout-steps") + 1] == "512"
@@ -113,6 +115,52 @@ def test_exploration_shared_campaign_defaults_and_runner_parameters(tmp_path: Pa
     assert command[command.index("--geo-gain-reward") + 1] == "0.0"
     assert command[command.index("--shade-recovery-reward") + 1] == "4.0"
     assert "--lifelong-memory-root" in command
+
+
+def test_challenge_and_help_features_are_explicitly_opt_in_without_contract_arguments(tmp_path: Path):
+    payload = _payload("exploration_training")
+    payload.update({
+        "reward_version": "explore_v4", "challenge_practice_enabled": True,
+        "help_requests_enabled": True,
+        "weights": {
+            "time_cost": -0.001, "novelty_reward": 0.05, "novelty_budget": 20.0,
+            "scene_change_reward": 5.0, "enemy_kill_reward": 1.0,
+            "enemy_kill_reward_budget": 5.0, "shade_recovery_reward": 4.0,
+            "damage_penalty": -0.5, "geo_gain_reward": 0.0,
+            "geo_spend_reward": 0.0, "death_penalty": -5.0,
+            "run_failed_penalty": -5.0,
+        },
+    })
+    spec = CampaignSpec.from_payload(payload)
+    command = ControlPlane(_project(tmp_path)).build_command(spec, execute=False)
+    assert spec.challenge_practice_enabled is True
+    assert spec.help_requests_enabled is True
+    assert "challenge_practice_enabled" not in command
+    assert "help_requests_enabled" not in command
+    payload["challenge_practice_enabled"] = "true"
+    with pytest.raises(TypeError, match="must be booleans"):
+        CampaignSpec.from_payload(payload)
+
+
+def test_challenge_practice_endpoint_is_blocked_by_default(tmp_path: Path):
+    payload = _payload("exploration_training")
+    payload.update({
+        "reward_version": "explore_v4", "save_source": "continuous_playthrough",
+        "weights": {
+            "time_cost": -0.001, "novelty_reward": 0.05, "novelty_budget": 20.0,
+            "scene_change_reward": 5.0, "enemy_kill_reward": 1.0,
+            "enemy_kill_reward_budget": 5.0, "shade_recovery_reward": 4.0,
+            "damage_penalty": -0.5, "geo_gain_reward": 0.0,
+            "geo_spend_reward": 0.0, "death_penalty": -5.0,
+            "run_failed_penalty": -5.0,
+        },
+    })
+    control = ControlPlane(_project(tmp_path))
+    campaign = control.create_campaign(payload)
+    with pytest.raises(ValueError, match="challenge practice is disabled"):
+        control.start_challenge_practice({
+            "campaign_id": campaign["campaign_id"], "challenge_id": "False_Knight", "slot": 1,
+        })
 
 
 def test_legacy_exploration_campaign_resolves_as_explore_v1(tmp_path: Path) -> None:

@@ -139,14 +139,18 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         try:
             payload = self._payload()
             if path == "/api/operator/start":
-                require_keys(payload, ("instances", "duration_kind", "duration_value"))
-                if set(payload) != {"instances", "duration_kind", "duration_value"}:
-                    raise ValueError("start accepts only number of instances and duration")
+                require_keys(payload, ("instances", "duration_kind", "duration_value", "campaign_name"))
+                if set(payload) not in (
+                    {"instances", "duration_kind", "duration_value"},
+                    {"instances", "duration_kind", "duration_value", "campaign_name"},
+                ):
+                    raise ValueError("start accepts instances, duration, and optional campaign_name")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
                 result = self.server.control_plane.start_operator_campaign(
                     instances=payload.get("instances"), duration_kind=payload.get("duration_kind"),
                     duration_value=payload.get("duration_value"),
+                    campaign_name=payload.get("campaign_name"),
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":
@@ -180,6 +184,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 else:
                     result = self.server.control_plane.restore_playthrough_backup(payload)
                 self._json(HTTPStatus.OK, result)
+            elif path == "/api/challenges/practice":
+                require_keys(payload, ("campaign_id", "slot", "challenge_id"))
+                if set(payload) != {"campaign_id", "slot", "challenge_id"}:
+                    raise ValueError("challenge practice accepts campaign_id, slot, and challenge_id")
+                if not self.server.control_plane.allow_execute:
+                    raise PermissionError("Start the panel with --allow-execute to launch a challenge actor")
+                result = self.server.control_plane.start_challenge_practice(payload)
+                self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/reports/generate":
                 require_keys(payload, ("campaign_id",))
                 campaign_id = payload.get("campaign_id")
@@ -226,6 +238,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                         "evaluation_interval",
                         "tutorial_hint_level",
                         "straggler_timeout_seconds",
+                        "challenge_practice_enabled",
+                        "help_requests_enabled",
                     ),
                 )
                 result = self.server.control_plane.create_campaign(payload)

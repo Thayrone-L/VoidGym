@@ -11,10 +11,16 @@ internal readonly struct EnemyKillEvent
         EnemyType = enemyType;
         SceneName = sceneName;
         HitsDealt = hitsDealt;
+        BossConfirmed = BossCatalog.TryGet(enemyType, out ConfirmedBoss boss);
+        BossKey = BossConfirmed ? boss.Key : null;
+        BossVersion = BossConfirmed ? boss.Version : null;
     }
     public string EnemyType { get; }
     public string SceneName { get; }
     public int HitsDealt { get; }
+    public bool BossConfirmed { get; }
+    public string? BossKey { get; }
+    public string? BossVersion { get; }
 }
 
 internal readonly struct EpisodeLifecycleSnapshot

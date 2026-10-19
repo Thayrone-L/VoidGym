@@ -4,6 +4,7 @@ import http.client
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hk_agent.control_plane import ControlPlane
@@ -79,6 +80,36 @@ def test_continue_warm_starts_v4_from_v3_and_repeat_uses_new_seed(tmp_path: Path
         launch.assert_called_once()
 
 
+def test_operator_start_uses_latest_compatible_policy_for_jogada1(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path, allow_execute=True)
+    recurrent = {"campaign_id": "newer-recurrent", "campaign_type": "exploration_training",
+                 "reward_version": "explore_v4", "shared_learner": True}
+    feedforward = {"campaign_id": "latest-compatible", "campaign_type": "exploration_training",
+                   "reward_version": "explore_v4", "shared_learner": True}
+    for record, algorithm in ((recurrent, "MaskableRecurrentPPO"), (feedforward, "MaskablePPO")):
+        root = plane.runtime_root / "shared" / str(record["campaign_id"])
+        (root / "checkpoints").mkdir(parents=True)
+        (root / "manifest.json").write_text(json.dumps({"algorithm": algorithm}), encoding="utf-8")
+        (root / "checkpoints" / "round-0001.zip").write_bytes(b"checkpoint")
+    with (patch("hk_agent.config.load_config", return_value=SimpleNamespace(instance_count=2)),
+          patch.object(plane, "list_campaigns", return_value=[recurrent, feedforward]),
+          patch.object(plane, "launch", return_value={"status": "RUNNING"}) as launch):
+        result = plane.start_operator_campaign(
+            instances=2, duration_kind="until_stopped", duration_value=None,
+            campaign_name="jogada-1",
+        )
+    campaign = result["campaign"]
+    assert campaign["campaign_id"] == "jogada-1"
+    assert campaign["name"] == "jogada-1"
+    assert campaign["actors"] == 2 and campaign["duration_mode"] == "continuous"
+    assert campaign["duration_limit_seconds"] == 0.0
+    assert campaign["challenge_practice_enabled"] is False
+    assert campaign["help_requests_enabled"] is False
+    assert campaign["warm_start_source_campaign"] == "latest-compatible"
+    assert campaign["warm_start_checkpoint"].endswith("round-0001.zip")
+    launch.assert_called_once_with("jogada-1", version=1, execute=True)
+
+
 def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None:
     plane = ControlPlane(tmp_path, allow_execute=False)
     server = ControlPlaneHTTPServer(("127.0.0.1", 0), plane, tmp_path)
@@ -95,6 +126,17 @@ def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None
         result = json.loads(response.read())
         assert response.status == 400
         assert "unknown fields: weights" in result["error"]
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        body = json.dumps({"instances": 1, "duration_kind": "until_stopped", "duration_value": None,
+                           "campaign_name": "smoke"})
+        connection.request("POST", "/api/operator/start", body=body,
+                           headers={"Content-Type": "application/json", "X-Control-Token": plane.csrf_token})
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        assert response.status == 403
+        assert "--allow-execute" in result["error"]
         connection.close()
     finally:
         server.shutdown()

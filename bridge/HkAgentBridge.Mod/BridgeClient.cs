@@ -448,6 +448,9 @@ internal sealed class BridgeClient : IDisposable
                                     ["enemy_type_id"] = EnemyObservationState.TypeId(item.EnemyType),
                                     ["scene_name"] = item.SceneName,
                                     ["hits_dealt"] = item.HitsDealt,
+                                    ["boss_confirmed"] = item.BossConfirmed,
+                                    ["boss_key"] = item.BossKey,
+                                    ["boss_version"] = item.BossVersion,
                                     ["geo_awarded"] = lifecycle.EnemyEventsSinceLastFrame.Count == 1
                                         ? lifecycle.GeoGainedSinceLastFrame : 0,
                                 }).ToArray(),

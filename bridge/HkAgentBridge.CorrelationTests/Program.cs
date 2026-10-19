@@ -32,6 +32,10 @@ Assert(EpisodeLifecycleState.NormalizeEnemyType("Crawler (Clone)") == "Crawler",
 Assert(EpisodeLifecycleState.NormalizeEnemyType("Crawler (12)") == "Crawler", "instance suffix must be stripped from enemy type");
 Assert(EpisodeLifecycleState.NormalizeEnemyType("Crawler") == "Crawler", "stable enemy type must be retained");
 Assert(EnemyObservationState.TypeId("Crawler (Clone)") == EnemyObservationState.TypeId("Crawler"), "enemy type IDs must ignore runtime clone suffixes");
+Assert(BossCatalog.TryGet("False Knight (Clone)", out ConfirmedBoss falseKnight)
+    && falseKnight.Key == "False_Knight" && falseKnight.Version == "normal",
+    "known boss aliases must produce stable challenge identity and version");
+Assert(!BossCatalog.TryGet("Crawler", out _), "unknown enemies must not be treated as bosses");
 var enemyObservations = new EnemyObservationState();
 enemyObservations.RecordHit(123);
 enemyObservations.RecordHit(123);

@@ -398,3 +398,65 @@ def test_partial_warm_start_copies_compatible_visual_tensors_only():
     }
     copied = shared.compatible_warm_start_state(source, target)
     assert list(copied) == ["features_extractor.image.cnn.weight"]
+
+
+def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path, monkeypatch):
+    import hashlib
+    import io
+    import json
+    from types import SimpleNamespace
+
+    import gymnasium as gym
+    from PIL import Image
+
+    from hk_agent.demonstrations import DemonstrationRecorder
+
+    context = "boss:False_Knight"
+    folder = tmp_path / "demonstrations" / hashlib.sha256(context.encode()).hexdigest()[:16]
+    recorder = DemonstrationRecorder(folder, game_version="1.5.78", context=context)
+    recorder.authorize(help_request_id="help-1")
+    encoded = io.BytesIO()
+    Image.new("RGB", (4, 3)).save(encoded, format="PNG")
+    recorder.append(
+        png_bytes=encoded.getvalue(), action=0, action_mask=np.array([True, False]),
+        player_knowledge=np.zeros(2, dtype=np.float32),
+    )
+    artifact = recorder.finish()
+    store = shared.SharedRoundStore(tmp_path)
+    store.publish_actor_status(
+        slot=0, launch_id="actor-0", status="COLLECTING",
+        challenge_context=context, game_version="1.5.78",
+    )
+    store.publish_actor_status(
+        slot=1, launch_id="actor-1", status="COLLECTING",
+        challenge_context="room:other", game_version="1.5.78",
+    )
+    model = SimpleNamespace(
+        observation_space=gym.spaces.Dict({
+            "pixels": gym.spaces.Box(0, 255, (1, 8, 8, 3), dtype=np.uint8),
+            "action_history": gym.spaces.Box(0, 1, (2,), dtype=np.int64),
+            "player_knowledge": gym.spaces.Box(-1, 1, (2,), dtype=np.float32),
+        }),
+        action_space=gym.spaces.Discrete(2),
+    )
+    calls = []
+    monkeypatch.setattr(shared, "train_behavioral_cloning_batch", lambda _model, batch, *, weight: calls.append(weight) or 0.5)
+    manifest = {}
+    rows = shared.apply_context_demonstrations(
+        model, tmp_path, store, actor_slots=[0, 1], round_number=0, manifest=manifest,
+        enabled=True,
+    )
+    assert len(rows) == 1 and rows[0]["context"] == context
+    assert rows[0]["weight"] == pytest.approx(0.25)
+    metadata = json.loads(artifact.with_suffix(".json").read_text())
+    assert metadata["first_used_round"] == 0
+    rows = shared.apply_context_demonstrations(
+        model, tmp_path, store, actor_slots=[0], round_number=20, manifest=manifest,
+        enabled=True,
+    )
+    assert rows == []
+    assert calls == [pytest.approx(0.25)]
+    assert shared.apply_context_demonstrations(
+        model, tmp_path, store, actor_slots=[0], round_number=21, manifest=manifest,
+    ) == []
+    assert calls == [pytest.approx(0.25)]

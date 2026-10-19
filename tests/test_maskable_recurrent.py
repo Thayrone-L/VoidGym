@@ -163,6 +163,7 @@ def test_sb3_maskable_recurrent_ppo_collects_and_updates_a_rollout() -> None:
             return {"state": np.zeros(3, dtype=np.float32)}, {}
 
         def step(self, action):
+            assert np.asarray(action).ndim == 0
             return {"state": np.full(3, action / 2.0, dtype=np.float32)}, 0.0, False, False, {}
 
         def action_masks(self):
@@ -178,6 +179,37 @@ def test_sb3_maskable_recurrent_ppo_collects_and_updates_a_rollout() -> None:
     from hk_agent.recurrent_sb3 import MaskableRecurrentDictRolloutBuffer
     assert isinstance(model.rollout_buffer, MaskableRecurrentDictRolloutBuffer)
     assert model.rollout_buffer.sequence_length == 4
+    vector.close()
+
+
+def test_sb3_recurrent_policy_normalizes_numpy_observation_dimensions() -> None:
+    import gymnasium as gym
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
+
+    class NumpyDimensionEnv(gym.Env):
+        observation_space = gym.spaces.Dict({
+            "state": gym.spaces.MultiDiscrete(np.array([2, 3], dtype=np.int64)),
+        })
+        action_space = gym.spaces.Discrete(2)
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            return {"state": np.array([0, 0], dtype=np.int64)}, {}
+
+        def step(self, action):
+            return {"state": np.array([0, 0], dtype=np.int64)}, 0.0, False, False, {}
+
+        def action_masks(self):
+            return np.ones(2, dtype=np.bool_)
+
+    vector = DummyVecEnv([NumpyDimensionEnv])
+    model = MaskableRecurrentPPO(
+        "MultiInputLstmPolicy", vector, n_steps=4, batch_size=4, n_epochs=1,
+        policy_kwargs={"lstm_hidden_size": 8}, device="cpu", verbose=0,
+    )
+    assert type(model.policy.lstm_actor.input_size) is int
     vector.close()
 
 

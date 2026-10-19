@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from hk_agent.bestiary import ENEMY_VECTOR_SIZE, MAX_ENEMY_SLOTS, BestiaryMemory
+from hk_agent.challenge_practice import ChallengeSignalTracker
 from hk_agent.story_objectives import (
     OBJECTIVE_BY_ID,
     STORY_OBJECTIVES,
@@ -100,6 +101,8 @@ class PlayerKnowledge:
     game_flags: dict[str, bool] = field(default_factory=dict)
     new_events: list[dict[str, Any]] = field(default_factory=list)
     bestiary: BestiaryMemory = field(default_factory=BestiaryMemory)
+    challenge_memory: dict[str, dict[str, Any]] = field(default_factory=dict)
+    challenge_signal_tracker: ChallengeSignalTracker = field(default_factory=ChallengeSignalTracker)
 
     def owned_charm_costs(self) -> dict[str, int]:
         """Return only acquired charms whose cost has been observed from the game."""
@@ -122,9 +125,30 @@ class PlayerKnowledge:
     @classmethod
     def from_payload(cls, value: object) -> PlayerKnowledge:
         memory = cls()
-        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3, 4}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3, 4, 5}:
             return memory
         memory.bestiary = BestiaryMemory.from_payload(value)
+        raw_challenges = value.get("challenge_memory", {})
+        if isinstance(raw_challenges, dict):
+            for key, raw in list(raw_challenges.items())[:128]:
+                if not isinstance(key, str) or not key or len(key) > 128 or not isinstance(raw, dict):
+                    continue
+                numeric = (raw.get("attempts", 0), raw.get("wins", 0))
+                if not all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in numeric):
+                    continue
+                progress = raw.get("best_progress", 0.0)
+                if not isinstance(progress, (int, float)) or isinstance(progress, bool) or not np.isfinite(progress) or progress < 0:
+                    continue
+                versions = raw.get("versions", [])
+                memory.challenge_memory[key] = {
+                    "kind": raw.get("kind") if raw.get("kind") in {"boss", "traversal", "item", "area"} else "area",
+                    "attempts": numeric[0], "wins": numeric[1], "best_progress": float(progress),
+                    "best_hits": max(0, raw.get("best_hits", 0)) if isinstance(raw.get("best_hits", 0), int) else 0,
+                    "best_survival_seconds": max(0.0, float(raw.get("best_survival_seconds", 0.0)))
+                    if isinstance(raw.get("best_survival_seconds", 0.0), (int, float)) else 0.0,
+                    "versions": sorted({version for version in versions if isinstance(version, str) and len(version) <= 64})[:32]
+                    if isinstance(versions, list) else [],
+                }
         flags, visited, exits, points = (value.get(key) for key in ("flags", "visited", "exits", "points"))
         if isinstance(flags, dict):
             memory.known_flags = {
@@ -220,7 +244,7 @@ class PlayerKnowledge:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "flags": dict(self.known_flags),
             "charm_costs": dict(self.charm_costs),
             "equipped_charms": sorted(self.equipped_charms),
@@ -244,12 +268,64 @@ class PlayerKnowledge:
             "claimed_tutorial_rewards": sorted(self.claimed_tutorial_rewards),
             "game_flags": dict(self.game_flags),
             "bestiary": self.bestiary.to_payload(),
+            "challenge_memory": dict(sorted(self.challenge_memory.items())[:128]),
             "last_scene": self.last_scene,
             "last_cell": list(self.last_cell) if self.last_cell else None,
         }
 
-    def update(self, info: dict[str, Any]) -> None:
+    def _record_challenge_events(self, raw_events: object) -> None:
+        if not isinstance(raw_events, list):
+            return
+        for event in raw_events[:32]:
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") not in {None, "challenge_attempt"}:
+                continue
+            key, kind, version = event.get("challenge_id"), event.get("kind"), event.get("version", "unknown")
+            if not isinstance(key, str) or not key or len(key) > 128:
+                continue
+            if kind not in {"boss", "traversal", "item", "area"} or not isinstance(version, str) or len(version) > 64:
+                continue
+            attempts = event.get("attempts", 1)
+            wins = event.get("wins", int(event.get("success") is True))
+            progress = event.get("progress", 0.0)
+            if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (attempts, wins)):
+                continue
+            if not isinstance(progress, (int, float)) or isinstance(progress, bool) or not np.isfinite(progress) or progress < 0:
+                continue
+            current = self.challenge_memory.setdefault(key, {
+                "kind": kind, "attempts": 0, "wins": 0, "best_progress": 0.0,
+                "best_hits": 0, "best_survival_seconds": 0.0, "versions": [],
+            })
+            duration = event.get("duration_seconds", 0.0)
+            hits = event.get("hits", 0)
+            if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not np.isfinite(duration) or duration < 0:
+                duration = 0.0
+            if not isinstance(hits, int) or isinstance(hits, bool) or hits < 0:
+                hits = 0
+            event["survival_improvement"] = float(duration) > float(current.get("best_survival_seconds", 0.0))
+            current["kind"] = kind
+            current["attempts"] = min(1_000_000, int(current.get("attempts", 0)) + attempts)
+            current["wins"] = min(1_000_000, int(current.get("wins", 0)) + wins)
+            current["best_progress"] = max(float(current.get("best_progress", 0.0)), float(progress))
+            current["best_survival_seconds"] = max(float(current.get("best_survival_seconds", 0.0)), float(duration))
+            if event.get("success") is True and (int(current.get("best_hits", 0)) == 0 or hits < int(current.get("best_hits", 0))):
+                current["best_hits"] = hits
+            versions = current.get("versions", [])
+            if isinstance(versions, list) and version not in versions:
+                versions.append(version)
+                del versions[:-32]
+        if len(self.challenge_memory) > 128:
+            self.challenge_memory = dict(list(self.challenge_memory.items())[-128:])
+
+    def update(self, info: dict[str, Any], *, challenge_tracking_enabled: bool = True) -> None:
         self.new_events = []
+        generated = self.challenge_signal_tracker.update(info) if challenge_tracking_enabled else []
+        supplied_events = info.get("challenge_events") if challenge_tracking_enabled else []
+        if not isinstance(supplied_events, list):
+            supplied_events = []
+        self._record_challenge_events([*generated, *supplied_events])
+        self.new_events.extend(generated)
         telemetry = info.get("operator_telemetry")
         if not isinstance(telemetry, dict):
             return

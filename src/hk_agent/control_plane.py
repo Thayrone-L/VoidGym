@@ -139,7 +139,9 @@ class CampaignSpec:
     evaluation_interval: int = 20
     tutorial_hint_level: int = 0
     straggler_timeout_seconds: float = 45.0
-    schema_version: int = 10
+    challenge_practice_enabled: bool = False
+    help_requests_enabled: bool = False
+    schema_version: int = 11
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -152,6 +154,12 @@ class CampaignSpec:
         )
         if not isinstance(shared_learner, bool):
             raise TypeError("shared_learner must be a boolean")
+        challenge_practice_enabled = payload.get("challenge_practice_enabled", False)
+        help_requests_enabled = payload.get("help_requests_enabled", False)
+        if not isinstance(challenge_practice_enabled, bool) or not isinstance(help_requests_enabled, bool):
+            raise TypeError("challenge_practice_enabled and help_requests_enabled must be booleans")
+        if (challenge_practice_enabled or help_requests_enabled) and campaign_type != "exploration_training":
+            raise ValueError("challenge practice and help requests require exploration_training")
         if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
             raise ValueError("shared learner requires a supported PPO training campaign")
         reward_version = payload.get("reward_version", "explore_v3")
@@ -347,6 +355,8 @@ class CampaignSpec:
                 payload.get("straggler_timeout_seconds", 45.0),
                 "straggler_timeout_seconds", 1.0, 300.0,
             ) if shared_learner else 45.0,
+            challenge_practice_enabled=challenge_practice_enabled,
+            help_requests_enabled=help_requests_enabled,
         )
         if spec.rollout_steps * spec.actors % spec.batch_size:
             raise ValueError("batch_size must divide rollout_steps times actors")
@@ -840,6 +850,9 @@ class ControlPlane:
         campaign_id = next((str(row.get("campaign_id")) for row in active_records if row.get("campaign_id")), None)
         if campaign_id is None and campaigns:
             campaign_id = str(campaigns[0].get("campaign_id", "")) or None
+        selected_campaign = next(
+            (row for row in campaigns if row.get("campaign_id") == campaign_id), {}
+        )
         shared_root_value = next((row.get("shared_root") for row in active_records if isinstance(row.get("shared_root"), str)), None)
         shared_root = Path(str(shared_root_value)) if shared_root_value else (self.runtime_root / "shared" / campaign_id if campaign_id else None)
         journey: dict[str, object] = {"svg": "", "runs": [], "milestones": [], "records": {}}
@@ -949,6 +962,8 @@ class ControlPlane:
             "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
             "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-100:], "evaluation_trend": manifest.get("evaluation_trend", []),
             "journey": journey,
+            "challenge_practice_enabled": selected_campaign.get("challenge_practice_enabled") is True,
+            "help_requests_enabled": selected_campaign.get("help_requests_enabled") is True,
             "playthroughs": self._operator_playthroughs(campaign_id, campaigns, active_records, journey),
             "alerts": sorted(set(alerts)), "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
@@ -999,6 +1014,22 @@ class ControlPlane:
             root = resolve_playthrough_root(self.runtime_root, campaign_id, slot_id + 1)
             state = playthrough_status(root) or {"last_scene": None, "progress": {}, "backup_count": 0}
             knowledge = self._read_json(root / "player-knowledge.json")
+            challenge_memory = knowledge.get("challenge_memory", {})
+            state["challenge_memory"] = (
+                [
+                    {"challenge_id": key, **dict(value)}
+                    for key, value in list(challenge_memory.items())[:64]
+                    if isinstance(key, str) and isinstance(value, Mapping)
+                ]
+                if isinstance(challenge_memory, Mapping) else []
+            )
+            snapshot_index_path = root.parent / "challenge-snapshots" / root.name / "index.json"
+            snapshot_payload = self._read_json(snapshot_index_path)
+            state["challenge_snapshots"] = [
+                dict(row) for row in snapshot_payload.get("snapshots", [])[-32:]
+                if isinstance(row, Mapping) and isinstance(row.get("challenge_id"), str)
+                and isinstance(row.get("save_path"), str)
+            ] if isinstance(snapshot_payload.get("snapshots"), list) else []
             raw_bestiary = knowledge.get("bestiary", {})
             bestiary_rows: list[dict[str, Any]] = []
             if isinstance(raw_bestiary, Mapping):
@@ -1035,6 +1066,28 @@ class ControlPlane:
                     })
             bestiary_rows.sort(key=lambda item: (-int(item["encounters"]), str(item["enemy_type_id"])))
             state["bestiary"] = bestiary_rows[:64]
+            practice_actor = next((row for row in active_records
+                                   if isinstance((resources := row.get("resources")), Mapping)
+                                   and resources.get("slot_id") == slot_id
+                                   and isinstance(row.get("challenge_practice"), Mapping)), None)
+            if practice_actor is not None:
+                practice = dict(practice_actor["challenge_practice"])
+                practice_memory_path = practice_actor.get("resources", {}).get("challenge_memory_root")
+                if isinstance(practice_memory_path, str):
+                    practice_knowledge = self._read_json(Path(practice_memory_path) / "player-knowledge.json")
+                    raw_memory = practice_knowledge.get("challenge_memory", {})
+                    practice["memory"] = [
+                        {"challenge_id": key, **dict(value)}
+                        for key, value in raw_memory.items()
+                        if isinstance(key, str) and isinstance(value, Mapping)
+                    ] if isinstance(raw_memory, Mapping) else []
+                shared_value = practice_actor.get("shared_root")
+                if isinstance(shared_value, str):
+                    actor_status = self._read_json(
+                        Path(shared_value) / "actors" / f"slot-{slot_id}.json"
+                    )
+                    practice.update(actor_status.get("challenge_practice", {}))
+                state["challenge_practice"] = practice
             if not state.get("last_scene"):
                 state["last_scene"] = last_scenes.get(slot_id)
             state.update({"slot": slot_id + 1, "active": slot_id in active_slots,
@@ -1587,7 +1640,10 @@ class ControlPlane:
             return float(seconds)
         raise ValueError("duration_kind must be until_stopped, hours, or until_time")
 
-    def start_operator_campaign(self, *, instances: object, duration_kind: object, duration_value: object) -> dict[str, object]:
+    def start_operator_campaign(
+        self, *, instances: object, duration_kind: object, duration_value: object,
+        campaign_name: object = None,
+    ) -> dict[str, object]:
         from hk_agent.config import load_config
 
         config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
@@ -1597,10 +1653,39 @@ class ControlPlane:
         limit_seconds = self._operator_duration(duration_kind, duration_value)
         seed = secrets.randbelow(2**31)
         now_slug = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        campaign_id = f"explore-{now_slug}-{secrets.token_hex(2)}"
+        if campaign_name is not None and (
+            not isinstance(campaign_name, str) or not campaign_name.strip()
+            or len(campaign_name.strip()) > 80
+        ):
+            raise ValueError("campaign_name must contain 1 to 80 characters")
+        name = campaign_name.strip() if isinstance(campaign_name, str) else f"Exploration {time.strftime('%d/%m %H:%M', time.localtime())}"
+        campaign_id = "jogada-1" if name.casefold() == "jogada-1" else f"explore-{now_slug}-{secrets.token_hex(2)}"
+        warm_start: tuple[str, str] | None = None
+        for previous in self.list_campaigns():
+            previous_id = previous.get("campaign_id")
+            if (
+                previous.get("campaign_type") != "exploration_training"
+                or previous.get("reward_version") != "explore_v4"
+                or previous.get("shared_learner") is not True
+                or not isinstance(previous_id, str)
+            ):
+                continue
+            previous_root = self.runtime_root / "shared" / previous_id
+            # The warm-start loader currently accepts feed-forward MaskablePPO
+            # archives and copies their compatible feature weights into the
+            # recurrent policy. Skip recurrent archives and other algorithms.
+            if self._read_json(previous_root / "manifest.json").get("algorithm") != "MaskablePPO":
+                continue
+            checkpoints = sorted(
+                (previous_root / "checkpoints").glob("round-*.zip"),
+                key=lambda path: path.stat().st_mtime_ns,
+            )
+            if checkpoints:
+                warm_start = (str(checkpoints[-1]), previous_id)
+                break
         payload: dict[str, object] = {
             "campaign_id": campaign_id,
-            "name": f"Exploration {time.strftime('%d/%m %H:%M', time.localtime())}",
+            "name": name,
             "campaign_type": "exploration_training",
             "reward_version": "explore_v4",
             "shared_learner": True,
@@ -1619,7 +1704,11 @@ class ControlPlane:
             "save_source": "continuous_playthrough",
             "save_slot": 1,
             "weights": {},
+            "challenge_practice_enabled": False,
+            "help_requests_enabled": False,
         }
+        if warm_start is not None:
+            payload["warm_start_checkpoint"], payload["warm_start_source_campaign"] = warm_start
         campaign = self.create_campaign(payload)
         launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
         return {"campaign": campaign, "launch": launched}
@@ -1967,6 +2056,8 @@ class ControlPlane:
             "OMP_NUM_THREADS": str(self.torch_threads),
             "MKL_NUM_THREADS": str(self.torch_threads),
             "OPENBLAS_NUM_THREADS": str(self.torch_threads),
+            "HK_AGENT_CHALLENGE_PRACTICE_ENABLED": "1" if spec.challenge_practice_enabled else "0",
+            "HK_AGENT_HELP_REQUESTS_ENABLED": "1" if spec.help_requests_enabled else "0",
         })
         log_handle = log_path.open("wb")
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -2018,6 +2109,8 @@ class ControlPlane:
         shared_group: str | None = None,
         shared_actor_count: int | None = None,
         shared_restart_of: str | None = None,
+        challenge_snapshot: Path | None = None,
+        challenge_context: str | None = None,
     ) -> dict[str, object]:
         self._require_owner()
         project_config = None
@@ -2224,6 +2317,22 @@ class ControlPlane:
                         raise RuntimeError("launch resources record is invalid")
                     resources_record["playthrough_root"] = str(playthrough)
                     atomic_json(launch_root / "launch.json", record)
+                if challenge_snapshot is not None:
+                    if challenge_context is None:
+                        raise ValueError("challenge actor is missing its context")
+                    challenge_snapshot = challenge_snapshot.resolve(strict=True)
+                    try:
+                        challenge_snapshot.relative_to(validated_runtime)
+                    except ValueError as error:
+                        raise ValueError("challenge snapshot is outside the managed runtime") from error
+                    if not challenge_snapshot.is_dir() or challenge_snapshot.is_symlink():
+                        raise ValueError("challenge snapshot must be a real directory")
+                    seed_root = challenge_snapshot
+                    record["challenge_practice"] = {
+                        "context": challenge_context,
+                        "snapshot": str(challenge_snapshot),
+                        "return_to_main": True,
+                    }
                 prepare_instance_saves(
                     data_root,
                     seed_root,
@@ -2266,6 +2375,8 @@ class ControlPlane:
                     "OMP_NUM_THREADS": str(self.torch_threads),
                     "MKL_NUM_THREADS": str(self.torch_threads),
                     "OPENBLAS_NUM_THREADS": str(self.torch_threads),
+                    "HK_AGENT_CHALLENGE_PRACTICE_ENABLED": "1" if spec.challenge_practice_enabled else "0",
+                    "HK_AGENT_HELP_REQUESTS_ENABLED": "1" if spec.help_requests_enabled else "0",
                 }
             )
             if shared_role == "actor":
@@ -2279,6 +2390,10 @@ class ControlPlane:
                 })
                 if shared_restart_of is not None:
                     environment["HK_AGENT_RESTART_OF"] = shared_restart_of
+                if challenge_context is not None:
+                    environment["HK_AGENT_CHALLENGE_CONTEXT"] = challenge_context
+                if challenge_snapshot is not None:
+                    environment["HK_AGENT_CHALLENGE_SNAPSHOT"] = str(challenge_snapshot)
                 record.update({
                     "role": "actor", "shared_group": shared_group,
                     "shared_root": str(shared_root), "shared_actor_count": shared_actor_count,
@@ -2291,7 +2406,15 @@ class ControlPlane:
                 environment["HK_AGENT_PERSONAL_ROOT"] = str(project_config.personal_save_root)
                 environment["HK_AGENT_PRODUCT_NAME"] = project_config.instance_product_names[slot_id]
                 if playthrough is not None:
-                    environment["HK_AGENT_PLAYTHROUGH_ROOT"] = str(playthrough)
+                    if challenge_context is not None and shared_root is not None:
+                        context_digest = hashlib.sha256(challenge_context.encode("utf-8")).hexdigest()[:16]
+                        challenge_memory_root = shared_root / "challenge-practice" / f"slot-{slot_id}" / context_digest
+                        environment["HK_AGENT_PLAYTHROUGH_ROOT"] = str(challenge_memory_root)
+                        resources_record = record.get("resources")
+                        if isinstance(resources_record, dict):
+                            resources_record["challenge_memory_root"] = str(challenge_memory_root)
+                    else:
+                        environment["HK_AGENT_PLAYTHROUGH_ROOT"] = str(playthrough)
                 environment["HK_AGENT_LOG_FILE"] = str(player_log_path)
                 environment["HK_AGENT_OTHER_INSTANCE_DATA_ROOTS"] = os.pathsep.join(str(root) for index, root in enumerate(project_config.instance_data_roots) if index != slot_id)
                 if spec.campaign_type == "parallel_smoke":
@@ -2386,7 +2509,8 @@ class ControlPlane:
             return dict(record)
 
     def restart_shared_actor(
-        self, launch_id: str, *, reason: str = "supervised actor restart", timeout: float = 90.0
+        self, launch_id: str, *, reason: str = "supervised actor restart", timeout: float = 90.0,
+        challenge_snapshot: Path | None = None, challenge_context: str | None = None,
     ) -> dict[str, object]:
         """Gracefully stop one shared actor and relaunch it in the learner's current round."""
         self._require_owner()
@@ -2439,7 +2563,8 @@ class ControlPlane:
         replacement = self._launch_single(
             campaign_id, version=version, execute=True, shared_role="actor",
             shared_root=shared_root, shared_group=group, shared_actor_count=actors,
-            shared_restart_of=launch_id,
+            shared_restart_of=launch_id, challenge_snapshot=challenge_snapshot,
+            challenge_context=challenge_context,
         )
         restart_record = {
             "time_unix_ns": time.time_ns(), "shared_group": group,
@@ -2457,6 +2582,67 @@ class ControlPlane:
         launch_path = self.control_root / "launches" / str(replacement["launch_id"]) / "launch.json"
         atomic_json(launch_path, replacement)
         return replacement
+
+    def start_challenge_practice(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Restart one spare actor from an isolated challenge snapshot in the shared campaign."""
+        self._require_owner()
+        campaign_id, challenge_id, snapshot_slot = payload.get("campaign_id"), payload.get("challenge_id"), payload.get("slot")
+        if not isinstance(campaign_id, str) or not campaign_id:
+            raise ValueError("campaign_id must be a non-empty string")
+        if isinstance(snapshot_slot, bool) or not isinstance(snapshot_slot, int) or snapshot_slot < 1:
+            raise ValueError("slot must be a positive one-based instance number")
+        if not isinstance(challenge_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", challenge_id):
+            raise ValueError("challenge_id is invalid")
+        campaign = next(
+            (row for row in self.list_campaigns() if row.get("campaign_id") == campaign_id),
+            None,
+        )
+        if campaign is None:
+            raise ValueError("campaign was not found")
+        if campaign.get("challenge_practice_enabled") is not True:
+            raise ValueError("challenge practice is disabled for this campaign")
+        active = self.status().get("active_launches", [])
+        actors = [row for row in active if isinstance(row, Mapping)
+                  and row.get("campaign_id") == campaign_id and row.get("role") == "actor"] if isinstance(active, list) else []
+        if len(actors) < 2:
+            raise RuntimeError("challenge practice needs at least two active actors so the main playthrough continues")
+        shared_roots = {row.get("shared_root") for row in actors}
+        if len(shared_roots) != 1 or not isinstance(next(iter(shared_roots)), str):
+            raise RuntimeError("active actors do not share one learner")
+        main_slot_id = snapshot_slot - 1
+        practice = next((row for row in actors
+                         if isinstance(row.get("resources"), Mapping)
+                         and row["resources"].get("slot_id") != main_slot_id), None)
+        if practice is None:
+            raise RuntimeError("no spare actor slot is available for challenge practice")
+        resources = practice.get("resources")
+        slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            raise TypeError("practice actor has no managed slot")
+        playthrough = resolve_playthrough_root(self.runtime_root, campaign_id, snapshot_slot)
+        snapshot_index = playthrough.parent / "challenge-snapshots" / playthrough.name / "index.json"
+        index = self._read_json(snapshot_index)
+        snapshots = index.get("snapshots", [])
+        matching = [item for item in snapshots if isinstance(item, Mapping)
+                    and item.get("challenge_id") == challenge_id and isinstance(item.get("save_path"), str)] if isinstance(snapshots, list) else []
+        if not matching:
+            raise FileNotFoundError(f"no isolated snapshot exists for challenge {challenge_id}")
+        snapshot = Path(str(matching[-1]["save_path"])).resolve(strict=True)
+        runtime = self.runtime_root.resolve(strict=True)
+        from hk_agent.config import load_config
+        personal = load_config(self.project_root / "config.training.local.toml", allow_training=True).personal_save_root.resolve(strict=False)
+        try:
+            snapshot.relative_to(runtime)
+        except ValueError as error:
+            raise ValueError("challenge snapshot must be inside the managed runtime") from error
+        if not snapshot.is_dir() or snapshot.is_symlink():
+            raise ValueError("challenge snapshot must be a real directory")
+        if personal and (snapshot == personal or personal in snapshot.parents or snapshot in personal.parents):
+            raise ValueError("challenge snapshot points into the personal save tree")
+        return self.restart_shared_actor(
+            str(practice["launch_id"]), reason=f"challenge practice: {challenge_id}",
+            challenge_snapshot=snapshot, challenge_context=f"{matching[-1].get('kind', 'area')}:{challenge_id}",
+        )
 
     def _wait_for_process(
         self,
@@ -2925,6 +3111,44 @@ class ControlPlane:
         origin = record.get("campaign_origin")
         return isinstance(origin, Mapping) and bool(origin.get("isolated_save_root"))
 
+    def _resume_finished_challenge_practices(self) -> None:
+        resumptions: list[str] = []
+        with self._lock:
+            self._refresh_locked()
+            for launch_id, record in self._launches.items():
+                if (record.get("role") != "actor" or not isinstance(record.get("challenge_practice"), Mapping)
+                        or record.get("challenge_return_started") is True
+                        or record.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}):
+                    continue
+                shared_value = record.get("shared_root")
+                resources = record.get("resources")
+                slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+                if not isinstance(shared_value, str) or isinstance(slot, bool) or not isinstance(slot, int):
+                    continue
+                actor_status = self._read_json(Path(shared_value) / "actors" / f"slot-{slot}.json")
+                if actor_status.get("challenge_practice_completed") is not True:
+                    continue
+                main_actor_active = any(
+                    other_id != launch_id and other.get("role") == "actor"
+                    and other.get("shared_root") == shared_value
+                    and other.get("status") in {"RUNNING", "STOP_REQUESTED", "PREPARING"}
+                    for other_id, other in self._launches.items()
+                )
+                if not main_actor_active:
+                    continue
+                record["challenge_return_started"] = True
+                launch_path = self.control_root / "launches" / launch_id / "launch.json"
+                atomic_json(launch_path, record)
+                resumptions.append(launch_id)
+        for launch_id in resumptions:
+            try:
+                self.restart_shared_actor(launch_id, reason="challenge practice reached exit criteria; return to main playthrough")
+            except (OSError, RuntimeError, TypeError, ValueError):
+                with self._lock:
+                    failed_record = self._launches.get(launch_id)
+                    if failed_record is not None:
+                        failed_record["challenge_return_started"] = False
+
     def status(self) -> dict[str, object]:
         if self.observer:
             observed = self._observer_snapshot()
@@ -2937,6 +3161,7 @@ class ControlPlane:
                 "active_launches": observed,
                 "active": observed[0] if observed else None,
             }
+        self._resume_finished_challenge_practices()
         with self._lock:
             self._refresh_locked()
             active_launches = self._active_records_locked()

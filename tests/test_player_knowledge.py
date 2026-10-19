@@ -229,3 +229,41 @@ def test_bestiary_expires_fought_instance_after_ten_missing_frames() -> None:
     assert experience.encounters == 1
     assert experience.fought_encounters == 1
     assert memory.bestiary.slots == []
+def test_challenge_events_roundtrip_and_reject_bad_values() -> None:
+    knowledge = PlayerKnowledge()
+    knowledge.update({"challenge_events": [
+        {"challenge_id": "False_Knight", "kind": "boss", "version": "v1", "attempts": 1,
+         "wins": 0, "progress": 12.0},
+        {"challenge_id": "False_Knight", "kind": "boss", "version": "v2", "success": True,
+         "progress": 15.0},
+        {"challenge_id": "bad", "kind": "unsupported", "progress": -1},
+    ]})
+    payload = knowledge.to_payload()
+    restored = PlayerKnowledge.from_payload(payload)
+    assert payload["schema_version"] == 5
+    assert restored.challenge_memory["False_Knight"] == {
+        "kind": "boss", "attempts": 2, "wins": 1, "best_progress": 15.0,
+        "best_hits": 0, "best_survival_seconds": 0.0,
+        "versions": ["v1", "v2"],
+    }
+
+
+def test_challenge_tracking_can_be_disabled_without_changing_knowledge_vector():
+    knowledge = PlayerKnowledge()
+    info = {
+        "operator_telemetry": {
+            "scene_name": "Room_Test", "visible_enemies": [{
+                "boss_confirmed": True, "boss_key": "False_Knight",
+                "boss_version": "normal", "struck_this_encounter": 0,
+            }],
+        },
+        "challenge_events": [{
+            "challenge_id": "False_Knight", "kind": "boss", "version": "normal",
+            "attempts": 1, "wins": 0, "progress": 0,
+        }],
+    }
+    before = knowledge.vector().copy()
+    knowledge.update(info, challenge_tracking_enabled=False)
+    assert knowledge.challenge_memory == {}
+    assert knowledge.new_events == []
+    assert np.array_equal(knowledge.vector(), before)

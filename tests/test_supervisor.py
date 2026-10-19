@@ -310,6 +310,7 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(captured.bestiary_events, ({
                     "enemy_type_id": "e_0123456789", "hits_dealt": 2,
                     "geo_awarded": 5, "item_awarded": False, "killed_player": False,
+                    "boss_confirmed": False,
                 },))
 
                 fallback_task = asyncio.create_task(

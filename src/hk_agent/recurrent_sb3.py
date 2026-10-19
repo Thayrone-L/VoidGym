@@ -18,6 +18,7 @@ from sb3_contrib.common.recurrent.policies import RecurrentMultiInputActorCritic
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 from sb3_contrib.ppo_recurrent import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.torch_layers import CombinedExtractor
 from torch import Tensor
 
 
@@ -94,12 +95,21 @@ class MaskableRecurrentDictRolloutBuffer(RecurrentDictRolloutBuffer):
         return MaskableRecurrentDictRolloutBufferSamples(*sample, action_masks=self.to_torch(masks))
 
 
+class IntDimensionCombinedExtractor(CombinedExtractor):
+    """Normalize Gym's NumPy dimensions before passing them to ``torch.nn.LSTM``."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._features_dim = int(self._features_dim)
+
+
 class MaskableRecurrentActorCriticPolicy(RecurrentMultiInputActorCriticPolicy):
     """sb3-contrib recurrent policy with MaskableCategorical at sampling and update time."""
 
     def __init__(self, observation_space: spaces.Space, action_space: spaces.Space, *args: Any, **kwargs: Any):
         if not isinstance(action_space, spaces.Discrete):
             raise TypeError("MaskableRecurrentPPO currently supports Discrete actions only")
+        kwargs.setdefault("features_extractor_class", IntDimensionCombinedExtractor)
         super().__init__(observation_space, action_space, *args, **kwargs)
         self.action_dist = make_masked_proba_distribution(action_space)
 
@@ -244,7 +254,9 @@ class MaskableRecurrentPPO(RecurrentPPO):
                 actions, values, log_probs, next_states = self.policy(
                     obs_tensor, lstm_states, starts, action_masks=masks
                 )
-            action_array = actions.cpu().numpy().reshape(env.num_envs, -1)
+            # Keep Discrete actions one-dimensional (n_envs,), as SB3's VecEnv
+            # expects; adding a trailing singleton makes each env receive array([a]).
+            action_array = actions.cpu().numpy()
             new_obs, rewards, dones, infos = env.step(action_array)
             self.num_timesteps += env.num_envs
             callback.update_locals(locals())

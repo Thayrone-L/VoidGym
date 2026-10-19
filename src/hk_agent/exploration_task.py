@@ -15,6 +15,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
+from hk_agent.challenge_practice import (
+    ChallengeAttempt,
+    ChallengePracticeController,
+    ChallengeSnapshot,
+    challenge_reward,
+    create_challenge_snapshot,
+)
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.player_knowledge import ITEM_FLAGS, PlayerKnowledge
 from hk_agent.run_journey import RunDiary, increment_campaign_count, rebuild_progress
@@ -510,7 +517,34 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._reload_checkpoint_next_reset = False
         self._player_knowledge = PlayerKnowledge()
         self._pending_tutorial_events: list[dict[str, Any]] = []
+        self._challenge_practice_controller: ChallengePracticeController | None = None
+        self._challenge_practice_finished = False
+        self._challenge_practice_enabled = os.environ.get(
+            "HK_AGENT_CHALLENGE_PRACTICE_ENABLED", "0"
+        ) == "1"
+        challenge_context = os.environ.get("HK_AGENT_CHALLENGE_CONTEXT")
+        challenge_snapshot = os.environ.get("HK_AGENT_CHALLENGE_SNAPSHOT")
+        if self._challenge_practice_enabled and challenge_context and challenge_snapshot:
+            kind, separator, challenge_id = challenge_context.partition(":")
+            if separator and kind in {"boss", "traversal", "item", "area"} and Path(challenge_snapshot).is_dir():
+                snapshot = ChallengeSnapshot(
+                    challenge_id, cast(Any, kind),
+                    "arena_entrance" if kind == "boss" else "challenge_room",
+                    challenge_snapshot, Path(challenge_snapshot).stat().st_mtime_ns,
+                )
+                controller = ChallengePracticeController(
+                    main_actor="actor-main", practice_actor=os.environ.get("HK_AGENT_SLOT_ID", "practice"),
+                    required_wins=2, recent_attempts=5, time_limit_seconds=3600.0,
+                )
+                controller.start(snapshot, lambda _rollout: None)
+                self._challenge_practice_controller = controller
+        self._challenge_snapshot_index: list[dict[str, Any]] = []
+        self._challenge_snapshot_root: Path | None = None
+        self._challenge_save_root = Path(os.environ["HK_AGENT_INSTANCE_DATA_ROOT"]) if os.environ.get("HK_AGENT_INSTANCE_DATA_ROOT") else None
+        self._personal_save_root = Path(os.environ["HK_AGENT_PERSONAL_ROOT"]) if os.environ.get("HK_AGENT_PERSONAL_ROOT") else None
         playthrough_root = os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
+        if playthrough_root:
+            self._challenge_snapshot_root = Path(playthrough_root).parent / "challenge-snapshots" / Path(playthrough_root).name
         self._knowledge_path = (
             Path(playthrough_root) / "player-knowledge.json"
             if playthrough_root
@@ -534,7 +568,11 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             reset_options["reload_checkpoint"] = True
             self._reload_checkpoint_next_reset = False
         observation, reset_info = self.environment.reset(seed=seed, options=reset_options)
-        self._player_knowledge.update(reset_info)
+        self._player_knowledge.update(
+            reset_info, challenge_tracking_enabled=self._challenge_practice_enabled
+        )
+        self._record_challenge_practice_events(self._player_knowledge.new_events)
+        self._capture_challenge_snapshots(self._player_knowledge.new_events, reset_info)
         self._pending_tutorial_events.extend(self._player_knowledge.new_events)
         self._persist_player_knowledge()
         descriptor = self._descriptor(observation["pixels"][-1])
@@ -666,8 +704,12 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 template.raw_action_index, lease_ms=lease
             )
         previous_skill_epoch = self._player_knowledge.skill_epoch
-        self._player_knowledge.update(base)
+        self._player_knowledge.update(
+            base, challenge_tracking_enabled=self._challenge_practice_enabled
+        )
+        self._record_challenge_practice_events(self._player_knowledge.new_events)
         tutorial_events = self._pending_tutorial_events + self._player_knowledge.new_events
+        self._capture_challenge_snapshots(self._player_knowledge.new_events, base)
         self._pending_tutorial_events = []
         self._persist_player_knowledge()
         ability_reexploration = self._player_knowledge.skill_epoch > previous_skill_epoch
@@ -737,6 +779,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "run_failed": 0.0,
             "milestone_novelty": 0.0,
             "tutorial_reward": 0.0,
+            "challenge_reward": 0.0,
             "time_cost": self.config.time_cost * (lease / self.config.lease_base_ms),
         }
         base_done = terminated or truncated
@@ -978,6 +1021,24 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 award = min(requested, max(0.0, 20.0 - self._milestone_paid))
                 components["tutorial_reward"] += award
                 self._milestone_paid += award
+            challenge_hits = 0
+            survival_record = False
+            challenge_success = False
+            for event in tutorial_events:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") == "challenge_hit":
+                    delta = event.get("hit_delta", 0)
+                    if isinstance(delta, int) and not isinstance(delta, bool) and delta > 0:
+                        challenge_hits += min(delta, 3)
+                elif event.get("event") == "challenge_attempt":
+                    survival_record |= event.get("survival_improvement") is True
+                    challenge_success |= event.get("success") is True
+            challenge_components = challenge_reward(
+                kind="boss", hit_delta=min(challenge_hits, 3),
+                survival_improvement=survival_record, success=challenge_success,
+            )
+            components["challenge_reward"] = sum(challenge_components.values())
         self._kills_paid += components["confirmed_enemy_kills"]
         components["shade_recovered"] = 0.0 if self._shade_paid else combat["shade_recovered"]
         self._shade_paid |= components["shade_recovered"] > 0
@@ -1174,6 +1235,11 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "scene_detector_audit": changed,
             "farm_alerts": farm_alerts,
             "player_knowledge_events": tutorial_events,
+            "challenge_practice": (
+                self._challenge_practice_controller.status()
+                if self._challenge_practice_controller is not None else None
+            ),
+            "challenge_practice_finished": self._challenge_practice_finished,
         }
         if episode_progress is not None:
             info["episode_progress"] = episode_progress
@@ -1214,6 +1280,78 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 hint_level=self.config.tutorial_hint_level
             )
         return result
+
+    def _capture_challenge_snapshots(
+        self, events: list[dict[str, Any]], info: dict[str, Any]
+    ) -> None:
+        if not self._challenge_practice_enabled:
+            return
+        if self._challenge_save_root is None or self._challenge_snapshot_root is None or self._personal_save_root is None:
+            return
+        requests: list[tuple[str, str, str, dict[str, Any] | None]] = []
+        for event in events:
+            if event.get("event") == "challenge_started" and event.get("snapshot_requested") is True:
+                key, kind = event.get("challenge_id"), event.get("kind")
+                if isinstance(key, str) and kind in {"boss", "traversal", "item", "area"}:
+                    requests.append((key, cast(str, kind), "arena_entrance" if kind == "boss" else "challenge_room", event))
+        raw_milestones = info.get("milestone_events_since_last_frame", [])
+        if isinstance(raw_milestones, list) and any(
+            isinstance(item, dict) and item.get("category") == "checkpoint"
+            and item.get("confirmed") is True for item in raw_milestones
+        ):
+            requests.append(("last-bench", "area", "last_bench", None))
+        for challenge_id, kind, source, snapshot_event in requests:
+            try:
+                snapshot = create_challenge_snapshot(
+                    challenge_id=challenge_id, kind=cast(Any, kind), source=cast(Any, source),
+                    save_root=self._challenge_save_root, snapshot_root=self._challenge_snapshot_root,
+                    personal_root=self._personal_save_root, max_snapshots=32,
+                )
+                entry = {
+                    "challenge_id": challenge_id, "kind": kind, "source": source,
+                    "save_path": snapshot.save_path, "created_ns": snapshot.created_ns,
+                }
+                self._challenge_snapshot_index.append(entry)
+                del self._challenge_snapshot_index[:-32]
+                if snapshot_event is not None:
+                    snapshot_event["snapshot_path"] = snapshot.save_path
+                index_path = self._challenge_snapshot_root / "index.json"
+                index_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = index_path.with_name(f".{index_path.name}.{os.getpid()}.tmp")
+                temporary.write_text(json.dumps({"schema_version": 1, "snapshots": self._challenge_snapshot_index}, allow_nan=False), encoding="utf-8", newline="\n")
+                os.replace(temporary, index_path)
+            except (OSError, ValueError, RuntimeError) as error:
+                if snapshot_event is not None:
+                    snapshot_event["snapshot_error"] = type(error).__name__
+
+    def _record_challenge_practice_events(self, events: list[dict[str, Any]]) -> None:
+        controller = self._challenge_practice_controller
+        if controller is None or self._challenge_practice_finished:
+            return
+        for event in events:
+            if event.get("event") != "challenge_attempt":
+                continue
+            challenge_id = event.get("challenge_id")
+            kind = event.get("kind")
+            version = event.get("version", "unknown")
+            snapshot = controller.snapshot
+            if snapshot is None or challenge_id != snapshot.challenge_id or kind != snapshot.kind:
+                continue
+            if not isinstance(challenge_id, str) or not isinstance(kind, str) or not isinstance(version, str):
+                continue
+            attempt = ChallengeAttempt(
+                challenge_id=challenge_id, kind=cast(Any, kind), version=version,
+                duration_seconds=float(event.get("duration_seconds", 0.0) or 0.0),
+                hits=int(event.get("hits", 0) or 0),
+                progress=float(event.get("progress", 0.0) or 0.0),
+                success=event.get("success") is True,
+            )
+            if controller.record_attempt(attempt):
+                self._challenge_practice_finished = True
+                break
+        if controller.should_exit():
+            controller.active = False
+            self._challenge_practice_finished = True
 
     def _persist_player_knowledge(self) -> None:
         if self._knowledge_path is None:
