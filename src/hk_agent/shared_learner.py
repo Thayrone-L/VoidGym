@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -20,7 +21,7 @@ from hk_agent.policy_artifact import export_policy_artifact, import_policy_artif
 MAX_ROLLOUT_BYTES = 512 * 1024 * 1024
 LEARNER_STALE_SECONDS = 300.0
 ACTOR_HEARTBEAT_STALE_SECONDS = 90.0
-DEFAULT_STRAGGLER_TIMEOUT_SECONDS = 45.0
+DEFAULT_STRAGGLER_TIMEOUT_SECONDS = 300.0
 SHARED_SCHEMA_VERSION = 1
 
 
@@ -260,6 +261,12 @@ class SharedRoundStore:
             current = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError):
             current = {}
+        waiting_since = current.get("waiting_policy_since_unix_ns")
+        if status == "WAITING_POLICY":
+            if current.get("status") != "WAITING_POLICY" or not isinstance(waiting_since, int):
+                waiting_since = time.time_ns()
+        else:
+            waiting_since = None
         if current.get("status") == "RESTARTING" and current.get("launch_id") == launch_id:
             return False
         if current.get("launch_id") not in (None, launch_id) and current.get("status") not in {
@@ -269,6 +276,7 @@ class SharedRoundStore:
         _atomic_json(path, {
             **current, **values, "slot": slot, "launch_id": launch_id,
             "status": status, "heartbeat_unix_ns": time.time_ns(),
+            "waiting_policy_since_unix_ns": waiting_since,
         })
         return True
 
@@ -819,8 +827,6 @@ class SharedRoundStore:
             if len(accepted) >= actors:
                 break
             availability = [self.actor_available(slot) for slot in range(actors)]
-            if not accepted and availability and all(value is False for value in availability):
-                raise TimeoutError("all shared actor slots are unavailable before the first rollout")
             if first_rollout_at is not None:
                 unavailable = [slot for slot in range(actors)
                                if slot not in accepted and availability[slot] is False]
@@ -1220,6 +1226,16 @@ def run_shared_actor(
             self.last_heartbeat = 0.0
             self.resets = 0
             self.latest_episode_progress: dict[str, Any] = {}
+            self.max_progress_by_scene: dict[str, float] = {}
+            previous_actor = store._read_actor_status(slot)
+            previous_progress = previous_actor.get("max_progress_by_scene")
+            if isinstance(previous_progress, Mapping):
+                self.max_progress_by_scene = {
+                    str(scene): float(value) for scene, value in previous_progress.items()
+                    if isinstance(scene, str) and isinstance(value, (int, float))
+                    and not isinstance(value, bool) and math.isfinite(float(value)) and value >= 0
+                }
+            self.action_counts: dict[str, int] = {}
             self.farm_alerts: set[str] = set()
             self.challenge_practice_completed = False
             self.challenge_practice_status: dict[str, Any] = {}
@@ -1239,6 +1255,16 @@ def run_shared_actor(
                 for info in infos:
                     if not isinstance(info, Mapping):
                         continue
+                    room_progress = info.get("max_progress_by_scene")
+                    if isinstance(room_progress, Mapping):
+                        for scene, value in room_progress.items():
+                            if isinstance(scene, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                                self.max_progress_by_scene[scene] = max(
+                                    self.max_progress_by_scene.get(scene, 0.0), float(value)
+                                )
+                    action_name = info.get("task_action")
+                    if isinstance(action_name, str):
+                        self.action_counts[action_name] = self.action_counts.get(action_name, 0) + 1
                     task_profile = info.get("actor_step_profile_ms")
                     if isinstance(task_profile, Mapping):
                         self.profile_steps += 1
@@ -1271,6 +1297,8 @@ def run_shared_actor(
                     slot=slot, launch_id=launch_id, status="COLLECTING",
                     round=self.round_number, collected_steps=self.n_calls,
                     episode_progress=self.latest_episode_progress,
+                    max_progress_by_scene=self.max_progress_by_scene,
+                    action_counts=self.action_counts,
                     farm_alerts=sorted(self.farm_alerts),
                     challenge_context=os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
                     game_version=_environment_game_version(environment),
@@ -1350,7 +1378,7 @@ def run_shared_actor(
                 break
             beat = learner_status.get("heartbeat_unix_ns")
             if not isinstance(beat, int) or (time.time_ns() - beat) / 1_000_000_000 > LEARNER_STALE_SECONDS:
-                status["status"] = "CANCELLED"
+                status["status"] = "FAILED"
                 status["failure"] = "learner heartbeat expired"
                 break
             policy_path = store.policy_root / f"round-{round_number:08d}.json"
@@ -1485,6 +1513,13 @@ def run_shared_actor(
                 "wait_policy_ms": wait_policy_ms, "collect_ms": collect_ms,
                 "publish_ms": publish_ms, "stale_rollouts": 0,
                 "step_profile_ms": callback.step_profile_ms,
+                "max_progress_by_scene": callback.max_progress_by_scene,
+                "action_counts": callback.action_counts,
+                "action_entropy": -sum(
+                    (count / max(1, sum(callback.action_counts.values())))
+                    * math.log(count / max(1, sum(callback.action_counts.values())))
+                    for count in callback.action_counts.values() if count > 0
+                ),
                 "relaunches": int(
                     bool(os.environ.get("HK_AGENT_RESTART_OF"))
                     and not status.get("relaunch_recorded")
@@ -1573,7 +1608,7 @@ def run_shared_learner(
     seed: int = 7,
     torch_threads: int = 3,
     torch_interop_threads: int = 1,
-    rollout_timeout_seconds: float = 600.0,
+    rollout_timeout_seconds: float = 3900.0,
     straggler_timeout_seconds: float = DEFAULT_STRAGGLER_TIMEOUT_SECONDS,
     warm_start_checkpoint: Path | None = None,
     warm_start_source_campaign: str | None = None,

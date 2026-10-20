@@ -26,7 +26,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--torch-threads", type=int, default=3)
     parser.add_argument("--torch-interop-threads", type=int, default=1)
-    parser.add_argument("--rollout-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--rollout-timeout-seconds", type=float, default=3900.0)
     parser.add_argument("--straggler-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--warm-start-checkpoint", type=Path)
     parser.add_argument("--warm-start-source-campaign")

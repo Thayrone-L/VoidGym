@@ -368,7 +368,7 @@ class CampaignSpec:
             evaluation_interval=_bounded_int(payload.get("evaluation_interval", 20), "evaluation_interval", 1, 10_000) if campaign_type == "exploration_training" else 20,
             tutorial_hint_level=_bounded_int(payload.get("tutorial_hint_level", 0), "tutorial_hint_level", 0, 1) if campaign_type == "exploration_training" else 0,
             straggler_timeout_seconds=_bounded_float(
-                payload.get("straggler_timeout_seconds", 45.0),
+                payload.get("straggler_timeout_seconds", 300.0),
                 "straggler_timeout_seconds", 1.0, 300.0,
             ) if shared_learner else 45.0,
             challenge_practice_enabled=challenge_practice_enabled,
@@ -462,6 +462,7 @@ class ControlPlane:
         self._slot_owners: dict[int, str] = {}
         self._shared_actor_restarts: dict[str, list[float]] = {}
         self._shared_actor_supervision: set[str] = set()
+        self._shared_failed_learners: set[str] = set()
         self._slot_fences: dict[int, str] = {}
         self.observer = observer
         self._system_cpu_previous: tuple[int, int] | None = None
@@ -989,11 +990,25 @@ class ControlPlane:
             alerts.append("Sem novas salas descobertas nas últimas 2 h")
         restart_count = 0
         instance_rows: list[dict[str, object]] = []
+        max_room_progress: dict[str, Any] = {"scene": None, "distance": None}
         shared_root_for_slots = shared_root
         if shared_root_for_slots is not None:
             actors_root = shared_root_for_slots / "actors"
             for slot_file in actors_root.glob("slot-*.json"):
                 actor = self._read_json(slot_file)
+                if actor.get("status") == "WAITING_POLICY":
+                    waiting_since = actor.get("waiting_policy_since_unix_ns")
+                    if (isinstance(waiting_since, int) and not isinstance(waiting_since, bool)
+                            and (now_ns - waiting_since) / 1_000_000_000 > 600):
+                        alerts.append(f"Instância {actor.get('slot')} aguarda política há mais de 10 min")
+                progress_by_scene = actor.get("max_progress_by_scene")
+                if isinstance(progress_by_scene, Mapping):
+                    for scene, distance in progress_by_scene.items():
+                        if (isinstance(scene, str) and isinstance(distance, (int, float))
+                                and not isinstance(distance, bool) and math.isfinite(float(distance))
+                                and (max_room_progress["distance"] is None
+                                     or float(distance) > float(max_room_progress["distance"]))):
+                            max_room_progress = {"scene": scene, "distance": float(distance)}
                 restart_times = actor.get("restart_times_unix_ns", [])
                 recent_restarts = [stamp for stamp in restart_times if isinstance(stamp, int) and stamp >= now_ns - 3_600_000_000_000] if isinstance(restart_times, list) else []
                 restart_count += len(recent_restarts)
@@ -1051,6 +1066,16 @@ class ControlPlane:
                             alerts.append(alert)
         if "same_scene_action_over_40_percent_without_novelty" in alerts:
             alerts[alerts.index("same_scene_action_over_40_percent_without_novelty")] = "A IA parece estar repetindo o mesmo lugar"
+        active_learner_groups = {
+            row.get("shared_group") for row in active_records
+            if row.get("role") == "learner" and isinstance(row.get("shared_group"), str)
+        }
+        for failed_learner in self._campaign_launch_records(campaign_id or "") if campaign_id else []:
+            if (failed_learner.get("role") == "learner" and failed_learner.get("status") == "FAILED"
+                    and (not active_learner_groups
+                         or failed_learner.get("shared_group") in active_learner_groups)):
+                detail = failed_learner.get("failure") or "erro não informado"
+                alerts.append(f"learner caiu: {detail}")
         alerts = [
             f"Componente dominante no alerta de farm: {item.removeprefix('farm_component:')}"
             if item.startswith("farm_component:") else item
@@ -1061,6 +1086,7 @@ class ControlPlane:
         return {
             "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
             "actor_performance": actor_performance,
+            "max_room_progress": max_room_progress,
             "remaining_seconds": remaining_seconds, "instances": instance_rows,
             "training_steps": completed_timesteps, "steps_per_second": completed_timesteps / max(elapsed_seconds, 1.0),
             "learner_updates": learner_round, "updates_per_hour": learner_round / hours,
@@ -1834,6 +1860,9 @@ class ControlPlane:
                          "name": f"{str(prior.get('name', 'Exploration'))[:55]} v4",
                          "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31-1),
                          "reward_version": "explore_v4"})
+            # Panel-created retries should retain the established long
+            # straggler allowance instead of an older 45-second default.
+            data["straggler_timeout_seconds"] = 300.0
             if source_version == "explore_v3":
                 data["warm_start_checkpoint"] = str(checkpoints[-1])
                 data["warm_start_source_campaign"] = campaign_id
@@ -3357,6 +3386,55 @@ class ControlPlane:
                 with self._lock:
                     self._shared_actor_supervision.discard(launch_id)
 
+    def _supervise_failed_shared_learners(self) -> None:
+        """Stop actors cleanly when their shared learner fails or stalls."""
+        actors_to_stop: list[str] = []
+        with self._lock:
+            self._refresh_locked()
+            for learner_id, learner in self._launches.items():
+                group = learner.get("shared_group")
+                shared_root = learner.get("shared_root")
+                if (learner.get("role") != "learner" or not isinstance(group, str)
+                        or not isinstance(shared_root, str) or group in self._shared_failed_learners):
+                    continue
+                learner_status = self._read_json(Path(shared_root) / "learner.json")
+                failure = learner.get("failure") or learner_status.get("failure")
+                failed = learner.get("status") == "FAILED" or learner_status.get("status") == "FAILED"
+                beat = learner_status.get("heartbeat_unix_ns")
+                wait_ms = learner_status.get("last_wait_rollouts_ms", 0.0)
+                train_ms = learner_status.get("last_train_ms", 0.0)
+                straggler_ms = learner_status.get("last_straggler_wait_ms", 0.0)
+                expected_round = sum(
+                    float(value) / 1000.0
+                    for value in (wait_ms, train_ms, straggler_ms)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                )
+                stale_after = max(120.0, 2.0 * expected_round) if expected_round else 300.0
+                stale = (
+                    isinstance(beat, int) and not isinstance(beat, bool)
+                    and (time.time_ns() - beat) / 1_000_000_000 > stale_after
+                )
+                if not failed and learner.get("status") in {"RUNNING", "STARTING"} and stale:
+                    failure = f"learner heartbeat expirou após {stale_after:.0f}s"
+                    learner_status.update({"status": "FAILED", "failure": failure})
+                    atomic_json(Path(shared_root) / "learner.json", learner_status)
+                    learner.update({"status": "FAILED", "failure": failure,
+                                    "finished_unix_ns": time.time_ns()})
+                    atomic_json(self.control_root / "launches" / learner_id / "launch.json", learner)
+                    failed = True
+                if not failed:
+                    continue
+                self._shared_failed_learners.add(group)
+                for actor_id, actor in self._launches.items():
+                    if (actor.get("role") == "actor" and actor.get("shared_group") == group
+                            and actor.get("status") in {"RUNNING", "STARTING"}):
+                        actors_to_stop.append(actor_id)
+        for actor_id in actors_to_stop:
+            try:
+                self.stop(actor_id, _shared_member=True)
+            except (RuntimeError, ValueError):
+                pass
+
     def status(self) -> dict[str, object]:
         if self.observer:
             observed = self._observer_snapshot()
@@ -3369,6 +3447,7 @@ class ControlPlane:
                 "active_launches": observed,
                 "active": observed[0] if observed else None,
             }
+        self._supervise_failed_shared_learners()
         self._supervise_failed_shared_actors()
         self._resume_finished_challenge_practices()
         with self._lock:

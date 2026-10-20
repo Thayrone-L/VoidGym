@@ -436,6 +436,24 @@ def test_v3_stuck_truncates_after_threshold_but_progress_resets_timer(tmp_path: 
     assert truncated
     assert final["termination_reason"] == "stuck"
     assert final["episode_progress"]["termination_reason"] == "stuck"
+    assert task._reload_checkpoint_next_reset is False
+
+
+def test_journey_episode_ids_continue_after_actor_process_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HK_AGENT_JOURNEY_ROOT", str(tmp_path / "journey"))
+    monkeypatch.setenv("HK_AGENT_SLOT_ID", "7")
+    first = ExplorationTask(_Environment(), config=_v3_config())
+    first.reset()
+    first.close()
+    second = ExplorationTask(_Environment(), config=_v3_config())
+    second.reset()
+    second.close()
+
+    actor_diary = tmp_path / "journey" / "actor-7"
+    assert (actor_diary / "episode-1.json").is_file()
+    assert (actor_diary / "episode-2.json").is_file()
 
 
 def test_v3_alert_thresholds_and_return_bounds() -> None:

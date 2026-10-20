@@ -529,6 +529,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._episode_total_reward = 0.0
         self._evaluation_mode = False
         self._episode_number = 0
+        self._scene_origins: dict[str, tuple[float, float]] = {}
+        self._scene_max_progress: dict[str, float] = {}
         self._pending_log_records: list[bytes] = []
         self._last_log_flush = time.monotonic()
         self._last_knowledge_persist_step = -32
@@ -540,6 +542,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         journey_value = os.environ.get("HK_AGENT_JOURNEY_ROOT")
         self._journey_root = Path(journey_value) if journey_value else None
         self._journey_actor = os.environ.get("HK_AGENT_SLOT_ID", "0")
+        if self._journey_root is not None:
+            actor_diary = self._journey_root / f"actor-{self._journey_actor}"
+            prior_episodes = [
+                int(path.stem.removeprefix("episode-"))
+                for path in actor_diary.glob("episode-*.json")
+                if path.stem.removeprefix("episode-").isdigit()
+            ]
+            self._episode_number = max(prior_episodes, default=0)
         self._diary: RunDiary | None = None
         self._reload_checkpoint_next_reset = False
         self._player_knowledge = PlayerKnowledge()
@@ -710,6 +720,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             initial_telemetry = reset_info.get("operator_telemetry", {})
             initial_record = dict(initial_telemetry) if isinstance(initial_telemetry, dict) else {}
+            initial_position = _player_position(initial_record)
+            if self._previous_scene_name and initial_position is not None:
+                self._scene_origins.setdefault(self._previous_scene_name, initial_position)
+                self._scene_max_progress.setdefault(self._previous_scene_name, 0.0)
             initial_record.setdefault("scene_name", self._previous_scene_name)
             initial_events = initial_record.get("milestone_events_since_last_frame", [])
             initial_record["events"] = (
@@ -870,6 +884,32 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}
             else None
         )
+        telemetry_for_position = base.get("operator_telemetry")
+        position = (
+            _player_position(telemetry_for_position)
+            if isinstance(telemetry_for_position, Mapping) else None
+        )
+        current_scene = base.get("scene_name")
+        if self.config.continuous_playthrough:
+            if isinstance(current_scene, str) and position is not None:
+                cell_key = hashlib.sha256((
+                    f"position:{current_scene}:{math.floor(position[0] / 4.0)}:"
+                    f"{math.floor(position[1] / 4.0)}"
+                ).encode()).hexdigest()
+                novelty_hash = cell_key
+                eligible = eligible and self._lifelong_visits.get(cell_key, 0) == 0
+            else:
+                # Without reliable player coordinates, visual changes alone
+                # are insufficient evidence that the agent reached a new place.
+                eligible = False
+        if isinstance(current_scene, str) and position is not None:
+            origin = self._scene_origins.setdefault(current_scene, position)
+            room_progress_distance = math.hypot(
+                position[0] - origin[0], position[1] - origin[1]
+            )
+            self._scene_max_progress[current_scene] = max(
+                self._scene_max_progress.get(current_scene, 0.0), room_progress_distance
+            )
         if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             stable_candidate = (
                 self._novelty_candidate_descriptor is not None
@@ -1287,11 +1327,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             and not base_done
             and not terminal_penalty
         )
-        if stuck:
-            # The next PPO slice reopens through the validated Continue plan,
-            # loading the game's last committed checkpoint instead of replaying
-            # the campaign seed. The owner closes the current process safely.
-            self._reload_checkpoint_next_reset = True
+        # A stuck PPO slice ends without reloading the last bench. The live
+        # game session preserves unsaved player progress.
         horizon = self._steps >= self.config.horizon_steps
         task_terminated = terminated or terminal_penalty
         task_truncated = truncated or ((horizon or stuck) and not task_terminated)
@@ -1334,6 +1371,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "steps_to_first_scene_change": self._steps_to_first_scene,
                 "termination_reason": termination_reason,
                 "return": self._episode_total_reward,
+                "max_progress_by_scene": dict(self._scene_max_progress),
             }
         info: dict[str, Any] = {
             "valid": True,
@@ -1348,6 +1386,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "visual_quality": [luma, dark_fraction, white_fraction, entropy],
             **audit,
             "novelty_eligible": eligible,
+            "max_progress_by_scene": dict(self._scene_max_progress),
+            "task_action": template.name,
             "scene_detector_audit": changed,
             "farm_alerts": farm_alerts,
             "player_knowledge_events": tutorial_events,
@@ -1825,6 +1865,15 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._last_log_flush = time.monotonic()
         finally:
             os.close(fd)
+
+
+def _player_position(value: Mapping[str, Any]) -> tuple[float, float] | None:
+    x, y = value.get("x"), value.get("y")
+    if (isinstance(x, bool) or isinstance(y, bool)
+            or not isinstance(x, (int, float)) or not isinstance(y, (int, float))
+            or not math.isfinite(float(x)) or not math.isfinite(float(y))):
+        return None
+    return float(x), float(y)
 
 
 def _descriptor_config() -> SceneChangeTaskConfig:

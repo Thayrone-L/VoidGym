@@ -67,6 +67,56 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert first["save_slot"] == 1
 
 
+def test_continue_campaign_resumes_latest_checkpoint_with_long_straggler_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    shared = runtime / "shared" / "jogada-1"
+    checkpoints = shared / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    checkpoint = checkpoints / "round-00000074.zip"
+    checkpoint.write_bytes(b"checkpoint")
+    control = ControlPlane(_project(tmp_path), runtime_root=runtime)
+    monkeypatch.setattr(control, "list_campaigns", lambda: [{
+        "campaign_id": "jogada-1", "version": 18, "name": "jogada-1 v4",
+        "campaign_type": "exploration_training", "reward_version": "explore_v4",
+        "shared_learner": True, "seed": 23, "straggler_timeout_seconds": 45.0,
+    }])
+    created: list[dict[str, object]] = []
+    monkeypatch.setattr(control, "create_campaign", lambda payload: created.append(dict(payload)) or {
+        "campaign_id": "jogada-1", "version": 19,
+    })
+    monkeypatch.setattr(control, "launch", lambda *args, **kwargs: {"status": "RUNNING"})
+
+    result = control.continue_operator_campaign()
+
+    assert result["checkpoint"] == str(checkpoint)
+    assert created[0]["straggler_timeout_seconds"] == 300.0
+    assert "warm_start_checkpoint" not in created[0]
+
+
+def test_failed_shared_learner_stops_its_actor_slots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    control = ControlPlane(_project(tmp_path), runtime_root=tmp_path / "runtime")
+    shared = tmp_path / "runtime" / "shared" / "campaign"
+    shared.mkdir(parents=True)
+    (shared / "learner.json").write_text(json.dumps({
+        "status": "FAILED", "failure": "synthetic learner failure",
+    }), encoding="utf-8")
+    control._launches = {
+        "learner-1": {"role": "learner", "campaign_id": "campaign",
+                       "shared_group": "campaign-v0001", "shared_root": str(shared),
+                       "status": "FAILED", "failure": "synthetic learner failure"},
+        "actor-1": {"role": "actor", "shared_group": "campaign-v0001", "status": "RUNNING"},
+    }
+    monkeypatch.setattr(control, "_refresh_locked", lambda: None)
+    stopped: list[str] = []
+    monkeypatch.setattr(control, "stop", lambda launch_id, **kwargs: stopped.append(launch_id))
+
+    control._supervise_failed_shared_learners()
+
+    assert stopped == ["actor-1"]
+
+
 def test_map_matching_prefers_capture_with_scene_bounds() -> None:
     from hk_agent.control_plane import _preferred_map_capture
 
@@ -114,10 +164,13 @@ def test_operator_snapshot_surfaces_persisted_actor_restart(
     monkeypatch.setattr(control, "_campaign_launch_records", lambda _campaign: [
         {"campaign_id": "campaign", "launch_id": "actor-old", "resources": {"slot_id": 1}},
         {"campaign_id": "campaign", "launch_id": "actor-new", "resources": {"slot_id": 1}},
+        {"campaign_id": "campaign", "launch_id": "learner-old", "role": "learner",
+         "shared_group": "campaign-v0000", "status": "FAILED", "failure": "old failure"},
     ])
     monkeypatch.setattr(control, "map_art_status", lambda: {"cached": False})
 
     snapshot = control.operator_snapshot()
+    assert not any(alert.startswith("learner caiu:") for alert in snapshot["alerts"])
 
     assert "Instância 1 foi relançada automaticamente (1/3 nesta hora)" in snapshot["alerts"]
     assert snapshot["instance_restarts_last_hour"] == 1
