@@ -1,0 +1,29 @@
+PROMPT 71 — AVISOS CLAROS NO PAINEL
+====================================
+
+Implementado no checkout C:\VoidGym, branch codex/parallel-instances-isolation.
+
+Mudanças
+--------
+- A API /api/operator agora retorna status_banner com estados vermelho, amarelo, verde e parado; o alerta inclui rodada e passos/s durante execução.
+- Falhas usam o motivo legível e a última linha do process.log do learner/ator em detalhes técnicos expansíveis; heartbeat expirado não oculta a exceção do processo.
+- Instâncias CANCELLED/FAILED expõem o motivo junto ao status. Alertas de relançamento, travada persistente, recompensa zerada, espera por política e pedidos de ajuda alimentam a faixa amarela.
+- Erros de iniciar/continuar/repetir e falhas de conexão aparecem na própria faixa. O toast do Windows era opcional e não foi incluído.
+- A validação de /api/operator/start aceita os campos help_stuck_count/help_stuck_minutes. O início de jogada-1 não pede warm-start quando já existe checkpoint no destino.
+- No trabalho associado 69/70, preservei cabeças de política por nome ao expandir ações e corrigi a fronteira de player_knowledge do schema 9.
+
+Validação
+---------
+- `pytest tests/test_operator_dashboard.py tests/test_shared_learner.py tests/test_exploration_task.py tests/test_action_masking.py tests/test_challenge_practice.py -q`: 104 passed.
+- `pytest -q`: 657 passed, 2 skipped, 3 warnings, 8 subtests passed. Executado antes do último caso de teste para alerta de travada; o lote final direcionado, já com esse caso, passou.
+- `ruff check src tools tests`: passou.
+- `mypy src`: passou, 54 arquivos.
+- `git diff --check`: passou.
+- Checagem visual: painel reaberto em http://127.0.0.1:8765; faixa vermelha exibiu o erro real `SharedLearnerError: warm-start campaigns must use a new shared checkpoint directory` em detalhes expansíveis.
+- Regressão da API enviou os dois parâmetros de ajuda ao start e recebeu o 403 esperado por `allow_execute=False`, sem rejeição de campos desconhecidos. GET /api/operator retornou status_banner.
+
+Execução e pendências
+--------------------
+- O painel foi encerrado e reaberto em 127.0.0.1:8765 sem `--allow-execute`; nenhum jogo ou campanha foi iniciado.
+- Por isso não fiz soak em jogo nem validei a correção com janelas reais. O painel mostra a falha histórica da campanha `jogada-1`; um novo start, com o diretório já ocupado, não deve configurar warm-start e tem teste de regressão.
+- Notificações do Windows não foram implementadas, pois eram opcionais.

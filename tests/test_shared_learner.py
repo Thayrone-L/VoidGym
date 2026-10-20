@@ -22,9 +22,19 @@ from hk_agent.shared_learner import (
     actor_join_round,
     run_deterministic_evaluation,
     train_shared_round,
+    zero_reward_fraction,
 )
 
 FINGERPRINT = "a" * 64
+
+
+def test_zero_reward_fraction_aggregates_all_actor_rollouts() -> None:
+    fraction = zero_reward_fraction([
+        {"rewards": np.array([0.0, 0.0, -0.001], dtype=np.float32)},
+        {"rewards": np.array([0.0, 0.0, 0.0], dtype=np.float32)},
+    ])
+    assert fraction == pytest.approx(5 / 6)
+    assert zero_reward_fraction([]) == 0.0
 
 
 def _tiny_torch_policy():
@@ -469,13 +479,24 @@ def test_two_actor_rollouts_fill_and_train_one_learner_buffer(tmp_path):
     assert model.rollout_buffer.n_envs == 2
 
 
-def test_v3_to_v4_warm_start_accepts_equal_spaces_and_rejects_mismatch():
-    observation = gym.spaces.Dict({"pixels": gym.spaces.Box(0, 255, (4, 10, 12, 3), dtype=np.uint8)})
+def test_v3_to_v4_warm_start_accepts_action_growth_and_rejects_observation_mismatch():
+    observation = gym.spaces.Dict({
+        "pixels": gym.spaces.Box(0, 255, (4, 10, 12, 3), dtype=np.uint8),
+        "action_history": gym.spaces.MultiDiscrete(np.full(5, 30)),
+    })
+    expanded_observation = gym.spaces.Dict({
+        "pixels": gym.spaces.Box(0, 255, (4, 10, 12, 3), dtype=np.uint8),
+        "action_history": gym.spaces.MultiDiscrete(np.full(5, 33)),
+    })
     actions = gym.spaces.Discrete(30)
-    shared.validate_warm_start_spaces(observation, actions, observation, actions)
-    different_actions = gym.spaces.Discrete(29)
-    with pytest.raises(SharedLearnerError, match="spaces differ"):
-        shared.validate_warm_start_spaces(observation, actions, observation, different_actions)
+    shared.validate_warm_start_spaces(observation, actions, expanded_observation, gym.spaces.Discrete(33))
+    with pytest.raises(SharedLearnerError, match="observation spaces differ"):
+        shared.validate_warm_start_spaces(observation, actions,
+            gym.spaces.Dict({"pixels": gym.spaces.Box(0, 255, (4, 10, 12, 4), dtype=np.uint8),
+                             "action_history": gym.spaces.MultiDiscrete(np.full(5, 33))}),
+            gym.spaces.Discrete(33))
+    with pytest.raises(SharedLearnerError, match="action spaces differ"):
+        shared.validate_warm_start_spaces(observation, actions, expanded_observation, gym.spaces.Discrete(29))
 
 
 def test_partial_warm_start_copies_compatible_visual_tensors_only():
@@ -489,7 +510,21 @@ def test_partial_warm_start_copies_compatible_visual_tensors_only():
         "new_observation_projection.weight": np.zeros((16, 4)),
     }
     copied = shared.compatible_warm_start_state(source, target)
-    assert list(copied) == ["features_extractor.image.cnn.weight"]
+    assert list(copied) == ["features_extractor.image.cnn.weight", "action_net.weight"]
+    assert np.array_equal(copied["action_net.weight"][:8], source["action_net.weight"])
+    assert np.array_equal(copied["action_net.weight"][8:], np.zeros((2, 16)))
+
+
+def test_warm_start_action_heads_are_remapped_by_name_when_indexes_shift():
+    source = {"features_extractor.cnn.weight": np.ones((2, 3)),
+              "action_net.weight": np.array([[1.0], [2.0]])}
+    target = {"features_extractor.cnn.weight": np.zeros((2, 3)),
+              "action_net.weight": np.zeros((3, 1))}
+    copied = shared.compatible_warm_start_state(
+        source, target, source_action_names=["LEFT", "ATTACK"],
+        target_action_names=["LEFT", "JUMP_MAX", "ATTACK"],
+    )
+    assert np.array_equal(copied["action_net.weight"], np.array([[1.0], [0.0], [2.0]]))
 
 
 def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path, monkeypatch):
@@ -546,9 +581,9 @@ def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path,
         model, tmp_path, store, actor_slots=[0], round_number=20, manifest=manifest,
         enabled=True,
     )
-    assert rows == []
-    assert calls == [pytest.approx(0.25)]
+    assert len(rows) == 1 and rows[0]["weight"] == pytest.approx(0.025)
+    assert calls == [pytest.approx(0.25), pytest.approx(0.025)]
     assert shared.apply_context_demonstrations(
         model, tmp_path, store, actor_slots=[0], round_number=21, manifest=manifest,
     ) == []
-    assert calls == [pytest.approx(0.25)]
+    assert calls == [pytest.approx(0.25), pytest.approx(0.025)]

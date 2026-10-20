@@ -17,12 +17,15 @@ from hk_agent.challenge_practice import (
 )
 from hk_agent.demonstrations import (
     DemonstrationRecorder,
+    HelpRequestLedger,
     HelpTriggerConfig,
+    augment_demonstration_batch,
     combine_ppo_and_imitation,
     demonstration_batch,
     help_request,
     imitation_schedule,
     load_demonstration,
+    map_human_action,
     masked_behavioral_cloning_loss,
 )
 
@@ -193,5 +196,98 @@ def test_human_demo_is_context_and_version_bound_with_masked_bc_loss(tmp_path) -
     loss = masked_behavioral_cloning_loss(logits, __import__("torch").tensor([0]), masks)
     assert loss.item() == pytest.approx(0.0)
     assert combine_ppo_and_imitation(loss, loss + 1, weight=0.5).item() == pytest.approx(0.5)
-    assert [imitation_schedule(initial_weight=0.5, decay_rounds=4, round_number=i) for i in range(5)] == [0.5, 0.375, 0.25, 0.125, 0.0]
+    assert [imitation_schedule(initial_weight=0.5, decay_rounds=4, round_number=i, samples_in_bank=64) for i in range(5)] == [0.5, 0.375, 0.25, 0.125, 0.0]
+    assert imitation_schedule(initial_weight=0.5, decay_rounds=4, round_number=100, samples_in_bank=3) == pytest.approx(0.05)
+
+
+def test_help_ledger_requests_early_same_cell_caps_per_hour_and_survives_restart(tmp_path) -> None:
+    config = HelpTriggerConfig(repeated_stuck_count=2, requests_per_hour=1)
+    ledger = HelpRequestLedger(tmp_path, slot=0, config=config)
+    assert ledger.record_stuck(scene="King_Passage", cell=(3, 5), progress=2.0, now=1000) is None
+    request = ledger.record_stuck(scene="King_Passage", cell=(3, 5), progress=2.0, now=1100)
+    assert request is not None and request["status"] == "pending"
+    assert "Instância 1 pede ajuda" in request["message"]
+    restored = HelpRequestLedger(tmp_path, slot=0, config=config)
+    assert restored.requests()[0]["request_id"] == request["request_id"]
+    assert restored.resolve(request["request_id"], status="dismissed")["status"] == "dismissed"
+    assert restored.record_stuck(scene="King_Passage", cell=(3, 5), progress=2.0, now=1200) is None
+    assert restored.record_stuck(scene="King_Passage", cell=(8, 5), progress=2.0, now=1300) is None
+
+
+def test_repeated_stuck_place_becomes_poi_and_new_neighbor_reward_decays(tmp_path) -> None:
+    ledger = HelpRequestLedger(
+        tmp_path / "help", slot=0,
+        config=HelpTriggerConfig(repeated_stuck_count=10, requests_per_hour=3),
+    )
+    for index in range(3):
+        ledger.record_stuck(scene="King_Passage", cell=(4, 7), progress=1.0, now=1000 + index)
+    location = next(row for row in ledger.stuck_locations() if row["place"] == "King_Passage:c4r7")
+    assert location["count"] == 3
+    assert location["point_of_interest"] is True
+    assert ledger._state["points_of_interest"][0]["label"] == "travei aqui"
+    first = ledger.reward_new_neighbor(scene="King_Passage", cell=(5, 7))
+    second = ledger.reward_new_neighbor(scene="King_Passage", cell=(5, 7))
+    assert first == pytest.approx(0.1)
+    assert second < first
+
+
+def test_help_ledger_supports_no_progress_trigger(tmp_path) -> None:
+    ledger = HelpRequestLedger(
+        tmp_path, slot=1,
+        config=HelpTriggerConfig(repeated_stuck_count=10, stuck_minutes=1),
+    )
+    ledger.observe_progress(scene="Room", progress=5, now=1000)
+    assert ledger.record_stuck(scene="Room", cell=(1, 1), progress=5, now=1059) is None
+    request = ledger.record_stuck(scene="Room", cell=(1, 1), progress=5, now=1061)
+    assert request is not None and request["reason"] == "no_room_progress"
+
+
+def test_human_actions_map_with_duration_and_horizontal_augmentation() -> None:
+    from hk_agent.temporal_actions import TEMPORAL_COMBAT_ACTIONS
+
+    action, covered = map_human_action(["right", "jump"], 50, TEMPORAL_COMBAT_ACTIONS)
+    assert TEMPORAL_COMBAT_ACTIONS[action].name == "RIGHT+JUMP_TAP"
+    assert covered is True
+    _action, covered = map_human_action(["right", "jump"], 600, TEMPORAL_COMBAT_ACTIONS)
+    assert covered is False
+    pixels = np.zeros((2, 1, 3, 4, 3), dtype=np.uint8)
+    pixels[0, :, :, 1, :] = 20
+    batch = {
+        "pixels": pixels,
+        "actions": np.asarray([1, 2], dtype=np.int64),
+        "action_masks": np.ones((2, len(TEMPORAL_COMBAT_ACTIONS)), dtype=np.bool_),
+        "action_history": np.asarray([[1, 2], [2, 1]], dtype=np.int64),
+        "player_knowledge": np.zeros((2, 3), dtype=np.float32),
+    }
+    augmented = augment_demonstration_batch(batch, TEMPORAL_COMBAT_ACTIONS, brightness_delta=0)
+    assert augmented["pixels"].shape[0] == 4
+    assert augmented["actions"][2:].tolist() == [2, 1]
+    assert augmented["pixels"][2, 0, 0, -1, 0] == 20
+
+
+def test_manual_recorder_reports_unrepresentable_human_durations(tmp_path) -> None:
+    from hk_agent.temporal_actions import TEMPORAL_COMBAT_ACTIONS
+
+    recorder = DemonstrationRecorder(tmp_path, game_version="1.5.78", context="traversal:Room:cell-2-3")
+    recorder.authorize(help_request_id="help-0-123")
+    png = b"\x89PNG\r\n\x1a\nframe"
+    mask = np.ones(len(TEMPORAL_COMBAT_ACTIONS), dtype=np.bool_)
+    knowledge = np.zeros(4, dtype=np.float32)
+    assert recorder.append_human(
+        png_bytes=png, buttons=["RIGHT", "JUMP"], duration_ms=50,
+        action_templates=TEMPORAL_COMBAT_ACTIONS, action_mask=mask,
+        player_knowledge=knowledge,
+    ) == (TEMPORAL_COMBAT_ACTIONS.index(next(a for a in TEMPORAL_COMBAT_ACTIONS if a.name == "RIGHT+JUMP_TAP")), True)
+    action, representable = recorder.append_human(
+        png_bytes=png, buttons=["RIGHT", "JUMP"], duration_ms=600,
+        action_templates=TEMPORAL_COMBAT_ACTIONS, action_mask=mask,
+        player_knowledge=knowledge,
+    )
+    assert action is not None and not representable
+    artifact = recorder.finish()
+    metadata = json.loads(artifact.with_suffix(".json").read_text())
+    assert metadata["frames_seen"] == 2
+    assert metadata["representable_frames"] == 1
+    assert metadata["representable_percent"] == pytest.approx(50.0)
+    assert metadata["unrepresentable_inputs"][0]["duration_ms"] == 600
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,10 +25,262 @@ class HelpTriggerConfig:
     failed_attempts: int = 100
     stalled_hours: float = 6.0
     stuck_minutes: float = 30.0
+    repeated_stuck_count: int = 10
+    requests_per_hour: int = 3
 
     def __post_init__(self) -> None:
-        if self.failed_attempts < 1 or self.stalled_hours <= 0 or self.stuck_minutes <= 0:
+        if (self.failed_attempts < 1 or self.stalled_hours <= 0 or self.stuck_minutes <= 0
+                or self.repeated_stuck_count < 1 or self.requests_per_hour < 1):
             raise ValueError("help trigger thresholds must be positive")
+
+
+class HelpRequestLedger:
+    """Per-actor durable help requests; pending requests never block collection."""
+
+    def __init__(self, root: Path, *, slot: int, config: HelpTriggerConfig | None = None) -> None:
+        if slot < 0:
+            raise ValueError("slot must be non-negative")
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / f"slot-{slot}.json"
+        self.slot = slot
+        self.config = config or HelpTriggerConfig()
+        self._state = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            value = {}
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            value = {}
+        stuck = value.get("stuck_by_place", {})
+        requests = value.get("requests", [])
+        return {
+            "schema_version": 1,
+            "stuck_by_place": dict(stuck) if isinstance(stuck, dict) else {},
+            "requests": [dict(row) for row in requests if isinstance(row, dict)][-128:]
+            if isinstance(requests, list) else [],
+            "no_progress_since_unix": value.get("no_progress_since_unix", time.time()),
+            "best_progress_by_scene": dict(value.get("best_progress_by_scene", {}))
+            if isinstance(value.get("best_progress_by_scene", {}), dict) else {},
+            "last_request_count_by_place": dict(value.get("last_request_count_by_place", {}))
+            if isinstance(value.get("last_request_count_by_place", {}), dict) else {},
+            "stuck_details": dict(value.get("stuck_details", {}))
+            if isinstance(value.get("stuck_details", {}), dict) else {},
+            "points_of_interest": list(value.get("points_of_interest", []))
+            if isinstance(value.get("points_of_interest", []), list) else [],
+            "neighbor_rewards": dict(value.get("neighbor_rewards", {}))
+            if isinstance(value.get("neighbor_rewards", {}), dict) else {},
+        }
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        temp.write_text(json.dumps(self._state, sort_keys=True, allow_nan=False), encoding="utf-8", newline="\n")
+        os.replace(temp, self.path)
+
+    def observe_progress(self, *, scene: str, progress: float, now: float | None = None) -> None:
+        if not scene or not np.isfinite(progress) or progress < 0:
+            return
+        now = time.time() if now is None else now
+        previous = self._state.get("best_progress_by_scene", {})
+        if not isinstance(previous, dict):
+            previous = {}
+        best = float(previous.get(scene, 0.0))
+        if progress > best:
+            previous[scene] = float(progress)
+            self._state["best_progress_by_scene"] = previous
+            self._state["no_progress_since_unix"] = now
+            self._save()
+
+    def record_stuck(
+        self, *, scene: str, cell: tuple[int, int], progress: float,
+        thumbnail_path: str | None = None, now: float | None = None,
+    ) -> dict[str, Any] | None:
+        if not scene or len(scene) > 256 or any(not 0 <= value < 12 for value in cell):
+            return None
+        now = time.time() if now is None else now
+        place = f"{scene}:c{cell[0]}r{cell[1]}"
+        counts = self._state.setdefault("stuck_by_place", {})
+        if not isinstance(counts, dict):
+            counts = {}
+            self._state["stuck_by_place"] = counts
+        count = int(counts.get(place, 0)) + 1
+        counts[place] = count
+        self.observe_progress(scene=scene, progress=progress, now=now)
+        since = self._state.get("no_progress_since_unix", now)
+        elapsed_minutes = max(0.0, (now - float(since)) / 60.0) if isinstance(since, (int, float)) else 0.0
+        details = self._state.setdefault("stuck_details", {})
+        assert isinstance(details, dict)
+        details[place] = {
+            "scene": scene, "cell": [cell[0], cell[1]], "count": count,
+            "last_stuck_unix": now, "stuck_minutes": elapsed_minutes,
+            "point_of_interest": count >= 3,
+        }
+        if count >= 3:
+            points = self._state.setdefault("points_of_interest", [])
+            assert isinstance(points, list)
+            if not any(isinstance(row, dict) and row.get("place") == place for row in points):
+                points.append({"place": place, "scene": scene, "cell": [cell[0], cell[1]],
+                               "label": "travei aqui", "created_unix": now})
+        reason = None
+        if count >= self.config.repeated_stuck_count:
+            reason = "repeated_stuck"
+        elif elapsed_minutes >= self.config.stuck_minutes:
+            reason = "no_room_progress"
+        requests = self._state.get("requests", [])
+        assert isinstance(requests, list)
+        last_counts = self._state.setdefault("last_request_count_by_place", {})
+        last_count = int(last_counts.get(place, 0)) if isinstance(last_counts, dict) else 0
+        if reason == "repeated_stuck" and count < last_count + self.config.repeated_stuck_count:
+            reason = None
+        hour_ago = now - 3600
+        recent = [row for row in requests if isinstance(row, dict)
+                  and isinstance(row.get("created_unix"), (int, float))
+                  and float(row["created_unix"]) >= hour_ago]
+        if reason is None or len(recent) >= self.config.requests_per_hour:
+            self._save()
+            return None
+        pending = next((row for row in requests if row.get("status") == "pending"), None)
+        if pending is not None:
+            self._save()
+            return None
+        request = {
+            "request_id": f"help-{self.slot}-{time.time_ns()}",
+            "slot": self.slot, "scene": scene, "place": place,
+            "context": f"traversal:{scene}:cell-{cell[0]}-{cell[1]}",
+            "cell": [cell[0], cell[1]], "stuck_count": count,
+            "reason": reason, "status": "pending", "created_unix": now,
+            "thumbnail_path": thumbnail_path,
+            "message": (
+                f"Instância {self.slot + 1} pede ajuda — "
+                f"{'Passagem do Rei' if 'King_Passage' in scene else scene}, "
+                f"trecho {cell[0]},{cell[1]} ({count} travadas)"
+            ),
+        }
+        requests.append(request)
+        self._state["requests"] = requests[-128:]
+        if isinstance(last_counts, dict):
+            last_counts[place] = count
+        self._save()
+        return dict(request)
+
+    def stuck_count(self, *, scene: str, cell: tuple[int, int]) -> int:
+        place = f"{scene}:c{cell[0]}r{cell[1]}"
+        counts = self._state.get("stuck_by_place", {})
+        value = counts.get(place, 0) if isinstance(counts, dict) else 0
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def stuck_locations(self) -> list[dict[str, Any]]:
+        details = self._state.get("stuck_details", {})
+        if not isinstance(details, dict):
+            return []
+        now = time.time()
+        rows = []
+        for place, raw in details.items():
+            if not isinstance(place, str) or not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            stamp = row.get("last_stuck_unix")
+            row["place"] = place
+            row["stuck_minutes"] = max(0.0, (now - float(stamp)) / 60.0) if isinstance(stamp, (int, float)) else 0.0
+            rows.append(row)
+        return sorted(rows, key=lambda row: (int(row.get("count", 0)), float(row.get("last_stuck_unix", 0))), reverse=True)
+
+    def reward_new_neighbor(self, *, scene: str, cell: tuple[int, int]) -> float:
+        """Pay a small, lifetime-decaying reward for a new neighbor after repeated stuck episodes."""
+        key = f"{scene}:c{cell[0]}r{cell[1]}"
+        counts = self._state.setdefault("neighbor_rewards", {})
+        if not isinstance(counts, dict):
+            counts = {}
+            self._state["neighbor_rewards"] = counts
+        raw_visits = counts.get(key, 0)
+        visits: int = int(raw_visits) if isinstance(raw_visits, int) and not isinstance(raw_visits, bool) else 0
+        award: float = float(0.1 / (1.0 + visits) ** 0.5)
+        counts[key] = visits + 1
+        self._save()
+        return award
+
+    def resolve(self, request_id: str, *, status: str) -> dict[str, Any]:
+        if status not in {"dismissed", "demonstration_requested", "discarded", "completed"}:
+            raise ValueError("invalid help request status")
+        for row in self._state["requests"]:
+            if row.get("request_id") == request_id:
+                if row.get("status") != "pending":
+                    raise ValueError("help request is no longer pending")
+                row["status"] = status
+                row["updated_unix"] = time.time()
+                self._save()
+                return dict(row)
+        raise FileNotFoundError("help request was not found")
+
+    def requests(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._state["requests"]]
+
+
+def map_human_action(
+    buttons: Sequence[str], duration_ms: int, actions: Sequence[Any], *,
+    maximum_button_distance: int = 0,
+) -> tuple[int | None, bool]:
+    """Map one human input window to the nearest policy token and report exact coverage."""
+    pressed = frozenset(str(button).upper() for button in buttons)
+    if duration_ms < 1:
+        raise ValueError("duration_ms must be positive")
+    candidates: list[tuple[int, int, int]] = []
+    for index, action in enumerate(actions):
+        action_buttons = frozenset(str(button).upper() for button in action.buttons)
+        distance = len(pressed.symmetric_difference(action_buttons))
+        target_duration = int(action.resolve_lease_ms(80))
+        duration_distance = abs(duration_ms - target_duration)
+        candidates.append((distance, duration_distance, index))
+    if not candidates:
+        return None, False
+    distance, duration_distance, index = min(candidates)
+    return (index if distance <= maximum_button_distance else None,
+            distance == 0 and duration_distance <= 40)
+
+
+def augment_demonstration_batch(
+    batch: dict[str, NDArray[Any]], actions: Sequence[Any], *, brightness_delta: float = 0.04,
+) -> dict[str, NDArray[Any]]:
+    """Add a physics-preserving horizontal mirror and slight brightness variants."""
+    if not 0 <= brightness_delta <= 0.2:
+        raise ValueError("brightness_delta must be in [0, 0.2]")
+    names = {str(action.name): index for index, action in enumerate(actions)}
+    mirrored: list[int] = []
+    for action in actions:
+        name = str(action.name).replace("LEFT", "__HORIZONTAL__").replace("RIGHT", "LEFT").replace("__HORIZONTAL__", "RIGHT")
+        index = names.get(name)
+        if index is None:
+            mirrored = []
+            break
+        mirrored.append(index)
+    if not mirrored:
+        return batch
+    result = {key: np.concatenate((value, value), axis=0) for key, value in batch.items()}
+    result["sequence_count"] = np.asarray(2, dtype=np.int64)
+    count = len(batch["actions"])
+    result["pixels"][count:] = np.flip(batch["pixels"], axis=-2).copy()
+    mapping = np.asarray(mirrored, dtype=np.int64)
+    result["actions"][count:] = mapping[batch["actions"]]
+    result["action_masks"][count:] = batch["action_masks"][:, mapping]
+    if len(batch["action_history"]):
+        result["action_history"][count:] = mapping[batch["action_history"]]
+    if brightness_delta:
+        # Deterministic per-sample exposure offsets avoid turning a single room
+        # into an absolute coordinate lookup while keeping local geometry fixed.
+        factors = np.linspace(1.0 - brightness_delta, 1.0 + brightness_delta, count, dtype=np.float32)
+        pixels = result["pixels"][count:].astype(np.float32)
+        result["pixels"][count:] = np.clip(pixels * factors.reshape((-1,) + (1,) * (pixels.ndim - 1)), 0, 255).astype(np.uint8)
+    if result["pixels"].ndim == 5 and result["pixels"].shape[2] > 2 and result["pixels"].shape[3] > 2:
+        pixels = result["pixels"][count:]
+        padded = np.pad(pixels, ((0, 0), (0, 0), (1, 1), (1, 1), (0, 0)), mode="edge")
+        height, width = pixels.shape[2:4]
+        for index in range(count):
+            dx, dy = (index % 3) - 1, ((index // 3) % 3) - 1
+            pixels[index] = padded[index, :, 1 + dy:1 + dy + height, 1 + dx:1 + dx + width]
+    return result
 
 
 def help_request(
@@ -58,6 +312,9 @@ class DemonstrationRecorder:
         self.masks: list[NDArray[np.bool_]] = []
         self.knowledge: list[NDArray[np.float32]] = []
         self.authorization: str | None = None
+        self.frames_seen = 0
+        self.representable_frames = 0
+        self.unrepresentable_inputs: list[dict[str, Any]] = []
 
     def authorize(self, *, help_request_id: str | None = None, operator_forced: bool = False) -> None:
         if operator_forced:
@@ -81,10 +338,39 @@ class DemonstrationRecorder:
             raise ValueError("human action was illegal under the recorded action mask")
         if player_knowledge.ndim != 1 or not np.isfinite(player_knowledge).all():
             raise ValueError("player knowledge vector is malformed")
+        self.frames_seen += 1
+        self.representable_frames += 1
         self.frames.append(np.frombuffer(png_bytes, dtype=np.uint8).copy())
         self.actions.append(action)
         self.masks.append(action_mask.astype(np.bool_, copy=True))
         self.knowledge.append(player_knowledge.astype(np.float32, copy=True))
+
+    def append_human(
+        self, *, png_bytes: bytes, buttons: Sequence[str], duration_ms: int,
+        action_templates: Sequence[Any], action_mask: NDArray[np.bool_],
+        player_knowledge: NDArray[np.float32],
+    ) -> tuple[int | None, bool]:
+        action, representable = map_human_action(buttons, duration_ms, action_templates)
+        if action is None or action >= len(action_mask) or not action_mask[action]:
+            self.frames_seen += 1
+            if not representable:
+                self.unrepresentable_inputs.append({
+                    "buttons": sorted({str(button).upper() for button in buttons}),
+                    "duration_ms": duration_ms,
+                    "reason": "no_exact_action" if action is None else "action_masked",
+                })
+            return None, False
+        self.append(
+            png_bytes=png_bytes, action=action, action_mask=action_mask,
+            player_knowledge=player_knowledge,
+        )
+        if not representable:
+            self.representable_frames -= 1
+            self.unrepresentable_inputs.append({
+                "buttons": sorted({str(button).upper() for button in buttons}),
+                "duration_ms": duration_ms, "reason": "duration_mismatch",
+            })
+        return action, representable
 
     def finish(self) -> Path:
         if self.authorization is None:
@@ -108,6 +394,10 @@ class DemonstrationRecorder:
             "context": self.context,
             "authorization": self.authorization,
             "samples": len(self.actions),
+            "frames_seen": self.frames_seen,
+            "representable_frames": self.representable_frames,
+            "representable_percent": 100.0 * self.representable_frames / max(1, self.frames_seen),
+            "unrepresentable_inputs": self.unrepresentable_inputs[:128],
             "artifact": target.name,
             "sha256": digest,
         }
@@ -183,10 +473,27 @@ def demonstration_batch(
         prior = actions[max(0, index - history_size):index]
         if len(prior):
             history[index, -len(prior):] = prior
-    knowledge = values["player_knowledge"].astype(np.float32, copy=False)
+    knowledge = values["player_knowledge"].astype(np.float32, copy=True)
     expected_knowledge_shape = tuple(spaces["player_knowledge"].shape)
     if knowledge.shape != (len(actions), *expected_knowledge_shape):
         raise ValueError("demonstration knowledge vector differs from the learner")
+    # The task observation contains room-map cells. Keep skills/objectives, but
+    # remove visited-cell, POI, and last-cell coordinates so imitation follows
+    # visible geometry instead of memorizing where this demonstration occurred.
+    from hk_agent.player_knowledge import GRID_HEIGHT, GRID_WIDTH, ITEM_FLAGS, PLACE_DESCRIPTORS
+
+    grid = GRID_WIDTH * GRID_HEIGHT
+    item_size = sum(1 + len(descriptor) for _flag, descriptor in ITEM_FLAGS)
+    visited = item_size
+    exits = visited + grid
+    points = exits + 8 * 6
+    last_cell = points + 8 * 5
+    knowledge[:, visited:visited + grid] = 0
+    knowledge[:, points:last_cell] = 0
+    knowledge[:, last_cell:last_cell + grid] = 0
+    places_start = last_cell + grid
+    place_maps_start = places_start + 4 * len(PLACE_DESCRIPTORS)
+    knowledge[:, place_maps_start:place_maps_start + grid * len(PLACE_DESCRIPTORS)] = 0
     return {
         "pixels": pixels,
         "action_history": history.reshape((len(actions), *spaces["action_history"].shape)),
@@ -196,10 +503,16 @@ def demonstration_batch(
     }
 
 
-def imitation_schedule(*, initial_weight: float, decay_rounds: int, round_number: int) -> float:
-    if initial_weight < 0 or decay_rounds < 1 or round_number < 0:
+def imitation_schedule(
+    *, initial_weight: float, decay_rounds: int, round_number: int,
+    samples_in_bank: int = 1, minimum_bank_size: int = 64,
+) -> float:
+    if initial_weight < 0 or decay_rounds < 1 or round_number < 0 or samples_in_bank < 0 or minimum_bank_size < 1:
         raise ValueError("invalid imitation schedule")
-    return initial_weight * max(0.0, 1.0 - round_number / decay_rounds)
+    scheduled = initial_weight * max(0.0, 1.0 - round_number / decay_rounds)
+    if samples_in_bank < minimum_bank_size and initial_weight > 0:
+        return max(scheduled, initial_weight * 0.1)
+    return scheduled
 
 
 def masked_behavioral_cloning_loss(

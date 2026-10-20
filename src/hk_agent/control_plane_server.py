@@ -81,6 +81,22 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(content)
+        elif path == "/api/help-thumbnail":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                content = self.server.control_plane.read_help_thumbnail(
+                    query.get("campaign_id", [""])[0], query.get("request_id", [""])[0]
+                )
+            except (OSError, ValueError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
         elif path in {"/api/journey/map/tile", "/api/journey/map/thumbnail"}:
             query = parse_qs(urlsplit(self.path).query)
             try:
@@ -139,26 +155,36 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         try:
             payload = self._payload()
             if path == "/api/operator/start":
-                require_keys(payload, ("instances", "duration_kind", "duration_value", "campaign_name"))
+                require_keys(
+                    payload,
+                    ("instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes"),
+                )
                 if set(payload) not in (
                     {"instances", "duration_kind", "duration_value"},
                     {"instances", "duration_kind", "duration_value", "campaign_name"},
+                    {"instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count"},
+                    {"instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes"},
                 ):
-                    raise ValueError("start accepts instances, duration, and optional campaign_name")
+                    raise ValueError("start accepts instances, duration, campaign_name, help_stuck_count, and help_stuck_minutes")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
                 result = self.server.control_plane.start_operator_campaign(
                     instances=payload.get("instances"), duration_kind=payload.get("duration_kind"),
                     duration_value=payload.get("duration_value"),
                     campaign_name=payload.get("campaign_name"),
+                    help_stuck_count=payload.get("help_stuck_count", 10),
+                    help_stuck_minutes=payload.get("help_stuck_minutes", 360.0),
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":
-                if payload:
-                    raise ValueError("continue does not accept settings")
+                if set(payload) not in ({}, {"help_stuck_count"}, {"help_stuck_count", "help_stuck_minutes"}):
+                    raise ValueError("continue only accepts help trigger settings")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
-                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.continue_operator_campaign())
+                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.continue_operator_campaign(
+                    help_stuck_count=payload.get("help_stuck_count", 10),
+                    help_stuck_minutes=payload.get("help_stuck_minutes", 360.0),
+                ))
             elif path == "/api/operator/repeat":
                 if payload:
                     raise ValueError("repeat does not accept reward settings")
@@ -192,6 +218,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     raise PermissionError("Start the panel with --allow-execute to launch a challenge actor")
                 result = self.server.control_plane.start_challenge_practice(payload)
                 self._json(HTTPStatus.ACCEPTED, result)
+            elif path == "/api/help-requests/resolve":
+                require_keys(payload, ("campaign_id", "request_id", "action"))
+                if set(payload) != {"campaign_id", "request_id", "action"}:
+                    raise ValueError("help request resolution accepts campaign_id, request_id, and action")
+                self._json(HTTPStatus.OK, self.server.control_plane.resolve_help_request(payload))
             elif path == "/api/reports/generate":
                 require_keys(payload, ("campaign_id",))
                 campaign_id = payload.get("campaign_id")

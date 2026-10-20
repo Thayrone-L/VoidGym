@@ -13,6 +13,10 @@
     <div class="brand"><span class="brand-mark">V</span><div><p class="eyebrow">TREINO LOCAL</p><h1>Void Lab</h1></div></div>
     <div class="connection"><span id="live-dot" class="dot"></span><span id="live-label">Conectando…</span></div>
   </header>
+  <section id="status-banner" class="status-banner idle" role="status" aria-live="polite" aria-atomic="false">
+    <div class="status-banner-main"><strong id="status-message">Conectando ao painel…</strong><div id="status-alert-list" hidden></div></div>
+    <details id="status-technical" hidden><summary>Detalhes técnicos</summary><pre id="status-technical-detail"></pre></details>
+  </section>
   <main>
     <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
 
@@ -21,6 +25,8 @@
         <div class="panel-head"><div><p class="eyebrow">CONTROLE</p><h2>Iniciar treino</h2></div></div>
         <div class="form-grid">
           <label>Número de instâncias<select id="instance-count"><option value="1">1 instância</option><option value="2">2 instâncias</option><option value="3">3 instâncias</option></select></label>
+          <label>Pedir ajuda depois de N travadas no mesmo lugar<input id="help-stuck-count" type="number" min="1" max="1000" step="1" value="10"></label>
+          <label>Pedir ajuda após X min sem recorde na sala<input id="help-stuck-minutes" type="number" min="1" max="10080" step="1" value="360"></label>
           <label>Duração<select id="duration-kind"><option value="until_stopped">Até eu parar</option><option value="hours">Por algumas horas</option><option value="until_time">Até um horário</option></select></label>
           <label id="hours-wrap" hidden>Quantas horas?<input id="duration-hours" type="number" min="0.25" max="72" step="0.25" value="2"></label>
           <label id="time-wrap" hidden>Parar às<input id="end-time" type="time"></label>
@@ -76,7 +82,7 @@
       <article class="panel"><div class="panel-head"><div><p class="eyebrow">AVALIAÇÕES</p><h2>Resultado da IA</h2></div></div><div id="evaluation-chart" class="chart"><p class="empty">A primeira avaliação aparece após as primeiras rodadas.</p></div></article>
     </section>
 
-    <section class="panel bestiary-panel"><div class="panel-head"><div><p class="eyebrow">EXPERIÊNCIA</p><h2>Bestiário da IA</h2></div></div><div id="bestiary-list"><p class="empty">Inimigos aparecem depois do primeiro encontro.</p></div><h3>Desafios em memória</h3><div id="challenge-list"><p class="empty">Ainda sem desafios registrados.</p></div></section>
+    <section class="panel bestiary-panel"><div class="panel-head"><div><p class="eyebrow">EXPERIÊNCIA</p><h2>Bestiário da IA</h2></div></div><div id="bestiary-list"><p class="empty">Inimigos aparecem depois do primeiro encontro.</p></div><h3>Desafios em memória</h3><div id="challenge-list"><p class="empty">Ainda sem desafios registrados.</p></div><h3>Pedidos de ajuda</h3><div id="help-request-list"><p class="empty">Nenhum pedido de ajuda pendente.</p></div><h3>Ajudas recebidas</h3><div id="help-history-list"><p class="empty">Nenhuma ajuda registrada ainda.</p></div></section>
 
     <section class="content-grid">
       <article class="panel"><div class="panel-head"><div><p class="eyebrow">MAPA</p><h2>Salas descobertas</h2></div></div><div id="scene-list" class="scene-list"><p class="empty">Nenhuma sala nova registrada ainda.</p></div></article>

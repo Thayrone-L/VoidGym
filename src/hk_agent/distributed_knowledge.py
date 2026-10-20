@@ -89,7 +89,7 @@ _TASK_CONFIG_KEYS = frozenset(
     }
 )
 _BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST", "DASH", "SUPER_DASH", "DREAM_NAIL", "PAUSE", "MENU_SUBMIT", "MENU_CANCEL"})
-_DURATIONS = frozenset({"base", "tap", "hold", "focus", "charge"})
+_DURATIONS = frozenset({"base", "tap", "hold", "max_hold", "focus", "charge"})
 _ACTION_NAMES = frozenset(
     {
         "NOOP",
@@ -101,6 +101,9 @@ _ACTION_NAMES = frozenset(
         "LEFT+JUMP_HOLD",
         "RIGHT+JUMP_TAP",
         "RIGHT+JUMP_HOLD",
+        "JUMP_MAX",
+        "LEFT+JUMP_MAX",
+        "RIGHT+JUMP_MAX",
         "ATTACK",
         "LEFT+ATTACK",
         "RIGHT+ATTACK",
@@ -375,7 +378,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
     schema_version = contract.get("task_contract_schema_version", 1)
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
         raise KnowledgeValidationError("task_contract_schema_version is unsupported")
     result["task_contract_schema_version"] = schema_version
     if "observation_version" in contract:

@@ -23,6 +23,15 @@ def test_mask_covers_spell_focus_and_nail_art_availability() -> None:
     assert not mask[TASK_ACTION_NAMES.index("NAIL_ART_CHARGE")]
 
 
+def test_jump_remains_available_in_traversal_without_special_abilities() -> None:
+    unavailable_abilities = ActionAvailability(0, 33, 33, 0, 0, 0, False, False, False, False)
+    mask = build_action_mask(TASK_ACTION_NAMES, unavailable_abilities)
+    assert mask[TASK_ACTION_NAMES.index("JUMP_TAP")]
+    assert mask[TASK_ACTION_NAMES.index("JUMP_HOLD")]
+    assert mask[TASK_ACTION_NAMES.index("LEFT+JUMP_HOLD")]
+    assert mask[TASK_ACTION_NAMES.index("RIGHT+JUMP_HOLD")]
+
+
 def test_mask_allows_available_actions_and_unknown_bridge() -> None:
     available = ActionAvailability(33, 33, 33, 1, 1, 1, True, True, True, True,
                                    has_dash=True, has_super_dash=True, has_dream_nail=True,

@@ -9,7 +9,7 @@ from numpy.typing import NDArray
 
 from hk_agent.gym_env import BUTTON_ORDER
 
-DurationKind = Literal["base", "tap", "hold", "focus", "charge"]
+DurationKind = Literal["base", "tap", "hold", "max_hold", "focus", "charge"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +29,8 @@ class TemporalActionTemplate:
             return min(base_lease_ms, 50)
         if self.duration == "hold":
             return min(250, max(base_lease_ms * 2, 120))
+        if self.duration == "max_hold":
+            return 450
         if self.duration in {"focus", "charge"}:
             # Focus and Nail Arts both need an uninterrupted long press. The
             # automatic release executes the charged action and the backend
@@ -47,6 +49,9 @@ TEMPORAL_COMBAT_ACTIONS: tuple[TemporalActionTemplate, ...] = (
     TemporalActionTemplate("LEFT+JUMP_HOLD", ("LEFT", "JUMP"), "hold"),
     TemporalActionTemplate("RIGHT+JUMP_TAP", ("RIGHT", "JUMP"), "tap"),
     TemporalActionTemplate("RIGHT+JUMP_HOLD", ("RIGHT", "JUMP"), "hold"),
+    TemporalActionTemplate("JUMP_MAX", ("JUMP",), "max_hold"),
+    TemporalActionTemplate("LEFT+JUMP_MAX", ("LEFT", "JUMP"), "max_hold"),
+    TemporalActionTemplate("RIGHT+JUMP_MAX", ("RIGHT", "JUMP"), "max_hold"),
     TemporalActionTemplate("ATTACK", ("ATTACK",), "tap"),
     TemporalActionTemplate("LEFT+ATTACK", ("LEFT", "ATTACK"), "tap"),
     TemporalActionTemplate("RIGHT+ATTACK", ("RIGHT", "ATTACK"), "tap"),

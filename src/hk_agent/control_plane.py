@@ -157,6 +157,11 @@ class CampaignSpec:
     straggler_timeout_seconds: float = 45.0
     challenge_practice_enabled: bool = False
     help_requests_enabled: bool = False
+    help_stuck_count: int = 10
+    help_stuck_minutes: float = 360.0
+    help_requests_per_hour: int = 3
+    help_failed_attempts: int = 100
+    help_stalled_hours: float = 6.0
     schema_version: int = 11
 
     @classmethod
@@ -373,6 +378,11 @@ class CampaignSpec:
             ) if shared_learner else 45.0,
             challenge_practice_enabled=challenge_practice_enabled,
             help_requests_enabled=help_requests_enabled,
+            help_stuck_count=_bounded_int(payload.get("help_stuck_count", 10), "help_stuck_count", 1, 1000),
+            help_stuck_minutes=_bounded_float(payload.get("help_stuck_minutes", 360.0), "help_stuck_minutes", 1.0, 10080.0),
+            help_requests_per_hour=_bounded_int(payload.get("help_requests_per_hour", 3), "help_requests_per_hour", 1, 100),
+            help_failed_attempts=_bounded_int(payload.get("help_failed_attempts", 100), "help_failed_attempts", 1, 10000),
+            help_stalled_hours=_bounded_float(payload.get("help_stalled_hours", 6.0), "help_stalled_hours", 0.1, 720.0),
         )
         if spec.rollout_steps * spec.actors % spec.batch_size:
             raise ValueError("batch_size must divide rollout_steps times actors")
@@ -859,6 +869,56 @@ class ControlPlane:
             return {}
         return value if isinstance(value, dict) else {}
 
+    @staticmethod
+    def _operator_reason(reason: object) -> str:
+        raw = str(reason or "erro não informado").strip()
+        lowered = raw.casefold()
+        known = (
+            (("warm-start campaigns must use a new shared checkpoint directory",),
+             "A pasta de checkpoints já está em uso; continue a campanha existente ou use outra pasta."),
+            (("bridge disconnected", "bridge desconectou", "connection reset", "broken pipe"),
+             "A conexão com a ponte do jogo foi interrompida."),
+            (("relaunch limit", "maximum relaunch", "limite de relançamentos"),
+             "A instância atingiu o limite de relançamentos automáticos."),
+            (("no shared-learner checkpoint", "no checkpoint", "checkpoint is unavailable"),
+             "Não há checkpoint disponível para continuar o treino."),
+            (("personal game", "jogo pessoal", "another hollow knight process", "game already open"),
+             "O Hollow Knight pessoal parece estar aberto; feche-o antes de iniciar o treino."),
+        )
+        for needles, message in known:
+            if any(needle in lowered for needle in needles):
+                return message
+        if "learner" in lowered and any(word in lowered for word in ("failed", "failure", "caiu", "falhou")):
+            return "cancelada porque o learner caiu"
+        if "heartbeat expirou" in lowered or "heartbeat expired" in lowered:
+            return "O processo parou de responder; consulte os detalhes técnicos para ver a falha original."
+        if raw.casefold() in {"stop requested", "parada solicitada", "parada cooperativa solicitada"}:
+            return "parada solicitada pelo operador"
+        return "O treino foi encerrado por um erro."
+
+    def _launch_error_detail(self, record: Mapping[str, Any]) -> str | None:
+        raw_path = record.get("log_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = self.project_root / path
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.project_root)
+            lines = resolved.read_text("utf-8", errors="replace").splitlines()
+        except (OSError, ValueError):
+            return None
+        nonempty = [line.strip() for line in lines if line.strip()]
+        if not nonempty:
+            return None
+        # Prefer the actual tail of the failed process log; the summary reason
+        # can be a heartbeat timeout that hides the learner/actor exception.
+        detail = nonempty[-1]
+        if len(detail) > 500:
+            detail = detail[-500:]
+        return detail
+
     def operator_snapshot(self) -> dict[str, object]:
         status = self.status()
         self._ensure_auto_reports(status)
@@ -1012,7 +1072,23 @@ class ControlPlane:
                 restart_times = actor.get("restart_times_unix_ns", [])
                 recent_restarts = [stamp for stamp in restart_times if isinstance(stamp, int) and stamp >= now_ns - 3_600_000_000_000] if isinstance(restart_times, list) else []
                 restart_count += len(recent_restarts)
-                instance_rows.append({"slot": actor.get("slot"), "status": actor.get("status", "unknown"), "restarts_last_hour": len(recent_restarts), "problem": actor.get("status") == "FAILED"})
+                terminal_reason = actor.get("failure") or actor.get("stop_reason")
+                if actor.get("status") in {"CANCELLED", "FAILED"} and not terminal_reason:
+                    matching = [row for row in self._campaign_launch_records(campaign_id or "")
+                                if row.get("role") == "actor"
+                                and isinstance(row.get("resources"), Mapping)
+                                and row["resources"].get("slot_id") == actor.get("slot")
+                                and row.get("status") in {"CANCELLED", "FAILED"}]
+                    if matching:
+                        latest = max(matching, key=lambda row: int(row.get("finished_unix_ns", 0) or 0))
+                        terminal_reason = latest.get("failure") or latest.get("stop_reason")
+                instance_rows.append({
+                    "slot": actor.get("slot"), "status": actor.get("status", "unknown"),
+                    "restarts_last_hour": len(recent_restarts),
+                    "problem": actor.get("status") in {"FAILED", "CANCELLED"},
+                    "reason": (self._operator_reason(terminal_reason)
+                               if actor.get("status") in {"CANCELLED", "FAILED"} else None),
+                })
                 if len(recent_restarts) >= 3:
                     alerts.append(f"Instância {actor.get('slot')} reiniciou {len(recent_restarts)} vezes na última hora")
                 if recent_restarts:
@@ -1081,8 +1157,116 @@ class ControlPlane:
             if item.startswith("farm_component:") else item
             for item in alerts
         ]
+        alerts = [
+            "Mais de 90% dos passos da última rodada tiveram recompensa zero"
+            if item == "reward_zero_over_90_percent" else item
+            for item in alerts
+        ]
+        launch_records = self._campaign_launch_records(campaign_id or "") if campaign_id else []
+        current_group = next((row.get("shared_group") for row in active_records
+                              if isinstance(row.get("shared_group"), str)), None)
+        relevant_records = ([row for row in launch_records if row.get("shared_group") == current_group]
+                            if current_group else launch_records)
+        latest_group = max(
+            (row.get("shared_group") for row in relevant_records if isinstance(row.get("shared_group"), str)),
+            key=lambda group: max((int(row.get("finished_unix_ns", row.get("started_unix_ns", 0)) or 0)
+                                   for row in relevant_records if row.get("shared_group") == group), default=0),
+            default=None,
+        )
+        if latest_group is not None:
+            relevant_records = [row for row in relevant_records if row.get("shared_group") == latest_group]
+        failed_records = [
+            row for row in relevant_records
+            if row.get("status") == "FAILED"
+            or (row.get("status") == "CANCELLED" and isinstance(row.get("failure"), str)
+                and row.get("failure"))
+        ]
+        failed_record = max(failed_records, key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default=None)
+        status_banner: dict[str, object]
+        if failed_record is not None:
+            raw_reason = failed_record.get("failure") or failed_record.get("stop_reason")
+            detail = self._launch_error_detail(failed_record)
+            status_banner = {
+                "kind": "error",
+                "message": f"O treino parou: {self._operator_reason(f'{raw_reason or ""} {detail or ""}')}",
+                "technical_detail": detail,
+            }
+        elif alerts:
+            running_text = (f" · Treinando — rodada {learner_round}, "
+                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
+            status_banner = {"kind": "warning", "message": f"Aviso: {alerts[0]}{running_text}",
+                             "technical_detail": None}
+        elif active_records:
+            status_banner = {
+                "kind": "running",
+                "message": f"Treinando — rodada {learner_round}, {completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s",
+                "technical_detail": None,
+            }
+        elif relevant_records and any(row.get("status") == "CANCELLED" for row in relevant_records):
+            cancelled = max((row for row in relevant_records if row.get("status") == "CANCELLED"),
+                            key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default={})
+            raw_reason = cancelled.get("stop_reason") or cancelled.get("failure") or "parada solicitada"
+            status_banner = {"kind": "idle", "message": f"Treino parado: {self._operator_reason(raw_reason)}",
+                             "technical_detail": None}
+        elif alerts:
+            status_banner = {"kind": "warning", "message": f"Aviso: {alerts[0]}",
+                             "technical_detail": None}
+        else:
+            status_banner = {"kind": "idle", "message": "Treino parado — aguardando início.",
+                             "technical_detail": None}
+        if not active_records and status_banner["kind"] == "idle" and alerts:
+            status_banner = {"kind": "warning", "message": f"Aviso: {alerts[0]}",
+                             "technical_detail": None}
         raw_capacity = status.get("capacity", 1)
         capacity = raw_capacity if isinstance(raw_capacity, int) and not isinstance(raw_capacity, bool) else 1
+        help_requests: list[dict[str, Any]] = []
+        help_history: list[dict[str, Any]] = []
+        stuck_locations: list[dict[str, Any]] = []
+        if shared_root is not None:
+            help_root = shared_root / "help-requests"
+            for ledger_path in sorted(help_root.glob("slot-*.json")) if help_root.is_dir() else ():
+                ledger = self._read_json(ledger_path)
+                slot_text = ledger_path.stem.removeprefix("slot-")
+                try:
+                    slot_number = int(slot_text)
+                except ValueError:
+                    slot_number = 0
+                details = ledger.get("stuck_details", {})
+                if isinstance(details, Mapping):
+                    for place, raw in details.items():
+                        if not isinstance(place, str) or not isinstance(raw, Mapping):
+                            continue
+                        count = raw.get("count", 0)
+                        stamp = raw.get("last_stuck_unix", now_ns / 1_000_000_000)
+                        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                            continue
+                        minutes = max(0.0, now_ns / 1_000_000_000 - float(stamp)) / 60.0 if isinstance(stamp, (int, float)) else 0.0
+                        location = {**dict(raw), "slot": slot_number, "place": place, "stuck_minutes": minutes}
+                        stuck_locations.append(location)
+                        alerts.append(
+                            f"Instância {slot_number + 1} travada há {minutes:.0f} min em {place} "
+                            f"({count} travadas aqui)"
+                        )
+                rows = ledger.get("requests", [])
+                if isinstance(rows, list):
+                    help_history.extend(dict(row) for row in rows if isinstance(row, Mapping))
+            help_history.sort(key=lambda row: float(row.get("created_unix", 0.0))
+                              if isinstance(row.get("created_unix"), (int, float))
+                              and not isinstance(row.get("created_unix"), bool) else 0.0)
+            help_requests = [row for row in help_history if row.get("status") == "pending"]
+        stuck_alert = next((item for item in reversed(alerts) if "travada há" in item), None)
+        if stuck_alert and status_banner["kind"] != "error":
+            running_text = (f" · Treinando — rodada {learner_round}, "
+                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
+            status_banner = {"kind": "warning", "message": f"Aviso: {stuck_alert}{running_text}",
+                             "technical_detail": None}
+        if help_requests:
+            help_alert = (f"Há {len(help_requests)} pedido(s) de ajuda pendente(s) no painel")
+            alerts.append(help_alert)
+            running_text = (f" · Treinando — rodada {learner_round}, "
+                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
+            status_banner = {"kind": "warning", "message": f"Aviso: {help_alert}{running_text}",
+                             "technical_detail": None}
         return {
             "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
             "actor_performance": actor_performance,
@@ -1090,6 +1274,7 @@ class ControlPlane:
             "remaining_seconds": remaining_seconds, "instances": instance_rows,
             "training_steps": completed_timesteps, "steps_per_second": completed_timesteps / max(elapsed_seconds, 1.0),
             "learner_updates": learner_round, "updates_per_hour": learner_round / hours,
+            "last_zero_reward_fraction": manifest.get("last_zero_reward_fraction"),
             "deaths_per_hour": deaths / hours, "shade_recoveries_per_hour": recoveries / hours,
             "shade_losses": shade_losses, "average_steps_to_first_scene": sum(first_scene_steps) / len(first_scene_steps) if first_scene_steps else None,
             "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
@@ -1097,8 +1282,17 @@ class ControlPlane:
             "journey": journey,
             "challenge_practice_enabled": selected_campaign.get("challenge_practice_enabled") is True,
             "help_requests_enabled": selected_campaign.get("help_requests_enabled") is True,
+            "help_stuck_count": selected_campaign.get("help_stuck_count", 10),
+            "help_requests": help_requests[-16:],
+            "help_request_history": help_history[-64:],
+            "stuck_locations": sorted(
+                stuck_locations,
+                key=lambda row: (int(row.get("count", 0)), float(row.get("last_stuck_unix", 0))),
+                reverse=True,
+            )[:64],
             "playthroughs": self._operator_playthroughs(campaign_id, campaigns, active_records, journey),
-            "alerts": sorted(set(alerts)), "instance_restarts_last_hour": restart_count,
+            "alerts": sorted(set(alerts)), "status_banner": status_banner,
+            "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
             "max_instances": min(3, capacity),
             "can_continue": latest_checkpoint_exists, "has_campaign": bool(latest_shared),
@@ -1377,6 +1571,12 @@ class ControlPlane:
         episodes = [row for row in manifest.get("episode_progress", []) if isinstance(row, Mapping)] if isinstance(manifest.get("episode_progress", []), list) else []
         evaluations = [row for row in manifest.get("evaluations", []) if isinstance(row, Mapping)] if isinstance(manifest.get("evaluations", []), list) else []
         scenes = self._campaign_scene_discoveries(campaign_id)
+        help_request_history: list[dict[str, Any]] = []
+        help_root = shared_root / "help-requests"
+        for ledger_path in sorted(help_root.glob("slot-*.json")) if help_root.is_dir() else ():
+            rows = self._read_json(ledger_path).get("requests", [])
+            if isinstance(rows, list):
+                help_request_history.extend(dict(row) for row in rows if isinstance(row, Mapping))
         journey_root = shared_root / "journey"
         journey_progress: dict[str, Any] = {}
         try:
@@ -1406,6 +1606,11 @@ class ControlPlane:
             "map_art_attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry.",
             "sharing_courtesy": "Antes de distribuir o projeto, considere avisar o autor e pedir permissão para compartilhar o mapa.",
             "episode_progress": episodes, "evaluations": evaluations,
+            "help_requests": sorted(help_request_history, key=lambda row: (
+                float(row.get("created_unix", 0.0))
+                if isinstance(row.get("created_unix"), (int, float))
+                and not isinstance(row.get("created_unix"), bool) else 0.0
+            )),
             "deaths": sum(int(row.get("deaths", 0) or 0) for row in episodes),
             "shade_recoveries": sum(int(row.get("shade_recoveries", 0) or 0) for row in episodes),
             "shade_losses": sum(int(row.get("shade_losses", 0) or 0) for row in episodes),
@@ -1443,6 +1648,36 @@ class ControlPlane:
             raise ValueError("capture path is outside the milestone directory") from error
         if target.suffix.lower() != ".png" or not target.is_file() or target.stat().st_size > 24 * 1024 * 1024:
             raise ValueError("journey capture is missing or exceeds its limit")
+        from hk_agent.run_journey import validate_png_header
+
+        with target.open("rb") as stream:
+            validate_png_header(stream)
+        return target.read_bytes()
+
+    def read_help_thumbnail(self, campaign_id: str, request_id: str) -> bytes:
+        if not _IDENTIFIER.fullmatch(campaign_id) or not re.fullmatch(r"help-\d+-\d+", request_id):
+            raise ValueError("invalid help thumbnail reference")
+        root = (self.runtime_root / "shared" / campaign_id / "help-requests").resolve(strict=True)
+        target_path: str | None = None
+        for ledger_path in root.glob("slot-*.json"):
+            ledger = self._read_json(ledger_path)
+            rows = ledger.get("requests", [])
+            if isinstance(rows, list):
+                row = next((item for item in rows if isinstance(item, Mapping)
+                            and item.get("request_id") == request_id), None)
+                if row is not None and isinstance(row.get("thumbnail_path"), str):
+                    target_path = row["thumbnail_path"]
+                    break
+        if target_path is None:
+            raise FileNotFoundError("help request thumbnail was not found")
+        target = Path(target_path).resolve(strict=True)
+        journey = (self.runtime_root / "shared" / campaign_id / "journey").resolve(strict=True)
+        try:
+            target.relative_to(journey)
+        except ValueError as error:
+            raise ValueError("help thumbnail is outside the campaign journey") from error
+        if target.suffix.lower() != ".png" or not target.is_file() or target.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError("help thumbnail is missing or too large")
         from hk_agent.run_journey import validate_png_header
 
         with target.open("rb") as stream:
@@ -1775,7 +2010,8 @@ class ControlPlane:
 
     def start_operator_campaign(
         self, *, instances: object, duration_kind: object, duration_value: object,
-        campaign_name: object = None,
+        campaign_name: object = None, help_stuck_count: object = 10,
+        help_stuck_minutes: object = 360.0,
     ) -> dict[str, object]:
         from hk_agent.config import load_config
 
@@ -1784,6 +2020,8 @@ class ControlPlane:
         if count > min(3, config.instance_count):
             raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
         limit_seconds = self._operator_duration(duration_kind, duration_value)
+        stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
+        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 1.0, 10080.0)
         seed = secrets.randbelow(2**31)
         now_slug = time.strftime("%Y%m%d-%H%M%S", time.localtime())
         if campaign_name is not None and (
@@ -1816,6 +2054,10 @@ class ControlPlane:
             if checkpoints:
                 warm_start = (str(checkpoints[-1]), previous_id)
                 break
+        # Reusing an existing campaign directory (e.g. "jogada-1") must resume from
+        # its own checkpoints; the learner refuses warm-start into a used directory.
+        if any((self.runtime_root / "shared" / campaign_id / "checkpoints").glob("round-*.zip")):
+            warm_start = None
         payload: dict[str, object] = {
             "campaign_id": campaign_id,
             "name": name,
@@ -1826,6 +2068,7 @@ class ControlPlane:
             "rollout_steps": 512,
             "batch_size": 256,
             "checkpoint_interval": 512 * count,
+            "max_checkpoints": 100,
             "timesteps": 10_000_000,
             "episodes": 1,
             "horizon": 3000,
@@ -1837,8 +2080,10 @@ class ControlPlane:
             "save_source": "continuous_playthrough",
             "save_slot": 1,
             "weights": {},
-            "challenge_practice_enabled": False,
-            "help_requests_enabled": False,
+            "challenge_practice_enabled": True,
+            "help_requests_enabled": True,
+            "help_stuck_count": stuck_count,
+            "help_stuck_minutes": stuck_minutes,
         }
         if warm_start is not None:
             payload["warm_start_checkpoint"], payload["warm_start_source_campaign"] = warm_start
@@ -1846,7 +2091,11 @@ class ControlPlane:
         launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
         return {"campaign": campaign, "launch": launched}
 
-    def continue_operator_campaign(self) -> dict[str, object]:
+    def continue_operator_campaign(
+        self, *, help_stuck_count: object = 10, help_stuck_minutes: object = 360.0,
+    ) -> dict[str, object]:
+        stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
+        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 1.0, 10080.0)
         campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
         for prior in campaigns:
             campaign_id = str(prior.get("campaign_id", ""))
@@ -1863,6 +2112,11 @@ class ControlPlane:
             # Panel-created retries should retain the established long
             # straggler allowance instead of an older 45-second default.
             data["straggler_timeout_seconds"] = 300.0
+            data["max_checkpoints"] = 100
+            data["help_requests_enabled"] = True
+            data["help_stuck_count"] = stuck_count
+            data["help_stuck_minutes"] = stuck_minutes
+            data["challenge_practice_enabled"] = True
             if source_version == "explore_v3":
                 data["warm_start_checkpoint"] = str(checkpoints[-1])
                 data["warm_start_source_campaign"] = campaign_id
@@ -2198,6 +2452,11 @@ class ControlPlane:
             "OPENBLAS_NUM_THREADS": str(self.torch_threads),
             "HK_AGENT_CHALLENGE_PRACTICE_ENABLED": "1" if spec.challenge_practice_enabled else "0",
             "HK_AGENT_HELP_REQUESTS_ENABLED": "1" if spec.help_requests_enabled else "0",
+            "HK_AGENT_HELP_STUCK_COUNT": str(spec.help_stuck_count),
+            "HK_AGENT_HELP_STUCK_MINUTES": str(spec.help_stuck_minutes),
+            "HK_AGENT_HELP_REQUESTS_PER_HOUR": str(spec.help_requests_per_hour),
+            "HK_AGENT_HELP_FAILED_ATTEMPTS": str(spec.help_failed_attempts),
+            "HK_AGENT_HELP_STALLED_HOURS": str(spec.help_stalled_hours),
         })
         log_handle = log_path.open("wb")
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -2517,6 +2776,11 @@ class ControlPlane:
                     "OPENBLAS_NUM_THREADS": str(self.torch_threads),
                     "HK_AGENT_CHALLENGE_PRACTICE_ENABLED": "1" if spec.challenge_practice_enabled else "0",
                     "HK_AGENT_HELP_REQUESTS_ENABLED": "1" if spec.help_requests_enabled else "0",
+                    "HK_AGENT_HELP_STUCK_COUNT": str(spec.help_stuck_count),
+                    "HK_AGENT_HELP_STUCK_MINUTES": str(spec.help_stuck_minutes),
+                    "HK_AGENT_HELP_REQUESTS_PER_HOUR": str(spec.help_requests_per_hour),
+                    "HK_AGENT_HELP_FAILED_ATTEMPTS": str(spec.help_failed_attempts),
+                    "HK_AGENT_HELP_STALLED_HOURS": str(spec.help_stalled_hours),
                 }
             )
             if shared_role == "actor":
@@ -2821,6 +3085,38 @@ class ControlPlane:
             str(practice["launch_id"]), reason=f"challenge practice: {challenge_id}",
             challenge_snapshot=snapshot, challenge_context=f"{matching[-1].get('kind', 'area')}:{challenge_id}",
         )
+
+    def resolve_help_request(self, payload: Mapping[str, object]) -> dict[str, Any]:
+        self._require_owner()
+        campaign_id, request_id, action = payload.get("campaign_id"), payload.get("request_id"), payload.get("action")
+        if not isinstance(campaign_id, str) or not isinstance(request_id, str):
+            raise TypeError("campaign_id and request_id must be strings")
+        if action not in {"show", "now_not", "discard", "complete"}:
+            raise ValueError("action must be show, now_not, discard, or complete")
+        campaign = next((row for row in self.list_campaigns() if row.get("campaign_id") == campaign_id), None)
+        if campaign is None or campaign.get("help_requests_enabled") is not True:
+            raise ValueError("help requests are not enabled for this campaign")
+        shared_root = (self.runtime_root / "shared" / campaign_id).resolve(strict=True)
+        root = (shared_root / "help-requests").resolve(strict=True)
+        if root.parent != shared_root or root.is_symlink():
+            raise ValueError("help request store escaped the campaign runtime")
+        status = {"show": "demonstration_requested", "now_not": "dismissed",
+                  "discard": "discarded", "complete": "completed"}[str(action)]
+        for path in root.glob("slot-*.json"):
+            ledger_payload = self._read_json(path)
+            rows = ledger_payload.get("requests", [])
+            if not isinstance(rows, list) or not any(
+                isinstance(row, Mapping) and row.get("request_id") == request_id for row in rows
+            ):
+                continue
+            match = re.fullmatch(r"slot-(\d+)\.json", path.name)
+            if match is None:
+                continue
+            from hk_agent.demonstrations import HelpRequestLedger
+
+            ledger = HelpRequestLedger(root, slot=int(match.group(1)))
+            return ledger.resolve(request_id, status=status)
+        raise FileNotFoundError("help request was not found")
 
     def _wait_for_process(
         self,

@@ -322,7 +322,7 @@ def test_v4_contract_adds_player_knowledge_and_keeps_raw_telemetry_out() -> None
     task = ExplorationTask(environment, config=_v4_config())
     contract = task.task_contract()
     assert contract["reward_version"] == "explore_v4"
-    assert contract["task_contract_schema_version"] == 8
+    assert contract["task_contract_schema_version"] == 9
     assert contract["observation_version"] == "pixels_action_history_player_knowledge_charms_v1"
     assert contract["information_boundary"] == ["pixels", "applied_action_history", "player_knowledge"]
     assert "milestone_events_since_last_frame" in contract["reward_only_signals"]
@@ -477,8 +477,9 @@ def test_continuous_reward_budget_survives_slice_and_expires_from_rolling_window
     task = object.__new__(ExplorationTask)
     task.config = ExplorationTaskConfig(reward_version="explore_v4", continuous_playthrough=True)
     task._continuous_budget_state = {
-        "schema_version": 1,
+        "schema_version": 2,
         "game_steps": 64,
+        "game_time_ms": 60_000,
         "segment_paid": {"confirmed_enemy_kills": 4.8},
         "buckets": {"1": {"confirmed_enemy_kills": 4.8}},
     }
@@ -487,7 +488,7 @@ def test_continuous_reward_budget_survives_slice_and_expires_from_rolling_window
     task._continuous_budget_path = None
     assert task._remaining_budget("confirmed_enemy_kills", 5.0, 0.0) == pytest.approx(0.2)
     task._continuous_budget_state["segment_paid"] = {}
-    task._continuous_budget_state["game_steps"] = 16_000
+    task._continuous_budget_state["game_time_ms"] = 660_000
     assert task._remaining_budget("confirmed_enemy_kills", 5.0, 0.0) == pytest.approx(5.0)
 
 
@@ -495,7 +496,8 @@ def test_continuous_budget_commit_handles_empty_batch_and_commits_once() -> None
     task = object.__new__(ExplorationTask)
     task.config = ExplorationTaskConfig(reward_version="explore_v4", continuous_playthrough=True)
     task._continuous_budget_state = {
-        "schema_version": 1, "game_steps": 130, "segment_paid": {}, "buckets": {}
+        "schema_version": 2, "game_steps": 130, "game_time_ms": 130_000,
+        "segment_paid": {}, "buckets": {}
     }
     task._pending_continuous_budget = {}
     task._continuous_budget_path = None
@@ -507,6 +509,45 @@ def test_continuous_budget_commit_handles_empty_batch_and_commits_once() -> None
 
     assert task._continuous_budget_state["segment_paid"] == {"novelty": 0.75}
     assert task._continuous_budget_state["buckets"] == {"2": {"novelty": 0.75}}
+
+
+def test_continuous_reward_charges_every_step_for_20000_steps_without_a_bench(
+    tmp_path: Path,
+) -> None:
+    task = ExplorationTask(
+        _Environment(), config=_v4_config(continuous_playthrough=True, horizon_steps=3000),
+        lifelong_memory_root=tmp_path / "memory",
+    )
+    task.reset()
+    rewards: list[float] = []
+    time_cost = 0.0
+    for _ in range(20_000):
+        _, reward, terminated, truncated, info = task.step(0)
+        rewards.append(reward)
+        time_cost += float(info["reward_components"]["time_cost"])
+        if terminated or truncated:
+            task.reset()
+    assert time_cost == pytest.approx(-20.0)
+    assert any(reward != 0 for reward in rewards)
+    assert sum(reward == 0 for reward in rewards) / len(rewards) < 0.90
+
+
+def test_old_continuous_budget_is_backed_up_and_reset(tmp_path: Path) -> None:
+    path = tmp_path / "continuous-reward-slot-0.json"
+    path.write_text(json.dumps({
+        "schema_version": 1, "game_steps": 53_422,
+        "segment_paid": {"time_cost": 20.0, "novelty": 4.65}, "buckets": {},
+    }), encoding="utf-8")
+    task = object.__new__(ExplorationTask)
+    state = task._load_continuous_budget(path)
+    assert state == {
+        "schema_version": 2, "game_steps": 0, "game_time_ms": 0,
+        "segment_paid": {}, "buckets": {},
+    }
+    backups = list(tmp_path.glob("continuous-reward-slot-0.backup-*.json"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text(encoding="utf-8"))["segment_paid"]["time_cost"] == 20.0
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_continuous_enemy_kill_reward_decays_without_episode_floor() -> None:

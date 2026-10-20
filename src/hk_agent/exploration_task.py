@@ -24,6 +24,7 @@ from hk_agent.challenge_practice import (
     challenge_reward,
     create_challenge_snapshot,
 )
+from hk_agent.demonstrations import HelpRequestLedger, HelpTriggerConfig
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.player_knowledge import ITEM_FLAGS, PlayerKnowledge
 from hk_agent.run_journey import RunDiary, atomic_json, increment_campaign_count, rebuild_progress
@@ -522,7 +523,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._farm_alert_latched = False
         self._continuous_budget_path: Path | None = None
         self._continuous_budget_state: dict[str, Any] = {
-            "schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}
+            "schema_version": 2, "game_steps": 0, "game_time_ms": 0,
+            "segment_paid": {}, "buckets": {}
         }
         self._continuous_budget_dirty_steps = 0
         self._pending_continuous_budget: dict[str, float] = {}
@@ -559,6 +561,24 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._challenge_practice_enabled = os.environ.get(
             "HK_AGENT_CHALLENGE_PRACTICE_ENABLED", "0"
         ) == "1"
+        self._help_requests_enabled = os.environ.get("HK_AGENT_HELP_REQUESTS_ENABLED", "0") == "1"
+        self._help_request_ledger: HelpRequestLedger | None = None
+        shared_root = os.environ.get("HK_AGENT_SHARED_ROOT")
+        slot_value = os.environ.get("HK_AGENT_SLOT_ID")
+        if self._help_requests_enabled and shared_root and slot_value and slot_value.isdigit():
+            try:
+                self._help_request_ledger = HelpRequestLedger(
+                    Path(shared_root) / "help-requests", slot=int(slot_value),
+                    config=HelpTriggerConfig(
+                        failed_attempts=int(os.environ.get("HK_AGENT_HELP_FAILED_ATTEMPTS", "100")),
+                        stalled_hours=float(os.environ.get("HK_AGENT_HELP_STALLED_HOURS", "6")),
+                        stuck_minutes=float(os.environ.get("HK_AGENT_HELP_STUCK_MINUTES", "360")),
+                        repeated_stuck_count=int(os.environ.get("HK_AGENT_HELP_STUCK_COUNT", "10")),
+                        requests_per_hour=int(os.environ.get("HK_AGENT_HELP_REQUESTS_PER_HOUR", "3")),
+                    ),
+                )
+            except (OSError, ValueError):
+                self._help_request_ledger = None
         challenge_context = os.environ.get("HK_AGENT_CHALLENGE_CONTEXT")
         challenge_snapshot = os.environ.get("HK_AGENT_CHALLENGE_SNAPSHOT")
         if self._challenge_practice_enabled and challenge_context and challenge_snapshot:
@@ -611,7 +631,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._reload_checkpoint_next_reset = False
         observation, reset_info = self.environment.reset(seed=seed, options=reset_options)
         self._player_knowledge.update(
-            reset_info, challenge_tracking_enabled=self._challenge_practice_enabled
+            reset_info, challenge_tracking_enabled=(self._challenge_practice_enabled or self._help_requests_enabled)
         )
         self._record_challenge_practice_events(self._player_knowledge.new_events)
         self._capture_challenge_snapshots(self._player_knowledge.new_events, reset_info)
@@ -759,7 +779,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         if self._diary is not None:
             self._diary.capture_before_exit(template.buttons)
         self._pending_continuous_budget = {}
-        self._advance_continuous_budget_step()
+        self._advance_continuous_budget_step(lease)
         started = time.perf_counter()
         if isinstance(self.environment, HollowKnightEnv):
             observation, _, terminated, truncated, base = self.environment.step(
@@ -780,8 +800,14 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._save_continuous_budget(force=True)
         started = time.perf_counter()
         previous_skill_epoch = self._player_knowledge.skill_epoch
+        prior_scene = self._player_knowledge.last_scene
+        prior_cell = self._player_knowledge.last_cell
+        prior_visited = (
+            set(self._player_knowledge.visited.get(prior_scene, set()))
+            if isinstance(prior_scene, str) else set()
+        )
         self._player_knowledge.update(
-            base, challenge_tracking_enabled=self._challenge_practice_enabled
+            base, challenge_tracking_enabled=(self._challenge_practice_enabled or self._help_requests_enabled)
         )
         self._record_challenge_practice_events(self._player_knowledge.new_events)
         knowledge_events = bool(self._player_knowledge.new_events)
@@ -863,6 +889,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "milestone_novelty": 0.0,
             "tutorial_reward": 0.0,
             "challenge_reward": 0.0,
+            "stuck_pressure": 0.0,
+            "stuck_escape_reward": 0.0,
             "time_cost": self.config.time_cost * (lease / self.config.lease_base_ms),
         }
         base_done = terminated or truncated
@@ -1259,16 +1287,16 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._shade_distance = None
             if base.get("shade_pending") is True:
                 components["time_cost"] -= 0.001 * (lease / 1000.0)
-        if self.config.reward_version in {"explore_v3", "explore_v4"}:
+        if (
+            self.config.reward_version in {"explore_v3", "explore_v4"}
+            and not self.config.continuous_playthrough
+        ):
             payable_time_cost = min(
                 abs(components["time_cost"]),
-                self._remaining_budget(
-                    "time_cost", self.config.time_cost_budget, self._time_cost_paid
-                ),
+                max(0.0, self.config.time_cost_budget - self._time_cost_paid),
             )
             components["time_cost"] = -payable_time_cost
             self._time_cost_paid += payable_time_cost
-            self._record_continuous_budget("time_cost", payable_time_cost)
         geo = combat["confirmed_geo_gained"] + combat["confirmed_geo_spent"]
         geo_award = min(
             geo, self._remaining_budget("geo", self.config.geo_reward_budget, self._geo_paid)
@@ -1296,6 +1324,28 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._episode_deaths += 1
         if components["run_failed"] < 0:
             self._episode_shade_lost += 1
+        current_cell = self._player_knowledge.last_cell
+        if self._help_request_ledger is not None and isinstance(current_scene, str) and current_cell is not None:
+            place_stuck_count = self._help_request_ledger.stuck_count(
+                scene=current_scene, cell=current_cell
+            )
+            if place_stuck_count >= 3:
+                components["stuck_pressure"] = -min(
+                    0.005, abs(self.config.time_cost) * (lease / self.config.lease_base_ms) * 2.0
+                )
+            prior_place_stuck_count = (
+                self._help_request_ledger.stuck_count(scene=prior_scene, cell=prior_cell)
+                if isinstance(prior_scene, str) and prior_cell is not None else 0
+            )
+            if (
+                prior_place_stuck_count >= 3 and prior_scene == current_scene and prior_cell is not None
+                and current_cell != prior_cell
+                and abs(current_cell[0] - prior_cell[0]) + abs(current_cell[1] - prior_cell[1]) == 1
+                and current_cell not in prior_visited
+            ):
+                components["stuck_escape_reward"] = self._help_request_ledger.reward_new_neighbor(
+                    scene=current_scene, cell=current_cell
+                )
         # Death/run-failure and any base terminal/truncation suppress all positive rewards on this transition.
         terminal_penalty = components["death"] < 0 or components["run_failed"] < 0
         if base_done or terminal_penalty:
@@ -1310,6 +1360,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "shade_approach",
                 "hp_restored",
                 "milestone_novelty",
+                "stuck_escape_reward",
             ):
                 components[name] = 0.0
         self._commit_continuous_budget(components)
@@ -1341,6 +1392,37 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             termination_reason = "stuck"
         elif termination_reason is None and horizon:
             termination_reason = "time_limit"
+        help_request: dict[str, Any] | None = None
+        if self._help_request_ledger is not None:
+            current_progress = self._scene_max_progress.get(current_scene, 0.0) if isinstance(current_scene, str) else 0.0
+            if isinstance(current_scene, str):
+                self._help_request_ledger.observe_progress(scene=current_scene, progress=current_progress)
+            if termination_reason == "stuck" and isinstance(current_scene, str):
+                cell = self._player_knowledge.last_cell
+                if cell is not None:
+                    thumbnail_path: str | None = None
+                    if self._journey_root is not None:
+                        try:
+                            from PIL import Image
+
+                            thumbnail_root = self._journey_root / "help-thumbnails"
+                            thumbnail_root.mkdir(parents=True, exist_ok=True)
+                            thumbnail = thumbnail_root / f"slot-{self._journey_actor}-{time.time_ns()}.png"
+                            Image.fromarray(np.asarray(observation["pixels"][-1], dtype=np.uint8)).save(thumbnail)
+                            thumbnail_path = str(thumbnail)
+                        except (OSError, ValueError):
+                            pass
+                    help_request = self._help_request_ledger.record_stuck(
+                        scene=current_scene, cell=cell, progress=current_progress,
+                        thumbnail_path=thumbnail_path,
+                    )
+        stuck_location: dict[str, Any] | None = None
+        if self._help_request_ledger is not None and isinstance(current_scene, str) and current_cell is not None:
+            place = f"{current_scene}:c{current_cell[0]}r{current_cell[1]}"
+            stuck_location = next(
+                (row for row in self._help_request_ledger.stuck_locations() if row.get("place") == place),
+                None,
+            )
         self._done = task_terminated or task_truncated
         if self._done and self._diary is not None and self._journey_root is not None:
             self._diary.finish(
@@ -1396,6 +1478,12 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 if self._challenge_practice_controller is not None else None
             ),
             "challenge_practice_finished": self._challenge_practice_finished,
+            "help_request": help_request,
+            "stuck_location": stuck_location,
+            "pending_help_requests": (
+                [row for row in self._help_request_ledger.requests() if row.get("status") == "pending"]
+                if self._help_request_ledger is not None else []
+            ),
         }
         timing_profile = base.get("timing_ms")
         if isinstance(timing_profile, Mapping):
@@ -1579,22 +1667,32 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         )
 
     def _load_continuous_budget(self, path: Path) -> dict[str, Any]:
+        empty = {"schema_version": 2, "game_steps": 0, "game_time_ms": 0,
+                 "segment_paid": {}, "buckets": {}}
         if not path.is_file():
-            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+            return dict(empty)
         try:
             payload = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+            self._backup_and_reset_continuous_budget(path, empty)
+            return dict(empty)
+        if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+            self._backup_and_reset_continuous_budget(path, empty)
+            return dict(empty)
         game_steps = payload.get("game_steps", 0)
+        game_time_ms = payload.get("game_time_ms", 0)
         segment = payload.get("segment_paid", {})
         buckets = payload.get("buckets", {})
         if not isinstance(game_steps, int) or isinstance(game_steps, bool) or game_steps < 0:
-            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+            self._backup_and_reset_continuous_budget(path, empty)
+            return dict(empty)
+        if not isinstance(game_time_ms, int) or isinstance(game_time_ms, bool) or game_time_ms < 0:
+            self._backup_and_reset_continuous_budget(path, empty)
+            return dict(empty)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "game_steps": game_steps,
+            "game_time_ms": game_time_ms,
             "segment_paid": {str(k): float(v) for k, v in segment.items()
                               if isinstance(k, str) and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0}
             if isinstance(segment, dict) else {},
@@ -1604,13 +1702,27 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             if isinstance(buckets, dict) else {},
         }
 
-    def _advance_continuous_budget_step(self) -> None:
+    @staticmethod
+    def _backup_and_reset_continuous_budget(path: Path, empty: Mapping[str, Any]) -> None:
+        try:
+            backup = path.with_name(f"{path.stem}.backup-{time.time_ns()}{path.suffix}")
+            backup.write_bytes(path.read_bytes())
+            atomic_json(path, empty)
+        except OSError:
+            # The caller still starts from clean in-memory budgets; a writable
+            # memory directory will persist the migrated state on the first save.
+            return
+
+    def _advance_continuous_budget_step(self, lease_ms: int = 0) -> None:
         if not self.config.continuous_playthrough:
             return
         self._continuous_budget_state["game_steps"] = int(self._continuous_budget_state.get("game_steps", 0)) + 1
-        current_bucket = int(self._continuous_budget_state["game_steps"]) // 64
+        self._continuous_budget_state["game_time_ms"] = int(
+            self._continuous_budget_state.get("game_time_ms", 0)
+        ) + max(0, lease_ms)
+        current_bucket = int(self._continuous_budget_state["game_time_ms"]) // 60_000
         buckets = self._continuous_budget_state.setdefault("buckets", {})
-        cutoff = current_bucket - 235
+        cutoff = current_bucket - 9
         for key in list(buckets):
             if key.isdigit() and int(key) < cutoff:
                 del buckets[key]
@@ -1621,14 +1733,18 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             return max(0.0, budget - episode_paid)
         segment = self._continuous_budget_state.get("segment_paid", {})
         buckets = self._continuous_budget_state.get("buckets", {})
-        current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
+        current = int(self._continuous_budget_state.get("game_time_ms", 0)) // 60_000
         window_paid = sum(
             float(row.get(name, 0.0)) for key, row in buckets.items()
-            if key.isdigit() and current - 235 <= int(key) <= current and isinstance(row, dict)
+            if key.isdigit() and current - 9 <= int(key) <= current and isinstance(row, dict)
         )
         segment_paid = float(segment.get(name, 0.0)) if isinstance(segment, dict) else 0.0
         pending = self._pending_continuous_budget.get(name, 0.0)
-        return max(0.0, min(budget - segment_paid - pending, budget - window_paid - pending))
+        return max(0.0, min(
+            budget - episode_paid - pending,
+            budget - segment_paid - pending,
+            budget - window_paid - pending,
+        ))
 
     def _record_continuous_budget(self, name: str, amount: float) -> None:
         if not self.config.continuous_playthrough or amount <= 0:
@@ -1649,7 +1765,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "hp_restored": components.get("hp_restored", 0.0) > 0,
             "shade_approach_positive": components.get("shade_approach", 0.0) > 0,
             "shade_approach_negative": components.get("shade_approach", 0.0) < 0,
-            "time_cost": components.get("time_cost", 0.0) < 0,
+            "time_cost": False,
             "geo": components.get("confirmed_geo_gained", 0.0) + components.get("confirmed_geo_spent", 0.0) > 0,
             "damage_health": components.get("damage_taken", 0.0) < 0,
         }
@@ -1658,7 +1774,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 continue
             segment = self._continuous_budget_state.setdefault("segment_paid", {})
             segment[name] = float(segment.get(name, 0.0)) + amount
-            current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
+            current = int(self._continuous_budget_state.get("game_time_ms", 0)) // 60_000
             buckets = self._continuous_budget_state.setdefault("buckets", {})
             row = buckets.setdefault(str(current), {})
             row[name] = float(row.get(name, 0.0)) + amount
@@ -1707,7 +1823,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self.config.reward_version
         ]
         if self.config.reward_version == "explore_v4":
-            schema_version = 8
+            schema_version = 9
         return {
             "task_contract_schema_version": schema_version,
             "reward_version": self.config.reward_version,
@@ -1726,7 +1842,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 and (key != "tutorial_hint_level" or self.config.reward_version == "explore_v4")
             },
             "observation_version": "pixels_action_history_player_knowledge_charms_v1" if schema_version >= 8 else "pixels_action_history_player_knowledge_bestiary_v1" if schema_version == 7 else "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
-            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version in {5, 6, 7, 8} else ["pixels", "applied_action_history"],
+            "information_boundary": ["pixels", "applied_action_history", "player_knowledge"] if schema_version >= 5 else ["pixels", "applied_action_history"],
             "reward_only_signals": [
                 "enemy_kills_since_last_frame",
                 "hp_lost_since_last_frame",

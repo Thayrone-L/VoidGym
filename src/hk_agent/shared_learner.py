@@ -90,23 +90,81 @@ def validate_warm_start_spaces(
     source_observation: gym.Space[Any], source_action: gym.Space[Any],
     target_observation: gym.Space[Any], target_action: gym.Space[Any],
 ) -> None:
-    if (_space_to_payload(source_observation) != _space_to_payload(target_observation)
-            or _space_to_payload(source_action) != _space_to_payload(target_action)):
-        raise SharedLearnerError("warm-start observation or action spaces differ from the new campaign")
+    source_payload = _space_to_payload(source_observation)
+    target_payload = _space_to_payload(target_observation)
+    if not _compatible_warm_start_observation(source_payload, target_payload):
+        raise SharedLearnerError("warm-start observation spaces differ from the new campaign")
+    if _space_to_payload(source_action) == _space_to_payload(target_action):
+        return
+    if (isinstance(source_action, gym.spaces.Discrete)
+            and isinstance(target_action, gym.spaces.Discrete)
+            and source_action.start == target_action.start and source_action.n < target_action.n):
+        return
+    raise SharedLearnerError("warm-start action spaces differ from the new campaign")
+
+
+def _compatible_warm_start_observation(source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    if source == target:
+        return True
+    source_spaces, target_spaces = source.get("spaces"), target.get("spaces")
+    if (source.get("type") != "Dict" or target.get("type") != "Dict"
+            or not isinstance(source_spaces, Mapping) or not isinstance(target_spaces, Mapping)
+            or set(source_spaces) != set(target_spaces)):
+        return False
+    for name, source_space in source_spaces.items():
+        target_space = target_spaces.get(name)
+        if not isinstance(source_space, Mapping) or not isinstance(target_space, Mapping):
+            return False
+        if source_space == target_space:
+            continue
+        if (name == "action_history" and source_space.get("type") == "MultiDiscrete"
+                and target_space.get("type") == "MultiDiscrete"
+                and source_space.get("dtype") == target_space.get("dtype")
+                and source_space.get("start") == target_space.get("start")):
+            old_nvec, new_nvec = source_space.get("nvec"), target_space.get("nvec")
+            if (isinstance(old_nvec, list) and isinstance(new_nvec, list)
+                    and len(old_nvec) == len(new_nvec)
+                    and all(isinstance(old, int) and isinstance(new, int) and old <= new
+                            for old, new in zip(old_nvec, new_nvec, strict=True))):
+                continue
+        return False
+    return True
 
 
 def compatible_warm_start_state(
-    source_state: Mapping[str, Any], target_state: Mapping[str, Any]
+    source_state: Mapping[str, Any], target_state: Mapping[str, Any],
+    source_action_names: Sequence[str] | None = None,
+    target_action_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Return only identically named, identically shaped source policy tensors."""
-    compatible = {
-        name: tensor for name, tensor in source_state.items()
-        if name in target_state and getattr(target_state[name], "shape", None) == getattr(tensor, "shape", None)
-    }
+    """Copy matching tensors and align action heads by name when the action set grows."""
+    compatible: dict[str, Any] = {}
+    for name, tensor in source_state.items():
+        if name not in target_state:
+            continue
+        target_tensor = target_state[name]
+        if getattr(target_tensor, "shape", None) == getattr(tensor, "shape", None):
+            compatible[name] = tensor
+            continue
+        source_shape = cast(tuple[int, ...], getattr(tensor, "shape", ()))
+        target_shape = cast(tuple[int, ...], getattr(target_tensor, "shape", ()))
+        if ("action_net" not in name or len(source_shape) != len(target_shape) or not source_shape
+                or source_shape[1:] != target_shape[1:] or source_shape[0] >= target_shape[0]):
+            continue
+        clone = getattr(target_tensor, "clone", None)
+        expanded = clone() if callable(clone) else target_tensor.copy()
+        if source_action_names is not None and target_action_names is not None:
+            if len(source_action_names) != source_shape[0] or len(target_action_names) != target_shape[0]:
+                raise SharedLearnerError("warm-start action names do not match policy output dimensions")
+            target_index = {action: index for index, action in enumerate(target_action_names)}
+            for source_index, action in enumerate(source_action_names):
+                if action in target_index:
+                    expanded[target_index[action]] = tensor[source_index]
+        else:
+            expanded[:source_shape[0]] = tensor
+        compatible[name] = expanded
     if not compatible or not any("features_extractor" in name for name in compatible):
         raise SharedLearnerError("warm-start has no compatible visual feature extractor tensors")
     return compatible
-
 
 def _space_to_payload(space: gym.Space[Any]) -> dict[str, Any]:
     if isinstance(space, gym.spaces.Dict):
@@ -921,6 +979,16 @@ def train_shared_round(model: Any, rollouts: Sequence[Mapping[str, np.ndarray]])
     return transitions
 
 
+def zero_reward_fraction(rollouts: Sequence[Mapping[str, np.ndarray]]) -> float:
+    """Fraction of transitions whose reward is exactly zero in one learner round."""
+    arrays = [np.asarray(row.get("rewards", []), dtype=np.float32).reshape(-1) for row in rollouts]
+    total = sum(len(values) for values in arrays)
+    if total == 0:
+        return 0.0
+    zero = sum(int(np.count_nonzero(values == 0.0)) for values in arrays)
+    return zero / total
+
+
 def train_behavioral_cloning_batch(model: Any, batch: Mapping[str, np.ndarray], *, weight: float) -> float:
     """Apply one masked supervised update to a context-matched human batch."""
     if not 0 < weight <= 1:
@@ -943,9 +1011,14 @@ def train_behavioral_cloning_batch(model: Any, batch: Mapping[str, np.ndarray], 
         from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
         lstm = model.policy.lstm_actor
-        shape = (lstm.num_layers, len(actions), lstm.hidden_size)
+        sequence_count = int(batch.get("sequence_count", np.asarray(1)).item())
+        if sequence_count < 1 or len(actions) % sequence_count:
+            raise SharedLearnerError("demonstration sequence layout is malformed")
+        shape = (lstm.num_layers, sequence_count, lstm.hidden_size)
         zero = torch.zeros(shape, dtype=torch.float32, device=device)
-        starts = torch.ones(len(actions), dtype=torch.float32, device=device)
+        starts = torch.zeros(len(actions), dtype=torch.float32, device=device)
+        sequence_length = len(actions) // sequence_count
+        starts[::sequence_length] = 1.0
         _values, log_probability, _entropy = model.policy.evaluate_actions(
             observations, actions, RNNStates((zero, zero), (zero, zero)), starts, masks,
         )
@@ -1001,9 +1074,11 @@ def apply_context_demonstrations(
                     artifact.with_suffix(".json").write_text(
                         json.dumps(metadata, sort_keys=True), encoding="utf-8"
                     )
+                sample_count = metadata.get("samples", 0)
+                sample_count = sample_count if isinstance(sample_count, int) and not isinstance(sample_count, bool) else 0
                 weight = imitation_schedule(
                     initial_weight=initial_weight, decay_rounds=decay_rounds,
-                    round_number=round_number - first_used,
+                    round_number=round_number - first_used, samples_in_bank=sample_count,
                 )
                 if weight <= 0:
                     continue
@@ -1012,6 +1087,16 @@ def apply_context_demonstrations(
                     observation_space=model.observation_space,
                     action_count=int(model.action_space.n),
                 )
+                from hk_agent.demonstrations import augment_demonstration_batch
+                from hk_agent.scene_change_task import (
+                    SCENE_CHANGE_ACTION_TEMPLATES,
+                    SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES,
+                )
+
+                if int(model.action_space.n) == len(SCENE_CHANGE_ACTION_TEMPLATES):
+                    batch = augment_demonstration_batch(batch, SCENE_CHANGE_ACTION_TEMPLATES)
+                elif int(model.action_space.n) == len(SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES):
+                    batch = augment_demonstration_batch(batch, SCENE_CHANGE_INTERACTION_ACTION_TEMPLATES)
                 loss = train_behavioral_cloning_batch(model, batch, weight=weight)
                 row = {
                     "round": round_number, "context": context, "artifact": artifact.name,
@@ -1239,6 +1324,8 @@ def run_shared_actor(
             self.farm_alerts: set[str] = set()
             self.challenge_practice_completed = False
             self.challenge_practice_status: dict[str, Any] = {}
+            self.pending_help_requests: list[dict[str, Any]] = []
+            self.help_context: str | None = None
             self.step_profile_ms: dict[str, float] = {}
             self.task_profile_totals: dict[str, float] = {}
             self.bridge_profile_totals: dict[str, float] = {}
@@ -1285,6 +1372,12 @@ def run_shared_actor(
                     practice_status = info.get("challenge_practice")
                     if isinstance(practice_status, Mapping):
                         self.challenge_practice_status = dict(practice_status)
+                    help_rows = info.get("pending_help_requests")
+                    if isinstance(help_rows, list):
+                        self.pending_help_requests = [dict(row) for row in help_rows if isinstance(row, Mapping)][:8]
+                        context = next((row.get("context") for row in self.pending_help_requests
+                                        if isinstance(row.get("context"), str)), None)
+                        self.help_context = context
                     progress = info.get("episode_progress")
                     if isinstance(progress, Mapping) and info.get("evaluation_only") is not True:
                         self.latest_episode_progress = dict(progress)
@@ -1300,9 +1393,10 @@ def run_shared_actor(
                     max_progress_by_scene=self.max_progress_by_scene,
                     action_counts=self.action_counts,
                     farm_alerts=sorted(self.farm_alerts),
-                    challenge_context=os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
+                    challenge_context=self.help_context or os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
                     game_version=_environment_game_version(environment),
                     challenge_practice=self.challenge_practice_status,
+                    pending_help_requests=self.pending_help_requests,
                 )
                 self.last_heartbeat = now
             return True
@@ -1692,10 +1786,32 @@ def run_shared_learner(
     if warm_start_checkpoint is not None:
         if previous:
             raise SharedLearnerError("warm-start campaigns must use a new shared checkpoint directory")
-        source_model = contrib.MaskablePPO.load(str(warm_start_checkpoint), device="cpu")
-        source_state = source_model.policy.state_dict()
+        source_model = model_class.load(str(warm_start_checkpoint), device="cpu")
+        validate_warm_start_spaces(source_model.observation_space, source_model.action_space,
+                                   observation_space, action_space)
+        target_task = contract.get("task_contract", {})
+        target_names_raw = target_task.get("action_names") if isinstance(target_task, Mapping) else None
+        target_names = target_names_raw if isinstance(target_names_raw, list) and all(
+            isinstance(item, str) for item in target_names_raw
+        ) else None
+        source_names: list[str] | None = None
+        source_manifest_path = warm_start_checkpoint.parent.parent / "manifest.json"
+        try:
+            source_manifest = json.loads(source_manifest_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            source_manifest = {}
+        source_task = source_manifest.get("task_contract", {}) if isinstance(source_manifest, Mapping) else {}
+        source_names_raw = source_task.get("action_names") if isinstance(source_task, Mapping) else None
+        if isinstance(source_names_raw, list) and all(isinstance(item, str) for item in source_names_raw):
+            source_names = source_names_raw
+        elif target_names is not None:
+            added_names = {"JUMP_MAX", "LEFT+JUMP_MAX", "RIGHT+JUMP_MAX"}
+            source_names = [item for item in target_names if item not in added_names]
+        compatible = compatible_warm_start_state(
+            source_model.policy.state_dict(), model.policy.state_dict(),
+            source_action_names=source_names, target_action_names=target_names,
+        )
         target_state = model.policy.state_dict()
-        compatible = compatible_warm_start_state(source_state, target_state)
         target_state.update(compatible)
         model.policy.load_state_dict(target_state, strict=True)
         model.policy.optimizer.state.clear()
@@ -1725,6 +1841,7 @@ def run_shared_learner(
     manifest["status"] = "RUNNING"
     manifest["algorithm"] = "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO"
     manifest["task_contract_fingerprint"] = fingerprint
+    manifest["task_contract"] = dict(contract.get("task_contract", {})) if isinstance(contract.get("task_contract"), Mapping) else {}
     manifest["rollout_steps"] = rollout_steps
     manifest["batch_size"] = batch_size
     manifest["ppo_hyperparameters"] = _shared_ppo_parameters(
@@ -1740,6 +1857,26 @@ def run_shared_learner(
             "source_reward_version": "explore_v3",
         }
     manifest.setdefault("round_timings", [])
+    entropy_target = float(model.ent_coef)
+    existing_recovery = manifest.get("entropy_recovery")
+    if (
+        isinstance(existing_recovery, Mapping)
+        and isinstance(existing_recovery.get("end_round_exclusive"), int)
+        and existing_recovery["end_round_exclusive"] > current_round
+    ):
+        entropy_recovery_start = int(existing_recovery.get("start_round", current_round))
+        entropy_recovery_end = int(existing_recovery["end_round_exclusive"])
+        entropy_target = float(existing_recovery.get("target_ent_coef", entropy_target))
+        manifest["entropy_recovery"] = dict(existing_recovery)
+    else:
+        entropy_recovery_start = current_round
+        entropy_recovery_end = current_round + 10
+        manifest["entropy_recovery"] = {
+            "start_round": entropy_recovery_start,
+            "end_round_exclusive": entropy_recovery_end,
+            "recovery_ent_coef": 0.025,
+            "target_ent_coef": entropy_target,
+        }
     next_checkpoint = ((completed // checkpoint_interval) + 1) * checkpoint_interval
 
     def save_checkpoint(round_number: int) -> None:
@@ -1748,9 +1885,19 @@ def run_shared_learner(
         target = checkpoints / f"round-{round_number:08d}.zip"
         model.save(temporary)
         os.replace(temporary, target)
-        checkpoint_paths = sorted(checkpoints.glob("round-*.zip"))
-        for stale in checkpoint_paths[:-max_checkpoints]:
-            stale.unlink(missing_ok=True)
+        checkpoint_paths = sorted(
+            checkpoints.glob("round-*.zip"),
+            key=lambda path: int(path.stem.removeprefix("round-")),
+        )
+        newest = set(checkpoint_paths[-max_checkpoints:])
+        permanent = {
+            path for path in checkpoint_paths
+            if path.stem.removeprefix("round-").isdigit()
+            and int(path.stem.removeprefix("round-")) % 20 == 0
+        }
+        for stale in checkpoint_paths:
+            if stale not in newest and stale not in permanent:
+                stale.unlink(missing_ok=True)
         inventory = manifest.setdefault("checkpoints", [])
         if isinstance(inventory, list):
             inventory[:] = [str(path) for path in sorted(checkpoints.glob("round-*.zip"))]
@@ -1781,6 +1928,10 @@ def run_shared_learner(
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"
                 break
+            zero_fraction = zero_reward_fraction(rollouts)
+            model.ent_coef = (
+                0.025 if current_round < entropy_recovery_end else entropy_target
+            )
             training_started = time.perf_counter()
             transitions = train_shared_round(model, rollouts)
             demonstration_rows = apply_context_demonstrations(
@@ -1813,6 +1964,8 @@ def run_shared_learner(
                     "train_ms": round(training_seconds * 1000, 3),
                     "actors_received": slots,
                     "stale_rollouts": wait_metrics["stale_rollouts"],
+                    "zero_reward_fraction": zero_fraction,
+                    "ent_coef": float(model.ent_coef),
                 })
             evaluation_rows = store.read_evaluations()
             manifest["evaluations"] = evaluation_rows
@@ -1848,6 +2001,10 @@ def run_shared_learner(
                 if isinstance(alerts, list):
                     alert_set.update(item for item in alerts if isinstance(item, str))
             manifest["farm_alerts"] = sorted(alert_set)
+            manifest["last_zero_reward_fraction"] = zero_fraction
+            if zero_fraction > 0.90:
+                alert_set.add("reward_zero_over_90_percent")
+                manifest["farm_alerts"] = sorted(alert_set)
             manifest["completed_timesteps"] = completed
             manifest["round"] = current_round
             rejected_count = 0
@@ -1865,6 +2022,7 @@ def run_shared_learner(
                 stale_rollouts_total=store.stale_rollout_count(),
                 evaluation_count=len(evaluation_rows),
                 farm_alerts=manifest["farm_alerts"],
+                zero_reward_fraction=zero_fraction,
             )
             if completed >= next_checkpoint:
                 save_checkpoint(current_round)
