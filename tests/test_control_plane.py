@@ -54,6 +54,20 @@ def _payload(campaign_type: str = "scene_change_probe") -> dict[str, object]:
     }
 
 
+def test_launch_commands_use_project_virtual_environment(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    python = root / ".venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"test executable marker")
+    payload = _payload("exploration_training")
+    payload["weights"] = {}
+    spec = CampaignSpec.from_payload(payload)
+
+    command = ControlPlane(root).build_command(spec, execute=False)
+
+    assert command[0] == str(python)
+
+
 def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     control = ControlPlane(_project(tmp_path))
     first = control.create_campaign(_payload())
@@ -115,6 +129,57 @@ def test_failed_shared_learner_stops_its_actor_slots(tmp_path: Path, monkeypatch
     control._supervise_failed_shared_learners()
 
     assert stopped == ["actor-1"]
+
+
+def test_shared_learner_ignores_prelaunch_heartbeat_during_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = ControlPlane(_project(tmp_path), runtime_root=tmp_path / "runtime")
+    shared = tmp_path / "runtime" / "shared" / "campaign"
+    shared.mkdir(parents=True)
+    now = time.time_ns()
+    (shared / "learner.json").write_text(json.dumps({
+        "status": "TRAINING", "heartbeat_unix_ns": now - 3_600_000_000_000,
+        "last_wait_rollouts_ms": 1000,
+    }), encoding="utf-8")
+    control._launches = {
+        "learner-new": {"role": "learner", "campaign_id": "campaign",
+                        "shared_group": "campaign-v0001", "shared_root": str(shared),
+                        "started_unix_ns": now, "status": "RUNNING"},
+        "actor-new": {"role": "actor", "shared_group": "campaign-v0001", "status": "RUNNING"},
+    }
+    monkeypatch.setattr(control, "_refresh_locked", lambda: None)
+    stopped: list[str] = []
+    monkeypatch.setattr(control, "stop", lambda launch_id, **kwargs: stopped.append(launch_id))
+
+    control._supervise_failed_shared_learners()
+
+    assert control._launches["learner-new"]["status"] == "RUNNING"
+    assert stopped == []
+
+
+def test_shared_learner_startup_without_heartbeat_expires_after_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = ControlPlane(_project(tmp_path), runtime_root=tmp_path / "runtime")
+    shared = tmp_path / "runtime" / "shared" / "campaign"
+    shared.mkdir(parents=True)
+    now = time.time_ns()
+    (shared / "learner.json").write_text(json.dumps({
+        "status": "TRAINING", "heartbeat_unix_ns": now - 3_600_000_000_000,
+    }), encoding="utf-8")
+    control._launches = {
+        "learner-new": {"role": "learner", "campaign_id": "campaign",
+                        "shared_group": "campaign-v0001", "shared_root": str(shared),
+                        "started_unix_ns": now - 301_000_000_000, "status": "RUNNING"},
+    }
+    monkeypatch.setattr(control, "_refresh_locked", lambda: None)
+    monkeypatch.setattr(control, "stop", lambda *args, **kwargs: None)
+
+    control._supervise_failed_shared_learners()
+
+    assert control._launches["learner-new"]["status"] == "FAILED"
+    assert "heartbeat expirou" in str(control._launches["learner-new"]["failure"])
 
 
 def test_map_matching_prefers_capture_with_scene_bounds() -> None:

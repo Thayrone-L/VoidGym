@@ -32,10 +32,12 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if self.server.upstream_port is not None and path.startswith("/api/"):
+        if self.server.upstream_port is not None and path == "/api/session" and not _supervisor_available(self.server.upstream_port):
+            self._json(HTTPStatus.OK, {"csrf_token": self.server.control_plane.csrf_token})
+        elif self.server.upstream_port is not None and path.startswith("/api/"):
             self._relay("GET")
             return
-        if path == "/api/status":
+        elif path == "/api/status":
             self._json(HTTPStatus.OK, self.server.control_plane.status())
         elif path == "/api/operator":
             self._json(HTTPStatus.OK, self.server.control_plane.operator_snapshot())
@@ -133,7 +135,36 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._static(path)
 
     def do_POST(self) -> None:
-        if self.server.upstream_port is not None and urlsplit(self.path).path.startswith("/api/"):
+        path = urlsplit(self.path).path
+        if path == "/api/operator/supervisor/restart":
+            allowed_tokens = {self.server.control_plane.csrf_token}
+            if self.server.upstream_port is not None and _supervisor_available(self.server.upstream_port):
+                try:
+                    with urlopen(f"http://127.0.0.1:{self.server.upstream_port}/api/session", timeout=0.5) as response:
+                        session = json.loads(response.read().decode("utf-8"))
+                    if isinstance(session, dict) and isinstance(session.get("csrf_token"), str):
+                        allowed_tokens.add(session["csrf_token"])
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            if not self._mutation_is_allowed(allowed_tokens):
+                return
+            try:
+                payload = self._payload()
+                if payload:
+                    raise ValueError("supervisor restart takes no settings")
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            if self.server.project_root is None or self.server.supervisor_port is None:
+                self._error(HTTPStatus.CONFLICT, "supervisor relaunch is unavailable in this panel mode")
+                return
+            try:
+                _start_detached_supervisor(self.server.project_root, port=self.server.supervisor_port)
+                self._json(HTTPStatus.OK, {"started": True, "port": self.server.supervisor_port})
+            except (OSError, RuntimeError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+            return
+        if self.server.upstream_port is not None and path.startswith("/api/"):
             self._relay("POST")
             return
         if not self._mutation_is_allowed():
@@ -196,13 +227,18 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":
-                if set(payload) not in ({}, {"help_stuck_count"}, {"help_stuck_count", "help_stuck_minutes"}):
-                    raise ValueError("continue only accepts help trigger settings")
+                if set(payload) not in (
+                    {}, {"help_stuck_count"}, {"help_stuck_count", "help_stuck_minutes"},
+                    {"campaign_id"}, {"campaign_id", "help_stuck_count"},
+                    {"campaign_id", "help_stuck_count", "help_stuck_minutes"},
+                ):
+                    raise ValueError("continue only accepts campaign id and help trigger settings")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
                 self._json(HTTPStatus.ACCEPTED, self.server.control_plane.continue_operator_campaign(
                     help_stuck_count=payload.get("help_stuck_count", 10),
                     help_stuck_minutes=payload.get("help_stuck_minutes", 60.0),
+                    campaign_id=payload.get("campaign_id"),
                 ))
             elif path == "/api/operator/repeat":
                 if payload:
@@ -339,13 +375,15 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return parse_json_body(self.rfile.read(length))
 
     def _relay(self, method: str) -> None:
+        path = urlsplit(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length", "0"))) if method == "POST" else None
         headers = {name: value for name, value in self.headers.items()
                    if name.lower() not in {"host", "origin", "connection", "content-length"}}
         if body is not None:
             headers["Content-Length"] = str(len(body))
         try:
-            connection = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=10)
+            timeout = 120 if method == "GET" and path == "/api/operator" else 15
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=timeout)
             connection.request(method, self.path, body=body, headers=headers)
             response = connection.getresponse()
             content = response.read()
@@ -358,11 +396,34 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             connection.close()
         except OSError as error:
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE, f"campaign supervisor unavailable: {error}")
+            if self.server.supervisor_port is not None and _supervisor_available(self.server.supervisor_port):
+                self._error(
+                    HTTPStatus.GATEWAY_TIMEOUT,
+                    f"O supervisor está online, mas a consulta {path} excedeu o tempo de resposta: {error}",
+                )
+                return
+            if (method == "GET" and self.server.project_root is not None
+                    and self.server.supervisor_port is not None
+                    and path in {"/api/status", "/api/operator", "/api/session"}
+                    and not getattr(self, "_supervisor_restart_attempted", False)
+                    and not _active_launch_process_exists(self.server.project_root)):
+                self._supervisor_restart_attempted = True
+                try:
+                    _start_detached_supervisor(self.server.project_root, port=self.server.supervisor_port)
+                except (OSError, RuntimeError):
+                    pass
+                else:
+                    return self._relay(method)
+            last_line = _last_supervisor_log_line(self.server.project_root) if self.server.project_root else None
+            message = "O supervisor do treino não está rodando."
+            if last_line:
+                message += f" Última linha do log: {last_line}"
+            message += f" ({error})"
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, message)
 
-    def _mutation_is_allowed(self) -> bool:
-        expected = self.server.control_plane.csrf_token
-        if self.headers.get("X-Control-Token") != expected:
+    def _mutation_is_allowed(self, expected_tokens: set[str] | None = None) -> bool:
+        allowed = expected_tokens or {self.server.control_plane.csrf_token}
+        if self.headers.get("X-Control-Token") not in allowed:
             self._error(HTTPStatus.FORBIDDEN, "missing or invalid control token")
             return False
         origin = self.headers.get("Origin")
@@ -424,11 +485,14 @@ class ControlPlaneHTTPServer(ThreadingHTTPServer):
         control_plane: ControlPlane,
         static_root: Path,
         upstream_port: int | None = None,
+        project_root: Path | None = None,
     ) -> None:
         super().__init__(address, ControlPlaneHandler)
         self.control_plane = control_plane
         self.static_root = static_root
         self.upstream_port = upstream_port
+        self.supervisor_port = upstream_port
+        self.project_root = project_root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -481,33 +545,84 @@ def _supervisor_available(port: int) -> bool:
         return False
 
 
+def _last_supervisor_log_line(project_root: Path) -> str | None:
+    log_root = project_root / "artifacts" / "control-plane"
+    try:
+        logs = sorted(log_root.glob("supervisor-*.log"), key=lambda path: path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    for path in reversed(logs):
+        try:
+            lines = path.read_text("utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if line.strip():
+                return line.strip()[-1000:]
+    return None
+
+
+def _active_launch_process_exists(project_root: Path) -> bool:
+    launch_root = project_root / "artifacts" / "control-plane" / "launches"
+    try:
+        paths = launch_root.glob("*/launch.json")
+        for path in paths:
+            try:
+                record = json.loads(path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("status") not in {"PREPARING", "RUNNING", "STOP_REQUESTED"}:
+                continue
+            if record.get("status") == "PREPARING":
+                try:
+                    if time.time_ns() - path.stat().st_mtime_ns < 15 * 60 * 1_000_000_000:
+                        return True
+                except OSError:
+                    continue
+                continue
+            pid = record.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and ControlPlane._launch_process_matches(record, pid):
+                return True
+    except OSError:
+        return True
+    return False
+
+
 def _start_detached_supervisor(project_root: Path, *, port: int) -> None:
     if _supervisor_available(port):
         return
+    log_root = project_root / "artifacts" / "control-plane"
+    log_root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    log_path = log_root / f"supervisor-{stamp}-{os.getpid()}.log"
     launcher = project_root / "tools" / "serve_training_dashboard.py"
-    command = [sys.executable, str(launcher), "--allow-execute", "--supervisor-mode", "--port", str(port)]
+    environment_python = project_root / ".venv" / "Scripts" / "python.exe"
+    if not environment_python.is_file():
+        environment_python = project_root / ".venv" / "bin" / "python"
+    python = str(environment_python) if environment_python.is_file() else sys.executable
+    command = [python, str(launcher), "--allow-execute", "--supervisor-mode", "--port", str(port)]
     flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
              | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
              | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)) if os.name == "nt" else 0
-    if os.name == "nt":
-        subprocess.Popen(
-            command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,
-        )
-    else:
-        subprocess.Popen(
-            command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
-        )
-    deadline = time.monotonic() + 8.0
+    with log_path.open("ab") as log_stream:
+        if os.name == "nt":
+            subprocess.Popen(
+                command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=log_stream,
+                stderr=subprocess.STDOUT, close_fds=True, creationflags=flags,
+            )
+        else:
+            subprocess.Popen(
+                command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=log_stream,
+                stderr=subprocess.STDOUT, close_fds=True, start_new_session=True,
+            )
+    deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         if _supervisor_available(port):
             return
         time.sleep(0.1)
-    raise RuntimeError(
-        f"campaign supervisor did not start on 127.0.0.1:{port}; "
-        "an older control-plane owner may need a safe stop before migration"
-    )
+    last_line = _last_supervisor_log_line(project_root)
+    detail = f" Last log line: {last_line}" if last_line else " The supervisor log is empty."
+    raise RuntimeError(f"campaign supervisor did not start on 127.0.0.1:{port}.{detail} Log: {log_path}")
 
 
 def main() -> int:
@@ -530,14 +645,18 @@ def main() -> int:
             control_plane = build_control_plane(
                 project_root, allow_execute=True, observer=True
             )
-            _start_detached_supervisor(project_root, port=supervisor_port)
             upstream_port = supervisor_port
+            try:
+                _start_detached_supervisor(project_root, port=supervisor_port)
+            except (OSError, RuntimeError):
+                # Keep the operator panel alive so it can show the log and offer recovery.
+                pass
         else:
             control_plane = build_control_plane(project_root, allow_execute=False)
     except (ConfigError, ControlPlaneBusyError) as error:
         raise SystemExit(str(error)) from error
     server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root,
-                                    upstream_port=upstream_port)
+                                    upstream_port=upstream_port, project_root=project_root)
     print(
         f"HK Training Control Plane: http://127.0.0.1:{args.port} "
         f"({'real launches enabled' if args.allow_execute else 'dry-run only'})",

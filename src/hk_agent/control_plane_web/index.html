@@ -17,6 +17,7 @@
     <div class="status-banner-main"><strong id="status-message">Conectando ao painel…</strong><div id="status-alert-list" hidden></div></div>
     <details id="status-technical" hidden><summary>Detalhes técnicos</summary><pre id="status-technical-detail"></pre></details>
     <details id="status-events" hidden><summary>Últimos eventos</summary><div id="status-event-list"></div></details>
+    <button id="supervisor-restart" class="button secondary" type="button" hidden>Religar supervisor</button>
   </section>
   <main>
     <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
@@ -33,10 +34,10 @@
           <label id="time-wrap" hidden>Parar às<input id="end-time" type="time"></label>
         </div>
         <p id="recommendation" class="hint">Calculando recomendação desta máquina…</p>
-        <button id="start-training" class="button primary large">Iniciar treino</button>
+        <button id="start-training" class="button secondary large">Começar campanha nova</button>
         <p class="hint safety-note">Antes de abrir o jogo, feche seu Hollow Knight pessoal.</p>
         <div class="button-row">
-          <button id="continue-training" class="button secondary">Continuar de onde parou</button>
+          <button id="continue-training" class="button primary">Continuar de onde parou</button>
           <button id="repeat-training" class="button secondary">Repetir treino do zero</button>
         </div>
         <button id="stop-training" class="button danger large" disabled>Parar com segurança</button>

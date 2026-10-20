@@ -56,6 +56,7 @@ def test_continue_warm_starts_v4_from_v3_and_repeat_uses_new_seed(tmp_path: Path
     checkpoint_dir = plane.runtime_root / "shared" / campaign_id / "checkpoints"
     checkpoint_dir.mkdir(parents=True)
     (checkpoint_dir / "round-0002.zip").write_bytes(b"synthetic checkpoint")
+    (checkpoint_dir.parent / "manifest.json").write_text(json.dumps({"algorithm": "MaskablePPO"}), encoding="utf-8")
     old = {"campaign_id": campaign_id, "name": "Night run", "campaign_type": "exploration_training",
            "reward_version": "explore_v3", "shared_learner": True, "seed": 7, "version": 2,
            "created_at": "old", "spec_path": "old.json"}
@@ -69,7 +70,7 @@ def test_continue_warm_starts_v4_from_v3_and_repeat_uses_new_seed(tmp_path: Path
         assert campaign["reward_version"] == "explore_v4"
         assert campaign["warm_start_checkpoint"].endswith("round-0002.zip")
         assert campaign["warm_start_source_campaign"] == campaign_id
-        assert "conhecimento foi mantido" in resumed["notice"]
+        assert "round-0002.zip" in resumed["notice"]
         launch.assert_called_once_with(campaign["campaign_id"], version=3, execute=True)
     with (patch.object(plane, "list_campaigns", return_value=[old]),
           patch.object(plane, "create_campaign", side_effect=lambda data: {**data, "version": 1}),
@@ -106,7 +107,7 @@ def test_operator_start_uses_latest_compatible_policy_for_jogada1(tmp_path: Path
     assert campaign["challenge_practice_enabled"] is True
     assert campaign["help_requests_enabled"] is True
     assert campaign["help_stuck_minutes"] == 60.0
-    assert campaign["warm_start_source_campaign"] == "latest-compatible"
+    assert campaign["warm_start_source_campaign"] == "newer-recurrent"
     assert campaign["warm_start_checkpoint"].endswith("round-0001.zip")
     launch.assert_called_once_with("jogada-1", version=1, execute=True)
 
@@ -130,9 +131,9 @@ def test_operator_start_does_not_warm_start_into_existing_campaign_checkpoints(t
             campaign_name="jogada-1", help_stuck_count=8, help_stuck_minutes=90,
         )
     campaign = result["campaign"]
-    assert campaign["campaign_id"] == "jogada-1"
-    assert campaign.get("warm_start_checkpoint") is None
-    assert campaign.get("warm_start_source_campaign") is None
+    assert campaign["campaign_id"].startswith("jogada-1-new-")
+    assert campaign["warm_start_source_campaign"] == "compatible"
+    assert campaign["warm_start_checkpoint"].endswith("round-0011.zip")
     assert campaign["help_stuck_count"] == 8 and campaign["help_stuck_minutes"] == 90
 
 
@@ -358,8 +359,11 @@ def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     assert 'id="map-view-toggle"' in html
     assert 'id="calibration-open"' in html and 'id="calibration-wizard"' in html
     assert 'id="theme-toggle"' in html and 'value="60"' in html
+    assert 'Começar campanha nova' in html and 'id="supervisor-restart"' in html
     assert 'localStorage.setItem("voidgym-theme"' in app
     assert 'window.matchMedia("(prefers-color-scheme: dark)")' in app
+    assert 'fetch("/api/session",{cache:"no-store"})' in app
+    assert 'data.resumable_campaign' in app and 'setTimeout(()=>{if(!latest&&!latestError)' in app and '},15000)' in app
     assert 'data-theme="dark"' in css and "prefers-color-scheme:dark" in css
     assert 'resolved_solo:"Resolvido por ela"' in app
     assert 'value="bounds"' in html and 'value="captures"' in html
@@ -373,3 +377,44 @@ def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     assert 'id="status-banner"' in html and 'id="status-technical-detail"' in html
     assert ".status-banner.error" in css and ".status-banner.warning" in css
     assert "setStatusBanner(\"error\"" in app and "friendlyFailure" in app
+
+
+
+def test_resume_candidate_prefers_recurrent_checkpoint_and_marks_empty_failure(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path)
+    campaigns_root = plane.control_root / "campaigns"
+    for campaign_id, created, algorithm, with_checkpoint in (
+        ("older-recurrent", "2026-01-01T00:00:00Z", "MaskableRecurrentPPO", True),
+        ("newer-feedforward", "2026-01-02T00:00:00Z", "MaskablePPO", True),
+        ("newest-recurrent-short", "2026-01-04T00:00:00Z", "MaskableRecurrentPPO", True),
+        ("empty-failure", "2026-01-03T00:00:00Z", "MaskableRecurrentPPO", False),
+    ):
+        directory = campaigns_root / campaign_id
+        directory.mkdir(parents=True)
+        (directory / "v0001.json").write_text(json.dumps({
+            "campaign_id": campaign_id, "name": campaign_id,
+            "campaign_type": "exploration_training", "reward_version": "explore_v4",
+            "shared_learner": True, "created_at": created,
+        }), encoding="utf-8")
+        shared = plane.runtime_root / "shared" / campaign_id
+        shared.mkdir(parents=True)
+        (shared / "manifest.json").write_text(json.dumps({"algorithm": algorithm}), encoding="utf-8")
+        if with_checkpoint:
+            checkpoints = shared / "checkpoints"
+            checkpoints.mkdir()
+            round_number = "00000002" if campaign_id == "newest-recurrent-short" else "00000108"
+            (checkpoints / f"round-{round_number}.zip").write_bytes(b"checkpoint")
+    failed = plane.control_root / "launches" / "failed-empty"
+    failed.mkdir(parents=True)
+    (failed / "launch.json").write_text(json.dumps({
+        "campaign_id": "empty-failure", "status": "FAILED",
+        "finished_unix_ns": 10, "failure": "learner failed before first round",
+    }), encoding="utf-8")
+
+    candidate = plane._operator_checkpoint_candidate()
+    assert candidate is not None
+    assert candidate["campaign_id"] == "older-recurrent"
+    assert candidate["round"] == 108
+    empty = next(row for row in plane.list_campaigns() if row["campaign_id"] == "empty-failure")
+    assert empty["operator_state"] == "not_started"
+    assert empty["operator_failure"] == "learner failed before first round"

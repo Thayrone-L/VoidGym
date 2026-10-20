@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
@@ -587,3 +589,19 @@ def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path,
         model, tmp_path, store, actor_slots=[0], round_number=21, manifest=manifest,
     ) == []
     assert calls == [pytest.approx(0.25), pytest.approx(0.025)]
+
+
+
+def test_warm_start_loader_uses_algorithm_from_source_manifest(monkeypatch) -> None:
+    feedforward = object()
+    recurrent = type("RecurrentModel", (), {})
+    monkeypatch.setitem(
+        sys.modules,
+        "hk_agent.recurrent_sb3",
+        SimpleNamespace(MaskableRecurrentPPO=recurrent),
+    )
+    assert shared._warm_start_model_class("MaskablePPO", feedforward) is feedforward
+    assert shared._warm_start_model_class(None, feedforward) is feedforward
+    assert shared._warm_start_model_class("MaskableRecurrentPPO", feedforward) is recurrent
+    with pytest.raises(SharedLearnerError, match="not supported"):
+        shared._warm_start_model_class("UnknownPPO", feedforward)

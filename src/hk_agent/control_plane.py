@@ -116,6 +116,17 @@ def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _project_python_executable(project_root: Path) -> str:
+    candidates = (
+        project_root / ".venv" / "Scripts" / "python.exe",
+        project_root / ".venv" / "bin" / "python",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignSpec:
     campaign_id: str
@@ -819,8 +830,54 @@ class ControlPlane:
                 continue
             if isinstance(payload, dict):
                 payload["spec_path"] = path.relative_to(self.project_root).as_posix()
+                campaign_id = payload.get("campaign_id")
+                if payload.get("shared_learner") is True and isinstance(campaign_id, str):
+                    checkpoint_root = self.runtime_root / "shared" / campaign_id / "checkpoints"
+                    if not any(checkpoint_root.glob("round-*.zip")):
+                        failures = [row for row in self._campaign_launch_records(campaign_id)
+                                    if row.get("status") == "FAILED"]
+                        if failures:
+                            latest = max(failures, key=lambda row: int(row.get("finished_unix_ns", 0) or 0))
+                            payload["operator_state"] = "not_started"
+                            payload["operator_failure"] = str(latest.get("failure") or "Falha antes da primeira rodada")
                 campaigns.append(payload)
         return sorted(campaigns, key=lambda item: str(item.get("created_at", "")), reverse=True)
+
+    def _operator_checkpoint_candidate(
+        self, *, allow_unknown_algorithm: bool = False, campaign_id: str | None = None,
+    ) -> dict[str, object] | None:
+        requested_campaign_id = campaign_id
+        candidates: list[tuple[int, int, int, dict[str, object]]] = []
+        for campaign in self.list_campaigns():
+            candidate_campaign_id = campaign.get("campaign_id")
+            if (campaign.get("campaign_type") != "exploration_training"
+                    or campaign.get("reward_version") not in {"explore_v3", "explore_v4"}
+                    or campaign.get("shared_learner") is not True
+                    or not isinstance(candidate_campaign_id, str)
+                    or (requested_campaign_id is not None and candidate_campaign_id != requested_campaign_id)):
+                continue
+            shared_root = self.runtime_root / "shared" / candidate_campaign_id
+            algorithm = self._read_json(shared_root / "manifest.json").get("algorithm")
+            if (algorithm not in {"MaskableRecurrentPPO", "MaskablePPO"}
+                    and (not allow_unknown_algorithm or algorithm is not None)):
+                continue
+            checkpoints = sorted(
+                (item for item in (shared_root / "checkpoints").glob("round-*.zip") if item.is_file()),
+                key=lambda item: int(item.stem.removeprefix("round-"))
+                if item.stem.removeprefix("round-").isdigit() else -1,
+            )
+            if not checkpoints:
+                continue
+            checkpoint = checkpoints[-1]
+            match = re.fullmatch(r"round-(\d+)", checkpoint.stem)
+            round_number = int(match.group(1)) if match else 0
+            rank = 0 if algorithm == "MaskableRecurrentPPO" else 1
+            candidates.append((rank, -round_number, len(candidates), {
+                "campaign": campaign, "campaign_id": candidate_campaign_id,
+                "checkpoint": checkpoint, "round": round_number,
+                "algorithm": algorithm,
+            }))
+        return min(candidates, key=lambda item: (item[0], item[1], item[2]))[3] if candidates else None
 
     def _operator_system_resources(self) -> dict[str, object]:
         if os.name != "nt":
@@ -926,7 +983,10 @@ class ControlPlane:
         active = status.get("active_launches", [])
         active_records = [row for row in active if isinstance(row, Mapping)] if isinstance(active, list) else []
         campaigns = self.list_campaigns()
+        resume_candidate = self._operator_checkpoint_candidate()
         campaign_id = next((str(row.get("campaign_id")) for row in active_records if row.get("campaign_id")), None)
+        if campaign_id is None and resume_candidate is not None:
+            campaign_id = str(resume_candidate["campaign_id"])
         if campaign_id is None and campaigns:
             campaign_id = str(campaigns[0].get("campaign_id", "")) or None
         selected_campaign = next(
@@ -1032,12 +1092,17 @@ class ControlPlane:
         shade_losses = sum(int(row.get("shade_losses", 0) or 0) for row in progress_rows)
         first_scene_steps = [int(row["steps_to_first_scene_change"]) for row in progress_rows if isinstance(row.get("steps_to_first_scene_change"), int)]
         alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
+        warm_start_warning = manifest.get("warm_start_warning")
+        if isinstance(warm_start_warning, str) and warm_start_warning:
+            alerts.append(warm_start_warning)
         memory_percent = system_resources.get("memory_percent")
         if isinstance(memory_percent, (int, float)) and not isinstance(memory_percent, bool) and memory_percent > 85:
             alerts.append(f"Memória do sistema acima de 85% ({memory_percent:.0f}%)")
-        latest_shared = next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True), None)
-        latest_shared_id = str(latest_shared.get("campaign_id")) if isinstance(latest_shared, Mapping) else None
-        latest_checkpoint_exists = bool(latest_shared_id and any((self.runtime_root / "shared" / latest_shared_id / "checkpoints").glob("round-*.zip")))
+        latest_shared = resume_candidate.get("campaign") if resume_candidate is not None else next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True), None)
+        latest_checkpoint_exists = resume_candidate is not None
+        resume_campaign = resume_candidate.get("campaign") if resume_candidate is not None else {}
+        if not isinstance(resume_campaign, Mapping):
+            resume_campaign = {}
         last_completion: dict[str, object] | None = None
         if not active_records and campaign_id:
             terminal_records = self._campaign_launch_records(campaign_id)
@@ -1330,6 +1395,12 @@ class ControlPlane:
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
             "max_instances": min(3, capacity),
             "can_continue": latest_checkpoint_exists, "has_campaign": bool(latest_shared),
+            "resumable_campaign": ({"campaign_id": resume_candidate["campaign_id"],
+                                    "name": resume_campaign.get("name", resume_candidate["campaign_id"]),
+                                    "round": resume_candidate["round"],
+                                    "checkpoint": Path(str(resume_candidate["checkpoint"])).name,
+                                    "algorithm": resume_candidate["algorithm"]}
+                                   if resume_candidate is not None else None),
             "last_completion": last_completion,
             "checkpoints": manifest.get("checkpoints", []), "reward_version": next((row.get("reward_version") for row in campaigns if row.get("campaign_id") == campaign_id), None),
             "advanced": {"launch_ids": [row.get("launch_id") for row in active_records], "shared_root": str(shared_root) if shared_root else None,
@@ -1623,6 +1694,9 @@ class ControlPlane:
         except (OSError, ValueError, TypeError):
             journey_svg = schematic_svg({})
         alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
+        warm_start_warning = manifest.get("warm_start_warning")
+        if isinstance(warm_start_warning, str) and warm_start_warning:
+            alerts.append(warm_start_warning)
         checkpoints = manifest.get("checkpoints", [])
         if not isinstance(checkpoints, list):
             checkpoints = [str(path) for path in sorted((shared_root / "checkpoints").glob("round-*.zip"))]
@@ -2099,34 +2173,18 @@ class ControlPlane:
         ):
             raise ValueError("campaign_name must contain 1 to 80 characters")
         name = campaign_name.strip() if isinstance(campaign_name, str) else f"Exploration {time.strftime('%d/%m %H:%M', time.localtime())}"
-        campaign_id = "jogada-1" if name.casefold() == "jogada-1" else f"explore-{now_slug}-{secrets.token_hex(2)}"
+        already_used_default_id = (
+            any(row.get("campaign_id") == "jogada-1" for row in self.list_campaigns())
+            or any((self.runtime_root / "shared" / "jogada-1" / "checkpoints").glob("round-*.zip"))
+        )
+        campaign_id = (f"jogada-1-new-{now_slug}-{secrets.token_hex(2)}"
+                       if name.casefold() == "jogada-1" and already_used_default_id
+                       else "jogada-1" if name.casefold() == "jogada-1"
+                       else f"explore-{now_slug}-{secrets.token_hex(2)}")
+        candidate = self._operator_checkpoint_candidate()
         warm_start: tuple[str, str] | None = None
-        for previous in self.list_campaigns():
-            previous_id = previous.get("campaign_id")
-            if (
-                previous.get("campaign_type") != "exploration_training"
-                or previous.get("reward_version") != "explore_v4"
-                or previous.get("shared_learner") is not True
-                or not isinstance(previous_id, str)
-            ):
-                continue
-            previous_root = self.runtime_root / "shared" / previous_id
-            # The warm-start loader currently accepts feed-forward MaskablePPO
-            # archives and copies their compatible feature weights into the
-            # recurrent policy. Skip recurrent archives and other algorithms.
-            if self._read_json(previous_root / "manifest.json").get("algorithm") != "MaskablePPO":
-                continue
-            checkpoints = sorted(
-                (previous_root / "checkpoints").glob("round-*.zip"),
-                key=lambda path: path.stat().st_mtime_ns,
-            )
-            if checkpoints:
-                warm_start = (str(checkpoints[-1]), previous_id)
-                break
-        # Reusing an existing campaign directory (e.g. "jogada-1") must resume from
-        # its own checkpoints; the learner refuses warm-start into a used directory.
-        if any((self.runtime_root / "shared" / campaign_id / "checkpoints").glob("round-*.zip")):
-            warm_start = None
+        if candidate is not None:
+            warm_start = (str(candidate["checkpoint"]), str(candidate["campaign_id"]))
         payload: dict[str, object] = {
             "campaign_id": campaign_id,
             "name": name,
@@ -2158,47 +2216,77 @@ class ControlPlane:
             payload["warm_start_checkpoint"], payload["warm_start_source_campaign"] = warm_start
         campaign = self.create_campaign(payload)
         launched = self.launch(campaign_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
-        return {"campaign": campaign, "launch": launched}
+        notice = (f"Warm-start a partir de {warm_start[1]} ({Path(warm_start[0]).name})."
+                  if warm_start else "Nenhum checkpoint compatível disponível; a campanha começa do zero.")
+        return {"campaign": campaign, "launch": launched, "notice": notice,
+                "warm_start_source_campaign": warm_start[1] if warm_start else None,
+                "warm_start_checkpoint": warm_start[0] if warm_start else None}
 
     def continue_operator_campaign(
         self, *, help_stuck_count: object = 10, help_stuck_minutes: object = 60.0,
+        campaign_id: object = None,
     ) -> dict[str, object]:
         stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
         stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 5.0, 10080.0)
-        campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
-        for prior in campaigns:
-            campaign_id = str(prior.get("campaign_id", ""))
-            shared_root = self.runtime_root / "shared" / campaign_id
-            checkpoints = sorted((shared_root / "checkpoints").glob("round-*.zip"))
-            if not checkpoints:
-                continue
-            data = dict(prior)
-            source_version = prior.get("reward_version")
-            data.update({"campaign_id": (f"{campaign_id[:42]}-v4-{secrets.token_hex(2)}" if source_version == "explore_v3" else campaign_id),
-                         "name": f"{str(prior.get('name', 'Exploration'))[:55]} v4",
-                         "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31-1),
-                         "reward_version": "explore_v4"})
-            # Panel-created retries should retain the established long
-            # straggler allowance instead of an older 45-second default.
-            data["straggler_timeout_seconds"] = 300.0
-            data["max_checkpoints"] = 100
-            data["help_requests_enabled"] = True
-            data["help_stuck_count"] = stuck_count
-            data["help_stuck_minutes"] = stuck_minutes
-            data["challenge_practice_enabled"] = True
-            if source_version == "explore_v3":
-                data["warm_start_checkpoint"] = str(checkpoints[-1])
-                data["warm_start_source_campaign"] = campaign_id
-            else:
-                data["reward_version"] = "explore_v4"
-                data.pop("warm_start_checkpoint", None)
-                data.pop("warm_start_source_campaign", None)
-            campaign = self.create_campaign(data)
-            new_id = str(campaign["campaign_id"])
-            launched = self.launch(new_id, version=_bounded_int(campaign["version"], "version", 1, 1_000_000), execute=True)
-            return {"campaign": campaign, "launch": launched, "checkpoint": str(checkpoints[-1]),
-                    "notice": "a pontuação foi atualizada; o conhecimento foi mantido" if source_version == "explore_v3" else "Campanha explore_v4 retomada."}
-        raise RuntimeError("No shared-learner checkpoint is available to continue")
+        requested_campaign_id = campaign_id if isinstance(campaign_id, str) else None
+        if campaign_id is not None and requested_campaign_id is None:
+            raise ValueError("campaign_id must be a string")
+        candidate = self._operator_checkpoint_candidate(
+            allow_unknown_algorithm=True, campaign_id=requested_campaign_id,
+        )
+        if candidate is None:
+            raise RuntimeError("No compatible shared-learner checkpoint is available to continue")
+        prior = candidate["campaign"]
+        if not isinstance(prior, Mapping):
+            raise TypeError("Resumable campaign metadata is invalid")
+        campaign_id = str(candidate["campaign_id"])
+        shared_root = self.runtime_root / "shared" / campaign_id
+        checkpoints = sorted(
+            (shared_root / "checkpoints").glob("round-*.zip"),
+            key=lambda path: int(path.stem.removeprefix("round-"))
+            if path.stem.removeprefix("round-").isdigit() else -1,
+        )
+        if not checkpoints:
+            raise RuntimeError("No shared-learner checkpoint is available to continue")
+        source_version = prior.get("reward_version")
+        data = dict(prior)
+        data.update({
+            "campaign_id": (f"{campaign_id[:42]}-v4-{secrets.token_hex(2)}"
+                            if source_version == "explore_v3" else campaign_id),
+            "name": f"{str(prior.get('name', 'Exploration'))[:55]} v4",
+            "seed": _bounded_int(prior.get("seed", 0), "seed", 0, 2**31 - 1),
+            "reward_version": "explore_v4",
+        })
+        data["straggler_timeout_seconds"] = 300.0
+        data["max_checkpoints"] = 100
+        data["help_requests_enabled"] = True
+        data["help_stuck_count"] = stuck_count
+        data["help_stuck_minutes"] = stuck_minutes
+        data["challenge_practice_enabled"] = True
+        zero_start_warning = source_version == "explore_v3" and candidate.get("algorithm") is None
+        if source_version == "explore_v3" and not zero_start_warning:
+            data["warm_start_checkpoint"] = str(checkpoints[-1])
+            data["warm_start_source_campaign"] = campaign_id
+        else:
+            data.pop("warm_start_checkpoint", None)
+            data.pop("warm_start_source_campaign", None)
+        campaign = self.create_campaign(data)
+        new_id = str(campaign["campaign_id"])
+        launched = self.launch(
+            new_id,
+            version=_bounded_int(campaign["version"], "version", 1, 1_000_000),
+            execute=True,
+        )
+        return {
+            "campaign": campaign,
+            "launch": launched,
+            "checkpoint": str(checkpoints[-1]),
+            "notice": (
+                f"{campaign_id} retomada do checkpoint {checkpoints[-1].name} ({candidate['round']})."
+                if not zero_start_warning else
+                f"Origem {campaign_id} sem algoritmo compatível no manifesto; v4 começa do zero."
+            ),
+        }
 
     def repeat_operator_campaign(self) -> dict[str, object]:
         campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
@@ -2252,7 +2340,7 @@ class ControlPlane:
         if tool_path.parent != (self.project_root / "tools").resolve():
             raise RuntimeError("tool escaped the allowlisted directory")
         command = [
-            sys.executable,
+            _project_python_executable(self.project_root),
             str(tool_path),
             "--seed",
             str(spec.seed if seed_override is None else seed_override),
@@ -2480,7 +2568,7 @@ class ControlPlane:
         log_path = launch_root / "process.log"
         tool_path = self.project_root / "tools" / "run_shared_learner.py"
         command = [
-            sys.executable, str(tool_path), "--shared-root", str(shared_root),
+            _project_python_executable(self.project_root), str(tool_path), "--shared-root", str(shared_root),
             "--stop-file", str(stop_file), "--actors", str(spec.actors),
             "--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size),
             "--checkpoint-interval", str(spec.checkpoint_interval),
@@ -3775,10 +3863,23 @@ class ControlPlane:
                     if isinstance(value, (int, float)) and not isinstance(value, bool)
                 )
                 stale_after = max(120.0, 2.0 * expected_round) if expected_round else 300.0
-                stale = (
+                launch_started = learner.get("started_unix_ns")
+                now_ns = time.time_ns()
+                beat_belongs_to_launch = (
                     isinstance(beat, int) and not isinstance(beat, bool)
-                    and (time.time_ns() - beat) / 1_000_000_000 > stale_after
+                    and isinstance(launch_started, int) and not isinstance(launch_started, bool)
+                    and beat >= launch_started
                 )
+                startup_expired = (
+                    isinstance(launch_started, int) and not isinstance(launch_started, bool)
+                    and now_ns - launch_started > max(300, int(stale_after * 1_000_000_000))
+                )
+                beat_stale = (
+                    isinstance(beat, int) and not isinstance(beat, bool)
+                    and beat_belongs_to_launch
+                    and (now_ns - beat) / 1_000_000_000 > stale_after
+                )
+                stale = beat_stale or (startup_expired and not beat_belongs_to_launch)
                 if not failed and learner.get("status") in {"RUNNING", "STARTING"} and stale:
                     failure = f"learner heartbeat expirou após {stale_after:.0f}s"
                     learner_status.update({"status": "FAILED", "failure": failure})

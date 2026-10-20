@@ -1688,6 +1688,15 @@ def _restore_latest_checkpoint(
     return None
 
 
+def _warm_start_model_class(algorithm: object, feedforward_class: Any) -> Any:
+    if algorithm == "MaskableRecurrentPPO":
+        from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
+        return MaskableRecurrentPPO
+    if algorithm in {None, "MaskablePPO"}:
+        return feedforward_class
+    raise SharedLearnerError(f"warm-start source algorithm {algorithm!r} is not supported")
+
+
 def run_shared_learner(
     *,
     shared_root: Path,
@@ -1783,40 +1792,52 @@ def run_shared_learner(
         key=lambda path: int(path.stem.removeprefix("round-"))
         if path.stem.removeprefix("round-").isdigit() else -1,
     )
+    warm_start_warning: str | None = None
     if warm_start_checkpoint is not None:
         if previous:
             raise SharedLearnerError("warm-start campaigns must use a new shared checkpoint directory")
-        source_model = model_class.load(str(warm_start_checkpoint), device="cpu")
-        validate_warm_start_spaces(source_model.observation_space, source_model.action_space,
-                                   observation_space, action_space)
-        target_task = contract.get("task_contract", {})
-        target_names_raw = target_task.get("action_names") if isinstance(target_task, Mapping) else None
-        target_names = target_names_raw if isinstance(target_names_raw, list) and all(
-            isinstance(item, str) for item in target_names_raw
-        ) else None
-        source_names: list[str] | None = None
-        source_manifest_path = warm_start_checkpoint.parent.parent / "manifest.json"
         try:
-            source_manifest = json.loads(source_manifest_path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
-            source_manifest = {}
-        source_task = source_manifest.get("task_contract", {}) if isinstance(source_manifest, Mapping) else {}
-        source_names_raw = source_task.get("action_names") if isinstance(source_task, Mapping) else None
-        if isinstance(source_names_raw, list) and all(isinstance(item, str) for item in source_names_raw):
-            source_names = source_names_raw
-        elif target_names is not None:
-            added_names = {"JUMP_MAX", "LEFT+JUMP_MAX", "RIGHT+JUMP_MAX"}
-            source_names = [item for item in target_names if item not in added_names]
-        compatible = compatible_warm_start_state(
-            source_model.policy.state_dict(), model.policy.state_dict(),
-            source_action_names=source_names, target_action_names=target_names,
-        )
-        target_state = model.policy.state_dict()
-        target_state.update(compatible)
-        model.policy.load_state_dict(target_state, strict=True)
-        model.policy.optimizer.state.clear()
-        model.num_timesteps = 0
-        model._n_updates = 0
+            source_manifest_path = warm_start_checkpoint.parent.parent / "manifest.json"
+            try:
+                source_manifest = json.loads(source_manifest_path.read_text("utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise SharedLearnerError(f"warm-start source manifest is unavailable: {error}") from error
+            source_algorithm = source_manifest.get("algorithm") if isinstance(source_manifest, Mapping) else None
+            source_model_class = _warm_start_model_class(source_algorithm, contrib.MaskablePPO)
+            source_model = source_model_class.load(str(warm_start_checkpoint), device="cpu")
+            validate_warm_start_spaces(
+                source_model.observation_space, source_model.action_space,
+                observation_space, action_space,
+            )
+            target_task = contract.get("task_contract", {})
+            target_names_raw = target_task.get("action_names") if isinstance(target_task, Mapping) else None
+            target_names = target_names_raw if isinstance(target_names_raw, list) and all(
+                isinstance(item, str) for item in target_names_raw
+            ) else None
+            source_task = source_manifest.get("task_contract", {}) if isinstance(source_manifest, Mapping) else {}
+            source_names_raw = source_task.get("action_names") if isinstance(source_task, Mapping) else None
+            source_names: list[str] | None = None
+            if isinstance(source_names_raw, list) and all(isinstance(item, str) for item in source_names_raw):
+                source_names = source_names_raw
+            elif target_names is not None:
+                added_names = {"JUMP_MAX", "LEFT+JUMP_MAX", "RIGHT+JUMP_MAX"}
+                source_names = [item for item in target_names if item not in added_names]
+            compatible = compatible_warm_start_state(
+                source_model.policy.state_dict(), model.policy.state_dict(),
+                source_action_names=source_names, target_action_names=target_names,
+            )
+            target_state = model.policy.state_dict()
+            target_state.update(compatible)
+            model.policy.load_state_dict(target_state, strict=True)
+            model.policy.optimizer.state.clear()
+            model.num_timesteps = 0
+            model._n_updates = 0
+        except (SharedLearnerError, OSError, ValueError, TypeError, KeyError,
+                RuntimeError, AttributeError, ImportError, EOFError, zipfile.BadZipFile) as error:
+            warm_start_warning = f"Warm-start incompatível; a campanha começou do zero. Motivo: {error}"
+            logging.getLogger(__name__).warning(warm_start_warning)
+            warm_start_checkpoint = None
+            warm_start_source_campaign = None
     completed = 0
     current_round = 0
     if previous:
@@ -1840,6 +1861,10 @@ def run_shared_learner(
         }
     manifest["status"] = "RUNNING"
     manifest["algorithm"] = "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO"
+    if warm_start_warning:
+        manifest["warm_start_warning"] = warm_start_warning
+    else:
+        manifest.pop("warm_start_warning", None)
     manifest["task_contract_fingerprint"] = fingerprint
     manifest["task_contract"] = dict(contract.get("task_contract", {})) if isinstance(contract.get("task_contract"), Mapping) else {}
     manifest["rollout_steps"] = rollout_steps
