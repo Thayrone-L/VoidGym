@@ -592,6 +592,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 controller = ChallengePracticeController(
                     main_actor="actor-main", practice_actor=os.environ.get("HK_AGENT_SLOT_ID", "practice"),
                     required_wins=2, recent_attempts=5, time_limit_seconds=3600.0,
+                    max_attempts=10,
                 )
                 controller.start(snapshot, lambda _rollout: None)
                 self._challenge_practice_controller = controller
@@ -728,7 +729,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         if self._previous_scene_name:
             self._episode_scene_names.add(self._previous_scene_name)
         self._diary = None
-        if self._journey_root is not None:
+        if self._journey_root is not None and not self._evaluation_mode:
             self._diary = RunDiary(
                 self._journey_root
                 / f"actor-{self._journey_actor}"
@@ -1603,7 +1604,6 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._challenge_practice_finished = True
                 break
         if controller.should_exit():
-            controller.active = False
             self._challenge_practice_finished = True
 
     def _persist_player_knowledge(self, *, force: bool = False) -> None:

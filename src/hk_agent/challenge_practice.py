@@ -196,16 +196,20 @@ class ChallengePracticeController:
     def __init__(
         self, *, main_actor: str, practice_actor: str, required_wins: int = 2,
         recent_attempts: int = 5, time_limit_seconds: float = 3600.0,
+        max_attempts: int = 10,
     ) -> None:
         if main_actor == practice_actor or required_wins < 1 or recent_attempts < required_wins:
             raise ValueError("invalid practice actor or exit criteria")
-        if time_limit_seconds <= 0:
-            raise ValueError("time limit must be positive")
+        if time_limit_seconds <= 0 or max_attempts < 1:
+            raise ValueError("time limit and max attempts must be positive")
         self.main_actor = main_actor
         self.practice_actor = practice_actor
         self.required_wins = required_wins
         self.recent: deque[bool] = deque(maxlen=recent_attempts)
         self.time_limit_seconds = time_limit_seconds
+        self.max_attempts = max_attempts
+        self.attempts = 0
+        self.finish_reason: str | None = None
         self.deadline = 0.0
         self.snapshot: ChallengeSnapshot | None = None
         self.active = False
@@ -220,6 +224,8 @@ class ChallengePracticeController:
         self.snapshot = snapshot
         self._submit = submit_to_shared_learner
         self.recent.clear()
+        self.attempts = 0
+        self.finish_reason = None
         self.deadline = time.monotonic() + self.time_limit_seconds
         self.active = True
 
@@ -229,33 +235,50 @@ class ChallengePracticeController:
         if attempt.challenge_id != self.snapshot.challenge_id or attempt.kind != self.snapshot.kind:
             raise ValueError("attempt belongs to a different challenge context")
         self.memory.setdefault(attempt.challenge_id, ChallengeMemory()).record(attempt)
+        self.attempts += 1
         self.recent.append(attempt.success)
-        should_exit = (
-            sum(self.recent) >= self.required_wins or time.monotonic() >= self.deadline
-        )
-        if should_exit:
-            self.active = False
-        return should_exit
+        if sum(self.recent) >= self.required_wins:
+            self.finish("target_met")
+        elif self.attempts >= self.max_attempts:
+            self.finish("attempt_limit")
+        elif time.monotonic() >= self.deadline:
+            self.finish("time_limit")
+        return not self.active
 
     def submit_rollout(self, rollout: Any) -> None:
         if not self.active or self._submit is None:
             raise RuntimeError("practice rollout outside active challenge mode")
         self._submit(rollout)
 
+    def finish(self, reason: str) -> None:
+        if reason not in {"target_met", "attempt_limit", "time_limit"}:
+            raise ValueError("unknown practice finish reason")
+        self.active = False
+        self.finish_reason = reason
+
     def should_exit(self) -> bool:
-        if not self.active:
-            return True
-        return sum(self.recent) >= self.required_wins or time.monotonic() >= self.deadline
+        if self.active and time.monotonic() >= self.deadline:
+            self.finish("time_limit")
+        return not self.active
 
     def status(self) -> dict[str, Any]:
         name = self.snapshot.challenge_id if self.snapshot else None
         memory = self.memory.get(name or "", ChallengeMemory())
+        label = None
+        if self.active and name:
+            label = f"Praticando trecho {name} (tentativa {self.attempts + 1}/{self.max_attempts})"
+        elif self.finish_reason and name:
+            label = f"Prática concluída: {name} ({self.finish_reason})"
         return {
             "mode": "challenge_practice" if self.active else "main_playthrough",
+            "active": self.active,
+            "finished": self.finish_reason is not None,
+            "finish_reason": self.finish_reason,
             "actor": self.practice_actor if self.active else self.main_actor,
             "challenge": name,
-            "label": f"Treinando: {name}" if self.active and name else None,
-            "attempts": memory.attempts,
+            "label": label,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
             "best_progress": memory.best_progress,
             "wins": memory.wins,
         }

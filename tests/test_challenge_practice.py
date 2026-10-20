@@ -75,8 +75,27 @@ def test_challenge_practice_routes_rollouts_to_shared_learner_and_exits_after_wi
     assert not controller.record_attempt(ChallengeAttempt("False_Knight", "boss", "v2", success=True, hits=6))
     assert controller.record_attempt(ChallengeAttempt("False_Knight", "boss", "v2", success=True, hits=5))
     assert controller.status()["mode"] == "main_playthrough"
+    assert controller.status()["finished"] is True
+    assert controller.status()["finish_reason"] == "target_met"
     assert controller.status()["wins"] == 2
     assert controller.memory["False_Knight"].versions == {"v1", "v2"}
+
+
+def test_challenge_practice_stops_after_attempt_limit_and_reports_return_to_main():
+    snapshot = ChallengeSnapshot("traversal-1", "traversal", "challenge_room", "snapshot", 1)
+    controller = ChallengePracticeController(
+        main_actor="main", practice_actor="practice", required_wins=2,
+        recent_attempts=5, max_attempts=2,
+    )
+    controller.start(snapshot, lambda _rollout: None)
+    assert "tentativa 1/2" in controller.status()["label"]
+    assert not controller.record_attempt(ChallengeAttempt("traversal-1", "traversal", "v1", progress=1.0))
+    assert "tentativa 2/2" in controller.status()["label"]
+    assert controller.record_attempt(ChallengeAttempt("traversal-1", "traversal", "v1", progress=1.0))
+    assert controller.status()["active"] is False
+    assert controller.status()["finished"] is True
+    assert controller.status()["finish_reason"] == "attempt_limit"
+    assert controller.status()["actor"] == "main"
 
 
 def test_challenge_progress_memory_and_rewards_are_bounded(tmp_path) -> None:

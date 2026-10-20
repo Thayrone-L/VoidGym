@@ -1151,8 +1151,25 @@ class ControlPlane:
                     if matching:
                         latest = max(matching, key=lambda row: int(row.get("finished_unix_ns", 0) or 0))
                         terminal_reason = latest.get("failure") or latest.get("stop_reason")
+                practice_status = actor.get("challenge_practice")
+                practice_label = (
+                    practice_status.get("label")
+                    if isinstance(practice_status, Mapping) and practice_status.get("active") is True
+                    and isinstance(practice_status.get("label"), str) else None
+                )
+                evaluation_steps = actor.get("evaluation_steps")
+                activity_label = practice_label or (
+                    actor.get("evaluation_label")
+                    if actor.get("status") == "EVALUATING" and isinstance(actor.get("evaluation_label"), str)
+                    else None
+                )
+                if actor.get("status") == "EVALUATING" and isinstance(evaluation_steps, int) and evaluation_steps > 1000:
+                    alerts.append(f"A avaliação da instância {actor.get('slot')} passou do limite de 1000 passos")
                 instance_rows.append({
                     "slot": actor.get("slot"), "status": actor.get("status", "unknown"),
+                    "activity_label": activity_label,
+                    "evaluation_steps": evaluation_steps if isinstance(evaluation_steps, int) else None,
+                    "challenge_practice": dict(practice_status) if isinstance(practice_status, Mapping) else None,
                     "restarts_last_hour": len(recent_restarts),
                     "problem": actor.get("status") in {"FAILED", "CANCELLED"},
                     "reason": (self._operator_reason(terminal_reason)

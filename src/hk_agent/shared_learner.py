@@ -786,14 +786,22 @@ class SharedRoundStore:
     def append_evaluation(self, record: Mapping[str, Any]) -> None:
         path = self.root / "evaluations.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        key = (record.get("round"), record.get("slot"))
+        measure = record.get("measure") or (
+            "deterministic" if record.get("deterministic") is True else "stochastic"
+        )
+        key = (record.get("round"), record.get("slot"), measure)
         if path.is_file():
             for line in path.read_text(encoding="utf-8").splitlines():
                 try:
                     existing = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(existing, Mapping) and (existing.get("round"), existing.get("slot")) == key:
+                if not isinstance(existing, Mapping):
+                    continue
+                existing_measure = existing.get("measure") or (
+                    "deterministic" if existing.get("deterministic") is True else "stochastic"
+                )
+                if (existing.get("round"), existing.get("slot"), existing_measure) == key:
                     return
         payload = json.dumps(dict(record), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
         with path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -1174,12 +1182,16 @@ def actor_join_round(learner_status: Mapping[str, Any]) -> int:
 
 def run_deterministic_evaluation(
     model: Any, environment: Any, *, round_number: int, slot: int,
-    max_steps: int, stop_file: Path | None = None,
+    max_steps: int = 1000, stop_file: Path | None = None,
     heartbeat: Callable[[int], None] | None = None,
+    deterministic: bool = True, stall_steps: int = 300,
+    stall_seconds: float = 30.0,
 ) -> dict[str, Any]:
-    """Run one direct-policy episode; this path never calls the rollout collector."""
+    """Run a short, direct-policy probe without submitting training rollouts."""
     from sb3_contrib.common.maskable.utils import get_action_masks
 
+    max_steps = min(1000, max(1, int(max_steps)))
+    stall_steps = min(300, max(1, int(stall_steps)))
     try:
         environment.env_method("set_evaluation_mode", True)
     except (AttributeError, NotImplementedError):
@@ -1195,30 +1207,72 @@ def run_deterministic_evaluation(
     episode_progress: dict[str, Any] = {}
     completed = False
     steps = 0
-    last_heartbeat = time.monotonic()
+    max_progress = 0.0
+    progress_scene: str | None = None
+    last_progress_step = 0
+    last_progress_at = time.monotonic()
+    evaluation_started_at = last_progress_at
+    last_heartbeat_at = last_progress_at
+    stop_reason = "step_limit"
+    stopped_early = False
     try:
         for steps in range(1, max_steps + 1):
             if stop_file is not None and stop_file.is_file():
+                stop_reason = "stop_requested"
+                stopped_early = True
                 break
             masks = get_action_masks(environment)
             if recurrent and policy is not None:
                 actions, evaluation_state = policy.predict_masked(
-                    observation, evaluation_state, evaluation_starts, masks, deterministic=True
+                    observation, evaluation_state, evaluation_starts, masks,
+                    deterministic=deterministic,
                 )
             else:
-                actions, _ = model.predict(observation, deterministic=True, action_masks=masks)
+                actions, _ = model.predict(
+                    observation, deterministic=deterministic, action_masks=masks
+                )
             observation, rewards, dones, infos = environment.step(actions)
             evaluation_starts = np.asarray(dones, dtype=np.bool_)
             episode_return += float(np.asarray(rewards).reshape(-1)[0])
             info = infos[0] if infos else {}
+            current_scene = info.get("scene_name") if isinstance(info, Mapping) else None
+            current_max = max_progress
+            progress_map = info.get("max_progress_by_scene") if isinstance(info, Mapping) else None
+            if not isinstance(progress_map, Mapping) and isinstance(info, Mapping):
+                step_progress = info.get("episode_progress")
+                progress_map = step_progress.get("max_progress_by_scene") if isinstance(step_progress, Mapping) else None
+            if isinstance(progress_map, Mapping):
+                valid_progress = {
+                    str(scene): float(value) for scene, value in progress_map.items()
+                    if isinstance(scene, str) and isinstance(value, (int, float))
+                    and not isinstance(value, bool) and math.isfinite(float(value))
+                } if isinstance(progress_map, Mapping) else {}
+                if valid_progress:
+                    current_max = max(current_max, max(valid_progress.values()))
+                    episode_progress["max_progress_by_scene"] = valid_progress
+            changed_scene = isinstance(current_scene, str) and current_scene != progress_scene
+            improved = current_max >= max_progress + 0.25 or changed_scene
+            if improved:
+                max_progress = max(max_progress, current_max)
+                progress_scene = current_scene if isinstance(current_scene, str) else progress_scene
+                last_progress_step = steps
+                last_progress_at = time.monotonic()
             if isinstance(info, Mapping) and isinstance(info.get("episode_progress"), Mapping):
-                episode_progress = dict(info["episode_progress"])
+                episode_progress.update(dict(info["episode_progress"]))
             if bool(np.asarray(dones).reshape(-1)[0]):
                 completed = True
+                stop_reason = "episode_ended"
                 break
-            if heartbeat is not None and time.monotonic() - last_heartbeat >= 5.0:
+            now = time.monotonic()
+            stalled_for_steps = steps - last_progress_step
+            stalled_for_seconds = now - last_progress_at
+            if stalled_for_steps >= stall_steps or stalled_for_seconds >= stall_seconds:
+                stop_reason = "stuck"
+                stopped_early = True
+                break
+            if heartbeat is not None and now - last_heartbeat_at >= 5.0:
                 heartbeat(steps)
-                last_heartbeat = time.monotonic()
+                last_heartbeat_at = now
     finally:
         try:
             environment.env_method("set_evaluation_mode", False)
@@ -1228,18 +1282,35 @@ def run_deterministic_evaluation(
         model._last_obs = previous_obs
     if previous_starts is not None:
         model._last_episode_starts = previous_starts
+    evaluation_elapsed = time.monotonic() - evaluation_started_at
+    episode_progress["evaluation_max_progress"] = max_progress
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "round": round_number,
         "slot": slot,
-        "deterministic": True,
+        "deterministic": deterministic,
+        "measure": "deterministic" if deterministic else "stochastic",
         "steps": steps,
         "return": episode_return,
         "completed": completed,
         "rollout_submitted": False,
         "episode_progress": episode_progress,
+        "evaluation_max_progress": max_progress,
+        "time_until_stuck_steps": steps if stop_reason == "stuck" else None,
+        "time_until_stuck_seconds": round(time.monotonic() - last_progress_at, 2) if stop_reason == "stuck" else None,
+        "elapsed_seconds": round(evaluation_elapsed, 2),
+        "stop_reason": stop_reason,
+        "stopped_early": stopped_early,
         "finished_unix_ns": time.time_ns(),
     }
+
+
+def evaluation_slot_for_round(round_number: int, interval: int, actor_count: int) -> int:
+    """Alternate the single actor that probes at each evaluation boundary."""
+    if round_number < 1 or interval < 1 or actor_count < 1:
+        raise ValueError("evaluation round, interval, and actor count must be positive")
+    evaluation_number = max(0, round_number // interval - 1)
+    return evaluation_number % actor_count
 
 
 def _shared_ppo_parameters(task_contract: Mapping[str, Any]) -> dict[str, Any]:
@@ -1517,30 +1588,60 @@ def run_shared_actor(
                 int(contract_config.get("evaluation_interval", 20))
                 if isinstance(contract_config, Mapping) else 20
             )
-            if (
+            evaluation_round = (
                 task_contract.get("reward_version") in {"explore_v3", "explore_v4"}
-                and round_number > 0
-                and evaluation_interval > 0
+                and round_number > 0 and evaluation_interval > 0
                 and round_number % evaluation_interval == 0
-                and not any(row.get("round") == round_number and row.get("slot") == slot for row in store.read_evaluations())
-            ):
-                store.publish_actor_status(slot=slot, launch_id=launch_id, status="EVALUATING", round=round_number)
-                def publish_evaluation_heartbeat(steps: int, round_number: int = round_number) -> None:
+            )
+            scheduled_slot = (
+                evaluation_slot_for_round(round_number, evaluation_interval, actors)
+                if evaluation_round else -1
+            )
+            if evaluation_round and slot == scheduled_slot:
+                existing_evaluations = [
+                    row for row in store.read_evaluations()
+                    if row.get("round") == round_number and row.get("slot") == slot
+                ]
+                existing_measures = {
+                    row.get("measure") or ("deterministic" if row.get("deterministic") is True else "stochastic")
+                    for row in existing_evaluations
+                }
+                missing_measures = [
+                    (True, "deterministic"), (False, "stochastic"),
+                ]
+                missing_measures = [item for item in missing_measures if item[1] not in existing_measures]
+                probe_max_steps = min(1000, max(1, int(contract_config.get("horizon_steps", 1000))))
+                for deterministic, measure in missing_measures:
+                    measure_label = "determinística" if deterministic else "estocástica"
+                    label = f"Avaliando (prova rápida {measure_label}, até ~2,5 min)"
                     store.publish_actor_status(
-                        slot=slot, launch_id=launch_id, status="EVALUATING",
-                        round=round_number, evaluation_steps=steps,
+                        slot=slot, launch_id=launch_id, status="EVALUATING", round=round_number,
+                        evaluation_steps=0, evaluation_max_steps=probe_max_steps,
+                        evaluation_measure=measure, evaluation_label=label,
                     )
-                evaluation = run_deterministic_evaluation(
-                    model, model.get_env(), round_number=round_number, slot=slot,
-                    max_steps=max(1, int(contract_config.get("horizon_steps", 3000))),
-                    stop_file=stop_file,
-                    heartbeat=publish_evaluation_heartbeat,
-                )
-                store.append_evaluation(evaluation)
-                status["evaluations_completed"] = int(status.get("evaluations_completed", 0)) + 1
-                _atomic_json(output_root / "manifest.json", status)
-                if stop_file is not None and stop_file.is_file():
-                    status["status"] = "CANCELLED"
+                    def publish_evaluation_heartbeat(
+                        steps: int, round_number: int = round_number,
+                        probe_max_steps: int = probe_max_steps, measure: str = measure,
+                        label: str = label,
+                    ) -> None:
+                        store.publish_actor_status(
+                            slot=slot, launch_id=launch_id, status="EVALUATING",
+                            round=round_number, evaluation_steps=steps,
+                            evaluation_max_steps=probe_max_steps,
+                            evaluation_measure=measure, evaluation_label=label,
+                        )
+                    evaluation = run_deterministic_evaluation(
+                        model, model.get_env(), round_number=round_number, slot=slot,
+                        max_steps=probe_max_steps, stop_file=stop_file,
+                        heartbeat=publish_evaluation_heartbeat, deterministic=deterministic,
+                    )
+                    store.append_evaluation(evaluation)
+                    status["evaluations_completed"] = int(status.get("evaluations_completed", 0)) + 1
+                    _atomic_json(output_root / "manifest.json", status)
+                    if stop_file is not None and stop_file.is_file():
+                        status["status"] = "CANCELLED"
+                        break
+                if status["status"] == "CANCELLED":
                     break
             store.publish_actor_status(
                 slot=slot, launch_id=launch_id, status="COLLECTING",

@@ -27,7 +27,7 @@ def build_report(summary: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
 
     scene_rows = table_rows("scenes_discovered", ("scene_name", "first_seen"))
     episode_rows = table_rows("episode_progress", ("episode", "steps", "distinct_scenes", "deaths", "shade_recoveries", "enemy_kills", "termination_reason", "return"))
-    evaluation_rows = table_rows("evaluations", ("round", "steps", "return", "completed", "rollout_submitted"))
+    evaluation_rows = table_rows("evaluations", ("round", "slot", "measure", "steps", "return", "evaluation_max_progress", "time_until_stuck_steps", "stop_reason", "completed", "rollout_submitted"))
     checkpoints = payload.get("checkpoints_saved", [])
     checkpoint_items = "".join(f"<li>{html.escape(str(item))}</li>" for item in checkpoints) if isinstance(checkpoints, list) and checkpoints else "<li>Nenhum checkpoint registrado</li>"
     alerts = payload.get("alerts", [])
@@ -61,7 +61,7 @@ body{{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0
 <section><h2>Salas descobertas</h2><table><thead><tr><th>Sala</th><th>Primeira descoberta</th></tr></thead><tbody>{scene_rows}</tbody></table></section>
 <section><h2>Jornada, marcos e recordes</h2>{journey_svg}<p>Mais salas: {html.escape(str(journey_records.get('max_scenes', 0)))} · Mais longe: {html.escape(str(journey_records.get('furthest', 0)))} · Menos mortes: {html.escape(str(journey_records.get('fewest_deaths', 0)))}</p><ul>{milestone_items or '<li>Sem marcos registrados</li>'}</ul><small>{html.escape(str(payload.get('sharing_courtesy', '')))}</small></section>
 <section><h2>Evolução por episódio</h2><table><thead><tr><th>Episódio</th><th>Passos</th><th>Salas</th><th>Mortes</th><th>Sombras recuperadas</th><th>Abates</th><th>Fim</th><th>Retorno</th></tr></thead><tbody>{episode_rows}</tbody></table></section>
-<section><h2>Avaliações periódicas</h2><table><thead><tr><th>Rodada</th><th>Passos</th><th>Retorno</th><th>Concluída</th><th>Enviada ao treino</th></tr></thead><tbody>{evaluation_rows}</tbody></table></section>
+<section><h2>Avaliações periódicas · provas determinísticas e estocásticas</h2><table><thead><tr><th>Rodada</th><th>Instância</th><th>Medida</th><th>Passos</th><th>Retorno</th><th>Progresso máximo</th><th>Passos até travar</th><th>Fim</th><th>Concluída</th><th>Enviada ao treino</th></tr></thead><tbody>{evaluation_rows}</tbody></table></section>
 <section><h2>Alertas e reinícios</h2><ul>{alert_items}</ul></section>
 <section><h2>Checkpoints e segurança dos saves</h2><ul>{checkpoint_items}</ul><p>Checagem de saves: {html.escape(str(rows['save_checks']))}</p></section>
 <section><h2>Motivo do fim</h2><p>{html.escape(str(rows['end_reason']))}</p></section></html>'''

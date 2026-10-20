@@ -308,6 +308,34 @@ def test_challenge_and_help_features_are_explicitly_opt_in_without_contract_argu
         CampaignSpec.from_payload(payload)
 
 
+def test_completed_challenge_practice_restarts_actor_in_main_playthrough(tmp_path: Path):
+    plane = ControlPlane(tmp_path)
+    shared_root = plane.runtime_root / "shared" / "campaign-a"
+    actor_root = shared_root / "actors"
+    actor_root.mkdir(parents=True)
+    (actor_root / "slot-1.json").write_text(json.dumps({
+        "challenge_practice_completed": True,
+        "challenge_practice": {"finished": True, "finish_reason": "attempt_limit"},
+    }), encoding="utf-8")
+    practice = {
+        "role": "actor", "status": "CANCELLED", "shared_root": str(shared_root),
+        "resources": {"slot_id": 1}, "challenge_practice": {"context": "traversal:test"},
+        "launch_id": "practice-launch",
+    }
+    main = {
+        "role": "actor", "status": "RUNNING", "shared_root": str(shared_root),
+        "resources": {"slot_id": 0}, "launch_id": "main-launch",
+    }
+    plane._launches.update({"practice-launch": practice, "main-launch": main})
+    with (patch.object(plane, "_refresh_locked"),
+          patch.object(plane, "restart_shared_actor", return_value={"status": "RUNNING"}) as restart):
+        plane._resume_finished_challenge_practices()
+    restart.assert_called_once_with(
+        "practice-launch", reason="challenge practice reached exit criteria; return to main playthrough"
+    )
+    assert practice["challenge_return_started"] is True
+
+
 def test_challenge_practice_endpoint_is_blocked_by_default(tmp_path: Path):
     payload = _payload("exploration_training")
     payload.update({

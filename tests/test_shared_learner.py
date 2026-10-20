@@ -22,6 +22,7 @@ from hk_agent.shared_learner import (
     _space_from_payload,
     _space_to_payload,
     actor_join_round,
+    evaluation_slot_for_round,
     run_deterministic_evaluation,
     train_shared_round,
     zero_reward_fraction,
@@ -445,8 +446,63 @@ def test_deterministic_evaluation_does_not_submit_training_rollout():
     assert result["rollout_submitted"] is False
     assert result["episode_progress"]["distinct_scenes"] == 2
     assert model.deterministic_values == [True, True]
+    assert result["measure"] == "deterministic"
     assert env.evaluation is False
     assert not model.collect_rollouts_called
+
+
+def test_evaluation_stops_after_300_steps_without_progress_and_supports_stochastic_probe():
+    class Env:
+        num_envs = 1
+
+        def env_method(self, name, *args):
+            return [None]
+
+        def get_wrapper_attr(self, name):
+            return lambda: np.ones(2, dtype=np.bool_)
+
+        def reset(self):
+            return np.zeros((1, 2), dtype=np.float32)
+
+        def step(self, actions):
+            return np.zeros((1, 2), dtype=np.float32), np.array([0.0]), np.array([False]), [
+                {"scene_name": "Tutorial_01", "max_progress_by_scene": {"Tutorial_01": 0.0}}
+            ]
+
+    class Model:
+        def __init__(self):
+            self.deterministic_values = []
+
+        def predict(self, observation, *, deterministic, action_masks):
+            self.deterministic_values.append(deterministic)
+            return np.array([0]), None
+
+    model = Model()
+    result = run_deterministic_evaluation(
+        model, Env(), round_number=20, slot=0, max_steps=2401, deterministic=False,
+    )
+    assert result["steps"] == 301
+    assert result["stopped_early"] is True and result["stop_reason"] == "stuck"
+    assert 300 <= result["time_until_stuck_steps"] <= 301
+    assert result["evaluation_max_progress"] == 0.0
+    assert result["measure"] == "stochastic"
+    assert model.deterministic_values == [False] * 301
+
+
+def test_evaluation_slot_alternates_between_actors():
+    assert [evaluation_slot_for_round(round_number, 20, 2) for round_number in (20, 40, 60, 80)] == [0, 1, 0, 1]
+
+
+def test_evaluation_store_keeps_both_measures_per_actor_and_round(tmp_path):
+    store = shared.SharedRoundStore(tmp_path)
+    deterministic = {"round": 1, "slot": 0, "measure": "deterministic", "deterministic": True}
+    stochastic = {"round": 1, "slot": 0, "measure": "stochastic", "deterministic": False}
+
+    store.append_evaluation(deterministic)
+    store.append_evaluation(stochastic)
+    store.append_evaluation(stochastic)
+
+    assert [row["measure"] for row in store.read_evaluations()] == ["deterministic", "stochastic"]
 
 
 def test_learner_waiting_for_calibration_honors_stop_file(tmp_path):
