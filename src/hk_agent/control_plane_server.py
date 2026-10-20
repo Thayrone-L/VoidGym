@@ -143,6 +143,13 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
+        if path == "/api/journey/map/calibration/remove":
+            try:
+                result = self.server.control_plane.remove_map_scene_calibration(self._payload())
+                self._json(HTTPStatus.OK, result)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         if path == "/api/journey/map/import":
             try:
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "image/png":

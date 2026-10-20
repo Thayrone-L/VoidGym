@@ -954,6 +954,37 @@ def apply_affine(transform: Sequence[float], x: float, y: float) -> tuple[float,
     return a * x + b * y + c, d * x + e * y + f
 
 
+def fit_manual_calibration(
+    points: Sequence[tuple[float, float, float, float]],
+) -> tuple[tuple[float, float, float, float, float, float], float, float]:
+    """Fit uniform scale and translation with an inverted map Y axis, without rotation."""
+    if len(points) < 2:
+        raise ValueError("manual calibration needs at least two point pairs")
+    if any(not math.isfinite(value) for point in points for value in point):
+        raise ValueError("manual calibration coordinates must be finite")
+    count = len(points)
+    mean_x = sum(point[0] for point in points) / count
+    mean_y = sum(point[1] for point in points) / count
+    mean_u = sum(point[2] for point in points) / count
+    mean_v = sum(point[3] for point in points) / count
+    variance = sum((x - mean_x) ** 2 + (y - mean_y) ** 2 for x, y, _, _ in points)
+    if variance < 1e-6:
+        raise ValueError("manual calibration points are too close to determine scale")
+    scale = sum((x - mean_x) * (u - mean_u) - (y - mean_y) * (v - mean_v)
+                for x, y, u, v in points) / variance
+    if not math.isfinite(scale) or scale <= 1e-9:
+        raise ValueError("manual calibration points do not match a positive scale with inverted Y")
+    transform = (scale, 0.0, mean_u - scale * mean_x,
+                 0.0, -scale, mean_v + scale * mean_y)
+    squared_error = sum(
+        (apply_affine(transform, x, y)[0] - u) ** 2
+        + (apply_affine(transform, x, y)[1] - v) ** 2
+        for x, y, u, v in points
+    )
+    rmse = math.sqrt(squared_error / count)
+    return transform, scale, rmse
+
+
 def fit_two_point_calibration(
     first: tuple[float, float, float, float],
     second: tuple[float, float, float, float],

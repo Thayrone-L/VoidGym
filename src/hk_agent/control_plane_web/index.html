@@ -16,6 +16,7 @@
   <section id="status-banner" class="status-banner idle" role="status" aria-live="polite" aria-atomic="false">
     <div class="status-banner-main"><strong id="status-message">Conectando ao painel…</strong><div id="status-alert-list" hidden></div></div>
     <details id="status-technical" hidden><summary>Detalhes técnicos</summary><pre id="status-technical-detail"></pre></details>
+    <details id="status-events" hidden><summary>Últimos eventos</summary><div id="status-event-list"></div></details>
   </section>
   <main>
     <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
@@ -68,13 +69,23 @@
     </section>
 
     <section class="panel journey-panel">
-      <div class="panel-head"><div><p class="eyebrow">JORNADA</p><h2>Mapa da campanha</h2></div><label>Run<select id="journey-run"><option value="">Melhor run</option></select></label></div>
+      <div class="panel-head"><div><p class="eyebrow">JORNADA</p><h2>Mapa da campanha</h2></div><div class="journey-map-actions"><button id="calibration-open" class="button secondary">Calibração manual</button><label>Run<select id="journey-run"><option value="">Melhor run</option></select></label></div></div>
       <div id="journey-map" class="journey-map"><p class="empty">O mapa vai se revelar durante a exploração.</p></div>
       <div id="journey-records" class="journey-records"></div><h3>Loadouts por trecho</h3><div id="journey-charms"><p class="empty">A IA ainda não registrou conjuntos de amuletos.</p></div><h3>Marcos</h3><div id="journey-milestones"><p class="empty">Ainda sem marcos.</p></div>
       <div class="map-art-controls"><p id="map-art-attribution">Mapa: The Embraced One — <a href="https://www.hallownest.net/downloads/" target="_blank" rel="noopener">hallownest.net</a> · Hollow Knight © Team Cherry.</p>
         <div class="map-art-actions"><button id="map-download" class="button secondary">Baixar mapa e gerar tiles</button><button id="map-import" class="button secondary">Importar PNG local</button><input id="map-file" type="file" accept="image/png" hidden><button id="map-view-toggle" class="button quiet" hidden>Arte ⇄ Esquemático</button></div>
         <progress id="map-progress" max="100" value="0" hidden></progress><p id="map-art-status" class="hint" aria-live="polite">A arte fica no cache local do operador; o mapa esquemático segue disponível.</p>
       </div><p class="hint">A arte permanece no cache local e não entra em relatórios. Antes de compartilhar o projeto, peça autorização ao autor do mapa.</p>
+    </section>
+
+    <section id="calibration-wizard" class="calibration-wizard" hidden aria-modal="true" role="dialog" aria-labelledby="calibration-title">
+      <header class="wizard-header"><div><p class="eyebrow">MAPA DA CAMPANHA</p><h2 id="calibration-title">Calibração manual</h2></div><button id="calibration-close" class="button quiet">Fechar</button></header>
+      <div class="wizard-controls"><label>1 · Sala<select id="calibration-scene"></select></label><fieldset><legend>2 · Como marcar a sala</legend><label><input type="radio" name="calibration-mode" value="bounds" checked> Pelos limites da sala</label><label><input type="radio" name="calibration-mode" value="captures"> Por capturas</label></fieldset></div>
+      <div id="calibration-warnings" class="wizard-warnings" aria-live="polite"></div><p id="calibration-help" class="hint">Escolha a sala e marque pelo menos dois pontos.</p>
+      <div class="wizard-workspace"><aside class="wizard-side-panel"><div id="calibration-bounds-controls" class="wizard-reference"><p id="calibration-bounds-help" class="hint">Use os limites de cena registrados pelo jogo; marque as bordas esquerda e direita na arte.</p><button id="calibration-bound-left" class="button secondary">Marcar limite esquerdo</button><button id="calibration-bound-right" class="button secondary">Marcar limite direito</button></div>
+      <div id="calibration-capture-controls" class="wizard-reference" hidden><label>Captura de referência<select id="calibration-capture"></select></label><img id="calibration-capture-image" alt="Captura real da sala" hidden><button id="calibration-add-capture" class="button secondary">Adicionar captura e marcar na arte</button></div></aside>
+      <div id="calibration-map-slot" class="wizard-map-slot"><div class="empty">A arte ainda não foi preparada.<br><button id="calibration-download" class="button secondary">Baixar mapa e gerar tiles</button></div></div></div>
+      <div class="wizard-footer"><span id="calibration-error">Erro estimado: —</span><div><button id="calibration-undo" class="button secondary" disabled>Desfazer ponto</button><button id="calibration-redo" class="button secondary">Refazer</button><button id="calibration-remove" class="button danger" disabled>Remover calibração</button><button id="calibration-save" class="button primary" disabled>Salvar calibração</button></div></div>
     </section>
 
     <section class="charts-grid">
@@ -92,7 +103,7 @@
     <section class="panel reports-panel"><div class="panel-head"><div><p class="eyebrow">HISTÓRICO</p><h2>Relatórios dos treinos</h2></div><button id="generate-report" class="button secondary" disabled>Gerar relatório</button></div><div id="reports"><p class="empty">Relatórios aparecem quando um treino termina.</p></div></section>
 
     <details class="panel advanced"><summary>Avançado para desenvolvedor</summary><div class="advanced-grid"><div><h3>Detalhes do treino</h3><dl id="advanced-info"></dl>
-      <section id="map-calibration"><h3>Calibrar pela arte do mapa</h3><label>Cena âncora<select id="calibration-scene"></select></label><p id="calibration-help" class="hint">Veja a captura, encontre o mesmo ponto na arte e clique nele.</p><div class="calibration-points"><figure><figcaption>1 · Onde fica o nascimento?</figcaption><img id="calibration-spawn-image" alt="Captura real do nascimento" hidden><button id="calibration-mark-1" class="button secondary" disabled>Marcar ponto 1 na arte</button><small id="calibration-point-1">Ainda não marcado</small></figure><figure><figcaption>2 · Onde fica este ponto mais distante?</figcaption><img id="calibration-farthest-image" alt="Captura real do ponto mais distante nesta sala" hidden><button id="calibration-mark-2" class="button secondary" disabled>Marcar ponto 2 na arte</button><small id="calibration-point-2">Ainda não marcado</small></figure></div><div class="map-art-actions"><button id="calibration-undo" class="button secondary" disabled>Desfazer último clique</button><button id="calibration-save" class="button secondary" disabled>Salvar posicionamento</button></div></section>
+
       </div><div><h3>Log bruto</h3><pre id="raw-log">Nenhum processo ativo.</pre></div></div></details>
   </main>
   <footer>Executa somente nesta máquina · servidor local 127.0.0.1</footer>

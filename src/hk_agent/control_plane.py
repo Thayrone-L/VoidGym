@@ -921,6 +921,7 @@ class ControlPlane:
 
     def operator_snapshot(self) -> dict[str, object]:
         status = self.status()
+        system_resources = self._operator_system_resources()
         self._ensure_auto_reports(status)
         active = status.get("active_launches", [])
         active_records = [row for row in active if isinstance(row, Mapping)] if isinstance(active, list) else []
@@ -1031,6 +1032,9 @@ class ControlPlane:
         shade_losses = sum(int(row.get("shade_losses", 0) or 0) for row in progress_rows)
         first_scene_steps = [int(row["steps_to_first_scene_change"]) for row in progress_rows if isinstance(row.get("steps_to_first_scene_change"), int)]
         alerts = [str(item) for item in manifest.get("farm_alerts", []) if isinstance(item, str)] if isinstance(manifest.get("farm_alerts", []), list) else []
+        memory_percent = system_resources.get("memory_percent")
+        if isinstance(memory_percent, (int, float)) and not isinstance(memory_percent, bool) and memory_percent > 85:
+            alerts.append(f"Memória do sistema acima de 85% ({memory_percent:.0f}%)")
         latest_shared = next((row for row in campaigns if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True), None)
         latest_shared_id = str(latest_shared.get("campaign_id")) if isinstance(latest_shared, Mapping) else None
         latest_checkpoint_exists = bool(latest_shared_id and any((self.runtime_root / "shared" / latest_shared_id / "checkpoints").glob("round-*.zip")))
@@ -1146,10 +1150,16 @@ class ControlPlane:
             row.get("shared_group") for row in active_records
             if row.get("role") == "learner" and isinstance(row.get("shared_group"), str)
         }
+        active_started_ns = min(
+            (int(row.get("started_unix_ns", 0) or 0) for row in active_records
+             if isinstance(row.get("started_unix_ns"), int)), default=0
+        )
         for failed_learner in self._campaign_launch_records(campaign_id or "") if campaign_id else []:
+            finished_ns = failed_learner.get("finished_unix_ns", 0)
             if (failed_learner.get("role") == "learner" and failed_learner.get("status") == "FAILED"
-                    and (not active_learner_groups
-                         or failed_learner.get("shared_group") in active_learner_groups)):
+                    and active_learner_groups
+                    and failed_learner.get("shared_group") in active_learner_groups
+                    and isinstance(finished_ns, int) and finished_ns >= active_started_ns):
                 detail = failed_learner.get("failure") or "erro não informado"
                 alerts.append(f"learner caiu: {detail}")
         alerts = [
@@ -1183,17 +1193,9 @@ class ControlPlane:
         ]
         failed_record = max(failed_records, key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default=None)
         status_banner: dict[str, object]
-        if failed_record is not None:
-            raw_reason = failed_record.get("failure") or failed_record.get("stop_reason")
-            detail = self._launch_error_detail(failed_record)
-            status_banner = {
-                "kind": "error",
-                "message": f"O treino parou: {self._operator_reason(f'{raw_reason or ""} {detail or ""}')}",
-                "technical_detail": detail,
-            }
-        elif alerts:
+        if active_records and alerts:
             running_text = (f" · Treinando — rodada {learner_round}, "
-                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
+                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s")
             status_banner = {"kind": "warning", "message": f"Aviso: {alerts[0]}{running_text}",
                              "technical_detail": None}
         elif active_records:
@@ -1202,6 +1204,23 @@ class ControlPlane:
                 "message": f"Treinando — rodada {learner_round}, {completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s",
                 "technical_detail": None,
             }
+        elif failed_record is not None:
+            raw_reason = failed_record.get("failure") or failed_record.get("stop_reason")
+            detail = self._launch_error_detail(failed_record)
+            reason = self._operator_reason(f'{raw_reason or ""} {detail or ""}')
+            if reason == "O treino foi encerrado por um erro.":
+                evidence = detail or str(raw_reason or "erro sem detalhe")
+                reason = f"Falha: {evidence[:180]}"
+            status_banner = {
+                "kind": "error",
+                "message": f"O treino parou: {reason}",
+                "technical_detail": detail,
+            }
+        elif alerts:
+            running_text = (f" · Treinando — rodada {learner_round}, "
+                            f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
+            status_banner = {"kind": "warning", "message": f"Aviso: {alerts[0]}{running_text}",
+                             "technical_detail": None}
         elif relevant_records and any(row.get("status") == "CANCELLED" for row in relevant_records):
             cancelled = max((row for row in relevant_records if row.get("status") == "CANCELLED"),
                             key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default={})
@@ -1267,6 +1286,21 @@ class ControlPlane:
                             f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
             status_banner = {"kind": "warning", "message": f"Aviso: {help_alert}{running_text}",
                              "technical_detail": None}
+        recent_events = []
+        for row in sorted(launch_records, key=lambda item: int(item.get("finished_unix_ns", 0) or 0), reverse=True):
+            if row.get("status") not in {"FAILED", "CANCELLED", "COMPLETED"}:
+                continue
+            raw_reason = row.get("failure") or row.get("stop_reason") or row.get("status")
+            detail = self._launch_error_detail(row) if row.get("status") == "FAILED" else None
+            reason = self._operator_reason(raw_reason)
+            if reason == "O treino foi encerrado por um erro.":
+                evidence = detail or str(raw_reason or "erro sem detalhe")
+                reason = f"Falha: {evidence[:180]}"
+            recent_events.append({"status": row.get("status"), "role": row.get("role"),
+                                  "finished_unix_ns": row.get("finished_unix_ns"),
+                                  "message": reason, "technical_detail": detail})
+            if len(recent_events) >= 8:
+                break
         return {
             "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
             "actor_performance": actor_performance,
@@ -1291,7 +1325,7 @@ class ControlPlane:
                 reverse=True,
             )[:64],
             "playthroughs": self._operator_playthroughs(campaign_id, campaigns, active_records, journey),
-            "alerts": sorted(set(alerts)), "status_banner": status_banner,
+            "alerts": sorted(set(alerts)), "status_banner": status_banner, "recent_events": recent_events,
             "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
             "max_instances": min(3, capacity),
@@ -1300,7 +1334,7 @@ class ControlPlane:
             "checkpoints": manifest.get("checkpoints", []), "reward_version": next((row.get("reward_version") for row in campaigns if row.get("campaign_id") == campaign_id), None),
             "advanced": {"launch_ids": [row.get("launch_id") for row in active_records], "shared_root": str(shared_root) if shared_root else None,
                          "artifact_path": str(shared_root) if shared_root else None},
-            "system": self._operator_system_resources(), "reports": self.list_reports()[:10],
+            "system": system_resources, "reports": self.list_reports()[:10],
         }
 
     def _operator_playthroughs(
@@ -1872,27 +1906,34 @@ class ControlPlane:
 
     def save_map_scene_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
         from hk_agent.run_journey import (
-            fit_two_point_calibration,
+            fit_manual_calibration,
             propagate_room_calibrations,
             save_scene_calibration,
         )
 
-        digest = str(self.map_art_status().get("sha256") or "")
-        if not digest or self.map_art_status().get("tiles_ready") is not True:
+        art = self.map_art_status()
+        digest = str(art.get("sha256") or "")
+        if not digest or art.get("tiles_ready") is not True:
             raise ValueError("map tiles must be ready before calibration")
-        scene = payload.get("scene")
-        first, second = payload.get("first"), payload.get("second")
+        scene, mode, raw_anchors = payload.get("scene"), payload.get("mode"), payload.get("anchors")
         if not isinstance(scene, str) or not scene or len(scene) > 256:
             raise ValueError("choose a valid scene")
-        def anchor(value: object) -> tuple[float, float, float, float]:
+        if mode not in {"bounds", "captures"}:
+            raise ValueError("calibration mode must be bounds or captures")
+        if not isinstance(raw_anchors, list) or len(raw_anchors) < 2 or (mode == "bounds" and len(raw_anchors) != 2):
+            raise ValueError("calibration needs two or more point pairs")
+        anchors: list[tuple[float, float, float, float]] = []
+        for value in raw_anchors[:64]:
             if not isinstance(value, Mapping):
-                raise TypeError("each calibration anchor must include world and map coordinates")
+                raise TypeError("each calibration point must include world and map coordinates")
             keys = ("world_x", "world_y", "map_x", "map_y")
             numbers = tuple(value.get(key) for key in keys)
-            if any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(float(number)) for number in numbers):
-                raise ValueError("calibration anchor coordinates must be finite numbers")
-            return tuple(float(number) for number in numbers)  # type: ignore[arg-type,return-value]
-        transform = fit_two_point_calibration(anchor(first), anchor(second))
+            if any(isinstance(number, bool) or not isinstance(number, (int, float))
+                   or not math.isfinite(float(number)) or abs(float(number)) > 10_000_000
+                   for number in numbers):
+                raise ValueError("calibration coordinates must be finite and bounded")
+            anchors.append(tuple(float(number) for number in numbers))  # type: ignore[arg-type]
+        transform, scale, rmse = fit_manual_calibration(anchors)
         path = self.map_art_runtime_root() / "cache" / "map-art" / digest / "calibration.json"
         campaign_id = payload.get("campaign_id")
         if not isinstance(campaign_id, str) or not _IDENTIFIER.fullmatch(campaign_id):
@@ -1918,8 +1959,36 @@ class ControlPlane:
             save_scene_calibration(path, map_sha256=digest, scene=room,
                                    transform=calibration["affine"],
                                    confidence=float(calibration["confidence"]))
-        return {"scene": scene, "map_sha256": digest, "transform": list(transform),
-                "positioned": True, "propagated_scenes": sorted(calibrations)}
+        tiles = art.get("tiles")
+        outside = False
+        if isinstance(tiles, Mapping):
+            width, height = tiles.get("width"), tiles.get("height")
+            if isinstance(width, (int, float)) and isinstance(height, (int, float)):
+                outside = any(not (0 <= u <= width and 0 <= v <= height)
+                              for _, _, u, v in anchors)
+        return {"scene": scene, "mode": mode, "map_sha256": digest,
+                "transform": list(transform), "scale": scale, "rmse": rmse,
+                "outside_map": outside, "positioned": True,
+                "propagated_scenes": sorted(calibrations)}
+
+    def remove_map_scene_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
+        from hk_agent.run_journey import atomic_json
+
+        art = self.map_art_status()
+        digest = str(art.get("sha256") or "")
+        scene = payload.get("scene")
+        if not digest or not isinstance(scene, str) or not scene or len(scene) > 256:
+            raise ValueError("choose a valid calibrated scene")
+        path = self.map_art_runtime_root() / "cache" / "map-art" / digest / "calibration.json"
+        current = self._read_json(path)
+        transforms = current.get("transforms")
+        if not isinstance(transforms, dict) or scene not in transforms:
+            return {"scene": scene, "removed": False}
+        transforms.pop(scene, None)
+        current["map_sha256"] = digest
+        current["schema_version"] = 1
+        atomic_json(path, current)
+        return {"scene": scene, "removed": True}
 
     def import_operator_map_art(self, body: Any, length: int) -> dict[str, object]:
         if length < 24 or length > 1_073_741_824:

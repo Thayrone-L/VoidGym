@@ -1,0 +1,28 @@
+PROMPT 72 — MAPA SEM NÉVOA E CALIBRAÇÃO MANUAL
+Data: 2026-10-20
+Branch: codex/parallel-instances-isolation
+
+Implementação
+- src/hk_agent/control_plane_web/app.js: removida névoa/recortes e outros overlays de descoberta; rota desenhada em vermelho com contorno escuro e cavaleiro no ponto mais distante. Assistente inclui ajuste por limites ou capturas, múltiplas âncoras, RMSE, avisos, prévia, desfazer/refazer/remover e zoom/arraste. Corrigido gesto para arraste não registrar ponto.
+- src/hk_agent/control_plane_web/index.html e app.css: botão e modal em tela cheia; modos e controles de captura/limites; opção para baixar a arte ausente; estilo responsivo; removido --map-fog.
+- src/hk_agent/run_journey.py: ajuste por mínimos quadrados com escala e translação uniformes, eixo Y invertido e sem rotação; calcula erro e rejeita pontos insuficientes ou degenerados.
+- src/hk_agent/control_plane.py e control_plane_server.py: endpoint de calibração para modos bounds/captures, remoção e propagação pelas transições; banner prioriza campanha ativa, eventos antigos ficam em histórico e falha genérica inclui motivo; adiciona alerta acima de 85% de memória.
+- tests/test_run_journey.py e tests/test_operator_dashboard.py: cobertura do ajuste, modos HTTP, remoção, banner durante campanha ativa, histórico e alerta de memória.
+
+Validação
+- .\.venv\Scripts\python.exe -m pytest tests\test_run_journey.py tests\test_operator_dashboard.py -q — 36 passaram.
+- .\.venv\Scripts\python.exe -m ruff check src tools tests — passou.
+- .\.venv\Scripts\python.exe -m mypy src — passou, 54 arquivos.
+- node --check src\hk_agent\control_plane_web\app.js — passou.
+- git diff --check — passou.
+- Inspeção visual no painel local: assistente abriu em tela cheia com Passagem do Rei selecionada; arte sem névoa; marquei duas âncoras temporárias e confirmei RMSE 0,0 px, marcadores numerados, prévia da rota vermelha e ícone do cavaleiro. Usei Refazer/fechei sem salvar; nenhuma calibração foi gravada na campanha. A captura foi inspecionada na sessão visual, mas não foi salva como arquivo no repositório.
+
+Adendo de memória/desempenho
+- Painel e campanha estavam ativos. O servidor (PID 4296) mantém Job Object com KILL_ON_JOB_CLOSE e é pai da árvore operacional; reiniciá-lo pode encerrar learner, atores e Hollow Knight. Não reiniciei painel nem campanha. O backend atualmente carregado continua mostrando o banner antigo; o novo banner/alerta RAM só entra em vigor num reinício seguro após o treino terminar. Os arquivos estáticos atualizados foram carregados pela página.
+- Duas amostras de memória com cerca de 15 s de intervalo mostraram oscilações: learner privado 1,90→1,87 GB; atores ~0,50→0,54 GB; processos do jogo ~1,38→1,40 GB; painel ~593 MB estável. Não há evidência suficiente nesse intervalo para concluir vazamento. O painel indicava 14,7/15,8 GB (~93%) no momento da inspeção.
+- Cache de tiles/arte: 71.251 arquivos, 1,03 GB em disco, não RAM residente. JSONs de conhecimento por instância tinham ~2,7 KB e tamanho limitado.
+- task_player_knowledge_write_ms inclui escrita temporária, flush/fsync e replace atômico; ocorre em lotes de 32 passos ou em eventos. Picos observados (~17 ms) são consistentes com I/O síncrono e não demonstram vazamento.
+
+Pendências operacionais
+- Depois que o operador encerrar a campanha, reiniciar somente o painel para carregar o backend novo e confirmar visualmente banner/histórico/alerta de memória contra a instância ativa.
+- Não apliquei calibração real ao save/campanha durante esta validação.

@@ -17,6 +17,7 @@ from hk_agent.run_journey import (
     cache_map_file,
     download_mediafire_map,
     fit_affine,
+    fit_manual_calibration,
     fit_two_point_calibration,
     load_scene_calibration,
     propagate_room_calibrations,
@@ -206,6 +207,18 @@ def test_manual_two_point_calibration_maps_both_anchors() -> None:
     transform = fit_two_point_calibration((0, 0, 10, 20), (1, 0, 10, 22))
     assert apply_affine(transform, 0, 0) == pytest.approx((10, 20))
     assert apply_affine(transform, 1, 0) == pytest.approx((10, 22))
+
+
+def test_manual_calibration_fits_multiple_points_with_inverted_y_and_no_rotation() -> None:
+    transform, scale, rmse = fit_manual_calibration([
+        (0, 0, 20, 50), (100, 0, 220, 50), (0, 100, 20, -150),
+        (100, 100, 220, -150),
+    ])
+    assert scale == pytest.approx(2)
+    assert rmse == pytest.approx(0)
+    assert apply_affine(transform, 25, 30) == pytest.approx((70, -10))
+    with pytest.raises(ValueError, match="at least two"):
+        fit_manual_calibration([(0, 0, 0, 0)])
 
 
 def test_passage_graph_filters_nonspatial_and_fits_cycles_with_median() -> None:

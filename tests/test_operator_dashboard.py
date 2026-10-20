@@ -183,6 +183,45 @@ def test_operator_snapshot_explains_failed_group_and_cancelled_actor(tmp_path: P
     assert plane._operator_reason("learner failed: actor cancelled") == "cancelada porque o learner caiu"
 
 
+def test_active_campaign_hides_old_failure_from_banner_but_keeps_event_history(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path)
+    campaign = {"campaign_id": "campaign-live", "campaign_type": "exploration_training",
+                "reward_version": "explore_v4", "shared_learner": True}
+    active = {"launch_id": "learner-live", "role": "learner", "status": "RUNNING",
+              "campaign_id": "campaign-live", "shared_group": "group-live",
+              "shared_root": str(plane.runtime_root / "shared" / "campaign-live"),
+              "started_unix_ns": 30}
+    failed = {"launch_id": "learner-old", "role": "learner", "status": "FAILED",
+              "campaign_id": "campaign-live", "shared_group": "group-old",
+              "failure": "old crash", "finished_unix_ns": 20}
+    with (patch.object(plane, "status", return_value={"active_count": 1, "active_launches": [active], "capacity": 1}),
+          patch.object(plane, "_ensure_auto_reports"),
+          patch.object(plane, "list_campaigns", return_value=[campaign]),
+          patch.object(plane, "_campaign_launch_records", return_value=[failed, active]),
+          patch.object(plane, "_campaign_scene_discoveries", return_value=[]),
+          patch.object(plane, "_operator_playthroughs", return_value=[]),
+          patch.object(plane, "_operator_system_resources", return_value={}),
+          patch.object(plane, "map_art_status", return_value={}),
+          patch.object(plane, "list_reports", return_value=[])):
+        snapshot = plane.operator_snapshot()
+    assert snapshot["status_banner"]["kind"] in {"running", "warning"}
+    assert "old crash" not in snapshot["status_banner"]["message"]
+    assert snapshot["recent_events"][0]["message"].startswith("Falha:")
+
+
+def test_high_system_memory_adds_operator_warning(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path)
+    with (patch.object(plane, "status", return_value={"active_count": 1, "active_launches": [], "capacity": 1}),
+          patch.object(plane, "_ensure_auto_reports"),
+          patch.object(plane, "list_campaigns", return_value=[]),
+          patch.object(plane, "_campaign_scene_discoveries", return_value=[]),
+          patch.object(plane, "_operator_system_resources", return_value={"memory_percent": 90}),
+          patch.object(plane, "map_art_status", return_value={}),
+          patch.object(plane, "list_reports", return_value=[])):
+        snapshot = plane.operator_snapshot()
+    assert any("Memória do sistema acima de 85%" in item for item in snapshot["alerts"])
+
+
 def test_operator_snapshot_promotes_repeated_stuck_place_to_warning_banner(tmp_path: Path) -> None:
     plane = ControlPlane(tmp_path)
     campaign = {"campaign_id": "campaign-stuck", "campaign_type": "exploration_training",
@@ -236,13 +275,58 @@ def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None
         assert "unknown fields" not in result["error"]
         connection.close()
 
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
-        connection.request("GET", "/api/operator")
-        response = connection.getresponse()
-        snapshot = json.loads(response.read())
+        with patch.object(plane, "_operator_system_resources", return_value={}):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("GET", "/api/operator")
+            response = connection.getresponse()
+            snapshot = json.loads(response.read())
         assert response.status == 200
         assert snapshot["status_banner"]["kind"] == "idle"
         assert "Treino parado" in snapshot["status_banner"]["message"]
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_map_calibration_api_supports_bounds_captures_and_removal(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    plane = ControlPlane(tmp_path)
+    digest = "a" * 64
+    monkeypatch.setattr(plane, "map_art_status", lambda: {
+        "sha256": digest, "tiles_ready": True, "tiles": {"width": 500, "height": 400},
+    })
+    server = ControlPlaneHTTPServer(("127.0.0.1", 0), plane, tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    headers = {"Content-Type": "application/json", "X-Control-Token": plane.csrf_token}
+    try:
+        for mode, anchors in (("bounds", [
+            {"world_x": -20, "world_y": 10, "map_x": 100, "map_y": 200},
+            {"world_x": 180, "world_y": 10, "map_x": 300, "map_y": 200},
+        ]), ("captures", [
+            {"world_x": 0, "world_y": 0, "map_x": 100, "map_y": 100},
+            {"world_x": 100, "world_y": 0, "map_x": 200, "map_y": 100},
+            {"world_x": 0, "world_y": 100, "map_x": 100, "map_y": 0},
+        ])):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            connection.request("POST", "/api/journey/map/calibration", body=json.dumps({
+                "campaign_id": "jogada-1", "scene": "Tutorial_01", "mode": mode, "anchors": anchors,
+            }), headers=headers)
+            response = connection.getresponse()
+            result = json.loads(response.read())
+            assert response.status == 201
+            assert result["mode"] == mode and result["positioned"] is True
+            assert result["rmse"] < 0.01
+            connection.close()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("POST", "/api/journey/map/calibration/remove", body=json.dumps({
+            "scene": "Tutorial_01",
+        }), headers=headers)
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["removed"] is True
         connection.close()
     finally:
         server.shutdown()
@@ -271,6 +355,10 @@ def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     assert 'id="map-import"' in html
     assert 'id="map-progress"' in html
     assert 'id="map-view-toggle"' in html
+    assert 'id="calibration-open"' in html and 'id="calibration-wizard"' in html
+    assert 'value="bounds"' in html and 'value="captures"' in html
+    assert '/api/journey/map/calibration/remove' in app
+    assert 'rgba(14,32,43,.78)' not in app and 'destination-out' not in app
     assert '/api/journey/map/tile?' in app
     assert 'worldTile' in app
     assert 'class="journey-run-summary"' in app
