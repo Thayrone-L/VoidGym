@@ -1225,6 +1225,7 @@ def run_shared_actor(
             self.challenge_practice_status: dict[str, Any] = {}
             self.step_profile_ms: dict[str, float] = {}
             self.task_profile_totals: dict[str, float] = {}
+            self.bridge_profile_totals: dict[str, float] = {}
             self.profile_steps = 0
 
         def _on_step(self) -> bool:
@@ -1245,6 +1246,13 @@ def run_shared_actor(
                             if isinstance(value, (int, float)) and not isinstance(value, bool):
                                 self.task_profile_totals[str(name)] = (
                                     self.task_profile_totals.get(str(name), 0.0) + float(value)
+                                )
+                    timing_profile = info.get("timing_ms")
+                    if isinstance(timing_profile, Mapping):
+                        for name, value in timing_profile.items():
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                self.bridge_profile_totals[str(name)] = (
+                                    self.bridge_profile_totals.get(str(name), 0.0) + float(value)
                                 )
                     if info.get("challenge_practice_finished") is True:
                         self.challenge_practice_completed = True
@@ -1467,6 +1475,10 @@ def run_shared_actor(
             callback.step_profile_ms.update({
                 f"task_{name}": value / max(1, callback.profile_steps)
                 for name, value in callback.task_profile_totals.items()
+            })
+            callback.step_profile_ms.update({
+                f"bridge_{name}_ms": value / max(1, callback.profile_steps)
+                for name, value in callback.bridge_profile_totals.items()
             })
             _append_actor_telemetry(shared_root, slot, {
                 "round": round_number, "launch_id": launch_id,

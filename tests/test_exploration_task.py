@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -472,12 +473,87 @@ def test_continuous_reward_budget_survives_slice_and_expires_from_rolling_window
     assert task._remaining_budget("confirmed_enemy_kills", 5.0, 0.0) == pytest.approx(5.0)
 
 
+def test_continuous_budget_commit_handles_empty_batch_and_commits_once() -> None:
+    task = object.__new__(ExplorationTask)
+    task.config = ExplorationTaskConfig(reward_version="explore_v4", continuous_playthrough=True)
+    task._continuous_budget_state = {
+        "schema_version": 1, "game_steps": 130, "segment_paid": {}, "buckets": {}
+    }
+    task._pending_continuous_budget = {}
+    task._continuous_budget_path = None
+    task._continuous_budget_dirty_steps = 0
+
+    task._commit_continuous_budget({})
+    task._pending_continuous_budget = {"novelty": 0.75}
+    task._commit_continuous_budget({"novelty": 0.75})
+
+    assert task._continuous_budget_state["segment_paid"] == {"novelty": 0.75}
+    assert task._continuous_budget_state["buckets"] == {"2": {"novelty": 0.75}}
+
+
 def test_continuous_enemy_kill_reward_decays_without_episode_floor() -> None:
     from hk_agent.exploration_task import enemy_kill_reward_for_visit
 
     rewards = [enemy_kill_reward_for_visit(visits, continuous=True) for visits in (0, 1, 5, 10)]
     assert rewards == pytest.approx([1.0, 0.25, 1 / 36, 1 / 121])
     assert rewards[-1] < 0.01
+
+
+def test_enemy_visit_memory_flushes_as_a_batch(tmp_path: Path) -> None:
+    from hk_agent.exploration_task import ExplorationTask
+
+    task = object.__new__(ExplorationTask)
+    task._campaign_enemy_path = tmp_path / "lifelong-enemies-slot-0.json"
+    task._enemy_visits = {"Room|Crawler": 12}
+    task._enemy_visits_dirty = True
+    task.config = ExplorationTaskConfig(lifelong_archive_max=100)
+
+    task._flush_enemy_visits()
+
+    assert task._enemy_visits_dirty is False
+    assert json.loads(task._campaign_enemy_path.read_text("utf-8"))["counts"] == {
+        "Room|Crawler": 12
+    }
+
+
+def test_continuous_enemy_memory_advances_when_segment_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    memory = tmp_path / "memory"
+    environment = _Environment()
+    task = ExplorationTask(
+        environment,
+        config=_v4_config(continuous_playthrough=True),
+        lifelong_memory_root=memory,
+    )
+    task.reset()
+    task._continuous_budget_state["segment_paid"] = {"confirmed_enemy_kills": 5.0}
+    environment.extra = {
+        "scene_name": "Room-A",
+        "enemy_events_since_last_frame": [
+            {"scene_name": "Room-A", "enemy_type": "Crawler"}
+        ],
+    }
+
+    _, _, _, _, info = task.step(0)
+
+    assert info["reward_components"]["confirmed_enemy_kills"] == 0
+    assert task._enemy_visits["Room-A|Crawler"] == 1
+    assert task._enemy_visits_dirty is True
+    task.close()
+    saved = json.loads((memory / "lifelong-enemies-slot-0.json").read_text("utf-8"))
+    assert saved["counts"]["Room-A|Crawler"] == 1
+
+
+def test_actor_timing_profile_passes_through_exploration_task() -> None:
+    environment = _Environment()
+    task = ExplorationTask(environment, config=_v4_config())
+    task.reset()
+    environment.extra = {"timing_ms": {"capture_rtt": 50.0, "decode": 2.0}}
+
+    _, _, _, _, info = task.step(0)
+
+    assert info["timing_ms"] == {"capture_rtt": 50.0, "decode": 2.0}
 
 
 def test_continuous_playthrough_flag_does_not_change_shared_task_contract() -> None:

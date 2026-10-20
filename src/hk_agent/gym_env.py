@@ -230,6 +230,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._actions: list[int] = []
         self._episode_id: str | None = None
         self._transition_id = 0
+        self._last_step_timing_ms: dict[str, float] = {}
         self._next_action_id = 1
         self._episode_steps = 0
         self._episode_done = True
@@ -259,6 +260,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._episode_done = True
         self._frames = []
         self._actions = []
+        self._last_step_timing_ms = {}
         try:
             result = self.backend.reset(seed=seed, options=options)
             if not result.episode_id:
@@ -327,6 +329,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             self._shade_run_update = self._observe_shade_lifecycle(frame)
             timing_ms = self._validate_timing(result.timing_ms)
+            timing_ms["env_step"] = (time.monotonic_ns() - started_ns) / 1_000_000
+            self._last_step_timing_ms = dict(timing_ms)
             if type(result.terminated) is not bool or type(result.truncated) is not bool:
                 raise ValueError("terminated and truncated must be bool values")
             if result.terminated and result.truncated:
@@ -574,7 +578,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         if not self._frames:
             return {}
         frame = self._frames[-1]
-        if not (
+        last_step_timing_ms = getattr(self, "_last_step_timing_ms", {})
+        if not last_step_timing_ms and not (
             frame.player_dead
             or frame.death_persisted
             or frame.shade_pending
@@ -633,6 +638,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "failed_gameplay_runs": (lifecycle.failed_runs if lifecycle is not None else 0),
             },
         }
+        if last_step_timing_ms:
+            result["timing_ms"] = dict(last_step_timing_ms)
         if frame.operator_telemetry:
             result["operator_telemetry"] = dict(frame.operator_telemetry)
             for name in (

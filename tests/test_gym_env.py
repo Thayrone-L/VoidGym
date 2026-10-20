@@ -247,6 +247,17 @@ def test_observation_is_detached_from_backend_buffer(tmp_path: Path) -> None:
     env.close()
 
 
+def test_step_exposes_backend_and_total_timing_in_info(tmp_path: Path) -> None:
+    env = make_env(FakeBackend(), tmp_path)
+    env.reset()
+
+    *_, info = env.step(0)
+
+    assert info["timing_ms"]["backend"] == pytest.approx(1.25)
+    assert info["timing_ms"]["env_step"] >= 0
+    env.close()
+
+
 def test_action_must_be_in_discrete_space(tmp_path: Path) -> None:
     env = make_env(FakeBackend(), tmp_path)
     env.reset()

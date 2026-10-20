@@ -492,6 +492,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._shade_distance: tuple[str, float] | None = None
         self._scene_visits: dict[str, int] = {}
         self._enemy_visits: dict[str, int] = {}
+        self._enemy_visits_dirty = False
         self._scene_paid = 0.0
         self._campaign_scene_path: Path | None = None
         self._campaign_enemy_path: Path | None = None
@@ -591,6 +592,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         super().reset(seed=seed)
         self._flush_transition_log()
         self._flush_lifelong_visits()
+        self._flush_enemy_visits()
         self._save_continuous_budget(force=True)
         self._persist_player_knowledge(force=True)
         reset_options = dict(options or {})
@@ -649,6 +651,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._enemy_visits = load_campaign_counts(
                     self._campaign_enemy_path, self.config.lifelong_archive_max
                 )
+                self._enemy_visits_dirty = False
                 self._scene_first_seen = load_scene_first_seen(
                     self._scene_first_seen_path, self.config.lifelong_archive_max
                 )
@@ -1032,12 +1035,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 award = min(requested, remaining_kill_budget)
                 components["confirmed_enemy_kills"] += award
                 remaining_kill_budget -= award
-                if award > 0:
-                    self._enemy_visits[key] = visits + 1
-            if self._campaign_enemy_path is not None and events and self._enemy_visits:
-                save_campaign_counts(
-                    self._campaign_enemy_path, self._enemy_visits, self.config.lifelong_archive_max
-                )
+                # Lifetime decay tracks every confirmed kill, including kills
+                # that landed while the segment/window budget was exhausted.
+                self._enemy_visits[key] = visits + 1
+                self._enemy_visits_dirty = True
         if self.config.reward_version in {"explore_v3", "explore_v4"}:
             components["confirmed_enemy_kills"] = min(
                 components["confirmed_enemy_kills"],
@@ -1272,6 +1273,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             ):
                 components[name] = 0.0
         self._commit_continuous_budget(components)
+        if self._enemy_visits_dirty and self._steps % 32 == 0:
+            self._flush_enemy_visits()
         reward = float(sum(components.values()))
         self._episode_total_reward += reward
         if components["novelty"] > 0 or scene_event_paid:
@@ -1354,6 +1357,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             ),
             "challenge_practice_finished": self._challenge_practice_finished,
         }
+        timing_profile = base.get("timing_ms")
+        if isinstance(timing_profile, Mapping):
+            info["timing_ms"] = dict(timing_profile)
         if episode_progress is not None:
             info["episode_progress"] = episode_progress
         _copy_lifecycle_info(base, info)
@@ -1618,12 +1624,6 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             row[name] = float(row.get(name, 0.0)) + amount
         self._pending_continuous_budget.clear()
         self._save_continuous_budget()
-        segment = self._continuous_budget_state.setdefault("segment_paid", {})
-        segment[name] = float(segment.get(name, 0.0)) + amount
-        current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
-        buckets = self._continuous_budget_state.setdefault("buckets", {})
-        row = buckets.setdefault(str(current), {})
-        row[name] = float(row.get(name, 0.0)) + amount
 
     def _save_continuous_budget(self, *, force: bool = False) -> None:
         if self._continuous_budget_path is None:
@@ -1642,11 +1642,20 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         save_lifelong_visits(self._lifelong_path, self._lifelong_visits)
         self._lifelong_dirty_steps = 0
 
+    def _flush_enemy_visits(self) -> None:
+        if self._campaign_enemy_path is None or not self._enemy_visits_dirty:
+            return
+        save_campaign_counts(
+            self._campaign_enemy_path, self._enemy_visits, self.config.lifelong_archive_max
+        )
+        self._enemy_visits_dirty = False
+
     def close(self) -> None:
         try:
             self._persist_player_knowledge(force=True)
             self._flush_transition_log()
             self._flush_lifelong_visits()
+            self._flush_enemy_visits()
             self._save_continuous_budget(force=True)
             if self._diary is not None:
                 self._diary.flush()
