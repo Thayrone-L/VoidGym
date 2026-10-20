@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -514,7 +514,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._damage_paid_health = 0.0
         self._time_cost_paid = 0.0
         self._recent_reward_window: deque[dict[str, float]] = deque(maxlen=2000)
+        self._recent_reward_totals: dict[str, float] = {}
+        self._recent_positive_total = 0.0
         self._recent_no_novelty_pairs: deque[tuple[str, str]] = deque(maxlen=2000)
+        self._recent_no_novelty_counts: Counter[tuple[str, str]] = Counter()
         self._farm_alert_latched = False
         self._continuous_budget_path: Path | None = None
         self._continuous_budget_state: dict[str, Any] = {
@@ -1744,29 +1747,45 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     ) -> list[str]:
         if self.config.reward_version not in {"explore_v3", "explore_v4"}:
             return []
-        self._recent_reward_window.append(
-            {name: value for name, value in components.items() if value > 0}
-        )
+        reward_row = {name: value for name, value in components.items() if value > 0}
+        if len(self._recent_reward_window) == self._recent_reward_window.maxlen:
+            expired = self._recent_reward_window[0]
+            for name, value in expired.items():
+                self._recent_reward_totals[name] -= value
+                self._recent_positive_total -= value
+                if self._recent_reward_totals[name] <= 1e-12:
+                    del self._recent_reward_totals[name]
+        self._recent_reward_window.append(reward_row)
+        for name, value in reward_row.items():
+            self._recent_reward_totals[name] = self._recent_reward_totals.get(name, 0.0) + value
+            self._recent_positive_total += value
         novelty_seen = components.get("novelty", 0.0) > 0 or components.get("scene_change", 0.0) > 0
         if not novelty_seen:
-            self._recent_no_novelty_pairs.append((str(scene or "unknown"), action))
+            pair = (str(scene or "unknown"), action)
+            if len(self._recent_no_novelty_pairs) == self._recent_no_novelty_pairs.maxlen:
+                expired_pair = self._recent_no_novelty_pairs.popleft()
+                self._recent_no_novelty_counts[expired_pair] -= 1
+                if self._recent_no_novelty_counts[expired_pair] <= 0:
+                    del self._recent_no_novelty_counts[expired_pair]
+            self._recent_no_novelty_pairs.append(pair)
+            self._recent_no_novelty_counts[pair] += 1
         triggers: list[str] = []
-        if len(self._recent_reward_window) == 2000:
-            totals: dict[str, float] = {}
-            for row in self._recent_reward_window:
-                for name, value in row.items():
-                    totals[name] = totals.get(name, 0.0) + value
-            positive_total = sum(totals.values())
-            if positive_total > 0 and max(totals.values(), default=0.0) / positive_total > 0.60:
-                triggers.append("component_over_60_percent")
-                dominant = max(totals, key=lambda name: totals[name])
-                triggers.append(f"farm_component:{dominant}")
-        if len(self._recent_no_novelty_pairs) == 2000:
-            counts: dict[tuple[str, str], int] = {}
-            for pair in self._recent_no_novelty_pairs:
-                counts[pair] = counts.get(pair, 0) + 1
-            if max(counts.values(), default=0) / 2000 > 0.40:
-                triggers.append("same_scene_action_over_40_percent_without_novelty")
+        if (
+            len(self._recent_reward_window) == 2000
+            and self._recent_positive_total > 0
+            and max(self._recent_reward_totals.values(), default=0.0)
+            / self._recent_positive_total > 0.60
+        ):
+            triggers.append("component_over_60_percent")
+            dominant = max(
+                self._recent_reward_totals, key=lambda name: self._recent_reward_totals[name]
+            )
+            triggers.append(f"farm_component:{dominant}")
+        if (
+            len(self._recent_no_novelty_pairs) == 2000
+            and max(self._recent_no_novelty_counts.values(), default=0) / 2000 > 0.40
+        ):
+            triggers.append("same_scene_action_over_40_percent_without_novelty")
         if triggers and not self._farm_alert_latched:
             self._farm_alert_latched = True
             return triggers
