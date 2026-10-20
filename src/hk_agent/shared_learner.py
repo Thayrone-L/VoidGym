@@ -1185,7 +1185,10 @@ def run_shared_actor(
     torch = importlib.import_module("torch")
     contrib = importlib.import_module("sb3_contrib")
     from stable_baselines3.common.callbacks import BaseCallback
-    torch.set_num_threads(config.torch_threads)
+    # Leave CPU capacity for the learner: actors only execute one policy forward
+    # per environment step, and additional BLAS workers contend with the game.
+    actor_threads = 1
+    torch.set_num_threads(actor_threads)
     torch.set_num_interop_threads(config.torch_interop_threads)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -1220,6 +1223,9 @@ def run_shared_actor(
             self.farm_alerts: set[str] = set()
             self.challenge_practice_completed = False
             self.challenge_practice_status: dict[str, Any] = {}
+            self.step_profile_ms: dict[str, float] = {}
+            self.task_profile_totals: dict[str, float] = {}
+            self.profile_steps = 0
 
         def _on_step(self) -> bool:
             if stop_file is not None and stop_file.is_file():
@@ -1232,6 +1238,14 @@ def run_shared_actor(
                 for info in infos:
                     if not isinstance(info, Mapping):
                         continue
+                    task_profile = info.get("actor_step_profile_ms")
+                    if isinstance(task_profile, Mapping):
+                        self.profile_steps += 1
+                        for name, value in task_profile.items():
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                self.task_profile_totals[str(name)] = (
+                                    self.task_profile_totals.get(str(name), 0.0) + float(value)
+                                )
                     if info.get("challenge_practice_finished") is True:
                         self.challenge_practice_completed = True
                     practice_status = info.get("challenge_practice")
@@ -1426,7 +1440,8 @@ def run_shared_actor(
                 _append_actor_telemetry(shared_root, slot, {
                     "round": round_number, "launch_id": launch_id,
                     "wait_policy_ms": wait_policy_ms, "collect_ms": collect_ms,
-                    "publish_ms": 0.0, "stale_rollouts": 1,
+                "publish_ms": 0.0, "stale_rollouts": 1,
+                "step_profile_ms": callback.step_profile_ms,
                     "relaunches": int(
                         bool(os.environ.get("HK_AGENT_RESTART_OF"))
                         and not status.get("relaunch_recorded")
@@ -1449,10 +1464,15 @@ def run_shared_actor(
                 fingerprint=fingerprint,
             )
             publish_ms = (time.perf_counter() - publish_started) * 1000
+            callback.step_profile_ms.update({
+                f"task_{name}": value / max(1, callback.profile_steps)
+                for name, value in callback.task_profile_totals.items()
+            })
             _append_actor_telemetry(shared_root, slot, {
                 "round": round_number, "launch_id": launch_id,
                 "wait_policy_ms": wait_policy_ms, "collect_ms": collect_ms,
                 "publish_ms": publish_ms, "stale_rollouts": 0,
+                "step_profile_ms": callback.step_profile_ms,
                 "relaunches": int(
                     bool(os.environ.get("HK_AGENT_RESTART_OF"))
                     and not status.get("relaunch_recorded")

@@ -222,6 +222,8 @@ class RunDiary:
     _scene_farthest: dict[str, float] = field(default_factory=dict)
     _last_thumbnail_seconds: dict[str, float] = field(default_factory=dict)
     _exit_capture_scenes: set[str] = field(default_factory=set)
+    _last_persist_monotonic: float = 0.0
+    last_persist_ms: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 < self.sample_interval_seconds:
@@ -243,13 +245,22 @@ class RunDiary:
         }
         self.path = self.path.with_suffix(".json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._persist()
+        self._persist(force=True)
 
-    def _persist(self) -> None:
+    def _persist(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_persist_monotonic < 2.0:
+            return
         raw = json.dumps(self.data, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         if len(raw.encode("utf-8")) > MAX_DIARY_BYTES:
             raise ValueError("run diary reached its size limit")
+        started = time.perf_counter()
         atomic_json(self.path, self.data)
+        self.last_persist_ms = (time.perf_counter() - started) * 1000
+        self._last_persist_monotonic = now
+
+    def flush(self) -> None:
+        self._persist(force=True)
 
     def observe(
         self, telemetry: Mapping[str, Any], *, monotonic_seconds: float | None = None
@@ -426,7 +437,7 @@ class RunDiary:
                 confirmed.append(event)
                 if key and key not in self._new_keys:
                     self._new_keys.add(key)
-        self._persist()
+        self._persist(force=bool(confirmed))
         return confirmed
 
     def _capture_calibration_point(
@@ -534,10 +545,12 @@ class RunDiary:
                 "shade": dict(shade or {}),
             }
         )
-        self._persist()
+        self._persist(force=True)
         return self.data
 
     def capture_firsts(self, events: Sequence[Mapping[str, Any]]) -> list[Path]:
+        if not events or self.capture_png is None:
+            return []
         with file_lock(self.campaign_root / ".journey-index.lock"):
             return self._capture_firsts_locked(events)
 

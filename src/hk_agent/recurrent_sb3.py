@@ -5,6 +5,7 @@ The independently typed sequence model and rollout schema live in maskable_recur
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Generator
 from typing import Any, ClassVar, NamedTuple
 
@@ -245,24 +246,46 @@ class MaskableRecurrentPPO(RecurrentPPO):
         rollout_buffer.reset()
         callback.on_rollout_start()
         n_steps = 0
+        profile_totals = {
+            "action_mask_ms": 0.0,
+            "observation_tensor_ms": 0.0,
+            "policy_forward_ms": 0.0,
+            "action_transfer_ms": 0.0,
+            "env_step_ms": 0.0,
+            "callback_ms": 0.0,
+            "buffer_ms": 0.0,
+        }
         lstm_states = self._last_lstm_states
         while n_steps < n_rollout_steps:
+            started = time.perf_counter()
             masks = get_action_masks(env)
+            profile_totals["action_mask_ms"] += (time.perf_counter() - started) * 1000
             with torch.no_grad():
+                started = time.perf_counter()
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 starts = torch.as_tensor(self._last_episode_starts, dtype=torch.float32, device=self.device)
+                profile_totals["observation_tensor_ms"] += (time.perf_counter() - started) * 1000
+                started = time.perf_counter()
                 actions, values, log_probs, next_states = self.policy(
                     obs_tensor, lstm_states, starts, action_masks=masks
                 )
+                profile_totals["policy_forward_ms"] += (time.perf_counter() - started) * 1000
             # Keep Discrete actions one-dimensional (n_envs,), as SB3's VecEnv
             # expects; adding a trailing singleton makes each env receive array([a]).
+            started = time.perf_counter()
             action_array = actions.cpu().numpy()
+            profile_totals["action_transfer_ms"] += (time.perf_counter() - started) * 1000
+            started = time.perf_counter()
             new_obs, rewards, dones, infos = env.step(action_array)
+            profile_totals["env_step_ms"] += (time.perf_counter() - started) * 1000
             self.num_timesteps += env.num_envs
+            started = time.perf_counter()
             callback.update_locals(locals())
             if not callback.on_step():
                 return False
+            profile_totals["callback_ms"] += (time.perf_counter() - started) * 1000
             self._update_info_buffer(infos, dones)
+            started = time.perf_counter()
             rollout_buffer.add(
                 self._last_obs,
                 action_array,
@@ -273,6 +296,10 @@ class MaskableRecurrentPPO(RecurrentPPO):
                 lstm_states=lstm_states,
                 action_masks=masks,
             )
+            profile_totals["buffer_ms"] += (time.perf_counter() - started) * 1000
+            callback.step_profile_ms = {
+                name: value / max(1, n_steps + 1) for name, value in profile_totals.items()
+            }
             self._last_obs = new_obs
             self._last_episode_starts = dones
             lstm_states = next_states

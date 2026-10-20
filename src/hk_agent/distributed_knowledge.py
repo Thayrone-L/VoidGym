@@ -85,6 +85,7 @@ _TASK_CONFIG_KEYS = frozenset(
         "hp_restored_budget", "scene_reward_budget", "time_cost_budget", "shade_hit_budget", "shade_approach_budget",
         "scene_change_reward", "lease_base_ms", "ent_coef", "gamma", "gae_lambda",
         "n_epochs", "target_kl", "learning_rate", "clip_range",
+        "continuous_playthrough",
     }
 )
 _BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST", "DASH", "SUPER_DASH", "DREAM_NAIL", "PAUSE", "MENU_SUBMIT", "MENU_CANCEL"})

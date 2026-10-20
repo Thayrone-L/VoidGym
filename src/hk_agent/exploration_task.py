@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -24,7 +26,7 @@ from hk_agent.challenge_practice import (
 )
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.player_knowledge import ITEM_FLAGS, PlayerKnowledge
-from hk_agent.run_journey import RunDiary, increment_campaign_count, rebuild_progress
+from hk_agent.run_journey import RunDiary, atomic_json, increment_campaign_count, rebuild_progress
 from hk_agent.scene_change_task import (
     SCENE_CHANGE_ACTION_NAMES,
     SCENE_CHANGE_ACTION_TEMPLATES,
@@ -58,6 +60,14 @@ def descriptor_hash(descriptor: NDArray[np.generic]) -> str:
         np.uint8
     )
     return hashlib.sha256(quantized.tobytes()).hexdigest()
+
+
+def enemy_kill_reward_for_visit(visits: int, *, continuous: bool) -> float:
+    if visits < 0:
+        raise ValueError("enemy visit count must be non-negative")
+    if continuous:
+        return 1.0 / float(1 + visits) ** 2
+    return max(0.2, 1.0 / float(np.sqrt(1 + visits)))
 
 
 def _ability_aware_novelty_hash(
@@ -250,6 +260,7 @@ class ExplorationTaskConfig:
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
     tutorial_hint_level: int = 0
+    continuous_playthrough: bool = False
 
     def validate(self) -> None:
         if (
@@ -474,6 +485,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self.mask_unavailable_count = 0
         self._lifelong_path: Path | None = None
         self._lifelong_visits: dict[str, int] = {}
+        self._lifelong_dirty_steps = 0
         self._novelty_candidate: str | None = None
         self._novelty_candidate_descriptor: NDArray[np.float32] | None = None
         self._novelty_candidate_steps = 0
@@ -504,9 +516,20 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._recent_reward_window: deque[dict[str, float]] = deque(maxlen=2000)
         self._recent_no_novelty_pairs: deque[tuple[str, str]] = deque(maxlen=2000)
         self._farm_alert_latched = False
+        self._continuous_budget_path: Path | None = None
+        self._continuous_budget_state: dict[str, Any] = {
+            "schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}
+        }
+        self._continuous_budget_dirty_steps = 0
+        self._pending_continuous_budget: dict[str, float] = {}
         self._episode_total_reward = 0.0
         self._evaluation_mode = False
         self._episode_number = 0
+        self._pending_log_records: list[bytes] = []
+        self._last_log_flush = time.monotonic()
+        self._last_knowledge_persist_step = -32
+        self._last_knowledge_persist_ms = 0.0
+        self._last_playthrough_update = 0.0
         self._milestone_counts: dict[str, int] = {}
         self._milestone_path: Path | None = None
         self._milestone_paid = 0.0
@@ -563,6 +586,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, NDArray[np.generic]], dict[str, Any]]:
         super().reset(seed=seed)
+        self._flush_transition_log()
+        self._flush_lifelong_visits()
+        self._save_continuous_budget(force=True)
+        self._persist_player_knowledge(force=True)
         reset_options = dict(options or {})
         if self._reload_checkpoint_next_reset:
             reset_options["reload_checkpoint"] = True
@@ -574,7 +601,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._record_challenge_practice_events(self._player_knowledge.new_events)
         self._capture_challenge_snapshots(self._player_knowledge.new_events, reset_info)
         self._pending_tutorial_events.extend(self._player_knowledge.new_events)
-        self._persist_player_knowledge()
+        self._persist_player_knowledge(force=bool(self._player_knowledge.new_events))
         descriptor = self._descriptor(observation["pixels"][-1])
         if self.config.reward_version in {"explore_v2", "explore_v3", "explore_v4"}:
             run_root = (
@@ -583,8 +610,18 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             memory_root = self.lifelong_memory_root or (
                 run_root if self.task_log_path is not None else None
             )
+            if self.config.continuous_playthrough and memory_root is not None:
+                actor_slot = os.environ.get("HK_AGENT_SLOT_ID", "0")
+                self._continuous_budget_path = memory_root / f"continuous-reward-slot-{actor_slot}.json"
+                self._continuous_budget_state = self._load_continuous_budget(self._continuous_budget_path)
+                if bool(reset_options.get("reload_checkpoint")):
+                    self._continuous_budget_state["segment_paid"] = {}
+                    self._save_continuous_budget(force=True)
+            actor_slot = os.environ.get("HK_AGENT_SLOT_ID", "0")
             self._lifelong_path = (
-                memory_root / "lifelong-novelty.json" if memory_root is not None else None
+                memory_root / (f"lifelong-novelty-slot-{actor_slot}.json"
+                               if self.config.continuous_playthrough else "lifelong-novelty.json")
+                if memory_root is not None else None
             )
             self._lifelong_visits = (
                 load_lifelong_visits(self._lifelong_path, self.config.lifelong_archive_max)
@@ -596,7 +633,12 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 and memory_root is not None
             ):
                 self._campaign_scene_path = memory_root / "lifelong-scenes.json"
-                self._campaign_enemy_path = memory_root / "lifelong-enemies.json"
+                actor_slot = os.environ.get("HK_AGENT_SLOT_ID", "0")
+                self._campaign_enemy_path = (
+                    memory_root / f"lifelong-enemies-slot-{actor_slot}.json"
+                    if self.config.continuous_playthrough
+                    else memory_root / "lifelong-enemies.json"
+                )
                 self._scene_first_seen_path = memory_root / "lifelong-scene-first-seen.json"
                 self._scene_visits = load_campaign_counts(
                     self._campaign_scene_path, self.config.lifelong_archive_max
@@ -678,6 +720,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     def step(
         self, action: int
     ) -> tuple[dict[str, NDArray[np.generic]], float, bool, bool, dict[str, Any]]:
+        step_profile: dict[str, float] = {}
         if self._done:
             raise RuntimeError("reset() is required before step()")
         if not self.action_space.contains(action):
@@ -695,6 +738,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         lease = template.resolve_lease_ms(self.environment.lease_ms)
         if self._diary is not None:
             self._diary.capture_before_exit(template.buttons)
+        self._pending_continuous_budget = {}
+        self._advance_continuous_budget_step()
+        started = time.perf_counter()
         if isinstance(self.environment, HollowKnightEnv):
             observation, _, terminated, truncated, base = self.environment.step(
                 template.raw_action_index, lease_ms=lease, action_audit=audit
@@ -703,16 +749,30 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             observation, _, terminated, truncated, base = self.environment.step(
                 template.raw_action_index, lease_ms=lease
             )
+        step_profile["environment_step_ms"] = (time.perf_counter() - started) * 1000
+        raw_milestones = base.get("milestone_events_since_last_frame", [])
+        if self.config.continuous_playthrough and isinstance(raw_milestones, list) and any(
+            isinstance(event, Mapping) and event.get("confirmed") is True
+            and (event.get("category") == "checkpoint" or event.get("type") in {"bench_rest", "first_bench_rest"})
+            for event in raw_milestones
+        ):
+            self._continuous_budget_state["segment_paid"] = {}
+            self._save_continuous_budget(force=True)
+        started = time.perf_counter()
         previous_skill_epoch = self._player_knowledge.skill_epoch
         self._player_knowledge.update(
             base, challenge_tracking_enabled=self._challenge_practice_enabled
         )
         self._record_challenge_practice_events(self._player_knowledge.new_events)
+        knowledge_events = bool(self._player_knowledge.new_events)
         tutorial_events = self._pending_tutorial_events + self._player_knowledge.new_events
         self._capture_challenge_snapshots(self._player_knowledge.new_events, base)
         self._pending_tutorial_events = []
-        self._persist_player_knowledge()
+        self._persist_player_knowledge(force=knowledge_events)
+        step_profile["player_knowledge_ms"] = (time.perf_counter() - started) * 1000
+        step_profile["player_knowledge_write_ms"] = self._last_knowledge_persist_ms
         ability_reexploration = self._player_knowledge.skill_epoch > previous_skill_epoch
+        started = time.perf_counter()
         if self._diary is not None:
             telemetry = base.get("operator_telemetry", {})
             record = dict(telemetry) if isinstance(telemetry, dict) else {}
@@ -747,14 +807,17 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 )
             journey_events = self._diary.observe(record)
             self._diary.capture_firsts(journey_events)
+            step_profile["diary_write_ms"] = self._diary.last_persist_ms
             self._update_playthrough(scene=str(record.get("scene_name") or "") or None,
                                      step=self._steps + 1, events=journey_events)
+        step_profile["journey_and_observation_ms"] = (time.perf_counter() - started) * 1000
         if base.get("valid") is not True:
             self._done = True
             self.environment.backend.release_all()
             raise InvalidTrainingTransition(
                 f"operationally invalid transition: {base.get('termination_reason')}"
             )
+        started = time.perf_counter()
         self._history.append(action)
         observation = self._history.apply(observation)
         frame = observation["pixels"][-1]
@@ -819,21 +882,26 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 self._novelty_candidate_descriptor = None
                 self._novelty_candidate_steps = 0
             eligible = eligible and self._novelty_candidate_steps >= 2
-        if eligible and self._novelty_paid < self.config.novelty_budget:
+        novelty_remaining = self._remaining_budget(
+            "novelty", self.config.novelty_budget, self._novelty_paid
+        )
+        if eligible and novelty_remaining > 0:
             visits = self._lifelong_visits.get(novelty_hash, 0) if novelty_hash else 0
             lifetime_factor = 1.0 / float(np.sqrt(1 + visits)) if novelty_hash else 1.0
             components["novelty"] = min(
                 self.config.novelty_reward * lifetime_factor,
-                self.config.novelty_budget - self._novelty_paid,
+                novelty_remaining,
             )
             self._novelty_paid += components["novelty"]
+            self._record_continuous_budget("novelty", components["novelty"])
             self._archive.append(descriptor.copy())
             if novelty_hash is not None:
                 self._lifelong_visits[novelty_hash] = visits + 1
                 if len(self._lifelong_visits) > self.config.lifelong_archive_max:
                     del self._lifelong_visits[next(iter(self._lifelong_visits))]
-                if self._lifelong_path is not None:
-                    save_lifelong_visits(self._lifelong_path, self._lifelong_visits)
+                self._lifelong_dirty_steps += 1
+                if self._lifelong_dirty_steps >= 32:
+                    self._flush_lifelong_visits()
         detection = detect_scene_change(
             descriptor=descriptor,
             frame=frame,
@@ -886,10 +954,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 ):
                     prior_visits = self._scene_visits.get(current_scene, 0)
                     requested_reward = 2.0 + 8.0 / float(np.sqrt(1 + prior_visits))
-                    remaining = max(0.0, self.config.scene_reward_budget - self._scene_paid)
+                    remaining = self._remaining_budget(
+                        "scene_change", self.config.scene_reward_budget, self._scene_paid
+                    )
                     components["scene_change"] = min(requested_reward, remaining)
                     if components["scene_change"] > 0:
                         self._scene_paid += components["scene_change"]
+                        self._record_continuous_budget("scene_change", components["scene_change"])
                         self._scene_visits[current_scene] = prior_visits + 1
                         self._episode_new_scenes.append(current_scene)
                         scene_event_paid = True
@@ -940,8 +1011,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             if rewardable_events:
                 self._episode_kills += len(events)
-            remaining_kill_budget = max(
-                0.0, self.config.enemy_kill_reward_budget - self._kills_paid
+            remaining_kill_budget = self._remaining_budget(
+                "confirmed_enemy_kills", self.config.enemy_kill_reward_budget, self._kills_paid
             )
             for event in events if rewardable_events else []:
                 if (
@@ -952,7 +1023,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                     raise InvalidTrainingTransition("invalid typed enemy reward event")
                 key = f"{event['scene_name']}|{event['enemy_type']}"
                 visits = self._enemy_visits.get(key, 0)
-                requested = max(0.2, 1.0 / float(np.sqrt(1 + visits)))
+                requested = enemy_kill_reward_for_visit(
+                    visits, continuous=self.config.continuous_playthrough
+                )
                 award = min(requested, remaining_kill_budget)
                 components["confirmed_enemy_kills"] += award
                 remaining_kill_budget -= award
@@ -965,7 +1038,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         if self.config.reward_version in {"explore_v3", "explore_v4"}:
             components["confirmed_enemy_kills"] = min(
                 components["confirmed_enemy_kills"],
-                max(0.0, self.config.enemy_kill_reward_budget - self._kills_paid),
+                self._remaining_budget(
+                    "confirmed_enemy_kills", self.config.enemy_kill_reward_budget, self._kills_paid
+                ),
             )
         if (
             self.config.reward_version == "explore_v4"
@@ -976,7 +1051,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             events = base.get("milestone_events_since_last_frame", [])
             if not isinstance(events, list) or len(events) > 128:
                 raise InvalidTrainingTransition("invalid milestone event list")
-            remaining = max(0.0, 20.0 - self._milestone_paid)
+            remaining = self._remaining_budget("milestone_novelty", 20.0, self._milestone_paid)
             for event in events:
                 if not isinstance(event, dict) or event.get("confirmed") is not True:
                     continue
@@ -1004,6 +1079,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                     continue
                 components["milestone_novelty"] += award
                 self._milestone_paid += award
+                self._record_continuous_budget("milestone_novelty", award)
                 remaining -= award
                 self._milestone_counts[key] = visits + 1
         if self.config.reward_version == "explore_v4":
@@ -1018,9 +1094,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 if not isinstance(event, dict):
                     continue
                 requested = tutorial_values.get(str(event.get("type")), 0.0)
-                award = min(requested, max(0.0, 20.0 - self._milestone_paid))
+                award = min(
+                    requested,
+                    self._remaining_budget("tutorial_reward", 20.0, self._milestone_paid),
+                )
                 components["tutorial_reward"] += award
                 self._milestone_paid += award
+                self._record_continuous_budget("tutorial_reward", award)
             challenge_hits = 0
             survival_record = False
             challenge_success = False
@@ -1040,7 +1120,17 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             components["challenge_reward"] = sum(challenge_components.values())
         self._kills_paid += components["confirmed_enemy_kills"]
-        components["shade_recovered"] = 0.0 if self._shade_paid else combat["shade_recovered"]
+        self._record_continuous_budget(
+            "confirmed_enemy_kills", components["confirmed_enemy_kills"]
+        )
+        shade_recovered_remaining = self._remaining_budget(
+            "shade_recovered", self.config.shade_recovery_reward,
+            self.config.shade_recovery_reward if self._shade_paid else 0.0,
+        )
+        components["shade_recovered"] = min(
+            0.0 if self._shade_paid else combat["shade_recovered"], shade_recovered_remaining
+        )
+        self._record_continuous_budget("shade_recovered", components["shade_recovered"])
         self._shade_paid |= components["shade_recovered"] > 0
         if components["shade_recovered"] > 0:
             self._episode_shade_recovered += 1
@@ -1055,9 +1145,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             components["shade_hits"] = min(
                 min(hits, 4) * self.config.shade_hit_reward,
-                max(0.0, hit_budget - self._shade_hits_paid),
+                self._remaining_budget("shade_hits", hit_budget, self._shade_hits_paid),
             )
             self._shade_hits_paid += components["shade_hits"]
+            self._record_continuous_budget("shade_hits", components["shade_hits"])
             restored = int(base.get("hp_restored_since_last_frame", 0))
             if restored < 0:
                 raise InvalidTrainingTransition("invalid restored health delta")
@@ -1068,9 +1159,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             components["hp_restored"] = min(
                 restored * self.config.hp_restored_reward,
-                max(0.0, hp_budget - self._hp_restored_paid),
+                self._remaining_budget("hp_restored", hp_budget, self._hp_restored_paid),
             )
             self._hp_restored_paid += components["hp_restored"]
+            self._record_continuous_budget("hp_restored", components["hp_restored"])
             distance = base.get("shade_distance")
             scene = base.get("scene_name")
             if (
@@ -1094,8 +1186,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                                 approach,
                                 max(
                                     0.0,
-                                    self.config.shade_approach_budget
-                                    - self._shade_approach_positive_paid,
+                                    self._remaining_budget(
+                                        "shade_approach_positive", self.config.shade_approach_budget,
+                                        self._shade_approach_positive_paid,
+                                    ),
                                 ),
                             )
                             self._shade_approach_positive_paid += approach
@@ -1104,11 +1198,17 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                                 approach,
                                 -max(
                                     0.0,
-                                    self.config.shade_approach_budget
-                                    - self._shade_approach_negative_paid,
+                                    self._remaining_budget(
+                                        "shade_approach_negative", self.config.shade_approach_budget,
+                                        self._shade_approach_negative_paid,
+                                    ),
                                 ),
                             )
                             self._shade_approach_negative_paid += -approach
+                    self._record_continuous_budget(
+                        "shade_approach_positive" if approach > 0 else "shade_approach_negative",
+                        abs(approach),
+                    )
                     components["shade_approach"] = approach
                 self._shade_distance = (scene, current_distance)
             else:
@@ -1118,25 +1218,34 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         if self.config.reward_version in {"explore_v3", "explore_v4"}:
             payable_time_cost = min(
                 abs(components["time_cost"]),
-                max(0.0, self.config.time_cost_budget - self._time_cost_paid),
+                self._remaining_budget(
+                    "time_cost", self.config.time_cost_budget, self._time_cost_paid
+                ),
             )
             components["time_cost"] = -payable_time_cost
             self._time_cost_paid += payable_time_cost
+            self._record_continuous_budget("time_cost", payable_time_cost)
         geo = combat["confirmed_geo_gained"] + combat["confirmed_geo_spent"]
-        geo_award = min(geo, max(0.0, self.config.geo_reward_budget - self._geo_paid))
+        geo_award = min(
+            geo, self._remaining_budget("geo", self.config.geo_reward_budget, self._geo_paid)
+        )
         if geo > 0:
             scale = geo_award / geo
             components["confirmed_geo_gained"] = combat["confirmed_geo_gained"] * scale
             components["confirmed_geo_spent"] = combat["confirmed_geo_spent"] * scale
             self._geo_paid += geo_award
+            self._record_continuous_budget("geo", geo_award)
         components["damage_taken"] = combat["confirmed_hp_lost"]
         if self.config.reward_version in {"explore_v3", "explore_v4"}:
             raw_damage = int(base.get("hp_lost_since_last_frame", 0))
             if raw_damage < 0:
                 raise InvalidTrainingTransition("invalid confirmed damage delta")
-            payable_damage = min(float(raw_damage), max(0.0, 9.0 - self._damage_paid_health))
+            payable_damage = min(
+                float(raw_damage), self._remaining_budget("damage_health", 9.0, self._damage_paid_health)
+            )
             components["damage_taken"] = -payable_damage * abs(self.config.damage_penalty)
             self._damage_paid_health += payable_damage
+            self._record_continuous_budget("damage_health", payable_damage)
         components["death"] = combat["player_death"]
         components["run_failed"] = combat["gameplay_run_failed"]
         if components["death"] < 0:
@@ -1159,6 +1268,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "milestone_novelty",
             ):
                 components[name] = 0.0
+        self._commit_continuous_budget(components)
         reward = float(sum(components.values()))
         self._episode_total_reward += reward
         if components["novelty"] > 0 or scene_event_paid:
@@ -1265,11 +1375,17 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "stuck_seconds": self._progress_elapsed_seconds,
                 "farm_alerts": farm_alerts,
                 "episode_progress": episode_progress,
+                "actor_step_profile_ms": step_profile,
                 "player_knowledge_events": tutorial_events,
                 **audit,
             }
         )
-        return self._apply_player_knowledge(observation), reward, task_terminated, task_truncated, info
+        step_profile["reward_and_log_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
+        observation = self._apply_player_knowledge(observation)
+        step_profile["knowledge_observation_ms"] = (time.perf_counter() - started) * 1000
+        info["actor_step_profile_ms"] = step_profile
+        return observation, reward, task_terminated, task_truncated, info
 
     def _apply_player_knowledge(
         self, observation: dict[str, NDArray[np.generic]]
@@ -1353,13 +1469,18 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             controller.active = False
             self._challenge_practice_finished = True
 
-    def _persist_player_knowledge(self) -> None:
+    def _persist_player_knowledge(self, *, force: bool = False) -> None:
         if self._knowledge_path is None:
+            return
+        current_step = int(getattr(self, "_steps", 0))
+        last_persist_step = int(getattr(self, "_last_knowledge_persist_step", -32))
+        if not force and current_step - last_persist_step < 32:
             return
         self._knowledge_path.parent.mkdir(parents=True, exist_ok=True)
         pending = self._knowledge_path.with_name(
             f".{self._knowledge_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         )
+        started = time.perf_counter()
         try:
             with pending.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(
@@ -1379,21 +1500,26 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                     if os.name != "nt" or attempt == 19:
                         raise
                     time.sleep(0.025)
+            self._last_knowledge_persist_step = current_step
+            self._last_knowledge_persist_ms = (time.perf_counter() - started) * 1000
         finally:
             pending.unlink(missing_ok=True)
 
-    @staticmethod
-    def _update_playthrough(*, scene: str | None, step: int, events: list[dict[str, Any]]) -> None:
+    def _update_playthrough(self, *, scene: str | None, step: int, events: list[dict[str, Any]]) -> None:
         root_value = os.environ.get("HK_AGENT_PLAYTHROUGH_ROOT")
         if not root_value:
             return
         checkpoint = next((event.get("key") for event in events
                            if event.get("category") == "checkpoint" and isinstance(event.get("key"), str)), None)
+        now = time.monotonic()
+        if checkpoint is None and now - self._last_playthrough_update < 5.0:
+            return
         try:
             from hk_agent.playthrough import update_playthrough_progress
 
             update_playthrough_progress(Path(root_value), scene=scene,
                                         progress={"step": step, "checkpoint": checkpoint})
+            self._last_playthrough_update = now
         except (OSError, ValueError, RuntimeError):
             # Progress display is best-effort; the save transaction remains authoritative.
             return
@@ -1403,11 +1529,126 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self._action_names, getattr(self.environment, "latest_action_availability", None)
         )
 
+    def _load_continuous_budget(self, path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+        try:
+            payload = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+        game_steps = payload.get("game_steps", 0)
+        segment = payload.get("segment_paid", {})
+        buckets = payload.get("buckets", {})
+        if not isinstance(game_steps, int) or isinstance(game_steps, bool) or game_steps < 0:
+            return {"schema_version": 1, "game_steps": 0, "segment_paid": {}, "buckets": {}}
+        return {
+            "schema_version": 1,
+            "game_steps": game_steps,
+            "segment_paid": {str(k): float(v) for k, v in segment.items()
+                              if isinstance(k, str) and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0}
+            if isinstance(segment, dict) else {},
+            "buckets": {str(k): {str(name): float(value) for name, value in row.items()
+                                 if isinstance(name, str) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0}
+                        for k, row in buckets.items() if isinstance(k, str) and isinstance(row, dict)}
+            if isinstance(buckets, dict) else {},
+        }
+
+    def _advance_continuous_budget_step(self) -> None:
+        if not self.config.continuous_playthrough:
+            return
+        self._continuous_budget_state["game_steps"] = int(self._continuous_budget_state.get("game_steps", 0)) + 1
+        current_bucket = int(self._continuous_budget_state["game_steps"]) // 64
+        buckets = self._continuous_budget_state.setdefault("buckets", {})
+        cutoff = current_bucket - 235
+        for key in list(buckets):
+            if key.isdigit() and int(key) < cutoff:
+                del buckets[key]
+        self._continuous_budget_dirty_steps += 1
+
+    def _remaining_budget(self, name: str, budget: float, episode_paid: float) -> float:
+        if not self.config.continuous_playthrough:
+            return max(0.0, budget - episode_paid)
+        segment = self._continuous_budget_state.get("segment_paid", {})
+        buckets = self._continuous_budget_state.get("buckets", {})
+        current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
+        window_paid = sum(
+            float(row.get(name, 0.0)) for key, row in buckets.items()
+            if key.isdigit() and current - 235 <= int(key) <= current and isinstance(row, dict)
+        )
+        segment_paid = float(segment.get(name, 0.0)) if isinstance(segment, dict) else 0.0
+        pending = self._pending_continuous_budget.get(name, 0.0)
+        return max(0.0, min(budget - segment_paid - pending, budget - window_paid - pending))
+
+    def _record_continuous_budget(self, name: str, amount: float) -> None:
+        if not self.config.continuous_playthrough or amount <= 0:
+            return
+        self._pending_continuous_budget[name] = self._pending_continuous_budget.get(name, 0.0) + amount
+
+    def _commit_continuous_budget(self, components: Mapping[str, float]) -> None:
+        if not self.config.continuous_playthrough:
+            return
+        allowed = {
+            "novelty": components.get("novelty", 0.0) > 0,
+            "scene_change": components.get("scene_change", 0.0) > 0,
+            "confirmed_enemy_kills": components.get("confirmed_enemy_kills", 0.0) > 0,
+            "milestone_novelty": components.get("milestone_novelty", 0.0) > 0,
+            "tutorial_reward": components.get("tutorial_reward", 0.0) > 0,
+            "shade_hits": components.get("shade_hits", 0.0) > 0,
+            "shade_recovered": components.get("shade_recovered", 0.0) > 0,
+            "hp_restored": components.get("hp_restored", 0.0) > 0,
+            "shade_approach_positive": components.get("shade_approach", 0.0) > 0,
+            "shade_approach_negative": components.get("shade_approach", 0.0) < 0,
+            "time_cost": components.get("time_cost", 0.0) < 0,
+            "geo": components.get("confirmed_geo_gained", 0.0) + components.get("confirmed_geo_spent", 0.0) > 0,
+            "damage_health": components.get("damage_taken", 0.0) < 0,
+        }
+        for name, amount in self._pending_continuous_budget.items():
+            if not allowed.get(name, False):
+                continue
+            segment = self._continuous_budget_state.setdefault("segment_paid", {})
+            segment[name] = float(segment.get(name, 0.0)) + amount
+            current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
+            buckets = self._continuous_budget_state.setdefault("buckets", {})
+            row = buckets.setdefault(str(current), {})
+            row[name] = float(row.get(name, 0.0)) + amount
+        self._pending_continuous_budget.clear()
+        self._save_continuous_budget()
+        segment = self._continuous_budget_state.setdefault("segment_paid", {})
+        segment[name] = float(segment.get(name, 0.0)) + amount
+        current = int(self._continuous_budget_state.get("game_steps", 0)) // 64
+        buckets = self._continuous_budget_state.setdefault("buckets", {})
+        row = buckets.setdefault(str(current), {})
+        row[name] = float(row.get(name, 0.0)) + amount
+
+    def _save_continuous_budget(self, *, force: bool = False) -> None:
+        if self._continuous_budget_path is None:
+            return
+        if not force and self._continuous_budget_dirty_steps < 32:
+            return
+        atomic_json(self._continuous_budget_path, self._continuous_budget_state)
+        self._continuous_budget_dirty_steps = 0
+
     def set_evaluation_mode(self, enabled: bool) -> None:
         self._evaluation_mode = bool(enabled)
 
+    def _flush_lifelong_visits(self) -> None:
+        if self._lifelong_path is None or self._lifelong_dirty_steps == 0:
+            return
+        save_lifelong_visits(self._lifelong_path, self._lifelong_visits)
+        self._lifelong_dirty_steps = 0
+
     def close(self) -> None:
-        self.environment.close()
+        try:
+            self._persist_player_knowledge(force=True)
+            self._flush_transition_log()
+            self._flush_lifelong_visits()
+            self._save_continuous_budget(force=True)
+            if self._diary is not None:
+                self._diary.flush()
+        finally:
+            self.environment.close()
 
     def task_contract(self) -> dict[str, Any]:
         schema_version = {"explore_v1": 1, "explore_v2": 2, "explore_v3": 3, "explore_v4": 5}[
@@ -1429,6 +1670,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "config": {
                 key: value for key, value in asdict(self.config).items()
                 if key != "reward_version"
+                and key != "continuous_playthrough"
                 and (key != "tutorial_hint_level" or self.config.reward_version == "explore_v4")
             },
             "observation_version": "pixels_action_history_player_knowledge_charms_v1" if schema_version >= 8 else "pixels_action_history_player_knowledge_bestiary_v1" if schema_version == 7 else "pixels_action_history_player_knowledge_tutorials_v2" if schema_version == 6 else "pixels_action_history_player_knowledge_v1" if schema_version == 5 else "pixels_action_history_v1",
@@ -1517,6 +1759,8 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             positive_total = sum(totals.values())
             if positive_total > 0 and max(totals.values(), default=0.0) / positive_total > 0.60:
                 triggers.append("component_over_60_percent")
+                dominant = max(totals, key=lambda name: totals[name])
+                triggers.append(f"farm_component:{dominant}")
         if len(self._recent_no_novelty_pairs) == 2000:
             counts: dict[tuple[str, str], int] = {}
             for pair in self._recent_no_novelty_pairs:
@@ -1533,13 +1777,24 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
     def _append_log(self, record: dict[str, Any]) -> None:
         if self.task_log_path is None:
             return
-        self.task_log_path.parent.mkdir(parents=True, exist_ok=True)
         payload = (json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n").encode()
+        self._pending_log_records.append(payload)
+        force = bool(record.get("farm_alerts")) or record.get("terminated") is True or record.get("truncated") is True
+        if len(self._pending_log_records) >= 32 or force or time.monotonic() - self._last_log_flush >= 2.0:
+            self._flush_transition_log()
+
+    def _flush_transition_log(self) -> None:
+        if self.task_log_path is None or not self._pending_log_records:
+            return
+        self.task_log_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"".join(self._pending_log_records)
         fd = os.open(self.task_log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         try:
             if os.write(fd, payload) != len(payload):
                 raise OSError("partial task JSONL append")
             os.fsync(fd)
+            self._pending_log_records.clear()
+            self._last_log_flush = time.monotonic()
         finally:
             os.close(fd)
 

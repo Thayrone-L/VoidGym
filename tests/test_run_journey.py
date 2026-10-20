@@ -37,6 +37,15 @@ def tiny_png(width: int = 1, height: int = 1) -> bytes:
     )
 
 
+def test_capture_firsts_without_events_does_not_lock_or_read_campaign_index(tmp_path: Path) -> None:
+    diary = object.__new__(RunDiary)
+    diary.campaign_root = tmp_path
+    diary.capture_png = lambda: tiny_png()
+
+    assert diary.capture_firsts([]) == []
+    assert not (tmp_path / ".journey-index.lock").exists()
+
+
 def test_diary_samples_at_most_two_hz_and_aggregates(tmp_path: Path) -> None:
     root = tmp_path / "campaign"
     diary = RunDiary(root / "actor-1" / "episode-1", root, "actor-1", 1)

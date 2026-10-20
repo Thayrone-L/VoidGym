@@ -510,6 +510,7 @@ def main() -> int:
     if args.task == "exploration":
         base_task_config = ExplorationTaskConfig(
             reward_version=reward_version,
+            continuous_playthrough=args.save_source == "continuous_playthrough",
             horizon_steps=args.horizon, novelty_reward=args.novelty_reward,
             novelty_threshold=args.novelty_threshold, novelty_budget=args.novelty_budget,
             scene_change_reward=args.scene_change_reward, enemy_kill_reward=args.enemy_kill_reward,

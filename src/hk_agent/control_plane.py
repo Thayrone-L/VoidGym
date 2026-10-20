@@ -872,6 +872,42 @@ class ControlPlane:
         )
         shared_root_value = next((row.get("shared_root") for row in active_records if isinstance(row.get("shared_root"), str)), None)
         shared_root = Path(str(shared_root_value)) if shared_root_value else (self.runtime_root / "shared" / campaign_id if campaign_id else None)
+        manifest = self._read_json(shared_root / "manifest.json") if shared_root is not None else {}
+        actor_performance: list[dict[str, Any]] = []
+        if shared_root is not None:
+            for actor_record in active_records:
+                resources = actor_record.get("resources")
+                slot = resources.get("slot_id") if isinstance(resources, Mapping) else None
+                launch_id = actor_record.get("launch_id")
+                if actor_record.get("role") != "actor" or not isinstance(slot, int) or not isinstance(launch_id, str):
+                    continue
+                telemetry_path = shared_root / "telemetry" / f"actor-slot-{slot}.jsonl"
+                try:
+                    lines = telemetry_path.read_text("utf-8").splitlines()[-64:]
+                except OSError:
+                    lines = []
+                sample: Mapping[str, Any] = {}
+                for line in reversed(lines):
+                    try:
+                        candidate = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(candidate, Mapping) and candidate.get("launch_id") == launch_id:
+                        sample = candidate
+                        break
+                collect_ms = sample.get("collect_ms") if isinstance(sample, Mapping) else None
+                profile = sample.get("step_profile_ms", {}) if isinstance(sample, Mapping) else {}
+                actor_performance.append({
+                    "slot": slot,
+                    "launch_id": launch_id,
+                    "steps_per_second": (
+                        float(manifest.get("rollout_steps", 0)) / (float(collect_ms) / 1000.0)
+                        if isinstance(collect_ms, (int, float)) and collect_ms > 0
+                        and isinstance(manifest.get("rollout_steps"), (int, float)) else None
+                    ),
+                    "collect_ms": collect_ms,
+                    "step_profile_ms": dict(profile) if isinstance(profile, Mapping) else {},
+                })
         journey: dict[str, object] = {"svg": "", "runs": [], "milestones": [], "records": {}}
         if shared_root is not None:
             try:
@@ -904,7 +940,6 @@ class ControlPlane:
             journey["map_art"] = self.map_art_status()
         except RuntimeError:
             journey["map_art"] = {"cached": False, "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
-        manifest = self._read_json(shared_root / "manifest.json") if shared_root is not None else {}
         if shared_root is not None and not manifest.get("evaluations"):
             eval_file = shared_root / "evaluations.jsonl"
             if eval_file.is_file():
@@ -1016,10 +1051,16 @@ class ControlPlane:
                             alerts.append(alert)
         if "same_scene_action_over_40_percent_without_novelty" in alerts:
             alerts[alerts.index("same_scene_action_over_40_percent_without_novelty")] = "A IA parece estar repetindo o mesmo lugar"
+        alerts = [
+            f"Componente dominante no alerta de farm: {item.removeprefix('farm_component:')}"
+            if item.startswith("farm_component:") else item
+            for item in alerts
+        ]
         raw_capacity = status.get("capacity", 1)
         capacity = raw_capacity if isinstance(raw_capacity, int) and not isinstance(raw_capacity, bool) else 1
         return {
             "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
+            "actor_performance": actor_performance,
             "remaining_seconds": remaining_seconds, "instances": instance_rows,
             "training_steps": completed_timesteps, "steps_per_second": completed_timesteps / max(elapsed_seconds, 1.0),
             "learner_updates": learner_round, "updates_per_hour": learner_round / hours,

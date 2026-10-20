@@ -443,13 +443,59 @@ def test_v3_alert_thresholds_and_return_bounds() -> None:
     assert task.config.minimum_negative_episode_reward() == pytest.approx(-35.5)
     for _ in range(1999):
         assert task._record_farm_window({"novelty": 0.1}, "A", "LEFT") == []
-    assert "component_over_60_percent" in task._record_farm_window({"novelty": 0.1}, "A", "LEFT")
+    alerts = task._record_farm_window({"novelty": 0.1}, "A", "LEFT")
+    assert "component_over_60_percent" in alerts
+    assert "farm_component:novelty" in alerts
     task = ExplorationTask(_Environment(), config=_v3_config(horizon_steps=1000))
     alerts = []
     for index in range(2000):
         scene, action = ("A", "LEFT") if index < 1200 else (f"scene-{index}", "RIGHT")
         alerts.extend(task._record_farm_window({}, scene, action))
     assert "same_scene_action_over_40_percent_without_novelty" in alerts
+
+
+def test_continuous_reward_budget_survives_slice_and_expires_from_rolling_window() -> None:
+    task = object.__new__(ExplorationTask)
+    task.config = ExplorationTaskConfig(reward_version="explore_v4", continuous_playthrough=True)
+    task._continuous_budget_state = {
+        "schema_version": 1,
+        "game_steps": 64,
+        "segment_paid": {"confirmed_enemy_kills": 4.8},
+        "buckets": {"1": {"confirmed_enemy_kills": 4.8}},
+    }
+    task._pending_continuous_budget = {}
+    task._continuous_budget_dirty_steps = 0
+    task._continuous_budget_path = None
+    assert task._remaining_budget("confirmed_enemy_kills", 5.0, 0.0) == pytest.approx(0.2)
+    task._continuous_budget_state["segment_paid"] = {}
+    task._continuous_budget_state["game_steps"] = 16_000
+    assert task._remaining_budget("confirmed_enemy_kills", 5.0, 0.0) == pytest.approx(5.0)
+
+
+def test_continuous_enemy_kill_reward_decays_without_episode_floor() -> None:
+    from hk_agent.exploration_task import enemy_kill_reward_for_visit
+
+    rewards = [enemy_kill_reward_for_visit(visits, continuous=True) for visits in (0, 1, 5, 10)]
+    assert rewards == pytest.approx([1.0, 0.25, 1 / 36, 1 / 121])
+    assert rewards[-1] < 0.01
+
+
+def test_continuous_playthrough_flag_does_not_change_shared_task_contract() -> None:
+    common = {
+        "reward_version": "explore_v4",
+        "geo_gain_reward": 0.0,
+        "geo_spend_reward": 0.0,
+        "shade_recovery_reward": 4.0,
+        "shade_hit_reward": 0.3,
+    }
+    regular = ExplorationTask(
+        _Environment(), config=ExplorationTaskConfig(**common)
+    )
+    continuous = ExplorationTask(
+        _Environment(),
+        config=ExplorationTaskConfig(**common, continuous_playthrough=True),
+    )
+    assert regular.task_contract() == continuous.task_contract()
 
 
 def test_v3_caps_damage_and_shade_components_per_episode(tmp_path: Path) -> None:
