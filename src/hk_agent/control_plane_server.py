@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import mimetypes
+import os
+import subprocess
+import sys
+import time
 from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import urlopen
 
 from hk_agent.config import ConfigError, load_config
 from hk_agent.control_plane import (
@@ -26,6 +32,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        if self.server.upstream_port is not None and path.startswith("/api/"):
+            self._relay("GET")
+            return
         if path == "/api/status":
             self._json(HTTPStatus.OK, self.server.control_plane.status())
         elif path == "/api/operator":
@@ -124,6 +133,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._static(path)
 
     def do_POST(self) -> None:
+        if self.server.upstream_port is not None and urlsplit(self.path).path.startswith("/api/"):
+            self._relay("POST")
+            return
         if not self._mutation_is_allowed():
             return
         path = urlsplit(self.path).path
@@ -180,7 +192,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     duration_value=payload.get("duration_value"),
                     campaign_name=payload.get("campaign_name"),
                     help_stuck_count=payload.get("help_stuck_count", 10),
-                    help_stuck_minutes=payload.get("help_stuck_minutes", 360.0),
+                    help_stuck_minutes=payload.get("help_stuck_minutes", 60.0),
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":
@@ -190,7 +202,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
                 self._json(HTTPStatus.ACCEPTED, self.server.control_plane.continue_operator_campaign(
                     help_stuck_count=payload.get("help_stuck_count", 10),
-                    help_stuck_minutes=payload.get("help_stuck_minutes", 360.0),
+                    help_stuck_minutes=payload.get("help_stuck_minutes", 60.0),
                 ))
             elif path == "/api/operator/repeat":
                 if payload:
@@ -326,6 +338,28 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid Content-Length") from error
         return parse_json_body(self.rfile.read(length))
 
+    def _relay(self, method: str) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0"))) if method == "POST" else None
+        headers = {name: value for name, value in self.headers.items()
+                   if name.lower() not in {"host", "origin", "connection", "content-length"}}
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=10)
+            connection.request(method, self.path, body=body, headers=headers)
+            response = connection.getresponse()
+            content = response.read()
+            self.send_response(response.status)
+            for name, value in response.getheaders():
+                if name.lower() in {"content-type", "cache-control", "x-content-type-options", "content-disposition"}:
+                    self.send_header(name, value)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            connection.close()
+        except OSError as error:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, f"campaign supervisor unavailable: {error}")
+
     def _mutation_is_allowed(self) -> bool:
         expected = self.server.control_plane.csrf_token
         if self.headers.get("X-Control-Token") != expected:
@@ -389,10 +423,12 @@ class ControlPlaneHTTPServer(ThreadingHTTPServer):
         address: tuple[str, int],
         control_plane: ControlPlane,
         static_root: Path,
+        upstream_port: int | None = None,
     ) -> None:
         super().__init__(address, ControlPlaneHandler)
         self.control_plane = control_plane
         self.static_root = static_root
+        self.upstream_port = upstream_port
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -403,10 +439,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="permit explicit real campaign launches; omitted means dry-run only",
     )
+    parser.add_argument("--supervisor-mode", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-port", type=int, help=argparse.SUPPRESS)
     return parser
 
 
-def build_control_plane(project_root: Path, *, allow_execute: bool) -> ControlPlane:
+def build_control_plane(project_root: Path, *, allow_execute: bool, observer: bool = False) -> ControlPlane:
     if not allow_execute:
         return ControlPlane(
             project_root,
@@ -417,6 +455,7 @@ def build_control_plane(project_root: Path, *, allow_execute: bool) -> ControlPl
             training_device="cpu",
             torch_threads=3,
             torch_interop_threads=1,
+            observer=observer,
         )
     project_config = load_config(
         project_root / "config.training.local.toml", allow_training=True
@@ -430,6 +469,44 @@ def build_control_plane(project_root: Path, *, allow_execute: bool) -> ControlPl
         training_device=project_config.training_device,
         torch_threads=project_config.torch_threads,
         torch_interop_threads=project_config.torch_interop_threads,
+        observer=observer,
+    )
+
+
+def _supervisor_available(port: int) -> bool:
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/api/session", timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _start_detached_supervisor(project_root: Path, *, port: int) -> None:
+    if _supervisor_available(port):
+        return
+    launcher = project_root / "tools" / "serve_training_dashboard.py"
+    command = [sys.executable, str(launcher), "--allow-execute", "--supervisor-mode", "--port", str(port)]
+    flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+             | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)) if os.name == "nt" else 0
+    if os.name == "nt":
+        subprocess.Popen(
+            command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,
+        )
+    else:
+        subprocess.Popen(
+            command, cwd=project_root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+        )
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if _supervisor_available(port):
+            return
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"campaign supervisor did not start on 127.0.0.1:{port}; "
+        "an older control-plane owner may need a safe stop before migration"
     )
 
 
@@ -440,10 +517,27 @@ def main() -> int:
     project_root = Path(__file__).resolve().parents[2]
     static_root = Path(__file__).resolve().parent / "control_plane_web"
     try:
-        control_plane = build_control_plane(project_root, allow_execute=args.allow_execute)
+        upstream_port: int | None = None
+        if args.supervisor_mode:
+            control_plane = build_control_plane(project_root, allow_execute=True)
+        elif args.allow_execute:
+            supervisor_port = args.supervisor_port or args.port + 1
+            if not 1 <= supervisor_port <= 65_535 or supervisor_port == args.port:
+                raise SystemExit("supervisor port must be valid and distinct from panel port")
+            # Validate training configuration without taking the owner lock before
+            # starting the detached process. The returned observer is the panel's
+            # read-only view; all operator API calls are relayed to the supervisor.
+            control_plane = build_control_plane(
+                project_root, allow_execute=True, observer=True
+            )
+            _start_detached_supervisor(project_root, port=supervisor_port)
+            upstream_port = supervisor_port
+        else:
+            control_plane = build_control_plane(project_root, allow_execute=False)
     except (ConfigError, ControlPlaneBusyError) as error:
         raise SystemExit(str(error)) from error
-    server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root)
+    server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root,
+                                    upstream_port=upstream_port)
     print(
         f"HK Training Control Plane: http://127.0.0.1:{args.port} "
         f"({'real launches enabled' if args.allow_execute else 'dry-run only'})",

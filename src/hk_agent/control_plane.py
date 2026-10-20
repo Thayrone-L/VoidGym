@@ -158,7 +158,7 @@ class CampaignSpec:
     challenge_practice_enabled: bool = False
     help_requests_enabled: bool = False
     help_stuck_count: int = 10
-    help_stuck_minutes: float = 360.0
+    help_stuck_minutes: float = 60.0
     help_requests_per_hour: int = 3
     help_failed_attempts: int = 100
     help_stalled_hours: float = 6.0
@@ -379,7 +379,7 @@ class CampaignSpec:
             challenge_practice_enabled=challenge_practice_enabled,
             help_requests_enabled=help_requests_enabled,
             help_stuck_count=_bounded_int(payload.get("help_stuck_count", 10), "help_stuck_count", 1, 1000),
-            help_stuck_minutes=_bounded_float(payload.get("help_stuck_minutes", 360.0), "help_stuck_minutes", 1.0, 10080.0),
+            help_stuck_minutes=_bounded_float(payload.get("help_stuck_minutes", 60.0), "help_stuck_minutes", 5.0, 10080.0),
             help_requests_per_hour=_bounded_int(payload.get("help_requests_per_hour", 3), "help_requests_per_hour", 1, 100),
             help_failed_attempts=_bounded_int(payload.get("help_failed_attempts", 100), "help_failed_attempts", 1, 10000),
             help_stalled_hours=_bounded_float(payload.get("help_stalled_hours", 6.0), "help_stalled_hours", 0.1, 720.0),
@@ -1272,7 +1272,7 @@ class ControlPlane:
             help_history.sort(key=lambda row: float(row.get("created_unix", 0.0))
                               if isinstance(row.get("created_unix"), (int, float))
                               and not isinstance(row.get("created_unix"), bool) else 0.0)
-            help_requests = [row for row in help_history if row.get("status") == "pending"]
+            help_requests = [row for row in help_history if row.get("status") in {"pending", "demonstration_requested"}]
         stuck_alert = next((item for item in reversed(alerts) if "travada há" in item), None)
         if stuck_alert and status_banner["kind"] != "error":
             running_text = (f" · Treinando — rodada {learner_round}, "
@@ -2080,7 +2080,7 @@ class ControlPlane:
     def start_operator_campaign(
         self, *, instances: object, duration_kind: object, duration_value: object,
         campaign_name: object = None, help_stuck_count: object = 10,
-        help_stuck_minutes: object = 360.0,
+        help_stuck_minutes: object = 60.0,
     ) -> dict[str, object]:
         from hk_agent.config import load_config
 
@@ -2090,7 +2090,7 @@ class ControlPlane:
             raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
         limit_seconds = self._operator_duration(duration_kind, duration_value)
         stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
-        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 1.0, 10080.0)
+        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 5.0, 10080.0)
         seed = secrets.randbelow(2**31)
         now_slug = time.strftime("%Y%m%d-%H%M%S", time.localtime())
         if campaign_name is not None and (
@@ -2161,10 +2161,10 @@ class ControlPlane:
         return {"campaign": campaign, "launch": launched}
 
     def continue_operator_campaign(
-        self, *, help_stuck_count: object = 10, help_stuck_minutes: object = 360.0,
+        self, *, help_stuck_count: object = 10, help_stuck_minutes: object = 60.0,
     ) -> dict[str, object]:
         stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
-        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 1.0, 10080.0)
+        stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 5.0, 10080.0)
         campaigns = [row for row in self.list_campaigns() if row.get("campaign_type") == "exploration_training" and row.get("reward_version") in {"explore_v3", "explore_v4"} and row.get("shared_learner") is True]
         for prior in campaigns:
             campaign_id = str(prior.get("campaign_id", ""))
@@ -3169,8 +3169,8 @@ class ControlPlane:
         root = (shared_root / "help-requests").resolve(strict=True)
         if root.parent != shared_root or root.is_symlink():
             raise ValueError("help request store escaped the campaign runtime")
-        status = {"show": "demonstration_requested", "now_not": "dismissed",
-                  "discard": "discarded", "complete": "completed"}[str(action)]
+        status = {"show": "demonstration_requested", "discard": "discarded",
+                  "complete": "resolved_with_help"}.get(str(action))
         for path in root.glob("slot-*.json"):
             ledger_payload = self._read_json(path)
             rows = ledger_payload.get("requests", [])
@@ -3184,7 +3184,7 @@ class ControlPlane:
             from hk_agent.demonstrations import HelpRequestLedger
 
             ledger = HelpRequestLedger(root, slot=int(match.group(1)))
-            return ledger.resolve(request_id, status=status)
+            return ledger.snooze(request_id, minutes=30) if action == "now_not" else ledger.resolve(request_id, status=str(status))
         raise FileNotFoundError("help request was not found")
 
     def _wait_for_process(

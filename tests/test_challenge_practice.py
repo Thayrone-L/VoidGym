@@ -242,6 +242,42 @@ def test_help_ledger_supports_no_progress_trigger(tmp_path) -> None:
     assert request is not None and request["reason"] == "no_room_progress"
 
 
+def test_help_request_is_campaign_wide_and_same_place_increments_open_request(tmp_path) -> None:
+    config = HelpTriggerConfig(repeated_stuck_count=1, requests_per_hour=3)
+    first_actor = HelpRequestLedger(tmp_path, slot=0, config=config)
+    second_actor = HelpRequestLedger(tmp_path, slot=1, config=config)
+    request = first_actor.record_stuck(scene="Room", cell=(2, 4), progress=3, now=1000)
+    assert request is not None
+    updated = second_actor.record_stuck(scene="Room", cell=(2, 4), progress=3, now=1010)
+    assert updated is not None and updated["request_id"] == request["request_id"]
+    assert updated["stuck_count"] == 2
+    another = second_actor.record_stuck(scene="Room", cell=(8, 4), progress=3, now=1020)
+    assert another is not None and another["request_id"] != request["request_id"]
+
+
+def test_help_request_snooze_stays_open_and_progress_resolves_solo(tmp_path) -> None:
+    ledger = HelpRequestLedger(
+        tmp_path, slot=0, config=HelpTriggerConfig(repeated_stuck_count=1),
+    )
+    request = ledger.record_stuck(scene="Room", cell=(2, 4), progress=5, now=1000)
+    assert request is not None
+    snoozed = ledger.snooze(request["request_id"], now=1100)
+    assert snoozed["status"] == "pending"
+    assert snoozed["snoozed_until_unix"] == 2900
+    ledger.observe_progress(scene="Room", progress=10, now=1200)
+    assert ledger.requests()[0]["status"] == "resolved_solo"
+
+
+def test_help_request_closes_when_actor_leaves_scene(tmp_path) -> None:
+    ledger = HelpRequestLedger(
+        tmp_path, slot=0, config=HelpTriggerConfig(repeated_stuck_count=1),
+    )
+    request = ledger.record_stuck(scene="RoomA", cell=(2, 4), progress=5, now=1000)
+    assert request is not None
+    ledger.observe_progress(scene="RoomB", progress=1, now=1200)
+    assert ledger.requests()[0]["status"] == "resolved_solo"
+
+
 def test_human_actions_map_with_duration_and_horizontal_augmentation() -> None:
     from hk_agent.temporal_actions import TEMPORAL_COMBAT_ACTIONS
 

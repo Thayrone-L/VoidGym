@@ -105,6 +105,7 @@ def test_operator_start_uses_latest_compatible_policy_for_jogada1(tmp_path: Path
     assert campaign["duration_limit_seconds"] == 0.0
     assert campaign["challenge_practice_enabled"] is True
     assert campaign["help_requests_enabled"] is True
+    assert campaign["help_stuck_minutes"] == 60.0
     assert campaign["warm_start_source_campaign"] == "latest-compatible"
     assert campaign["warm_start_checkpoint"].endswith("round-0001.zip")
     launch.assert_called_once_with("jogada-1", version=1, execute=True)
@@ -356,6 +357,11 @@ def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     assert 'id="map-progress"' in html
     assert 'id="map-view-toggle"' in html
     assert 'id="calibration-open"' in html and 'id="calibration-wizard"' in html
+    assert 'id="theme-toggle"' in html and 'value="60"' in html
+    assert 'localStorage.setItem("voidgym-theme"' in app
+    assert 'window.matchMedia("(prefers-color-scheme: dark)")' in app
+    assert 'data-theme="dark"' in css and "prefers-color-scheme:dark" in css
+    assert 'resolved_solo:"Resolvido por ela"' in app
     assert 'value="bounds"' in html and 'value="captures"' in html
     assert '/api/journey/map/calibration/remove' in app
     assert 'rgba(14,32,43,.78)' not in app and 'destination-out' not in app

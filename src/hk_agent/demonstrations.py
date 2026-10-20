@@ -48,10 +48,7 @@ class HelpRequestLedger:
         self._state = self._load()
 
     def _load(self) -> dict[str, Any]:
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            value = {}
+        value = self._load_file(self.path)
         if not isinstance(value, dict) or value.get("schema_version") != 1:
             value = {}
         stuck = value.get("stuck_by_place", {})
@@ -74,13 +71,23 @@ class HelpRequestLedger:
             if isinstance(value.get("neighbor_rewards", {}), dict) else {},
         }
 
+    @staticmethod
+    def _load_file(path: Path) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         temp.write_text(json.dumps(self._state, sort_keys=True, allow_nan=False), encoding="utf-8", newline="\n")
         os.replace(temp, self.path)
 
-    def observe_progress(self, *, scene: str, progress: float, now: float | None = None) -> None:
+    def observe_progress(
+        self, *, scene: str, progress: float, now: float | None = None, _lock_held: bool = False,
+    ) -> None:
         if not scene or not np.isfinite(progress) or progress < 0:
             return
         now = time.time() if now is None else now
@@ -88,18 +95,72 @@ class HelpRequestLedger:
         if not isinstance(previous, dict):
             previous = {}
         best = float(previous.get(scene, 0.0))
-        if progress > best:
+        new_record = progress > best
+        if new_record:
             previous[scene] = float(progress)
             self._state["best_progress_by_scene"] = previous
             self._state["no_progress_since_unix"] = now
-            self._save()
+        changed = False
+        resolved_requests: list[dict[str, Any]] = []
+        requests = self._state.get("requests", [])
+        if isinstance(requests, list):
+            for row in requests:
+                if not isinstance(row, dict) or row.get("status") not in {"pending", "demonstration_requested"}:
+                    continue
+                request_scene = row.get("scene")
+                baseline = row.get("progress_at_request", 0.0)
+                if request_scene != scene or (isinstance(baseline, (int, float)) and progress >= float(baseline) + 5.0):
+                    row.update({"status": "resolved_solo", "resolved_unix": now,
+                                "resolution_reason": "passou do local ou bateu novo recorde na sala"})
+                    resolved_requests.append(dict(row))
+                    changed = True
+        if new_record or changed:
+            def persist() -> None:
+                self._refresh_requests()
+                current_requests = self._state.get("requests", [])
+                if isinstance(current_requests, list):
+                    by_id = {row.get("request_id"): row for row in current_requests if isinstance(row, dict)}
+                    for resolved in resolved_requests:
+                        row = by_id.get(resolved.get("request_id"))
+                        if row is not None and row.get("status") in {"pending", "demonstration_requested"}:
+                            row.update(resolved)
+                self._save()
+            if _lock_held:
+                persist()
+            else:
+                from hk_agent.run_journey import file_lock
+
+                with file_lock(self.root / ".requests.lock"):
+                    persist()
+
+    def _refresh_requests(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        rows = payload.get("requests", []) if isinstance(payload, dict) else []
+        if isinstance(rows, list):
+            self._state["requests"] = [dict(row) for row in rows if isinstance(row, dict)][-128:]
 
     def record_stuck(
         self, *, scene: str, cell: tuple[int, int], progress: float,
         thumbnail_path: str | None = None, now: float | None = None,
     ) -> dict[str, Any] | None:
+        from hk_agent.run_journey import file_lock
+
+        with file_lock(self.root / ".requests.lock"):
+            return self._record_stuck_locked(
+                scene=scene, cell=cell, progress=progress,
+                thumbnail_path=thumbnail_path, now=now,
+            )
+
+    def _record_stuck_locked(
+        self, *, scene: str, cell: tuple[int, int], progress: float,
+        thumbnail_path: str | None, now: float | None,
+    ) -> dict[str, Any] | None:
         if not scene or len(scene) > 256 or any(not 0 <= value < 12 for value in cell):
             return None
+        self._refresh_requests()
         now = time.time() if now is None else now
         place = f"{scene}:c{cell[0]}r{cell[1]}"
         counts = self._state.setdefault("stuck_by_place", {})
@@ -108,7 +169,7 @@ class HelpRequestLedger:
             self._state["stuck_by_place"] = counts
         count = int(counts.get(place, 0)) + 1
         counts[place] = count
-        self.observe_progress(scene=scene, progress=progress, now=now)
+        self.observe_progress(scene=scene, progress=progress, now=now, _lock_held=True)
         since = self._state.get("no_progress_since_unix", now)
         elapsed_minutes = max(0.0, (now - float(since)) / 60.0) if isinstance(since, (int, float)) else 0.0
         details = self._state.setdefault("stuck_details", {})
@@ -136,14 +197,40 @@ class HelpRequestLedger:
         if reason == "repeated_stuck" and count < last_count + self.config.repeated_stuck_count:
             reason = None
         hour_ago = now - 3600
-        recent = [row for row in requests if isinstance(row, dict)
-                  and isinstance(row.get("created_unix"), (int, float))
+        all_requests: list[dict[str, Any]] = []
+        for ledger_path in self.root.glob("slot-*.json"):
+            rows = self._load_file(ledger_path).get("requests", [])
+            if isinstance(rows, list):
+                all_requests.extend(row for row in rows if isinstance(row, dict))
+        recent = [row for row in all_requests
+                  if isinstance(row.get("created_unix"), (int, float))
                   and float(row["created_unix"]) >= hour_ago]
+        from hk_agent.run_journey import atomic_json
+
+        for ledger_path in sorted(self.root.glob("slot-*.json")):
+            if ledger_path == self.path:
+                other_state = self._state
+            else:
+                try:
+                    other_state = self._load_file(ledger_path)
+                except (OSError, json.JSONDecodeError):
+                    continue
+            other_requests = other_state.get("requests", []) if isinstance(other_state, dict) else []
+            pending = next((row for row in other_requests if isinstance(row, dict)
+                            and row.get("place") == place
+                            and row.get("status") in {"pending", "demonstration_requested"}), None) if isinstance(other_requests, list) else None
+            if pending is None:
+                continue
+            pending["stuck_count"] = int(pending.get("stuck_count", 0)) + 1
+            pending["last_stuck_unix"] = now
+            pending["progress_at_request"] = max(float(pending.get("progress_at_request", 0.0)), progress)
+            if ledger_path == self.path:
+                self._save()
+            else:
+                atomic_json(ledger_path, other_state)
+                self._save()
+            return dict(pending)
         if reason is None or len(recent) >= self.config.requests_per_hour:
-            self._save()
-            return None
-        pending = next((row for row in requests if row.get("status") == "pending"), None)
-        if pending is not None:
             self._save()
             return None
         request = {
@@ -152,6 +239,7 @@ class HelpRequestLedger:
             "context": f"traversal:{scene}:cell-{cell[0]}-{cell[1]}",
             "cell": [cell[0], cell[1]], "stuck_count": count,
             "reason": reason, "status": "pending", "created_unix": now,
+            "last_stuck_unix": now, "progress_at_request": float(progress),
             "thumbnail_path": thumbnail_path,
             "message": (
                 f"Instância {self.slot + 1} pede ajuda — "
@@ -203,16 +291,40 @@ class HelpRequestLedger:
         return award
 
     def resolve(self, request_id: str, *, status: str) -> dict[str, Any]:
-        if status not in {"dismissed", "demonstration_requested", "discarded", "completed"}:
+        if status not in {"dismissed", "demonstration_requested", "discarded", "completed", "resolved_with_help"}:
             raise ValueError("invalid help request status")
-        for row in self._state["requests"]:
-            if row.get("request_id") == request_id:
-                if row.get("status") != "pending":
-                    raise ValueError("help request is no longer pending")
-                row["status"] = status
-                row["updated_unix"] = time.time()
-                self._save()
-                return dict(row)
+        from hk_agent.run_journey import file_lock
+
+        with file_lock(self.root / ".requests.lock"):
+            self._state = self._load()
+            for row in self._state["requests"]:
+                if row.get("request_id") == request_id:
+                    if row.get("status") not in {"pending", "demonstration_requested"}:
+                        raise ValueError("help request is no longer pending")
+                    row["status"] = status
+                    row["updated_unix"] = time.time()
+                    if status in {"completed", "resolved_with_help", "discarded", "dismissed"}:
+                        row["resolved_unix"] = row["updated_unix"]
+                    self._save()
+                    return dict(row)
+        raise FileNotFoundError("help request was not found")
+
+    def snooze(self, request_id: str, *, minutes: float = 30.0, now: float | None = None) -> dict[str, Any]:
+        if not np.isfinite(minutes) or not 1 <= minutes <= 1440:
+            raise ValueError("snooze minutes must be between 1 and 1440")
+        current = time.time() if now is None else now
+        from hk_agent.run_journey import file_lock
+
+        with file_lock(self.root / ".requests.lock"):
+            self._state = self._load()
+            for row in self._state["requests"]:
+                if row.get("request_id") == request_id:
+                    if row.get("status") not in {"pending", "demonstration_requested"}:
+                        raise ValueError("help request is no longer open")
+                    row["snoozed_until_unix"] = current + minutes * 60.0
+                    row["snooze_count"] = int(row.get("snooze_count", 0)) + 1
+                    self._save()
+                    return dict(row)
         raise FileNotFoundError("help request was not found")
 
     def requests(self) -> list[dict[str, Any]]:
