@@ -264,6 +264,53 @@ def test_shared_learner_trains_from_recurrent_state_rollouts() -> None:
     env.close()
 
 
+def test_self_imitation_updates_recurrent_policy_with_action_masks() -> None:
+    import gymnasium as gym
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
+    from hk_agent.self_imitation import train_sil_update
+
+    class TinyMaskedEnv(gym.Env):
+        observation_space = gym.spaces.Dict({"state": gym.spaces.Box(-1.0, 1.0, (3,), dtype=np.float32)})
+        action_space = gym.spaces.Discrete(3)
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            return {"state": np.zeros(3, dtype=np.float32)}, {}
+
+        def step(self, action):
+            return {"state": np.zeros(3, dtype=np.float32)}, 0.0, False, False, {}
+
+        def action_masks(self):
+            return np.array([True, False, True], dtype=np.bool_)
+
+    env = DummyVecEnv([TinyMaskedEnv])
+    model = MaskableRecurrentPPO(
+        "MultiInputLstmPolicy", env, n_steps=4, batch_size=4, n_epochs=1,
+        sequence_length=4, policy_kwargs={"lstm_hidden_size": 8}, device="cpu", verbose=0,
+    )
+    count, hidden = 4, 8
+    sample = {
+        "obs__state": np.zeros((count, 3), dtype=np.float32),
+        "actions": np.zeros(count, dtype=np.int64),
+        "action_masks": np.tile(np.array([True, False, True]), (count, 1)),
+        "episode_starts": np.zeros(count, dtype=np.float32),
+        "returns": np.ones(count, dtype=np.float32),
+        "log_probs": np.full(count, -0.69, dtype=np.float32),
+        "lstm_hidden_pi": np.zeros((1, hidden), dtype=np.float32),
+        "lstm_cell_pi": np.zeros((1, hidden), dtype=np.float32),
+        "lstm_hidden_vf": np.zeros((1, hidden), dtype=np.float32),
+        "lstm_cell_vf": np.zeros((1, hidden), dtype=np.float32),
+    }
+    result = train_sil_update(model, [sample])
+    assert result["active"] is True
+    assert result["positive_samples"] > 0
+    sample["actions"][:] = 1
+    assert train_sil_update(model, [sample])["reason"] == "invalid_action_mask"
+    env.close()
+
+
 def test_masked_distribution_matches_sb3_maskable_categorical() -> None:
     from sb3_contrib.common.maskable.distributions import MaskableCategorical
 

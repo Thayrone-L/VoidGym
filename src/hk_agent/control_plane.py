@@ -1391,6 +1391,7 @@ class ControlPlane:
             "training_steps": completed_timesteps, "steps_per_second": completed_timesteps / max(elapsed_seconds, 1.0),
             "learner_updates": learner_round, "updates_per_hour": learner_round / hours,
             "last_zero_reward_fraction": manifest.get("last_zero_reward_fraction"),
+            "self_imitation": manifest.get("self_imitation", {}),
             "deaths_per_hour": deaths / hours, "shade_recoveries_per_hour": recoveries / hours,
             "shade_losses": shade_losses, "average_steps_to_first_scene": sum(first_scene_steps) / len(first_scene_steps) if first_scene_steps else None,
             "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],

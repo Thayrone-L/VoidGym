@@ -2060,6 +2060,12 @@ def run_shared_learner(
             )
             training_started = time.perf_counter()
             transitions = train_shared_round(model, rollouts)
+            from hk_agent.self_imitation import SelfImitationBank, train_sil_update
+
+            sil_bank = SelfImitationBank(shared_root / "self-imitation")
+            sil_bank.ingest(rollouts, round_number=current_round, gamma=float(model.gamma))
+            sil_result = train_sil_update(model, sil_bank.load(), actor_coef=0.1, value_coef=0.01)
+            manifest["self_imitation"] = {**sil_bank.summary(), **sil_result, "round": current_round}
             demonstration_rows = apply_context_demonstrations(
                 model, shared_root, store, actor_slots=slots,
                 round_number=current_round, manifest=manifest,
