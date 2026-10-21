@@ -30,6 +30,7 @@ public sealed class HkAgentBridgeMod : Mod
 
     public override void Initialize()
     {
+        MapLayoutDump.Register();
         BridgeConfiguration configuration;
         try
         {

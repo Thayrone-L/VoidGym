@@ -2027,17 +2027,89 @@ class ControlPlane:
                 digest = None
         metadata = self._read_json(root / digest / "tiles.json") if digest else {}
         calibrations: Mapping[str, object] = {}
+        global_calibration: Mapping[str, object] = {}
+        room_offsets: Mapping[str, object] = {}
         if digest:
             from hk_agent.run_journey import load_scene_calibration
 
             calibrations = load_scene_calibration(root / str(digest) / "calibration.json", map_sha256=digest)
+            global_value = self._read_json(root / str(digest) / "global-calibration.json")
+            if global_value.get("map_sha256") == digest and global_value.get("schema_version") == 1:
+                global_calibration = global_value
+            offsets_value = self._read_json(root / str(digest) / "room-offsets.json")
+            if offsets_value.get("map_sha256") == digest and offsets_value.get("schema_version") == 1:
+                raw_offsets = offsets_value.get("offsets")
+                room_offsets = raw_offsets if isinstance(raw_offsets, Mapping) else {}
+        layout_path = self.runtime_root / "map-layout" / "game-map-layout.json"
+        try:
+            from hk_agent.map_layout import load_game_map_layout
+            game_layout: Mapping[str, object] = load_game_map_layout(layout_path)
+            layout_error = None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            game_layout = {}
+            layout_error = str(error)
         return {"cached": bool(digest), "sha256": digest,
                 "reference_changed": value.get("sha256") != digest if value else False,
                 "tiles_ready": metadata.get("complete") is True,
                 "tiles": metadata if metadata.get("complete") is True else None,
                 "progress": progress,
                 "calibrations": calibrations,
+                "game_layout": game_layout, "game_layout_error": layout_error,
+                "global_calibration": global_calibration, "room_offsets": room_offsets,
                 "attribution": "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry"}
+
+    def save_global_map_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
+        from hk_agent.map_layout import fit_global_calibration
+        from hk_agent.run_journey import atomic_json
+
+        art = self.map_art_status()
+        digest = art.get("sha256")
+        if not isinstance(digest, str) or art.get("tiles_ready") is not True:
+            raise ValueError("map tiles must be ready before global calibration")
+        raw = payload.get("anchors")
+        if not isinstance(raw, list) or len(raw) < 2 or len(raw) > 64:
+            raise ValueError("global calibration needs 2 to 64 anchors")
+        anchors: list[list[float]] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                raise TypeError("global anchor must be an object")
+            numbers: list[float] = []
+            for key in ("map_x", "map_y", "art_x", "art_y"):
+                value = item.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise TypeError("global anchor coordinates must be numbers")
+                number = float(value)
+                if not math.isfinite(number) or abs(number) > 10_000_000:
+                    raise ValueError("global anchor coordinates must be finite and bounded")
+                numbers.append(number)
+            anchors.append(numbers)
+        fit = fit_global_calibration(anchors)
+        result = {**fit, "map_sha256": digest, "anchors": anchors,
+                  "saved_unix_ns": time.time_ns()}
+        atomic_json(self.map_art_runtime_root() / "cache" / "map-art" / digest / "global-calibration.json", result)
+        return result
+
+    def save_map_room_offset(self, payload: Mapping[str, object]) -> dict[str, object]:
+        from hk_agent.run_journey import atomic_json
+
+        art = self.map_art_status()
+        digest = art.get("sha256")
+        scene, dx, dy = payload.get("scene"), payload.get("dx"), payload.get("dy")
+        if not isinstance(digest, str) or not isinstance(scene, str) or not scene or len(scene) > 256:
+            raise ValueError("choose a valid map and scene")
+        if isinstance(dx, bool) or not isinstance(dx, (int, float)) or isinstance(dy, bool) or not isinstance(dy, (int, float)):
+            raise TypeError("room offsets must be numeric")
+        dx_value, dy_value = float(dx), float(dy)
+        if not math.isfinite(dx_value) or not math.isfinite(dy_value) or abs(dx_value) > 100_000 or abs(dy_value) > 100_000:
+            raise ValueError("room offsets must be finite bounded pixel values")
+        path = self.map_art_runtime_root() / "cache" / "map-art" / digest / "room-offsets.json"
+        current = self._read_json(path)
+        offsets = current.get("offsets") if current.get("map_sha256") == digest else {}
+        if not isinstance(offsets, dict):
+            offsets = {}
+        offsets[scene] = [dx_value, dy_value]
+        atomic_json(path, {"schema_version": 1, "map_sha256": digest, "offsets": offsets})
+        return {"scene": scene, "offset": offsets[scene]}
 
     def download_operator_map_art(self) -> dict[str, object]:
         root = self.map_art_runtime_root() / "cache" / "map-art"

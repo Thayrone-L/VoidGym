@@ -220,6 +220,18 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
+        if path == "/api/journey/map/global-calibration":
+            try:
+                self._json(HTTPStatus.CREATED, self.server.control_plane.save_global_map_calibration(self._payload()))
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if path == "/api/journey/map/room-offset":
+            try:
+                self._json(HTTPStatus.OK, self.server.control_plane.save_map_room_offset(self._payload()))
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         if path == "/api/journey/map/calibration/remove":
             try:
                 result = self.server.control_plane.remove_map_scene_calibration(self._payload())
