@@ -82,6 +82,28 @@ def test_continue_warm_starts_v4_from_v3_and_repeat_uses_new_seed(tmp_path: Path
         launch.assert_called_once()
 
 
+def test_continue_operator_campaign_uses_requested_actor_count(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path, allow_execute=True)
+    campaign_id = "shared-campaign"
+    shared_root = plane.runtime_root / "shared" / campaign_id
+    (shared_root / "checkpoints").mkdir(parents=True)
+    checkpoint = shared_root / "checkpoints" / "round-0003.zip"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    prior = {"campaign_id": campaign_id, "name": "Night run", "campaign_type": "exploration_training",
+             "reward_version": "explore_v4", "shared_learner": True, "seed": 7,
+             "actors": 1, "version": 2, "created_at": "old", "spec_path": "old.json"}
+    with (patch("hk_agent.config.load_config", return_value=SimpleNamespace(instance_count=2)),
+          patch.object(plane, "_operator_checkpoint_candidate", return_value={
+              "campaign_id": campaign_id, "campaign": prior, "checkpoint": str(checkpoint),
+              "round": 3, "algorithm": "MaskablePPO",
+          }),
+          patch.object(plane, "create_campaign", side_effect=lambda data: {**data, "version": 3}) as create,
+          patch.object(plane, "launch", return_value={"launch_id": "next"})):
+        plane.continue_operator_campaign(campaign_id=campaign_id, instances=2)
+    assert create.call_args.args[0]["actors"] == 2
+    assert create.call_args.args[0]["checkpoint_interval"] == 1024
+
+
 def test_operator_start_uses_latest_compatible_policy_for_jogada1(tmp_path: Path) -> None:
     plane = ControlPlane(tmp_path, allow_execute=True)
     recurrent = {"campaign_id": "newer-recurrent", "campaign_type": "exploration_training",
@@ -148,6 +170,28 @@ def test_failure_reason_and_log_tail_are_available_for_operator_banner(tmp_path:
         "A pasta de checkpoints já está em uso; continue a campanha existente ou use outra pasta."
     )
     assert plane._launch_error_detail(record) == "ValueError: warm-start campaigns must use a new shared checkpoint directory"
+
+
+def test_operator_snapshot_keeps_dashboard_and_explains_instance_dll_marker_mismatch(tmp_path: Path) -> None:
+    from hk_agent.config import ConfigError
+
+    plane = ControlPlane(tmp_path)
+    with (patch.object(plane, "status", return_value={"active_count": 0, "active_launches": [], "capacity": 1}),
+          patch.object(plane, "_ensure_auto_reports"),
+          patch.object(plane, "list_campaigns", return_value=[]),
+          patch.object(plane, "_campaign_scene_discoveries", return_value=[]),
+          patch.object(plane, "_operator_playthroughs",
+                       side_effect=ConfigError("managed instance marker is missing or invalid: hk-ai-1")),
+          patch.object(plane, "_operator_system_resources", return_value={}),
+          patch.object(plane, "map_art_status", return_value={}),
+          patch.object(plane, "list_reports", return_value=[])):
+        snapshot = plane.operator_snapshot()
+    phrase = "A instância 1 está com a DLL diferente do registro — rode a implantação da DLL"
+    assert snapshot["status_banner"]["kind"] == "error"
+    assert snapshot["status_banner"]["message"] == phrase
+    assert phrase in snapshot["alerts"]
+    assert snapshot["playthroughs"] == []
+    assert "reports" in snapshot and "journey" in snapshot
 
 
 def test_operator_snapshot_explains_failed_group_and_cancelled_actor(tmp_path: Path) -> None:

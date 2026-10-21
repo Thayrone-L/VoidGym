@@ -250,6 +250,60 @@ def _install_modding_api(archive: Path, install: Path) -> str:
     return sha256_file(archive)
 
 
+def refresh_instance_bridge_marker(
+    install_root: Path, *, expected_index: int, expected_bridge_hash: str | None = None
+) -> dict[str, Any]:
+    """Refresh the managed marker only after the installed bridge hash is verified."""
+    from hk_agent.instance_marker import InstanceMarker, load_instance_marker
+
+    root = install_root.expanduser().resolve(strict=True)
+    marker_path = root / MARKER_NAME
+    bridge_path = root / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    if marker_path.is_symlink() or bridge_path.is_symlink():
+        raise InstanceInstallError("Instance marker and bridge DLL must be regular managed files")
+    try:
+        original_bytes = marker_path.read_bytes()
+        marker = json.loads(original_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstanceInstallError(f"Managed instance marker is invalid: {marker_path}") from error
+    if not isinstance(marker, dict) or set(marker) != set(InstanceMarker.__dataclass_fields__):
+        raise InstanceInstallError(f"Managed instance marker has an invalid schema: {marker_path}")
+    if marker.get("schema_version") != 1 or marker.get("index") != expected_index:
+        raise InstanceInstallError("Managed instance marker index or schema does not match")
+    if marker.get("product_name") != f"Hollow Knight AI {expected_index}" or marker.get("company_name") != COMPANY_NAME:
+        raise InstanceInstallError("Managed instance marker Unity identity does not match")
+    hashes = installation_hashes(root)
+    if marker.get("exe_sha256") != hashes.executable:
+        raise InstanceInstallError("Instance executable hash differs from marker")
+    if marker.get("globalgamemanagers_sha256") != hashes.globalgamemanagers:
+        raise InstanceInstallError("Instance globalgamemanagers hash differs from marker")
+    if not bridge_path.is_file():
+        raise InstanceInstallError(f"Managed instance bridge DLL is missing: {bridge_path}")
+    bridge_hash = sha256_file(bridge_path)
+    if expected_bridge_hash is not None and bridge_hash.casefold() != expected_bridge_hash.casefold():
+        raise InstanceInstallError("Installed bridge DLL does not match the requested build")
+    updated = dict(marker)
+    updated["bridge_dll_sha256"] = bridge_hash
+    updated["created_unix_ns"] = time.time_ns()
+    temporary = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        os.replace(temporary, marker_path)
+        validated = load_instance_marker(root, expected_index=expected_index)
+    except Exception as error:
+        if temporary.exists():
+            temporary.unlink()
+        rollback = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.rollback")
+        try:
+            rollback.write_bytes(original_bytes)
+            os.replace(rollback, marker_path)
+        finally:
+            if rollback.exists():
+                rollback.unlink()
+        raise InstanceInstallError(f"Updated instance marker failed validation: {error}") from error
+    return {field: getattr(validated, field) for field in InstanceMarker.__dataclass_fields__}
+
+
 def provision_instance(
     index: int,
     *,

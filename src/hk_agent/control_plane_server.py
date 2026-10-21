@@ -57,7 +57,12 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             self._json(HTTPStatus.OK, self.server.control_plane.status())
         elif path == "/api/operator":
-            self._json(HTTPStatus.OK, self.server.control_plane.operator_snapshot())
+            try:
+                snapshot = self.server.control_plane.operator_snapshot()
+            except Exception as error:  # noqa: BLE001 - never drop the panel connection on snapshot failure
+                self.log_message("operator snapshot failed: %s: %s", type(error).__name__, error)
+                snapshot = self.server.control_plane.operator_fallback_snapshot(error)
+            self._json(HTTPStatus.OK, snapshot)
         elif path == "/api/journey/run":
             query = parse_qs(urlsplit(self.path).query)
             try:
@@ -260,6 +265,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     {}, {"help_stuck_count"}, {"help_stuck_count", "help_stuck_minutes"},
                     {"campaign_id"}, {"campaign_id", "help_stuck_count"},
                     {"campaign_id", "help_stuck_count", "help_stuck_minutes"},
+                    {"instances"}, {"instances", "campaign_id"},
+                    {"instances", "help_stuck_count"},
+                    {"instances", "help_stuck_count", "help_stuck_minutes"},
+                    {"instances", "campaign_id", "help_stuck_count"},
+                    {"instances", "campaign_id", "help_stuck_count", "help_stuck_minutes"},
                 ):
                     raise ValueError("continue only accepts campaign id and help trigger settings")
                 if not self.server.control_plane.allow_execute:
@@ -268,6 +278,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     help_stuck_count=payload.get("help_stuck_count", 10),
                     help_stuck_minutes=payload.get("help_stuck_minutes", 60.0),
                     campaign_id=payload.get("campaign_id"),
+                    instances=payload.get("instances"),
                 ))
             elif path == "/api/operator/repeat":
                 if payload:

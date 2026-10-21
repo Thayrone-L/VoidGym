@@ -1370,6 +1370,14 @@ class ControlPlane:
         ]
         failed_record = max(failed_records, key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default=None)
         status_banner: dict[str, object]
+        marker_warning = "A instância 1 está com a DLL diferente do registro — rode a implantação da DLL"
+        marker_error: Exception | None = None
+        marker_failure_text = " ".join(
+            str(row.get("failure", "")) + " " + str(row.get("stop_reason", ""))
+            for row in relevant_records
+        ).casefold()
+        if "managed instance marker" in marker_failure_text or "bridge dll hash differs from marker" in marker_failure_text:
+            alerts.append(marker_warning)
         if active_records and alerts:
             running_text = (f" · Treinando — rodada {learner_round}, "
                             f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s")
@@ -1471,6 +1479,31 @@ class ControlPlane:
                             f"{completed_timesteps / max(elapsed_seconds, 1.0):.1f} passos/s") if active_records else ""
             status_banner = {"kind": "warning", "message": f"Aviso: {help_alert}{running_text}",
                              "technical_detail": None}
+        playthroughs: list[dict[str, Any]] = []
+        try:
+            playthroughs = self._operator_playthroughs(campaign_id, campaigns, active_records, journey)
+        except Exception as error:  # noqa: BLE001 - panel data must survive a broken optional playthrough block
+            marker_error = error
+            chain: BaseException | None = error
+            marker_mismatch = False
+            while chain is not None:
+                detail = str(chain).casefold()
+                marker_mismatch = marker_mismatch or (
+                    "bridge dll hash differs from marker" in detail
+                    or "managed instance marker is missing or invalid" in detail
+                )
+                chain = chain.__cause__
+            if marker_mismatch:
+                if marker_warning not in alerts:
+                    alerts.append(marker_warning)
+            else:
+                alerts.append(f"Jogadas contínuas indisponíveis: {type(error).__name__}: {error}")
+        if marker_warning in alerts:
+            status_banner = {
+                "kind": "error",
+                "message": marker_warning,
+                "technical_detail": str(marker_error) if marker_error is not None else None,
+            }
         recent_events = []
         for row in sorted(launch_records, key=lambda item: int(item.get("finished_unix_ns", 0) or 0), reverse=True):
             if row.get("status") not in {"FAILED", "CANCELLED", "COMPLETED"}:
@@ -1525,7 +1558,7 @@ class ControlPlane:
                 key=lambda row: (int(row.get("count", 0)), float(row.get("last_stuck_unix", 0))),
                 reverse=True,
             )[:64],
-            "playthroughs": self._operator_playthroughs(campaign_id, campaigns, active_records, journey),
+            "playthroughs": playthroughs,
             "alerts": sorted(set(alerts)), "status_banner": status_banner, "recent_events": recent_events,
             "instance_restarts_last_hour": restart_count,
             "recommended_instances": min(3, capacity, max(1, (os.cpu_count() or 1) // 4)),
@@ -1544,6 +1577,33 @@ class ControlPlane:
             "advanced": {"launch_ids": [row.get("launch_id") for row in active_records], "shared_root": str(shared_root) if shared_root else None,
                          "artifact_path": str(shared_root) if shared_root else None},
             "system": system_resources, "reports": self.list_reports()[:10],
+        }
+
+    def operator_fallback_snapshot(self, error: Exception) -> dict[str, object]:
+        """Small renderable response used when a whole snapshot unexpectedly fails."""
+        try:
+            status: Mapping[str, object] = self.status()
+        except Exception:  # noqa: BLE001 - emergency response must survive a broken status source
+            status = {"active_count": 0, "active_launches": []}
+        message = f"Não foi possível carregar uma parte do painel: {type(error).__name__}: {error}"
+        return {
+            "status": dict(status), "campaign_id": None, "elapsed_seconds": 0.0,
+            "remaining_seconds": None, "actor_performance": [], "max_room_progress": {},
+            "instances": [], "playthroughs": [], "training_steps": 0, "steps_per_second": 0.0,
+            "learner_updates": 0, "updates_per_hour": 0.0, "last_zero_reward_fraction": None,
+            "self_imitation": {}, "deaths_per_hour": 0.0, "shade_recoveries_per_hour": 0.0,
+            "shade_losses": 0, "average_steps_to_first_scene": None, "episode_progress": [],
+            "scene_trend": [], "scenes_discovered": [], "evaluations": [], "evaluation_trend": [],
+            "journey": {"svg": "", "runs": [], "milestones": [], "records": {}},
+            "challenge_practice_enabled": False, "help_requests_enabled": False, "help_stuck_count": 10,
+            "help_requests": [], "help_request_history": [], "stuck_locations": [], "alerts": [message],
+            "status_banner": {"kind": "error", "message": "O painel carregou com dados limitados.",
+                              "technical_detail": message}, "recent_events": [],
+            "instance_restarts_last_hour": 0, "recommended_instances": 1, "max_instances": 1,
+            "can_continue": False, "has_campaign": False, "resumable_campaign": None,
+            "last_completion": None, "checkpoints": [], "reward_version": None,
+            "advanced": {"launch_ids": [], "shared_root": None, "artifact_path": None},
+            "system": {}, "reports": [],
         }
 
     def _operator_playthroughs(
@@ -2378,7 +2438,7 @@ class ControlPlane:
 
     def continue_operator_campaign(
         self, *, help_stuck_count: object = 10, help_stuck_minutes: object = 60.0,
-        campaign_id: object = None,
+        campaign_id: object = None, instances: object = None,
     ) -> dict[str, object]:
         stuck_count = _bounded_int(help_stuck_count, "help_stuck_count", 1, 1000)
         stuck_minutes = _bounded_float(help_stuck_minutes, "help_stuck_minutes", 5.0, 10080.0)
@@ -2417,6 +2477,15 @@ class ControlPlane:
         data["help_stuck_count"] = stuck_count
         data["help_stuck_minutes"] = stuck_minutes
         data["challenge_practice_enabled"] = True
+        if instances is not None:
+            from hk_agent.config import load_config
+
+            config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
+            actor_count = _bounded_int(instances, "instances", 1, 3)
+            if actor_count > min(3, config.instance_count):
+                raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
+            data["actors"] = actor_count
+            data["checkpoint_interval"] = 512 * actor_count
         zero_start_warning = source_version == "explore_v3" and candidate.get("algorithm") is None
         if source_version == "explore_v3" and not zero_start_warning:
             data["warm_start_checkpoint"] = str(checkpoints[-1])

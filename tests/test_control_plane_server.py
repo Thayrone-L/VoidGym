@@ -109,6 +109,28 @@ def test_dashboard_client_relays_authenticated_api_calls_to_supervisor(tmp_path:
 
 
 
+def test_operator_get_returns_renderable_snapshot_when_snapshot_raises(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path, observer=True)
+    client = ControlPlaneHTTPServer(("127.0.0.1", 0), plane, tmp_path, project_root=tmp_path)
+    thread = threading.Thread(target=client.serve_forever, daemon=True)
+    thread.start()
+    with patch.object(plane, "operator_snapshot", side_effect=RuntimeError("component crashed")):
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", client.server_port, timeout=3)
+            connection.request("GET", "/api/operator")
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            assert response.status == 200
+            assert payload["status_banner"]["kind"] == "error"
+            assert "component crashed" in payload["alerts"][0]
+            assert payload["instances"] == [] and payload["playthroughs"] == []
+            connection.close()
+        finally:
+            client.shutdown()
+            client.server_close()
+            thread.join(timeout=3)
+
+
 def test_supervisor_diagnostic_reads_latest_nonempty_log_line(tmp_path: Path) -> None:
     root = tmp_path / "artifacts" / "control-plane"
     root.mkdir(parents=True)

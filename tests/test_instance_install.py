@@ -201,6 +201,59 @@ def test_sync_mods_requires_explicit_bridge_build(tmp_path: Path) -> None:
         provision(tmp_path, sync_mods=True)
 
 
+def test_deploy_bridge_backups_copies_updates_marker_and_validates(tmp_path: Path) -> None:
+    from tools.deploy_bridge import deploy
+
+    source = make_install(tmp_path)
+    source_bridge = source / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    provision(tmp_path, sync_mods=True, bridge_dll=source_bridge)
+    build = tmp_path / "release" / "HkAgentBridge.dll"
+    build.parent.mkdir()
+    build.write_bytes(b"release bridge")
+    instances_root = tmp_path / "safe" / "instances"
+    target = instances_root / "hk-ai-1" / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    old_dll = target.read_bytes()
+    old_marker = (instances_root / "hk-ai-1" / MARKER_NAME).read_bytes()
+
+    result = deploy(build, instance_indices=[1], instances_root=instances_root,
+                    backup_root=tmp_path / "backups")[0]
+
+    assert target.read_bytes() == build.read_bytes()
+    assert load_instance_marker(instances_root / "hk-ai-1", expected_index=1).bridge_dll_sha256 == result["sha256"]
+    backup = Path(str(result["backup"]))
+    assert (backup / target.name).read_bytes() == old_dll
+    assert (backup / MARKER_NAME).read_bytes() == old_marker
+
+
+def test_bridge_marker_refresh_requires_and_records_exact_installed_hash(tmp_path: Path) -> None:
+    source = make_install(tmp_path)
+    bridge = source / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    provision(tmp_path, sync_mods=True, bridge_dll=bridge)
+    root = tmp_path / "safe" / "instances" / "hk-ai-1"
+    installed = root / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    installed.write_bytes(b"new verified bridge build")
+    from hk_agent.instance_install import refresh_instance_bridge_marker, sha256_file
+
+    expected = sha256_file(installed)
+    marker = refresh_instance_bridge_marker(root, expected_index=1, expected_bridge_hash=expected)
+    assert marker["bridge_dll_sha256"] == expected
+    assert load_instance_marker(root, expected_index=1).bridge_dll_sha256 == expected
+
+
+def test_bridge_marker_refresh_rejects_wrong_build_without_mutating_marker(tmp_path: Path) -> None:
+    source = make_install(tmp_path)
+    bridge = source / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll"
+    provision(tmp_path, sync_mods=True, bridge_dll=bridge)
+    root = tmp_path / "safe" / "instances" / "hk-ai-1"
+    marker_path = root / MARKER_NAME
+    before = marker_path.read_bytes()
+    from hk_agent.instance_install import refresh_instance_bridge_marker
+
+    with pytest.raises(InstanceInstallError, match="does not match the requested build"):
+        refresh_instance_bridge_marker(root, expected_index=1, expected_bridge_hash="0" * 64)
+    assert marker_path.read_bytes() == before
+
+
 def test_marker_loader_checks_digest_and_identity(tmp_path: Path) -> None:
     provision(tmp_path, sync_mods=True, bridge_dll=make_install(tmp_path) / "Hollow Knight_Data" / "Managed" / "Mods" / "HkAgentBridge" / "HkAgentBridge.dll")
     root = tmp_path / "safe" / "instances" / "hk-ai-1"
