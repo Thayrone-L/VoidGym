@@ -19,6 +19,7 @@ internal sealed class VisualCaptureBackend : IDisposable
 
     private readonly ConcurrentQueue<CaptureRequest> _requests = new();
     private readonly Action<string> _log;
+    private readonly Func<(string[] Buttons, int DurationMilliseconds, bool Enabled, bool TestSource)> _humanSnapshot;
     private readonly GameObject _pumpObject;
     private long _nextFrameId = -1;
     private int _outstanding;
@@ -26,9 +27,12 @@ internal sealed class VisualCaptureBackend : IDisposable
     private readonly Queue<float> _frameDeltas = new();
     private float _frameDeltaTotal;
 
-    public VisualCaptureBackend(Action<string> log)
+    public VisualCaptureBackend(
+        Action<string> log,
+        Func<(string[] Buttons, int DurationMilliseconds, bool Enabled, bool TestSource)> humanSnapshot)
     {
         _log = log;
+        _humanSnapshot = humanSnapshot;
         _pumpObject = new GameObject("HK Agent Visual Capture");
         UnityEngine.Object.DontDestroyOnLoad(_pumpObject);
         CapturePump pump = _pumpObject.AddComponent<CapturePump>();
@@ -150,6 +154,7 @@ internal sealed class VisualCaptureBackend : IDisposable
 
             long frameId = Interlocked.Increment(ref _nextFrameId);
             ActionAvailability? availability = ReadActionAvailability();
+            var human = _humanSnapshot();
             long logStarted = Stopwatch.GetTimestamp();
             _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {frameBytes.Length} bytes ({request.Encoding})");
             double logMs = ElapsedMilliseconds(logStarted);
@@ -159,7 +164,7 @@ internal sealed class VisualCaptureBackend : IDisposable
                     request.Encoding, frameBytes, frameBytes.Length, pngBytes,
                     queuedToStartMs, captureMs, encodeMs, logMs,
                     AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount,
-                    availability
+                    availability, human.Buttons, human.DurationMilliseconds, human.Enabled, human.TestSource
                 )
             );
         }
@@ -410,7 +415,11 @@ internal sealed class CapturedFrame
         float unityFps,
         int targetFrameRate,
         int vSyncCount,
-        ActionAvailability? actionAvailability
+        ActionAvailability? actionAvailability,
+        string[] humanButtons,
+        int humanDurationMilliseconds,
+        bool humanMode,
+        bool humanInputTest
     )
     {
         FrameId = frameId;
@@ -429,6 +438,10 @@ internal sealed class CapturedFrame
         TargetFrameRate = targetFrameRate;
         VSyncCount = vSyncCount;
         ActionAvailability = actionAvailability;
+        HumanButtons = humanButtons;
+        HumanDurationMilliseconds = humanDurationMilliseconds;
+        HumanMode = humanMode;
+        HumanInputTest = humanInputTest;
     }
 
     public long FrameId { get; }
@@ -447,6 +460,10 @@ internal sealed class CapturedFrame
     public int TargetFrameRate { get; }
     public int VSyncCount { get; }
     public ActionAvailability? ActionAvailability { get; }
+    public string[] HumanButtons { get; }
+    public int HumanDurationMilliseconds { get; }
+    public bool HumanMode { get; }
+    public bool HumanInputTest { get; }
 }
 
 internal sealed record BridgeUiState(bool DialogOpen, bool MenuOpen, string? DialogueId,

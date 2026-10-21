@@ -20,6 +20,8 @@
     <button id="supervisor-restart" class="button secondary" type="button" hidden>Religar supervisor</button>
     <button id="retry-status" class="button secondary" type="button" hidden>Tentar de novo</button>
   </section>
+  <section id="help-alert" class="help-alert" hidden aria-live="polite"><strong id="help-alert-count"></strong></section>
+  <section id="help-top" class="panel help-top" hidden><div class="panel-head"><div><p class="eyebrow">AJUDA AO VIVO</p><h2>Pedido de ajuda</h2></div></div><div id="help-top-list"></div></section>
   <main>
     <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
 
@@ -97,7 +99,9 @@
       <article class="panel"><div class="panel-head"><div><p class="eyebrow">AVALIAÇÕES</p><h2>Resultado da IA</h2></div></div><div id="evaluation-chart" class="chart"><p class="empty">Provas rápidas alternadas mostram as medidas determinística e estocástica, progresso máximo e tempo até travar.</p></div></article>
     </section>
 
-    <section class="panel bestiary-panel"><div class="panel-head"><div><p class="eyebrow">EXPERIÊNCIA</p><h2>Bestiário da IA</h2></div></div><div id="bestiary-list"><p class="empty">Inimigos aparecem depois do primeiro encontro.</p></div><h3>Desafios em memória</h3><div id="challenge-list"><p class="empty">Ainda sem desafios registrados.</p></div><h3>Pedidos de ajuda</h3><div id="help-request-list"><p class="empty">Nenhum pedido de ajuda pendente.</p></div><h3>Ajudas recebidas</h3><div id="help-history-list"><p class="empty">Nenhuma ajuda registrada ainda.</p></div></section>
+    <section class="panel bestiary-panel"><div class="panel-head"><div><p class="eyebrow">EXPERIÊNCIA</p><h2>Bestiário da IA</h2></div></div><div id="bestiary-list"><p class="empty">Inimigos aparecem depois do primeiro encontro.</p></div><h3>Desafios em memória</h3><div id="challenge-list"><p class="empty">Ainda sem desafios registrados.</p></div></section>
+
+    <section class="panel help-history-panel"><div class="panel-head"><div><p class="eyebrow">AJUDA</p><h2>Pedidos e demonstrações</h2></div></div><div id="help-request-list"><p class="empty">Nenhum pedido de ajuda aberto.</p></div><h3>Histórico</h3><div id="help-history-list"><p class="empty">Nenhuma ajuda registrada ainda.</p></div></section>
 
     <section class="content-grid">
       <article class="panel"><div class="panel-head"><div><p class="eyebrow">MAPA</p><h2>Salas descobertas</h2></div></div><div id="scene-list" class="scene-list"><p class="empty">Nenhuma sala nova registrada ainda.</p></div></article>

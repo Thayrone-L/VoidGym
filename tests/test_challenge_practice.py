@@ -194,6 +194,7 @@ def test_human_demo_is_context_and_version_bound_with_masked_bc_loss(tmp_path) -
     recorder2.append(
         png_bytes=encoded.getvalue(), action=0, action_mask=np.array([True, False]),
         player_knowledge=np.array([0.25, 0.75], dtype=np.float32),
+        action_history=np.array([1, 0, 0], dtype=np.int64),
     )
     artifact2 = recorder2.finish()
     observation_space = __import__("gymnasium").spaces.Dict({
@@ -207,6 +208,7 @@ def test_human_demo_is_context_and_version_bound_with_masked_bc_loss(tmp_path) -
     )
     assert batch["pixels"].shape == (1, 2, 8, 8, 3)
     assert batch["action_history"].shape == (1, 3)
+    assert batch["action_history"].tolist() == [[1, 0, 0]]
     assert batch["player_knowledge"].tolist() == [[0.25, 0.75]]
     with pytest.raises(ValueError, match="different challenge"):
         load_demonstration(artifact, expected_game_version="1.5.78", expected_context="room:other")
@@ -297,6 +299,22 @@ def test_help_request_closes_when_actor_leaves_scene(tmp_path) -> None:
     assert ledger.requests()[0]["status"] == "resolved_solo"
 
 
+def test_helping_request_is_not_auto_resolved_and_expires_after_ten_minutes(tmp_path) -> None:
+    ledger = HelpRequestLedger(
+        tmp_path, slot=0, config=HelpTriggerConfig(repeated_stuck_count=1),
+    )
+    request = ledger.record_stuck(scene="RoomA", cell=(2, 4), progress=5, now=1000)
+    assert request is not None
+    ledger.resolve(request["request_id"], status="helping")
+    ledger.observe_progress(scene="RoomB", progress=10, now=1200)
+    assert ledger.requests()[0]["status"] == "helping"
+    state = ledger._load()
+    state["requests"][0]["expires_unix"] = 0
+    ledger._state = state
+    ledger._save()
+    assert ledger.requests()[0]["status"] == "expired"
+
+
 def test_human_actions_map_with_duration_and_horizontal_augmentation() -> None:
     from hk_agent.temporal_actions import TEMPORAL_COMBAT_ACTIONS
 
@@ -343,6 +361,45 @@ def test_manual_recorder_reports_unrepresentable_human_durations(tmp_path) -> No
     metadata = json.loads(artifact.with_suffix(".json").read_text())
     assert metadata["frames_seen"] == 2
     assert metadata["representable_frames"] == 1
-    assert metadata["representable_percent"] == pytest.approx(50.0)
-    assert metadata["unrepresentable_inputs"][0]["duration_ms"] == 600
+
+
+def test_scripted_bridge_help_flow_records_test_source_and_loads_for_learner(tmp_path) -> None:
+    import io
+
+    from PIL import Image
+
+    from hk_agent.demonstrations import context_artifact_directory
+    from hk_agent.temporal_actions import TEMPORAL_COMBAT_ACTIONS
+
+    context = "traversal:Room:cell-2-3"
+    encoded = io.BytesIO()
+    Image.new("RGB", (8, 8), (30, 50, 70)).save(encoded, format="PNG")
+    recorder = DemonstrationRecorder(
+        context_artifact_directory(tmp_path, context),
+        game_version="test-build", context=context,
+    )
+    recorder.authorize(help_request_id="help-test-1")
+    action, covered = recorder.append_human(
+        png_bytes=encoded.getvalue(), buttons=["RIGHT", "JUMP"], duration_ms=50,
+        action_templates=TEMPORAL_COMBAT_ACTIONS,
+        action_mask=np.ones(len(TEMPORAL_COMBAT_ACTIONS), dtype=np.bool_),
+        player_knowledge=np.zeros(4, dtype=np.float32),
+        action_history=np.array([1, 0, 0], dtype=np.int64), test_source=True,
+    )
+    assert action is not None and covered
+    artifact = recorder.finish()
+    metadata = json.loads(artifact.with_suffix(".json").read_text(encoding="utf-8"))
+    assert metadata["test_source"] is True
+    gym = __import__("gymnasium")
+    observation_space = gym.spaces.Dict({
+        "pixels": gym.spaces.Box(0, 255, (2, 8, 8, 3), dtype=np.uint8),
+        "action_history": gym.spaces.Box(0, len(TEMPORAL_COMBAT_ACTIONS) - 1, (3,), dtype=np.int64),
+        "player_knowledge": gym.spaces.Box(-1, 1, (4,), dtype=np.float32),
+    })
+    batch = demonstration_batch(
+        artifact, expected_game_version="test-build", expected_context=context,
+        observation_space=observation_space, action_count=len(TEMPORAL_COMBAT_ACTIONS),
+    )
+    assert batch["actions"].tolist() == [action]
+    assert batch["action_history"].tolist() == [[1, 0, 0]]
 

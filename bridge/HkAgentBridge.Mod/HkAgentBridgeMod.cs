@@ -78,7 +78,7 @@ public sealed class HkAgentBridgeMod : Mod
         }
 
         var input = new AgentInputBackend(message => Log(message));
-        var capture = new VisualCaptureBackend(message => Log(message));
+        var capture = new VisualCaptureBackend(message => Log(message), input.ReadHumanSnapshot);
         _input = input;
         _capture = capture;
         _client = new BridgeClient(
@@ -86,6 +86,7 @@ public sealed class HkAgentBridgeMod : Mod
             message => Log(message),
             message => LogError(message),
             ReleaseAll,
+            input.SetHumanMode,
             (buttons, leaseMilliseconds) =>
                 input.ApplyAction(buttons, leaseMilliseconds),
             (buttons, leaseMilliseconds) =>

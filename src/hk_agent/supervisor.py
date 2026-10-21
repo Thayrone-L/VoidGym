@@ -72,6 +72,10 @@ class CapturedFrame:
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
+    human_buttons: tuple[str, ...] = ()
+    human_duration_ms: int = 0
+    human_mode: bool = False
+    human_input_test: bool = False
 
 
 def require_png_frame(frame: CapturedFrame) -> None:
@@ -472,6 +476,22 @@ class SupervisorServer:
         assert duplicate_of is None or isinstance(duplicate_of, int)
         assert last_action is None or isinstance(last_action, int)
 
+        raw_human_buttons = payload.get("human_buttons", [])
+        human_buttons = tuple(button for button in raw_human_buttons if isinstance(button, str)) \
+            if isinstance(raw_human_buttons, list) else ()
+        raw_human_duration = payload.get("human_duration_ms", 0)
+        human_duration = raw_human_duration if isinstance(raw_human_duration, int) and not isinstance(raw_human_duration, bool) else 0
+        human_mode = payload.get("human_mode", False)
+        if not isinstance(human_mode, bool) or human_duration < 0 or human_duration > 2_000:
+            raise ProtocolError("FRAME human input metadata is malformed")
+        allowed_human_buttons = {
+            "LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "DASH", "CAST",
+            "SUPER_DASH", "DREAM_NAIL", "PAUSE", "MENU_SUBMIT", "MENU_CANCEL",
+        }
+        if len(human_buttons) > len(allowed_human_buttons) or any(
+            button not in allowed_human_buttons for button in human_buttons
+        ):
+            raise ProtocolError("FRAME human buttons are invalid")
         return CapturedFrame(
             episode_id=frame_episode_id,
             frame_id=frame_id,
@@ -503,6 +523,10 @@ class SupervisorServer:
             bestiary_events=tuple(bestiary_events),
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),
+            human_buttons=human_buttons,
+            human_duration_ms=human_duration,
+            human_mode=human_mode,
+            human_input_test=payload.get("human_input_test") is True,
         )
 
     async def _handle_client(

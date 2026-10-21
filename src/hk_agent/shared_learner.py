@@ -874,10 +874,23 @@ class SharedRoundStore:
         first_rollout_at: float | None = None
         wait_started = time.monotonic()
         stale_count = self.stale_rollout_count()
-        while time.monotonic() < deadline and len(accepted) < actors:
+        active_slots = list(range(actors))
+        while time.monotonic() < deadline:
             if stop_file is not None and stop_file.is_file():
                 break
-            for slot in range(actors):
+            active_slots = [slot for slot in range(actors)
+                            if not (self._read_actor_status(slot).get("status") == "HELPING"
+                                    and self.actor_available(slot) is not False)]
+            if not active_slots:
+                if accepted:
+                    break
+                self.heartbeat(round=round_number, status="WAITING_HELP", accepted_rollouts=0)
+                return [], [], {
+                    "wait_rollouts_ms": round((time.monotonic() - wait_started) * 1000, 3),
+                    "straggler_wait_ms": 0.0, "received_slots": [], "stale_rollouts": stale_count,
+                    "paused_slots": list(range(actors)),
+                }
+            for slot in active_slots:
                 if slot in accepted:
                     continue
                 sidecar = self.rollout_root / f"round-{round_number:08d}" / f"slot-{slot}.json"
@@ -920,16 +933,25 @@ class SharedRoundStore:
                         self.reject(round_number=round_number, slot=slot, reason=str(error))
                         inspected[slot] = marker
             self.heartbeat(round=round_number, status="WAITING", accepted_rollouts=len(accepted))
-            if len(accepted) >= actors:
+            if len(accepted) >= len(active_slots):
                 break
-            availability = [self.actor_available(slot) for slot in range(actors)]
+            availability = {slot: self.actor_available(slot) for slot in active_slots}
             if first_rollout_at is not None:
-                unavailable = [slot for slot in range(actors)
+                unavailable = [slot for slot in active_slots
                                if slot not in accepted and availability[slot] is False]
                 if unavailable or time.monotonic() - first_rollout_at >= straggler_timeout:
                     break
             time.sleep(0.2)
         if not accepted:
+            paused = [slot for slot in range(actors)
+                      if self._read_actor_status(slot).get("status") == "HELPING"
+                      and self.actor_available(slot) is not False]
+            if len(paused) == actors:
+                return [], [], {
+                    "wait_rollouts_ms": round((time.monotonic() - wait_started) * 1000, 3),
+                    "straggler_wait_ms": 0.0, "received_slots": [], "stale_rollouts": stale_count,
+                    "paused_slots": paused,
+                }
             if stop_file is not None and stop_file.is_file():
                 return [], [], {
                     "wait_rollouts_ms": round((time.monotonic() - wait_started) * 1000, 3),
@@ -1435,6 +1457,8 @@ def run_shared_actor(
             self.rollout_progress: list[float] = []
             self.rollout_events: list[str] = []
             self.previous_scene: str | None = None
+            self.helping_requested = False
+            self.help_metrics: dict[str, Any] = {}
 
         def take_rollout_metadata(self, steps: int) -> dict[str, np.ndarray]:
             scenes = self.rollout_scenes[:steps]
@@ -1462,6 +1486,21 @@ def run_shared_actor(
                 self.resets += int(np.count_nonzero(dones))
             infos = self.locals.get("infos")
             step_info = infos[0] if isinstance(infos, (list, tuple)) and infos and isinstance(infos[0], Mapping) else {}
+            if step_info.get("helping") is True:
+                self.helping_requested = True
+                self.help_metrics = {
+                    "help_id": step_info.get("help_id"),
+                    "help_elapsed_seconds": step_info.get("help_elapsed_seconds", 0.0),
+                    "help_coverage_percent": step_info.get("help_coverage_percent", 0.0),
+                    "pending_help_requests": step_info.get("pending_help_requests", []),
+                }
+                store.publish_actor_status(
+                    slot=slot, launch_id=launch_id, status="HELPING",
+                    round=self.round_number, collected_steps=self.n_calls,
+                    challenge_context=self.help_context or os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
+                    game_version=_environment_game_version(environment), **self.help_metrics,
+                )
+                return False
             scene_value = step_info.get("scene_name")
             scene = scene_value if isinstance(scene_value, str) else ""
             room_progress = step_info.get("max_progress_by_scene")
@@ -1729,8 +1768,32 @@ def run_shared_actor(
             if not model.collect_rollouts(
                 model.get_env(), callback, model.rollout_buffer, n_rollout_steps=config.rollout_steps
             ):
-                status["status"] = "CANCELLED"
-                break
+                if not callback.helping_requested:
+                    status["status"] = "CANCELLED"
+                    break
+                help_env = model.get_env()
+                if help_env is None:
+                    raise SharedLearnerError("actor environment is unavailable during help mode")
+                while stop_file is None or not stop_file.is_file():
+                    _observations, _rewards, _dones, help_infos = help_env.step(np.asarray([0], dtype=np.int64))
+                    help_info = help_infos[0] if isinstance(help_infos, (list, tuple)) and help_infos else {}
+                    if not isinstance(help_info, Mapping) or help_info.get("helping") is not True:
+                        break
+                    callback.help_metrics = {
+                        "help_id": help_info.get("help_id"),
+                        "help_elapsed_seconds": help_info.get("help_elapsed_seconds", 0.0),
+                        "help_coverage_percent": help_info.get("help_coverage_percent", 0.0),
+                        "pending_help_requests": help_info.get("pending_help_requests", []),
+                    }
+                    store.publish_actor_status(
+                        slot=slot, launch_id=launch_id, status="HELPING", round=round_number,
+                        challenge_context=callback.help_context or os.environ.get("HK_AGENT_CHALLENGE_CONTEXT"),
+                        game_version=_environment_game_version(environment), **callback.help_metrics,
+                    )
+                callback.helping_requested = False
+                store.publish_actor_status(slot=slot, launch_id=launch_id, status="COLLECTING",
+                                           round=round_number, collected_steps=0)
+                continue
             collect_ms = (time.perf_counter() - collect_started) * 1000
             try:
                 learner_status = json.loads(store.learner_status_path.read_text("utf-8"))
@@ -2133,6 +2196,11 @@ def run_shared_learner(
             if stop_file is not None and stop_file.is_file():
                 manifest["status"] = "CANCELLED"
                 break
+            if not rollouts:
+                store.heartbeat(status="WAITING_HELP", round=current_round,
+                                completed_timesteps=completed, paused_slots=wait_metrics.get("paused_slots", []))
+                time.sleep(0.5)
+                continue
             zero_fraction = zero_reward_fraction(rollouts)
             model.ent_coef = (
                 0.025 if current_round < entropy_recovery_end else entropy_target

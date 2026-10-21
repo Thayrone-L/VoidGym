@@ -85,6 +85,10 @@ class PixelFrame:
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
+    human_buttons: tuple[str, ...] = ()
+    human_duration_ms: int = 0
+    human_mode: bool = False
+    human_input_test: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +532,10 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
             action_availability=frame.action_availability,
+            human_buttons=frame.human_buttons,
+            human_duration_ms=frame.human_duration_ms,
+            human_mode=frame.human_mode,
+            human_input_test=frame.human_input_test,
         )
 
     def _validate_applied_action(
@@ -607,6 +615,10 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
             "shade_distance": frame.shade_distance,
             "scene_name": frame.scene_name,
+            "human_buttons": list(frame.human_buttons),
+            "human_duration_ms": frame.human_duration_ms,
+            "human_mode": frame.human_mode,
+            "human_input_test": frame.human_input_test,
             "shade_pending": frame.shade_pending,
             "enemy_events_since_last_frame": [
                 {"scene_name": scene, "enemy_type": enemy_type}

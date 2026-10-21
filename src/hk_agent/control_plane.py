@@ -919,7 +919,11 @@ class ControlPlane:
                 "checkpoint": Path(str(candidate["checkpoint"])).name,
                 "created_at": campaign.get("created_at"),
             })
-        rows.sort(key=lambda row: int(row.get("round", 0)), reverse=True)
+        def round_number(row: dict[str, object]) -> int:
+            value = row.get("round")
+            return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+        rows.sort(key=round_number, reverse=True)
         return rows
 
     def _operator_system_resources(self) -> dict[str, object]:
@@ -1445,7 +1449,15 @@ class ControlPlane:
             help_history.sort(key=lambda row: float(row.get("created_unix", 0.0))
                               if isinstance(row.get("created_unix"), (int, float))
                               and not isinstance(row.get("created_unix"), bool) else 0.0)
-            help_requests = [row for row in help_history if row.get("status") in {"pending", "demonstration_requested"}]
+            help_requests = [row for row in help_history if row.get("status") in {"pending", "demonstration_requested", "helping", "completion_requested"}]
+            for help_row in help_requests:
+                slot = help_row.get("slot")
+                actor_path = (shared_root / "actors" / f"slot-{slot}.json"
+                              if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None)
+                actor = self._read_json(actor_path) if actor_path is not None and not actor_path.is_symlink() else {}
+                if actor.get("help_id") == help_row.get("request_id"):
+                    help_row["help_elapsed_seconds"] = actor.get("help_elapsed_seconds", 0.0)
+                    help_row["help_coverage_percent"] = actor.get("help_coverage_percent", 0.0)
         stuck_alert = next((item for item in reversed(alerts) if "travada há" in item), None)
         if stuck_alert and status_banner["kind"] != "error":
             running_text = (f" · Treinando — rodada {learner_round}, "
@@ -3390,8 +3402,8 @@ class ControlPlane:
         campaign_id, request_id, action = payload.get("campaign_id"), payload.get("request_id"), payload.get("action")
         if not isinstance(campaign_id, str) or not isinstance(request_id, str):
             raise TypeError("campaign_id and request_id must be strings")
-        if action not in {"show", "now_not", "discard", "complete"}:
-            raise ValueError("action must be show, now_not, discard, or complete")
+        if action not in {"show", "help_now", "now_not", "discard", "complete"}:
+            raise ValueError("action must be show, help_now, now_not, discard, or complete")
         campaign = next((row for row in self.list_campaigns() if row.get("campaign_id") == campaign_id), None)
         if campaign is None or campaign.get("help_requests_enabled") is not True:
             raise ValueError("help requests are not enabled for this campaign")
@@ -3399,7 +3411,7 @@ class ControlPlane:
         root = (shared_root / "help-requests").resolve(strict=True)
         if root.parent != shared_root or root.is_symlink():
             raise ValueError("help request store escaped the campaign runtime")
-        status = {"show": "demonstration_requested", "discard": "discarded",
+        status = {"show": "demonstration_requested", "help_now": "helping", "discard": "discarded",
                   "complete": "resolved_with_help"}.get(str(action))
         for path in root.glob("slot-*.json"):
             ledger_payload = self._read_json(path)
@@ -3414,8 +3426,51 @@ class ControlPlane:
             from hk_agent.demonstrations import HelpRequestLedger
 
             ledger = HelpRequestLedger(root, slot=int(match.group(1)))
-            return ledger.snooze(request_id, minutes=30) if action == "now_not" else ledger.resolve(request_id, status=str(status))
+            if action == "now_not":
+                return ledger.snooze(request_id, minutes=30)
+            if action == "complete":
+                # The actor saves the recording before it is marked resolved.
+                return ledger.resolve(request_id, status="completion_requested")
+            return ledger.resolve(request_id, status=str(status))
         raise FileNotFoundError("help request was not found")
+
+    def help_request_snapshot(self, campaign_id: str) -> dict[str, Any]:
+        """Read help state without constructing the full operator performance snapshot."""
+        if not isinstance(campaign_id, str) or not _IDENTIFIER.fullmatch(campaign_id):
+            raise ValueError("invalid campaign_id")
+        campaign = next((row for row in self.list_campaigns()
+                         if row.get("campaign_id") == campaign_id), None)
+        if campaign is None or campaign.get("help_requests_enabled") is not True:
+            raise ValueError("help requests are not enabled for this campaign")
+        shared_root = (self.runtime_root / "shared" / campaign_id).resolve(strict=True)
+        root = shared_root / "help-requests"
+        if root.is_symlink():
+            raise ValueError("help request store escaped the campaign runtime")
+        history: list[dict[str, Any]] = []
+        for ledger_path in sorted(root.glob("slot-*.json")) if root.is_dir() else ():
+            ledger = self._read_json(ledger_path)
+            rows = ledger.get("requests", [])
+            if not isinstance(rows, list):
+                continue
+            for raw in rows:
+                if not isinstance(raw, Mapping):
+                    continue
+                row = dict(raw)
+                slot = row.get("slot")
+                actor_path = (shared_root / "actors" / f"slot-{slot}.json"
+                              if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0 else None)
+                actor = self._read_json(actor_path) if actor_path is not None and not actor_path.is_symlink() else {}
+                if actor.get("help_id") == row.get("request_id"):
+                    row["help_elapsed_seconds"] = actor.get("help_elapsed_seconds", 0.0)
+                    row["help_coverage_percent"] = actor.get("help_coverage_percent", 0.0)
+                history.append(row)
+        history.sort(key=lambda row: float(row.get("created_unix", 0.0))
+                     if isinstance(row.get("created_unix"), (int, float))
+                     and not isinstance(row.get("created_unix"), bool) else 0.0)
+        opened = [row for row in history if row.get("status") in {
+            "pending", "demonstration_requested", "helping", "completion_requested",
+        }]
+        return {"campaign_id": campaign_id, "help_requests": opened, "help_request_history": history[-128:]}
 
     def _wait_for_process(
         self,

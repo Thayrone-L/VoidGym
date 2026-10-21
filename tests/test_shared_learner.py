@@ -425,6 +425,20 @@ def test_restarting_actor_does_not_hold_rollout_quorum(tmp_path):
     assert metrics["straggler_wait_ms"] < 1000
 
 
+def test_helping_actor_is_paused_without_becoming_straggler(tmp_path):
+    store = SharedRoundStore(tmp_path)
+    store.publish_actor_status(slot=0, launch_id="actor-0", status="HELPING")
+    observation_space, action_count = _spaces()
+    rollouts, slots, metrics = store.wait_rollouts(
+        round_number=1, actors=1, fingerprint=FINGERPRINT, n_steps=2,
+        observation_space=observation_space, action_count=action_count, timeout=2,
+    )
+    assert rollouts == []
+    assert slots == []
+    assert metrics["paused_slots"] == [0]
+    assert metrics["straggler_wait_ms"] == 0.0
+
+
 def test_stale_rollouts_are_counted_separately_from_bug_rejections(tmp_path):
     store = SharedRoundStore(tmp_path)
     store.record_stale_rollout(round_number=2, slot=0, launch_id="restarted")
@@ -653,7 +667,7 @@ def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path,
     Image.new("RGB", (4, 3)).save(encoded, format="PNG")
     recorder.append(
         png_bytes=encoded.getvalue(), action=0, action_mask=np.array([True, False]),
-        player_knowledge=np.zeros(2, dtype=np.float32),
+        player_knowledge=np.zeros(2, dtype=np.float32), test_source=True,
     )
     artifact = recorder.finish()
     store = shared.SharedRoundStore(tmp_path)
@@ -683,7 +697,9 @@ def test_context_demonstrations_are_version_checked_scoped_and_decayed(tmp_path,
     assert len(rows) == 1 and rows[0]["context"] == context
     assert rows[0]["weight"] == pytest.approx(0.25)
     metadata = json.loads(artifact.with_suffix(".json").read_text())
+    assert metadata["test_source"] is True
     assert metadata["first_used_round"] == 0
+    assert manifest["demonstration_training"][0]["loss"] == pytest.approx(0.5)
     rows = shared.apply_context_demonstrations(
         model, tmp_path, store, actor_slots=[0], round_number=20, manifest=manifest,
         enabled=True,

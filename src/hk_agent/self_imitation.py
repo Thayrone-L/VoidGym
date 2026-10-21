@@ -70,7 +70,9 @@ class SelfImitationBank:
                             "scene_change", "shade_created", "shade_recovered", "shade_lost",
                             "item", "bench", "help_solo",
                         })
-                event = max(set(confirmed_events), key=confirmed_events.count) if confirmed_events else "high_return"
+                # `max(set(...))` makes ties depend on hash iteration order, so
+                # the same rollout could be filed under different event buckets.
+                event = max(confirmed_events, key=confirmed_events.count) if confirmed_events else "high_return"
                 for name in ("meta__scene", "meta__progress", "meta__events"):
                     if name in rollout:
                         payload[name] = np.asarray(rollout[name][start:stop]).copy()

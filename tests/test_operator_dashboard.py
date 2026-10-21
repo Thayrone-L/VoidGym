@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -245,6 +246,28 @@ def test_operator_snapshot_promotes_repeated_stuck_place_to_warning_banner(tmp_p
         snapshot = plane.operator_snapshot()
     assert snapshot["status_banner"]["kind"] == "warning"
     assert "travada há" in snapshot["status_banner"]["message"]
+
+
+def test_help_request_api_starts_and_finishes_live_help_without_launching_game(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path, allow_execute=False)
+    campaign_id = "campaign-help"
+    help_root = plane.runtime_root / "shared" / campaign_id / "help-requests"
+    help_root.mkdir(parents=True)
+    request = {
+        "request_id": "help-0-test", "slot": 0, "scene": "Tutorial_01",
+        "place": "Tutorial_01:c9r1", "context": "traversal:Tutorial_01:cell-9-1",
+        "status": "pending", "created_unix": 10.0,
+    }
+    (help_root / "slot-0.json").write_text(json.dumps({"schema_version": 1, "requests": [request]}), encoding="utf-8")
+    campaign = {"campaign_id": campaign_id, "help_requests_enabled": True}
+    with patch.object(plane, "list_campaigns", return_value=[campaign]):
+        started = plane.resolve_help_request({"campaign_id": campaign_id, "request_id": request["request_id"], "action": "help_now"})
+        assert started["status"] == "helping"
+        assert started["expires_unix"] > time.time()
+        help_snapshot = plane.help_request_snapshot(campaign_id)
+        assert help_snapshot["help_requests"][0]["status"] == "helping"
+        completed = plane.resolve_help_request({"campaign_id": campaign_id, "request_id": request["request_id"], "action": "complete"})
+    assert completed["status"] == "completion_requested"
 
 
 def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None:

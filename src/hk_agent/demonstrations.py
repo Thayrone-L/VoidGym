@@ -9,7 +9,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -18,6 +18,11 @@ from PIL import Image
 from torch import Tensor
 
 DEMONSTRATION_SCHEMA = 1
+
+
+def context_artifact_directory(shared_root: Path, context: str) -> Path:
+    digest = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+    return shared_root / "demonstrations" / digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +223,7 @@ class HelpRequestLedger:
             other_requests = other_state.get("requests", []) if isinstance(other_state, dict) else []
             pending = next((row for row in other_requests if isinstance(row, dict)
                             and row.get("place") == place
-                            and row.get("status") in {"pending", "demonstration_requested"}), None) if isinstance(other_requests, list) else None
+                            and row.get("status") in {"pending", "demonstration_requested", "helping", "completion_requested"}), None) if isinstance(other_requests, list) else None
             if pending is None:
                 continue
             pending["stuck_count"] = int(pending.get("stuck_count", 0)) + 1
@@ -291,7 +296,7 @@ class HelpRequestLedger:
         return award
 
     def resolve(self, request_id: str, *, status: str) -> dict[str, Any]:
-        if status not in {"dismissed", "demonstration_requested", "discarded", "completed", "resolved_with_help"}:
+        if status not in {"dismissed", "demonstration_requested", "helping", "completion_requested", "discarded", "completed", "resolved_with_help", "expired"}:
             raise ValueError("invalid help request status")
         from hk_agent.run_journey import file_lock
 
@@ -299,10 +304,12 @@ class HelpRequestLedger:
             self._state = self._load()
             for row in self._state["requests"]:
                 if row.get("request_id") == request_id:
-                    if row.get("status") not in {"pending", "demonstration_requested"}:
+                    if row.get("status") not in {"pending", "demonstration_requested", "helping", "completion_requested"}:
                         raise ValueError("help request is no longer pending")
                     row["status"] = status
                     row["updated_unix"] = time.time()
+                    if status == "helping":
+                        row["expires_unix"] = row["updated_unix"] + 600.0
                     if status in {"completed", "resolved_with_help", "discarded", "dismissed"}:
                         row["resolved_unix"] = row["updated_unix"]
                     self._save()
@@ -328,7 +335,20 @@ class HelpRequestLedger:
         raise FileNotFoundError("help request was not found")
 
     def requests(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self._state["requests"]]
+        from hk_agent.run_journey import file_lock
+
+        with file_lock(self.root / ".requests.lock"):
+            self._state = self._load()
+            now = time.time()
+            changed = False
+            for row in self._state["requests"]:
+                expiry = row.get("expires_unix")
+                if row.get("status") == "helping" and isinstance(expiry, (int, float)) and now >= expiry:
+                    row.update({"status": "expired", "updated_unix": now, "resolved_unix": now})
+                    changed = True
+            if changed:
+                self._save()
+            return [dict(row) for row in self._state["requests"]]
 
 
 def map_human_action(
@@ -423,10 +443,12 @@ class DemonstrationRecorder:
         self.actions: list[int] = []
         self.masks: list[NDArray[np.bool_]] = []
         self.knowledge: list[NDArray[np.float32]] = []
+        self.action_history: list[NDArray[np.int64] | None] = []
         self.authorization: str | None = None
         self.frames_seen = 0
         self.representable_frames = 0
         self.unrepresentable_inputs: list[dict[str, Any]] = []
+        self.test_source = False
 
     def authorize(self, *, help_request_id: str | None = None, operator_forced: bool = False) -> None:
         if operator_forced:
@@ -439,6 +461,8 @@ class DemonstrationRecorder:
     def append(
         self, *, png_bytes: bytes, action: int,
         action_mask: NDArray[np.bool_], player_knowledge: NDArray[np.float32],
+        action_history: NDArray[np.int64] | None = None,
+        test_source: bool = False,
     ) -> None:
         if self.authorization is None:
             raise ValueError("demonstration recording has not been requested")
@@ -456,12 +480,19 @@ class DemonstrationRecorder:
         self.actions.append(action)
         self.masks.append(action_mask.astype(np.bool_, copy=True))
         self.knowledge.append(player_knowledge.astype(np.float32, copy=True))
+        self.action_history.append(
+            action_history.astype(np.int64, copy=True) if action_history is not None else None
+        )
+        self.test_source = self.test_source or test_source
 
     def append_human(
         self, *, png_bytes: bytes, buttons: Sequence[str], duration_ms: int,
         action_templates: Sequence[Any], action_mask: NDArray[np.bool_],
         player_knowledge: NDArray[np.float32],
+        action_history: NDArray[np.int64] | None = None,
+        test_source: bool = False,
     ) -> tuple[int | None, bool]:
+        self.test_source = self.test_source or test_source
         action, representable = map_human_action(buttons, duration_ms, action_templates)
         if action is None or action >= len(action_mask) or not action_mask[action]:
             self.frames_seen += 1
@@ -474,7 +505,8 @@ class DemonstrationRecorder:
             return None, False
         self.append(
             png_bytes=png_bytes, action=action, action_mask=action_mask,
-            player_knowledge=player_knowledge,
+            player_knowledge=player_knowledge, action_history=action_history,
+            test_source=test_source,
         )
         if not representable:
             self.representable_frames -= 1
@@ -491,20 +523,23 @@ class DemonstrationRecorder:
             raise ValueError("empty human demonstration")
         target = self.root / f"demo-{time.time_ns()}.npz"
         offsets = np.cumsum([0, *(len(frame) for frame in self.frames)], dtype=np.int64)
-        np.savez_compressed(
-            target,
-            frame_bytes=np.concatenate(self.frames),
-            frame_offsets=offsets,
-            actions=np.asarray(self.actions, dtype=np.int64),
-            action_masks=np.stack(self.masks),
-            player_knowledge=np.stack(self.knowledge),
-        )
+        arrays: dict[str, NDArray[Any]] = {
+            "frame_bytes": np.concatenate(self.frames),
+            "frame_offsets": offsets,
+            "actions": np.asarray(self.actions, dtype=np.int64),
+            "action_masks": np.stack(self.masks),
+            "player_knowledge": np.stack(self.knowledge),
+        }
+        if self.action_history and all(row is not None for row in self.action_history):
+            arrays["action_history"] = np.stack([row for row in self.action_history if row is not None])
+        np.savez_compressed(target, **cast(Any, arrays))
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
         manifest = {
             "schema_version": DEMONSTRATION_SCHEMA,
             "game_version": self.game_version,
             "context": self.context,
             "authorization": self.authorization,
+            "test_source": self.test_source,
             "samples": len(self.actions),
             "frames_seen": self.frames_seen,
             "representable_frames": self.representable_frames,
@@ -585,6 +620,11 @@ def demonstration_batch(
         prior = actions[max(0, index - history_size):index]
         if len(prior):
             history[index, -len(prior):] = prior
+    recorded_history = values.get("action_history")
+    if recorded_history is not None:
+        if recorded_history.shape != (len(actions), history_size):
+            raise ValueError("demonstration action history differs from the learner")
+        history = recorded_history.astype(np.int64, copy=True)
     knowledge = values["player_knowledge"].astype(np.float32, copy=True)
     expected_knowledge_shape = tuple(spaces["player_knowledge"].shape)
     if knowledge.shape != (len(actions), *expected_knowledge_shape):

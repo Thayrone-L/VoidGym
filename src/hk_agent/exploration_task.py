@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from typing import Any, cast
 import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
+from PIL import Image
 
 from hk_agent.action_masking import action_mask_audit, build_action_mask, decide_masked_action
 from hk_agent.challenge_practice import (
@@ -24,7 +26,7 @@ from hk_agent.challenge_practice import (
     challenge_reward,
     create_challenge_snapshot,
 )
-from hk_agent.demonstrations import HelpRequestLedger, HelpTriggerConfig
+from hk_agent.demonstrations import DemonstrationRecorder, HelpRequestLedger, HelpTriggerConfig
 from hk_agent.gym_env import HollowKnightEnv
 from hk_agent.player_knowledge import ITEM_FLAGS, PlayerKnowledge
 from hk_agent.run_journey import RunDiary, atomic_json, increment_campaign_count, rebuild_progress
@@ -563,6 +565,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         ) == "1"
         self._help_requests_enabled = os.environ.get("HK_AGENT_HELP_REQUESTS_ENABLED", "0") == "1"
         self._help_request_ledger: HelpRequestLedger | None = None
+        self._active_help_id: str | None = None
+        self._help_recorder: DemonstrationRecorder | None = None
+        self._last_policy_observation: dict[str, NDArray[np.generic]] | None = None
+        self._help_elapsed_started: float | None = None
         shared_root = os.environ.get("HK_AGENT_SHARED_ROOT")
         slot_value = os.environ.get("HK_AGENT_SLOT_ID")
         if self._help_requests_enabled and shared_root and slot_value and slot_value.isdigit():
@@ -756,7 +762,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._done = False
         self.mask_unavailable_count = 0
         self._history.reset()
-        return self._apply_player_knowledge(self._history.apply(observation)), {}
+        policy_observation = self._apply_player_knowledge(self._history.apply(observation))
+        self._last_policy_observation = {key: np.asarray(value).copy() for key, value in policy_observation.items()}
+        return policy_observation, {}
 
     def step(
         self, action: int
@@ -766,6 +774,50 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             raise RuntimeError("reset() is required before step()")
         if not self.action_space.contains(action):
             raise ValueError(f"invalid task action: {action!r}")
+        help_ledger = self._help_request_ledger
+        help_row = next((row for row in reversed(help_ledger.requests())
+                         if row.get("status") in {"helping", "completion_requested", "discarded", "expired"}), None) \
+            if help_ledger is not None else None
+        if (help_ledger is not None and help_row is not None and self._active_help_id is not None
+                and help_row.get("request_id") == self._active_help_id
+                and help_row.get("status") in {"completion_requested", "discarded", "expired"}):
+            backend = self.environment.backend
+            set_human_mode = getattr(backend, "set_human_mode", None)
+            if callable(set_human_mode):
+                set_human_mode(False)
+            if help_row.get("status") == "completion_requested" and self._help_recorder is not None:
+                if self._help_recorder.actions:
+                    self._help_recorder.finish()
+                    help_ledger.resolve(self._active_help_id, status="resolved_with_help")
+                else:
+                    help_ledger.resolve(self._active_help_id, status="discarded")
+            self._active_help_id = None
+            self._help_recorder = None
+            self._help_elapsed_started = None
+        helping = help_row is not None and help_row.get("status") == "helping"
+        if helping and help_row is not None and self._active_help_id != help_row.get("request_id"):
+            self._active_help_id = str(help_row.get("request_id"))
+            game_version = None
+            backend_bridge = getattr(self.environment.backend, "_bridge", None)
+            if backend_bridge is not None:
+                game_version = getattr(backend_bridge, "game_version", None)
+            if not isinstance(game_version, str) or not game_version:
+                game_version = os.environ.get("HK_AGENT_GAME_VERSION", "hollow-knight")
+            context = str(help_row.get("context") or f"traversal:{help_row.get('scene', 'unknown')}")
+            campaign_root = Path(os.environ.get("HK_AGENT_SHARED_ROOT", "."))
+            from hk_agent.demonstrations import context_artifact_directory
+            self._help_recorder = DemonstrationRecorder(
+                context_artifact_directory(campaign_root, context),
+                game_version=game_version, context=context,
+            )
+            self._help_recorder.authorize(help_request_id=self._active_help_id)
+            self._help_elapsed_started = time.monotonic()
+            set_human_mode = getattr(self.environment.backend, "set_human_mode", None)
+            if callable(set_human_mode):
+                set_human_mode(True)
+        if helping:
+            noop = next((index for index, template in enumerate(self._action_templates) if template.name == "NOOP"), 0)
+            action = noop
         decision = decide_masked_action(
             int(action),
             self._action_names,
@@ -776,6 +828,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         action = decision.executed_index
         audit = action_mask_audit(decision, self.mask_unavailable_count)
         template = self._action_templates[action]
+        policy_observation = self._last_policy_observation
+        demonstration_mask = self.action_masks().copy() if helping else None
+        demonstration_knowledge = (
+            np.asarray(policy_observation.get("player_knowledge", self._player_knowledge.vector(
+                hint_level=self.config.tutorial_hint_level)), dtype=np.float32).copy()
+            if helping and policy_observation is not None else None
+        )
         lease = template.resolve_lease_ms(self.environment.lease_ms)
         if self._diary is not None:
             self._diary.capture_before_exit(template.buttons)
@@ -791,6 +850,38 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 template.raw_action_index, lease_ms=lease
             )
         step_profile["environment_step_ms"] = (time.perf_counter() - started) * 1000
+        if helping and help_row is not None and self._active_help_id and help_ledger is not None:
+            scene_changed = isinstance(base.get("scene_name"), str) and base.get("scene_name") != help_row.get("scene")
+            if scene_changed:
+                if self._help_recorder is not None and self._help_recorder.actions:
+                    self._help_recorder.finish()
+                    help_ledger.resolve(self._active_help_id, status="resolved_with_help")
+                else:
+                    help_ledger.resolve(self._active_help_id, status="discarded")
+                set_human_mode = getattr(self.environment.backend, "set_human_mode", None)
+                if callable(set_human_mode):
+                    set_human_mode(False)
+                helping = False
+                self._active_help_id = None
+                self._help_recorder = None
+                self._help_elapsed_started = None
+        if (helping and self._help_recorder is not None and demonstration_mask is not None
+                and demonstration_knowledge is not None):
+            buttons = base.get("human_buttons", [])
+            duration_ms = base.get("human_duration_ms", 0)
+            if (help_row is not None and isinstance(buttons, list) and isinstance(duration_ms, int)
+                    and duration_ms > 0 and policy_observation is not None):
+                pixels = np.asarray(policy_observation["pixels"][-1], dtype=np.uint8)
+                png = io.BytesIO()
+                Image.fromarray(pixels, mode="RGB").save(png, format="PNG")
+                self._help_recorder.append_human(
+                    png_bytes=png.getvalue(), buttons=buttons, duration_ms=duration_ms,
+                    action_templates=self._action_templates, action_mask=demonstration_mask,
+                    player_knowledge=demonstration_knowledge,
+                    action_history=(np.asarray(policy_observation["action_history"], dtype=np.int64)
+                                    if "action_history" in policy_observation else None),
+                    test_source=base.get("human_input_test") is True,
+                )
         raw_milestones = base.get("milestone_events_since_last_frame", [])
         if self.config.continuous_playthrough and isinstance(raw_milestones, list) and any(
             isinstance(event, Mapping) and event.get("confirmed") is True
@@ -810,6 +901,26 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._player_knowledge.update(
             base, challenge_tracking_enabled=(self._challenge_practice_enabled or self._help_requests_enabled)
         )
+        if helping and help_row is not None and help_ledger is not None and self._active_help_id is not None:
+            target_cell = help_row.get("cell")
+            current_cell = self._player_knowledge.last_cell
+            if (self._player_knowledge.last_scene == help_row.get("scene")
+                    and isinstance(target_cell, list) and len(target_cell) == 2
+                    and isinstance(current_cell, tuple) and len(current_cell) == 2
+                    and all(isinstance(value, int) for value in target_cell)
+                    and abs(current_cell[0] - target_cell[0]) + abs(current_cell[1] - target_cell[1]) > 2):
+                if self._help_recorder is not None and self._help_recorder.actions:
+                    self._help_recorder.finish()
+                    help_ledger.resolve(self._active_help_id, status="resolved_with_help")
+                else:
+                    help_ledger.resolve(self._active_help_id, status="discarded")
+                set_human_mode = getattr(self.environment.backend, "set_human_mode", None)
+                if callable(set_human_mode):
+                    set_human_mode(False)
+                helping = False
+                self._active_help_id = None
+                self._help_recorder = None
+                self._help_elapsed_started = None
         self._record_challenge_practice_events(self._player_knowledge.new_events)
         knowledge_events = bool(self._player_knowledge.new_events)
         tutorial_events = self._pending_tutorial_events + self._player_knowledge.new_events
@@ -1404,8 +1515,6 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                     thumbnail_path: str | None = None
                     if self._journey_root is not None:
                         try:
-                            from PIL import Image
-
                             thumbnail_root = self._journey_root / "help-thumbnails"
                             thumbnail_root.mkdir(parents=True, exist_ok=True)
                             thumbnail = thumbnail_root / f"slot-{self._journey_actor}-{time.time_ns()}.png"
@@ -1482,9 +1591,13 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             "help_request": help_request,
             "stuck_location": stuck_location,
             "pending_help_requests": (
-                [row for row in self._help_request_ledger.requests() if row.get("status") == "pending"]
+                [row for row in self._help_request_ledger.requests() if row.get("status") in {"pending", "demonstration_requested", "helping", "completion_requested"}]
                 if self._help_request_ledger is not None else []
             ),
+            "helping": helping,
+            "help_id": self._active_help_id if helping else None,
+            "help_elapsed_seconds": max(0.0, time.monotonic() - self._help_elapsed_started) if helping and self._help_elapsed_started else 0.0,
+            "help_coverage_percent": (100.0 * self._help_recorder.representable_frames / max(1, self._help_recorder.frames_seen)) if helping and self._help_recorder else 0.0,
         }
         timing_profile = base.get("timing_ms")
         if isinstance(timing_profile, Mapping):
@@ -1523,6 +1636,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         observation = self._apply_player_knowledge(observation)
         step_profile["knowledge_observation_ms"] = (time.perf_counter() - started) * 1000
         info["actor_step_profile_ms"] = step_profile
+        self._last_policy_observation = {key: np.asarray(value).copy() for key, value in observation.items()}
         return observation, reward, task_terminated, task_truncated, info
 
     def _apply_player_knowledge(

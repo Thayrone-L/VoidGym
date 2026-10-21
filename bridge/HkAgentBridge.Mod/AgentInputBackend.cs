@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using InControl;
 using UnityEngine;
@@ -45,6 +47,17 @@ internal sealed class AgentInputBackend : IDisposable
     private int _desiredMenuMask;
     private long _menuLeaseExpiresAt;
     private bool _disposed;
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr window);
+    private bool _humanModeRequested;
+    private long _humanModeExpiresAt;
+    private string[] _humanButtons = Array.Empty<string>();
+    private long _lastHumanCaptureAt = Stopwatch.GetTimestamp();
+    private readonly bool _scriptedHumanInputTest =
+        Environment.GetEnvironmentVariable("HK_AGENT_HUMAN_INPUT_TEST") == "1";
+    private int _scriptedHumanFrame;
 
     public AgentInputBackend(Action<string> log)
     {
@@ -80,10 +93,14 @@ internal sealed class AgentInputBackend : IDisposable
             _previousDevice = actions.Device;
         }
 
-        bool deviceRestored = !ReferenceEquals(actions.Device, _device);
+        bool humanMode;
+        lock (_stateLock) humanMode = _humanModeRequested;
+        bool deviceRestored = humanMode
+            ? !ReferenceEquals(actions.Device, _previousDevice)
+            : !ReferenceEquals(actions.Device, _device);
         if (deviceRestored)
         {
-            actions.Device = _device;
+            actions.Device = humanMode ? _previousDevice : _device;
         }
 
         int bindingsRestored = EnsureBindings(actions);
@@ -148,6 +165,10 @@ internal sealed class AgentInputBackend : IDisposable
         );
         lock (_stateLock)
         {
+            if (_humanModeRequested)
+            {
+                return Array.Empty<string>();
+            }
             ReleaseMenuUnsafe();
             _desiredMask = mask;
             _leaseExpiresAt = Stopwatch.GetTimestamp() + leaseTicks;
@@ -215,6 +236,83 @@ internal sealed class AgentInputBackend : IDisposable
             ReleaseGameplayUnsafe();
             ReleaseMenuUnsafe();
         }
+    }
+
+    public void SetHumanMode(bool enabled)
+    {
+        lock (_stateLock)
+        {
+            ReleaseGameplayUnsafe();
+            ReleaseMenuUnsafe();
+            _humanModeRequested = enabled;
+            _humanModeExpiresAt = enabled
+                ? Stopwatch.GetTimestamp() + (long)(600.0 * Stopwatch.Frequency)
+                : 0;
+        }
+        if (enabled)
+        {
+            IntPtr window = Process.GetCurrentProcess().MainWindowHandle;
+            if (window != IntPtr.Zero)
+            {
+                ShowWindow(window, 9); // SW_RESTORE
+                SetForegroundWindow(window);
+            }
+        }
+        _log($"Human input mode {(enabled ? "enabled" : "disabled")}");
+    }
+
+    public (string[] Buttons, int DurationMilliseconds, bool Enabled, bool TestSource) ReadHumanSnapshot()
+    {
+        lock (_stateLock)
+        {
+            long now = Stopwatch.GetTimestamp();
+            int duration = Math.Max(1, Math.Min(2000,
+                (int)((now - _lastHumanCaptureAt) * 1000.0 / Stopwatch.Frequency)));
+            _lastHumanCaptureAt = now;
+            return (_humanButtons, duration, _humanModeRequested, _humanModeRequested && _scriptedHumanInputTest);
+        }
+    }
+
+    private void SampleHumanInput()
+    {
+        if (InputHandler.Instance == null) return;
+        HeroActions actions = InputHandler.Instance.inputActions;
+        lock (_stateLock)
+        {
+            if (!_humanModeRequested) { _humanButtons = Array.Empty<string>(); return; }
+            if (_scriptedHumanInputTest)
+            {
+                _humanButtons = (_scriptedHumanFrame++ % 2 == 0)
+                    ? new[] { "RIGHT" }
+                    : new[] { "RIGHT", "JUMP" };
+                return;
+            }
+            var buttons = new List<string>();
+            if (actions.left.IsPressed) buttons.Add("LEFT");
+            if (actions.right.IsPressed) buttons.Add("RIGHT");
+            if (actions.up.IsPressed) buttons.Add("UP");
+            if (actions.down.IsPressed) buttons.Add("DOWN");
+            if (actions.jump.IsPressed) buttons.Add("JUMP");
+            if (actions.attack.IsPressed) buttons.Add("ATTACK");
+            if (actions.dash.IsPressed) buttons.Add("DASH");
+            if (actions.cast.IsPressed) buttons.Add("CAST");
+            if (actions.superDash.IsPressed) buttons.Add("SUPER_DASH");
+            if (actions.dreamNail.IsPressed) buttons.Add("DREAM_NAIL");
+            if (actions.pause.IsPressed) buttons.Add("PAUSE");
+            if (actions.menuSubmit.IsPressed) buttons.Add("MENU_SUBMIT");
+            if (actions.menuCancel.IsPressed) buttons.Add("MENU_CANCEL");
+            _humanButtons = buttons.ToArray();
+        }
+    }
+
+    private void ExpireHumanModeIfNeeded()
+    {
+        bool expired;
+        lock (_stateLock)
+        {
+            expired = _humanModeRequested && Stopwatch.GetTimestamp() >= _humanModeExpiresAt;
+        }
+        if (expired) SetHumanMode(false);
     }
 
     private void ReleaseGameplayUnsafe()
@@ -308,9 +406,11 @@ internal sealed class AgentInputBackend : IDisposable
             {
                 return;
             }
+            _owner.ExpireHumanModeIfNeeded();
             _owner.AttachWhenReady();
             if (!_owner._disposed)
             {
+                _owner.SampleHumanInput();
                 _owner._pointerGuard.Enforce();
                 _owner._audioMute.Enforce();
             }

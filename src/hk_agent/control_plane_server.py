@@ -43,6 +43,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if self.server.upstream_port is not None and path == "/api/session" and not _supervisor_available(self.server.upstream_port):
             self._json(HTTPStatus.OK, {"csrf_token": self.server.control_plane.csrf_token})
+        elif path == "/api/help-requests":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                self._json(HTTPStatus.OK, self.server.control_plane.help_request_snapshot(
+                    query.get("campaign_id", [""])[0]
+                ))
+            except (OSError, ValueError, TypeError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
         elif self.server.upstream_port is not None and path.startswith("/api/"):
             self._relay("GET")
             return

@@ -512,6 +512,25 @@ class SupervisorEnvironmentBackend:
             self._ensure_open()
             self._release_locked(best_effort=False)
 
+    def set_human_mode(self, enabled: bool) -> dict[str, object]:
+        """Route this isolated game window to physical inputs during operator help."""
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be bool")
+        with self._operation_lock:
+            self._ensure_open()
+            bridge, _episode_id = self._require_episode()
+            self._release_locked(best_effort=False)
+            response = self._submit(
+                self._supervisor.send_command(
+                    "SET_HUMAN_MODE", {"enabled": enabled},
+                    timeout=self._command_timeout, bridge=bridge,
+                ),
+                timeout=self._command_timeout + 0.5,
+            )
+            if response.message_type == "ERROR":
+                raise ProtocolError("SET_HUMAN_MODE failed")
+            return dict(response.payload)
+
     def close(self) -> None:
         with self._operation_lock:
             if self._closed:
@@ -709,6 +728,10 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
         bridge_timing=frame.bridge_timing,
         action_availability=frame.action_availability,
+        human_buttons=frame.human_buttons,
+        human_duration_ms=frame.human_duration_ms,
+        human_mode=frame.human_mode,
+        human_input_test=frame.human_input_test,
     )
 
 

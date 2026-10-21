@@ -22,6 +22,7 @@ internal sealed class BridgeClient : IDisposable
     private readonly Action<string> _log;
     private readonly Action<string> _logError;
     private readonly Action _releaseAll;
+    private readonly Action<bool> _setHumanMode;
     private readonly Func<IEnumerable<string>, int, string[]> _applyAction;
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
     private readonly Func<string, CancellationToken, Task<CapturedFrame>> _captureOnce;
@@ -42,6 +43,7 @@ internal sealed class BridgeClient : IDisposable
         Action<string> log,
         Action<string> logError,
         Action releaseAll,
+        Action<bool> setHumanMode,
         Func<IEnumerable<string>, int, string[]> applyAction,
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
         Func<string, CancellationToken, Task<CapturedFrame>> captureOnce,
@@ -54,6 +56,7 @@ internal sealed class BridgeClient : IDisposable
         _log = log;
         _logError = logError;
         _releaseAll = releaseAll;
+        _setHumanMode = setHumanMode;
         _applyAction = applyAction;
         _applyMenuAction = applyMenuAction;
         _captureOnce = captureOnce;
@@ -244,6 +247,20 @@ internal sealed class BridgeClient : IDisposable
                     _releaseAll();
                     payload = new { command_type = messageType, status = "released" };
                     break;
+                case "SET_HUMAN_MODE":
+                    bool? humanEnabled = (bool?)command["payload"]?["enabled"];
+                    if (humanEnabled == null)
+                    {
+                        responseType = "ERROR";
+                        payload = new { command_type = messageType, error_code = "invalid_human_mode", recoverable = true };
+                    }
+                    else
+                    {
+                        _releaseAll();
+                        _setHumanMode(humanEnabled.Value);
+                        payload = new { command_type = messageType, status = "accepted", enabled = humanEnabled.Value };
+                    }
+                    break;
                 case "APPLY_ACTION":
                     try
                     {
@@ -400,6 +417,10 @@ internal sealed class BridgeClient : IDisposable
                                 ["pixel_format"] = "RGB8",
                                 ["encoding"] = frame.Encoding,
                                 ["data_base64"] = Convert.ToBase64String(frame.Data),
+                                ["human_buttons"] = frame.HumanMode ? frame.HumanButtons : Array.Empty<string>(),
+                                ["human_duration_ms"] = frame.HumanMode ? frame.HumanDurationMilliseconds : 0,
+                                ["human_mode"] = frame.HumanMode,
+                                ["human_input_test"] = frame.HumanInputTest,
                                 ["payload_bytes"] = frame.PayloadByteCount,
                                 ["queued_to_start_ms"] = frame.QueuedToStartMs,
                                 ["capture_ms"] = frame.CaptureMs,
