@@ -171,7 +171,7 @@ def test_shared_learner_startup_without_heartbeat_expires_after_grace(
     control._launches = {
         "learner-new": {"role": "learner", "campaign_id": "campaign",
                         "shared_group": "campaign-v0001", "shared_root": str(shared),
-                        "started_unix_ns": now - 601_000_000_000, "status": "RUNNING"},
+                        "started_unix_ns": now - 1_801_000_000_000, "status": "RUNNING"},
     }
     monkeypatch.setattr(control, "_refresh_locked", lambda: None)
     monkeypatch.setattr(control, "stop", lambda *args, **kwargs: None)

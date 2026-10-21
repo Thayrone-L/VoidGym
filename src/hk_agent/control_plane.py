@@ -3982,10 +3982,10 @@ class ControlPlane:
                     for value in (wait_ms, train_ms, straggler_ms)
                     if isinstance(value, (int, float)) and not isinstance(value, bool)
                 )
-                # Shared CPU PPO updates can occasionally exceed five minutes on
-                # memory-constrained machines. Keep the launch alive through one
-                # long update while still failing a genuinely silent learner.
-                stale_after = max(600.0, 2.0 * expected_round) if expected_round else 600.0
+                # Shared CPU PPO updates can occasionally exceed ten minutes on
+                # memory-constrained machines. Keep one long update from being
+                # misreported as a dead learner while retaining a finite timeout.
+                stale_after = max(1800.0, 2.0 * expected_round) if expected_round else 1800.0
                 launch_started = learner.get("started_unix_ns")
                 now_ns = time.time_ns()
                 beat_belongs_to_launch = (
