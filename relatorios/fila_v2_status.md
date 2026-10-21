@@ -13,12 +13,12 @@
 | Prompt | Status | Commit | Pendente no PC principal com jogo/GPU |
 |---|---|---|---|
 | 83 | ✅ pronto | `8610ca7` | smoke real da v1 e comparação de checkpoint |
-| 83b | ✅ pronto nesta máquina | commit atual da fila | executar CUDA com RTX 3060/VRAM, conferir Actions e atualizar PR #8 |
-| 84 | pendente | — | confirmar `STEP_GAME_MS` no jogo real |
-| 85 | pendente | — | transferência/avaliação do checkpoint no HK |
+| 83b | ✅ pronto nesta máquina | `5ffd6ba` | executar CUDA com RTX 3060/VRAM e conferir Actions |
+| 84 | ✅ pronto nesta máquina | em preparação | confirmar `STEP_GAME_MS` no jogo real; benchmark CPU single-process 1.259/s |
+| 85 | 🟡 em andamento | — | CUDA/VRAM e treino no PC principal; avaliação no HK |
 
 ## Bloqueios observados
 
 - `mypy src` reporta apenas os dois diagnósticos existentes em `src/hk_agent/map_art.py:27` sobre pyvips; `mypy src/voidgym tools/v2` passa.
 - E2E 83b passou em 9,14 s. A suíte integral na validação 83b ficou parada no teste v1 de 20.000 passos e o `faulthandler_timeout=90` disparou; sem resultado final dessa tentativa.
-- `gh` ausente, então não foi possível abrir/atualizar PR ou inspecionar Actions.
+- O executável `gh` não está disponível nesta sessão, apesar da configuração informada; usar conector GitHub para operações de PR. Actions ainda precisa ser conferido.

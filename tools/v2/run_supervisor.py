@@ -45,6 +45,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--game", choices=("fake", "platform_gym"), default="fake")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -58,11 +59,11 @@ def main() -> int:
     _write_files(root)
     processes: dict[str, subprocess.Popen[bytes]] = {
         "learner": _spawn("run_learner.py", root, "--rounds", str(args.rounds)),
-        "actor-1": _spawn("run_actor.py", root, "--actor-id", "actor-1"),
-        "actor-2": _spawn("run_actor.py", root, "--actor-id", "actor-2"),
+        "actor-1": _spawn("run_actor.py", root, "--actor-id", "actor-1", "--game", args.game),
+        "actor-2": _spawn("run_actor.py", root, "--actor-id", "actor-2", "--game", args.game),
     }
     try:
-        _run_rounds(root, args.rounds, progress_path, processes)
+        _run_rounds(root, args.rounds, progress_path, processes, args.game)
         return 0
     except (TimeoutError, RuntimeError) as error:
         print(f"Supervisor v2: {error}", file=sys.stderr)
@@ -84,14 +85,15 @@ def _run_rounds(
     rounds: int,
     progress_path: Path,
     processes: dict[str, subprocess.Popen[bytes]],
+    game: str,
 ) -> None:
     progress = json.loads(progress_path.read_text(encoding="utf-8"))
     completed = int(progress.get("completed_rounds", 0))
     for round_number in range(completed + 1, rounds + 1):
         for actor in ("actor-1", "actor-2"):
-            _ensure_running(actor, processes, root, progress_path)
+            _ensure_running(actor, processes, root, progress_path, game)
             _write_text(root / "requests" / f"{actor}.txt", str(round_number))
-        _wait_for_actors(root, round_number, processes, progress_path)
+        _wait_for_actors(root, round_number, processes, progress_path, game)
         _write_text(root / "requests" / "learner.txt", str(round_number))
         _wait_for_learner(root, round_number, processes["learner"])
         time.sleep(0.25)
@@ -102,13 +104,14 @@ def _ensure_running(
     processes: dict[str, subprocess.Popen[bytes]],
     root: Path,
     progress_path: Path,
+    game: str,
 ) -> None:
     process = processes[actor]
     if process.poll() is not None:
         progress = json.loads(progress_path.read_text(encoding="utf-8"))
         progress["actor_restarts"] = int(progress.get("actor_restarts", 0)) + 1
         _write_text(progress_path, json.dumps(progress))
-        processes[actor] = _spawn("run_actor.py", root, "--actor-id", actor)
+        processes[actor] = _spawn("run_actor.py", root, "--actor-id", actor, "--game", game)
 
 
 def _wait_for_actors(
@@ -116,12 +119,13 @@ def _wait_for_actors(
     round_number: int,
     processes: dict[str, subprocess.Popen[bytes]],
     progress_path: Path,
+    game: str,
 ) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         ready = True
         for actor in ("actor-1", "actor-2"):
-            _ensure_running(actor, processes, root, progress_path)
+            _ensure_running(actor, processes, root, progress_path, game)
             ready &= (root / "acks" / f"{actor}-{round_number}.txt").exists()
         if ready:
             return

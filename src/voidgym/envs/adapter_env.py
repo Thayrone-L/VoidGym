@@ -43,6 +43,9 @@ class AdapterEnv(gym.Env[dict[str, NDArray[Any]], int]):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
         super().reset(seed=seed)
+        reset_reward = getattr(self.reward_fn, "reset", None)
+        if callable(reset_reward):
+            reset_reward()
         adapter_reset = getattr(self.adapter, "reset", None)
         if callable(adapter_reset):
             adapter_reset(seed=seed, options=options)

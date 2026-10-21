@@ -51,6 +51,19 @@ class UniversalReward:
         self._rolling_rewards: deque[float] = deque()
         self._episode_steps = 0
 
+    def reset(self) -> None:
+        self._visited.clear()
+        self._best.clear()
+        self._steps_by_place.clear()
+        self._paid_stuck.clear()
+        self._rooms.clear()
+        self._slice_rewards.clear()
+        self._rolling_rewards.clear()
+        self._episode_steps = 0
+
+    def __call__(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> float:
+        return self.compute(before, after).universal
+
     def compute(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> RewardBreakdown:
         components: dict[str, float] = {"time": self.config.time}
         room = str(after.get("room_id", "unknown"))

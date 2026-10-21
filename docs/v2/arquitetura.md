@@ -9,9 +9,12 @@ A v2 separa o cérebro do agente das regras de cada jogo. O núcleo trabalha com
 - `src/voidgym/core/`: ações, observações, semântica, contrato, configuração validada, caminhos, hardware, recompensa e armazenamento de experiência.
 - `src/voidgym/envs/`: ambiente Gymnasium que usa qualquer adaptador.
 - `src/voidgym/adapters/hollow_knight/`: ponte temporária ao código v1; será portada no prompt 86.
-- `src/voidgym/gyms/`: ambientes sintéticos; o ginásio de plataformas entra no prompt 84.
-- `src/voidgym/models/`: modelos universais, prompt 85.
-- `src/voidgym/training/`: learner e atores da v2, prompts 85–87.
+- `src/voidgym/gyms/platform_gym/`: salas procedurais, física, render numpy, gabarito,
+  recompensa, adaptador e currículo (prompt 84).
+- `src/voidgym/models/`: encoder IMPALA, percepção semântica, cabeças auxiliares e política
+  recorrente universal (prompt 85).
+- `src/voidgym/training/`: buffers de sequência, PPO recorrente e checkpoints universais
+  (prompt 85).
 - `src/voidgym/operator/`: integração com painel e bandeja, em etapa futura.
 - `tools/v2/`: setup CUDA e processos mínimos de ator, learner e supervisor para o teste ponta a ponta.
 - `tests/v2/`: testes independentes da v2 e ciclo integrado sem jogo.
@@ -43,3 +46,12 @@ O núcleo não depende de adaptadores, ambientes, modelos nem treino. A v1 não 
 | Painel, supervisor e bandeja | `operator/` | depois |
 
 Código morto, caminhos `explore_v1`–`explore_v3`, `visual_motion` e hacks de prompts antigos não serão portados sem justificativa.
+
+## Ginásio e política universal
+
+O ginásio não importa o Hollow Knight. Sua imagem RGB 192×108 é empilhada em quatro quadros
+CHW (12 canais); gabaritos privilegiados são entregues em `info.training_labels`, fora da
+observação. `STEP_GAME_MS=240` replica lease 80 ms × repetição 3 da v1. A política contém
+encoder compartilhado, cabeça semântica, LSTM, ator mascarado e crítico assimétrico opcional.
+Gabarito, movimento do herói e dinâmica inversa são perdas auxiliares de treino e nunca entradas
+do ator.
