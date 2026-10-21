@@ -29,3 +29,9 @@ Redução de payload: aproximadamente **97,1%**. As medições HTTP ficaram abai
 - Busca no JavaScript do painel: nenhum atributo `style=` ou `setAttribute('style')` inline.
 - Os dois serviços foram reiniciados sem campanhas ativas. Painel em `http://127.0.0.1:8765`, supervisor em `http://127.0.0.1:8766`.
 - A validação real de 30 minutos iniciada por Continuar e a observação do painel durante treino estão pendentes de execução nesta etapa.
+
+## Retomada da validação real (20/10/2026)
+
+A campanha `jogada-1-repeat-1c3b` foi retomada pelo endpoint autenticado equivalente ao botão **Continuar**, com um ator e checkpoint R134. O soak de 30 minutos (22:26:46–22:56:46, horário local) terminou com a campanha em execução: ator `COLLECTING`, rodada 151, 5.633 passos coletados e seis relançamentos automáticos registrados. O checkpoint mais recente ao fim da janela era R150 (criado às 22:55:21). Durante a janela, o checkpoint avançou de R146 para R150 e o ator permaneceu com heartbeat atual.
+
+A medição do painel durante a campanha ficou limitada pelo ambiente desta sessão: `127.0.0.1:8765/api/operator` não aceitou conexão (acesso ao socket bloqueado), então não há nova medição HTTP ativa nem confirmação do console CSP nesta validação. A inspeção estática anterior não encontrou atributos `style=` ou `setAttribute('style')` no JavaScript do painel. O soak confirma avanço e persistência de checkpoints; não confirma o alvo de <300 ms sob carga.
