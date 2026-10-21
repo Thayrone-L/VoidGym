@@ -48,10 +48,23 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["e2e: ciclo ponta a ponta sem o jogo"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["C901", "I", "N"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+"src/hk_agent/**/*.py" = ["C901", "I", "N"]
+"tests/test_*.py" = ["C901", "I", "N"]
+"tools/*.py" = ["C901", "I", "N"]
+"tools/scripted_validation/**/*.py" = ["C901", "I", "N"]
 
 [tool.mypy]
 python_version = "3.12"

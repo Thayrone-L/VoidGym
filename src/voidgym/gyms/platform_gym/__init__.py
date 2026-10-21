@@ -1,0 +1,1 @@
+"""Ginásio procedural de plataformas."""
