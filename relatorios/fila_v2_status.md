@@ -2,24 +2,23 @@
 
 ## Preparação
 
-- Repositório remoto confirmado: `Thayrone-L/VoidGym`.
-- Branch: `v2/fundacao`, criada sobre `origin/codex/parallel-instances-isolation`.
-- Ambiente: Windows 10 (build 26200), Intel Core Ultra 7 258V, 8 núcleos lógicos, 31,5 GiB RAM; sem GPU NVIDIA; disco C: com 697,2 GiB livres no inventário.
-- Python 3.12.14 (runtime empacotado pelo Codex); `.venv` criado com esse executável. Lock de treino e lock de desenvolvimento instalados.
-- Linha de base v1: `pytest --basetemp .test-tmp/pt83-baseline -o faulthandler_timeout=90 -q --tb=no`: 286 passed, 10 failed, 409 errors, 0 skipped; 8 subtests passed. Erros/falhas pré-existentes foram registrados antes de mudanças da v2.
-- `.gitignore` já tinha alteração local (`agent-prompts/`); preservada junto da entrada `runtime/` existente na branch destino.
+- Remoto `Thayrone-L/VoidGym`; branch `v2/fundacao`, baseada em `origin/codex/parallel-instances-isolation`.
+- Windows 10 build 26200, Intel Core Ultra 7 258V, 8 núcleos lógicos, 31,5 GiB RAM, sem GPU NVIDIA detectada; C: tinha 697,2 GiB livres no inventário.
+- Python 3.12.14 empacotado pelo Codex; `.venv` criado; locks CPU/dev/map instalados.
+- Baseline v1 antes da v2: 286 passed, 10 failed, 409 errors, 0 skipped, 8 subtests passed. Falhas/erros dependem de recursos locais do HK.
+- `.gitignore` tinha alteração local `agent-prompts/`; preservada junto de `runtime/` e não incluída nos commits.
 
 ## Prompts
 
-| Prompt | Status | Commit | Pendente no PC principal com o jogo |
+| Prompt | Status | Commit | Pendente no PC principal com jogo/GPU |
 |---|---|---|---|
-| 83 | ✅ pronto nesta máquina | pendente de commit | smoke real da v1 e comparação de checkpoint no PC principal. `mypy src` aponta somente o import opcional pyvips preexistente; `mypy src/voidgym` passa. |
-| 83b | pendente | — | execução do check CUDA no PC principal. |
-| 84 | pendente | — | confirmar `STEP_GAME_MS` no jogo real. |
-| 85 | pendente | — | transferência/avaliação do checkpoint no HK. |
+| 83 | ✅ pronto | `8610ca7` | smoke real da v1 e comparação de checkpoint |
+| 83b | ✅ pronto nesta máquina | commit atual da fila | executar CUDA com RTX 3060/VRAM, conferir Actions e atualizar PR #8 |
+| 84 | pendente | — | confirmar `STEP_GAME_MS` no jogo real |
+| 85 | pendente | — | transferência/avaliação do checkpoint no HK |
 
-## Bloqueios / tentativas
+## Bloqueios observados
 
-- Prompt 83: `mypy src` mantém dois diagnósticos em `src/hk_agent/map_art.py:27` (pyvips sem stub e ignore não aplicável). Instalado `requirements-map.lock`; o aviso persiste. Nenhuma mudança em `src/hk_agent/`. `mypy src/voidgym` está verde e a linha de base integral da suíte não piorou.
-
-- O primeiro `pytest` alcançou 100%, mas o sandbox bloqueou a limpeza do diretório temporário. Repetido com execução fora do sandbox e basetemp dentro do workspace para obter as contagens.
+- `mypy src` reporta apenas os dois diagnósticos existentes em `src/hk_agent/map_art.py:27` sobre pyvips; `mypy src/voidgym tools/v2` passa.
+- E2E 83b passou em 9,14 s. A suíte integral na validação 83b ficou parada no teste v1 de 20.000 passos e o `faulthandler_timeout=90` disparou; sem resultado final dessa tentativa.
+- `gh` ausente, então não foi possível abrir/atualizar PR ou inspecionar Actions.

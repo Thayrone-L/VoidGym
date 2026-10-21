@@ -1,0 +1,16 @@
+# Use somente no venv CUDA separado do PC principal (driver/RTX 3060 verificados por check_gpu.py).
+# O lock de CPU segue em requirements-training.lock e não deve ser substituído.
+--extra-index-url https://download.pytorch.org/whl/cu124
+safetensors==0.8.0
+stable-baselines3==2.9.0
+sb3-contrib==2.9.0
+torch==2.14.1+cu124
+filelock==4.1.1
+fsspec==2026.9.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+Pillow==12.3.0
+mpmath==1.3.0
+networkx==3.7
+setuptools==84.0.0
+sympy==1.14.0

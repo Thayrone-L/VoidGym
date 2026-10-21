@@ -1,0 +1,59 @@
+schema_version = 1
+campaign_id = "pretrain-platform"
+kind = "pretrain_platform"
+game_id = "platform_gym"
+
+[model]
+contract_version = "2.0"
+image_height = 108
+image_width = 192
+frame_stack = 4
+sem_height = 27
+sem_width = 48
+experts = ["explore"]
+
+[ppo]
+learning_rate = 0.00025
+gamma = 0.995
+gae_lambda = 0.95
+clip_range = 0.2
+ent_coef = 0.01
+n_epochs = 4
+batch_size = 2048
+seq_len = 32
+rollout_steps = 256
+
+[aux]
+c_sem = 0.5
+c_inv = 0.1
+c_mot = 0.1
+augment = true
+
+[reward]
+novelty = 0.02
+progress = 1.0
+damage = -0.3
+death = -1.0
+time = -0.001
+game_reward_name = "platform_gym"
+
+[resources]
+# Deixe null para usar o plano detectado automaticamente.
+game_instances = 1
+gym_envs = 2
+train_device = "cpu"
+torch_threads_learner = 1
+batch_size = 512
+
+[storage]
+budget_gb = 100.0
+block_steps = 1024
+
+[help]
+help_stuck_count = 10
+help_no_progress_minutes = 60
+
+[evaluation]
+episodes = 100
+deterministic = true
+interval_steps = 1000000

@@ -20,6 +20,7 @@ obj/
 artifacts/
 runs/
 runtime/
+agent-prompts/
 artifacts/diagnostics/*.json
 artifacts/diagnostics/*.txt
 artifacts/diagnostics/*.png
