@@ -900,6 +900,28 @@ class ControlPlane:
         self._checkpoint_candidate_cache[cache_key] = (self._monotonic_clock(), result)
         return dict(result) if result is not None else None
 
+    def resumable_operator_campaigns(self) -> list[dict[str, object]]:
+        """Return compact checkpoint-backed campaign choices for external clients."""
+        rows: list[dict[str, object]] = []
+        for campaign in self.list_campaigns():
+            campaign_id = campaign.get("campaign_id")
+            if not isinstance(campaign_id, str):
+                continue
+            candidate = self._operator_checkpoint_candidate(
+                allow_unknown_algorithm=True, campaign_id=campaign_id,
+            )
+            if candidate is None:
+                continue
+            rows.append({
+                "campaign_id": campaign_id,
+                "name": str(campaign.get("name", campaign_id)),
+                "round": candidate["round"],
+                "checkpoint": Path(str(candidate["checkpoint"])).name,
+                "created_at": campaign.get("created_at"),
+            })
+        rows.sort(key=lambda row: int(row.get("round", 0)), reverse=True)
+        return rows
+
     def _operator_system_resources(self) -> dict[str, object]:
         if os.name != "nt":
             return {"cpu_percent": None, "memory_percent": None, "memory_used_bytes": None, "memory_total_bytes": None}
@@ -3499,7 +3521,7 @@ class ControlPlane:
                             else "launcher exited while job processes remained"
                         )
                         record["drain_reason"] = drain_reason
-                        if stop_requested_before_exit:
+                        if stop_requested_before_exit or record.get("status") == "ABORT_REQUESTED":
                             record["status"] = "CANCELLED"
                         else:
                             record["status"] = "FAILED"
@@ -3557,7 +3579,7 @@ class ControlPlane:
             record = self._launches.get(launch_id)
             if record is not None and self._processes.get(launch_id) is process:
                 stop_was_requested = (
-                    stop_requested_before_exit or record.get("status") == "STOP_REQUESTED"
+                    stop_requested_before_exit or record.get("status") in {"STOP_REQUESTED", "ABORT_REQUESTED"}
                 )
                 # Draining after a requested stop is cleanup, not a failure; the
                 # remaining PIDs stay recorded in draining_pids/drain_reason.
@@ -3649,7 +3671,7 @@ class ControlPlane:
             if self._launch_process_matches(self._launches[launch_id], pid):
                 continue
             record = self._launches[launch_id]
-            stop_was_requested = record.get("status") == "STOP_REQUESTED"
+            stop_was_requested = record.get("status") in {"STOP_REQUESTED", "ABORT_REQUESTED"}
             resources = record.get("resources")
             data_root = resources.get("instance_data_root") if isinstance(resources, Mapping) else None
             capture_failure: str | None = None
@@ -4114,6 +4136,35 @@ class ControlPlane:
             atomic_json(launch_root / "launch.json", record)
             pid = process.pid if process is not None else self._reattached_pids[launch_id]
             return {"status": "STOP_REQUESTED", "pid": pid}
+
+    def abort(self, launch_id: str | None = None) -> dict[str, object]:
+        """Terminate every process in one shared campaign through owned Job Objects."""
+        self._require_owner()
+        with self._lock:
+            self._refresh_locked()
+            active = self._active_records_locked()
+            actors = [row for row in active if row.get("role") == "actor"]
+            selected = (next((row for row in active if row.get("launch_id") == launch_id), None)
+                        if launch_id is not None else (actors[0] if actors else (active[0] if active else None)))
+            if selected is None:
+                raise RuntimeError("there is no active campaign to abort")
+            group = selected.get("shared_group")
+            members = ([row for row in active if row.get("shared_group") == group]
+                       if isinstance(group, str) else [selected])
+            launch_ids = [str(row.get("launch_id")) for row in members]
+            jobs = {item: self._jobs.get(item) for item in launch_ids}
+            missing = [item for item, job in jobs.items() if job is None]
+            if missing:
+                raise RuntimeError("owned Job Object unavailable for: " + ", ".join(missing))
+            for item in launch_ids:
+                record = self._launches[item]
+                record["status"] = "ABORT_REQUESTED"
+                record["abort_requested"] = True
+                atomic_json(self.control_root / "launches" / item / "launch.json", record)
+            for job in jobs.values():
+                assert job is not None
+                job.terminate()
+            return {"status": "ABORT_REQUESTED", "shared_group": group, "members": launch_ids}
 
     def shared_group_stopped(self, shared_group: str) -> bool:
         """A group is stopped only when its learner and every actor are terminal."""

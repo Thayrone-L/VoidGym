@@ -2057,6 +2057,39 @@ def test_shared_group_stop_waits_for_fake_processes_in_either_order(
     assert all(row[0]["status"] == "CANCELLED" for row in launches.values())
 
 
+def test_abort_terminates_only_the_owned_shared_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    control = ControlPlane(_project(tmp_path))
+    group_records = [
+        {"launch_id": "learner", "role": "learner", "shared_group": "g", "status": "RUNNING"},
+        {"launch_id": "actor", "role": "actor", "shared_group": "g", "status": "RUNNING"},
+    ]
+    foreign = {"launch_id": "foreign", "role": "actor", "shared_group": "other", "status": "RUNNING"}
+    calls: list[str] = []
+
+    class FakeJob:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def terminate(self) -> None:
+            calls.append(self.name)
+
+    monkeypatch.setattr(control, "_refresh_locked", lambda: None)
+    monkeypatch.setattr(control, "_active_records_locked", lambda: [*group_records, foreign])
+    for row in [*group_records, foreign]:
+        path = control.control_root / "launches" / str(row["launch_id"])
+        path.mkdir(parents=True)
+        control._launches[str(row["launch_id"])] = row
+    control._jobs.update({"learner": FakeJob("learner"), "actor": FakeJob("actor"), "foreign": FakeJob("foreign")})  # type: ignore[dict-item]
+
+    result = control.abort("actor")
+
+    assert result["status"] == "ABORT_REQUESTED"
+    assert set(result["members"]) == {"learner", "actor"}
+    assert set(calls) == {"learner", "actor"}
+    assert all(row["status"] == "ABORT_REQUESTED" for row in group_records)
+    assert foreign["status"] == "RUNNING"
+
+
 def _foreign_owner(control_root: Path, pid: int = 424242, creation_time: object = 99) -> Path:
     control_root.mkdir(parents=True, exist_ok=True)
     lock = control_root / ".control-plane.owner.json"

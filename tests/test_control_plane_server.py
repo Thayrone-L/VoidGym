@@ -59,6 +59,7 @@ def test_dashboard_client_relays_authenticated_api_calls_to_supervisor(tmp_path:
             seen["token"] = self.headers.get("X-Control-Token")
             seen["origin"] = self.headers.get("Origin")
             seen["body"] = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            seen["path"] = self.path
             content = b'{"status":"STOP_REQUESTED"}'
             self.send_response(202)
             self.send_header("Content-Type", "application/json")
@@ -86,7 +87,17 @@ def test_dashboard_client_relays_authenticated_api_calls_to_supervisor(tmp_path:
         response = connection.getresponse()
         assert response.status == 202
         assert response.read() == b'{"status":"STOP_REQUESTED"}'
-        assert seen == {"token": "campaign-secret", "origin": None, "body": b"{}"}
+        assert {key: value for key, value in seen.items() if key != "path"} == {"token": "campaign-secret", "origin": None, "body": b"{}"}
+        assert seen["path"] == "/api/operator/stop"
+        connection.request("POST", "/api/operator/abort", body=b"{}", headers={
+            "Content-Type": "application/json", "Content-Length": "2",
+            "X-Control-Token": session["csrf_token"],
+            "Origin": f"http://127.0.0.1:{client.server_port}",
+        })
+        response = connection.getresponse()
+        assert response.status == 202
+        assert seen["path"] == "/api/operator/abort"
+        assert seen["body"] == b"{}"
         connection.close()
     finally:
         client.shutdown()

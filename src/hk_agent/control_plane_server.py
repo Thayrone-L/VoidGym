@@ -81,6 +81,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"runs": self.server.control_plane.list_runs()})
         elif path == "/api/campaigns":
             self._json(HTTPStatus.OK, {"campaigns": self.server.control_plane.list_campaigns()})
+        elif path == "/api/operator/resumable":
+            self._json(HTTPStatus.OK, {"campaigns": self.server.control_plane.resumable_operator_campaigns()})
         elif path == "/api/log":
             query = parse_qs(urlsplit(self.path).query)
             try:
@@ -275,6 +277,12 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 actor = next((row for row in active if isinstance(row, Mapping) and row.get("role") == "actor"), active[0])
                 launch_id = actor.get("launch_id") if isinstance(actor, Mapping) else None
                 self._json(HTTPStatus.ACCEPTED, self.server.control_plane.stop(str(launch_id)))
+            elif path == "/api/operator/abort":
+                if payload:
+                    raise ValueError("abort does not accept settings")
+                if not self.server.control_plane.allow_execute:
+                    raise PermissionError("Abort is unavailable in observer mode")
+                self._json(HTTPStatus.ACCEPTED, self.server.control_plane.abort())
             elif path in {"/api/playthrough/new", "/api/playthrough/restore"}:
                 require_keys(payload, ("campaign_id", "slot"))
                 if set(payload) != {"campaign_id", "slot"}:
@@ -380,6 +388,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.FORBIDDEN, str(error))
         except RuntimeError as error:
             self._error(HTTPStatus.CONFLICT, str(error))
+        except OSError as error:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
 
