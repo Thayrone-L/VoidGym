@@ -7,6 +7,7 @@ import mimetypes
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from http import HTTPStatus
@@ -32,6 +33,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/operator":
+            with self.server.client_lock(self.client_address[0]):
+                self._do_get()
+            return
+        self._do_get()
+
+    def _do_get(self) -> None:
+        path = urlsplit(self.path).path
         if self.server.upstream_port is not None and path == "/api/session" and not _supervisor_available(self.server.upstream_port):
             self._json(HTTPStatus.OK, {"csrf_token": self.server.control_plane.csrf_token})
         elif self.server.upstream_port is not None and path.startswith("/api/"):
@@ -41,6 +50,16 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, self.server.control_plane.status())
         elif path == "/api/operator":
             self._json(HTTPStatus.OK, self.server.control_plane.operator_snapshot())
+        elif path == "/api/journey/run":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                detail = self.server.control_plane.journey_run(
+                    query.get("campaign", [""])[0], query.get("run", [""])[0]
+                )
+            except (OSError, ValueError, TypeError) as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+                return
+            self._json(HTTPStatus.OK, detail)
         elif path == "/api/reports":
             self._json(HTTPStatus.OK, {"reports": self.server.control_plane.list_reports()})
         elif path == "/api/report":
@@ -493,6 +512,14 @@ class ControlPlaneHTTPServer(ThreadingHTTPServer):
         self.upstream_port = upstream_port
         self.supervisor_port = upstream_port
         self.project_root = project_root
+        self._client_locks_guard = threading.Lock()
+        self._client_locks: dict[str, threading.Lock] = {}
+
+    def client_lock(self, client: str) -> threading.Lock:
+        with self._client_locks_guard:
+            if len(self._client_locks) > 256:
+                self._client_locks.clear()
+            return self._client_locks.setdefault(client, threading.Lock())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -657,6 +684,10 @@ def main() -> int:
         raise SystemExit(str(error)) from error
     server = ControlPlaneHTTPServer(("127.0.0.1", args.port), control_plane, static_root,
                                     upstream_port=upstream_port, project_root=project_root)
+    if args.supervisor_mode:
+        # Warm the mtime-backed operator caches before serving the first browser
+        # request, so initial page render does not pay the cold filesystem scan.
+        control_plane.operator_snapshot()
     print(
         f"HK Training Control Plane: http://127.0.0.1:{args.port} "
         f"({'real launches enabled' if args.allow_execute else 'dry-run only'})",

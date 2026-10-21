@@ -363,7 +363,9 @@ def test_journey_summary_wraps_and_map_art_controls_are_operator_only() -> None:
     assert 'localStorage.setItem("voidgym-theme"' in app
     assert 'window.matchMedia("(prefers-color-scheme: dark)")' in app
     assert 'fetch("/api/session",{cache:"no-store"})' in app
-    assert 'data.resumable_campaign' in app and 'setTimeout(()=>{if(!latest&&!latestError)' in app and '},15000)' in app
+    assert 'data.resumable_campaign' in app and 'new AbortController()' in app and 'setInterval(refresh,2500)' not in app
+    assert 'id="retry-status"' in html and 'document.hidden' in app
+    assert 'style="stroke:${color}"' not in app and 'style="fill:${color}"' not in app
     assert 'data-theme="dark"' in css and "prefers-color-scheme:dark" in css
     assert 'resolved_solo:"Resolvido por ela"' in app
     assert 'value="bounds"' in html and 'value="captures"' in html

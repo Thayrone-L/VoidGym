@@ -210,6 +210,46 @@ def test_dict_multidiscrete_space_round_trips_strictly():
     assert restored == source
 
 
+def test_publish_contract_refreshes_only_provenance_fingerprint(tmp_path):
+    store = SharedRoundStore(tmp_path)
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "calibration.json").write_text(
+        json.dumps({"contract": None}), encoding="utf-8"
+    )
+    observation_space = gym.spaces.Box(0, 1, (3,), dtype=np.float32)
+    action_space = gym.spaces.Discrete(2)
+    task_contract = {"task": "hallownest"}
+
+    first = store.publish_contract(
+        task_contract=task_contract,
+        fingerprint="a" * 64,
+        observation_space=observation_space,
+        action_space=action_space,
+        rollout_steps=512,
+        actors=2,
+    )
+    refreshed = store.publish_contract(
+        task_contract=task_contract,
+        fingerprint="b" * 64,
+        observation_space=observation_space,
+        action_space=action_space,
+        rollout_steps=512,
+        actors=2,
+    )
+    assert first["contract"]["task_contract_fingerprint"] == "a" * 64
+    assert refreshed["contract"]["task_contract_fingerprint"] == "b" * 64
+
+    with pytest.raises(SharedLearnerError, match="actor task contract differs"):
+        store.publish_contract(
+            task_contract=task_contract,
+            fingerprint="c" * 64,
+            observation_space=observation_space,
+            action_space=action_space,
+            rollout_steps=512,
+            actors=1,
+        )
+
+
 def test_atomic_json_normalizes_numpy_scalars_and_arrays(tmp_path):
     path = tmp_path / "contract.json"
     _atomic_json(path, {"count": np.int64(4), "shape": np.asarray([2, 3], dtype=np.int64)})
@@ -251,13 +291,22 @@ def test_published_rollout_normalizes_maskable_buffer_masks_to_bool(tmp_path):
         returns=np.ones((2, 1), dtype=np.float32),
         action_masks=np.ones((2, 1, 2), dtype=np.float32),
     )
-    store.publish_rollout(round_number=1, slot=0, launch_id="actor", buffer=buffer, fingerprint=FINGERPRINT)
+    store.publish_rollout(
+        round_number=1, slot=0, launch_id="actor", buffer=buffer, fingerprint=FINGERPRINT,
+        metadata_arrays={
+            "meta__scene": np.asarray(["Tutorial_01", "Town"], dtype="U256"),
+            "meta__progress": np.asarray([1.0, 2.0], dtype=np.float32),
+            "meta__events": np.asarray(["[]", '["scene_change"]'], dtype="U2048"),
+        },
+    )
     observation_space = gym.spaces.Dict({"image": gym.spaces.Box(0, 1, (3,), dtype=np.float32)})
     arrays = store.read_rollout(
         round_number=1, slot=0, fingerprint=FINGERPRINT, n_steps=2,
         observation_space=observation_space, action_count=2,
     )
     assert arrays["action_masks"].dtype == np.bool_
+    assert arrays["meta__scene"].tolist() == ["Tutorial_01", "Town"]
+    assert arrays["meta__progress"].tolist() == [1.0, 2.0]
 
 
 def test_rollout_round_trip_and_rejects_old_round(tmp_path):

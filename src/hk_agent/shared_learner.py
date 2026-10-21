@@ -414,7 +414,16 @@ class SharedRoundStore:
                 raise SharedLearnerError("shared calibration document is invalid")
             existing = current.get("contract")
             if existing is not None and _canonical_json(existing) != _canonical_json(contract):
-                raise SharedLearnerError("actor task contract differs from shared calibration")
+                # The task fingerprint includes source provenance. A code rollout can
+                # change it while the task, spaces and shared PPO geometry remain
+                # identical, so permit that single field to refresh in place.
+                old_semantics = dict(existing) if isinstance(existing, dict) else existing
+                new_semantics = dict(contract)
+                if isinstance(old_semantics, dict):
+                    old_semantics.pop("task_contract_fingerprint", None)
+                new_semantics.pop("task_contract_fingerprint", None)
+                if _canonical_json(old_semantics) != _canonical_json(new_semantics):
+                    raise SharedLearnerError("actor task contract differs from shared calibration")
             current["contract"] = contract
             _atomic_json(calibration_path, current)
             return cast(dict[str, Any], current)
@@ -639,6 +648,7 @@ class SharedRoundStore:
         launch_id: str,
         buffer: Any,
         fingerprint: str,
+        metadata_arrays: Mapping[str, np.ndarray] | None = None,
     ) -> dict[str, Any]:
         if not launch_id or slot < 0 or buffer.pos < 1:
             raise SharedLearnerError("actor rollout identity or size is invalid")
@@ -652,11 +662,20 @@ class SharedRoundStore:
             raise SharedLearnerError("actor rollout observations are not a Dict")
         for name, values in observations.items():
             arrays[f"obs__{name}"] = np.asarray(values[:steps, 0]).copy()
+        if metadata_arrays:
+            allowed_metadata = {"meta__scene", "meta__progress", "meta__events"}
+            if set(metadata_arrays) != allowed_metadata:
+                raise SharedLearnerError("rollout metadata inventory is invalid")
+            for name, value in metadata_arrays.items():
+                array = np.asarray(value)
+                if array.shape != (steps,) or array.dtype == object:
+                    raise SharedLearnerError(f"rollout metadata shape or dtype is invalid for {name}")
+                arrays[name] = np.asarray(array).copy()
         for name in ("actions", "rewards", "episode_starts", "values", "log_probs", "advantages", "returns", "action_masks"):
-            value = getattr(buffer, name, None)
-            if value is None:
+            buffer_value = getattr(buffer, name, None)
+            if buffer_value is None:
                 raise SharedLearnerError(f"actor rollout is missing {name}")
-            array = np.asarray(value[:steps, 0]).copy()
+            array = np.asarray(buffer_value[:steps, 0]).copy()
             if name == "action_masks":
                 if not np.isfinite(array).all() or not np.isin(array, (0, 1)).all():
                     raise SharedLearnerError("actor rollout action masks must contain only finite 0/1 values")
@@ -674,8 +693,8 @@ class SharedRoundStore:
         if any(value is not None for value in present_recurrent.values()):
             if any(value is None for value in present_recurrent.values()):
                 raise SharedLearnerError("recurrent rollout is missing an LSTM state array")
-            for key, value in present_recurrent.items():
-                arrays[key] = np.asarray(cast(Any, value)[:steps, 0]).copy()
+            for key, recurrent_value in present_recurrent.items():
+                arrays[key] = cast(np.ndarray, np.asarray(cast(Any, recurrent_value)[:steps, 0]).copy())
         pending = artifact.with_name(f".{artifact.name}.{secrets.token_hex(6)}.tmp")
         folder.mkdir(parents=True, exist_ok=True)
         try:
@@ -740,7 +759,11 @@ class SharedRoundStore:
         recurrent_fields = {"lstm_hidden_pi", "lstm_cell_pi", "lstm_hidden_vf", "lstm_cell_vf"}
         try:
             with np.load(artifact, allow_pickle=False) as packed:
-                if set(packed.files) not in (required, required | recurrent_fields):
+                optional_metadata = {"meta__scene", "meta__progress", "meta__events"}
+                inventory = set(packed.files)
+                if inventory not in (required, required | recurrent_fields,
+                                     required | optional_metadata,
+                                     required | recurrent_fields | optional_metadata):
                     raise SharedLearnerError("rollout NPZ field inventory is invalid")
                 arrays = {name: packed[name].copy() for name in packed.files}
         except (ValueError, OSError, zipfile.BadZipFile) as error:
@@ -750,6 +773,13 @@ class SharedRoundStore:
             space = observation_space.spaces[name.removeprefix("obs__")]
             if array.shape != shape or array.dtype != space.dtype:
                 raise SharedLearnerError(f"rollout observation shape/dtype differs for {name}")
+        metadata_names = {"meta__scene", "meta__progress", "meta__events"}
+        present_metadata = metadata_names & set(arrays)
+        if present_metadata and present_metadata != metadata_names:
+            raise SharedLearnerError("rollout metadata fields are incomplete")
+        for name in present_metadata:
+            if arrays[name].shape != (n_steps,) or arrays[name].dtype == object:
+                raise SharedLearnerError(f"rollout metadata shape or dtype is invalid for {name}")
         for name in ("rewards", "episode_starts", "values", "log_probs", "advantages", "returns"):
             if arrays[name].shape != (n_steps,):
                 raise SharedLearnerError(f"rollout {name} shape is invalid")
@@ -1401,6 +1431,28 @@ def run_shared_actor(
             self.task_profile_totals: dict[str, float] = {}
             self.bridge_profile_totals: dict[str, float] = {}
             self.profile_steps = 0
+            self.rollout_scenes: list[str] = []
+            self.rollout_progress: list[float] = []
+            self.rollout_events: list[str] = []
+            self.previous_scene: str | None = None
+
+        def take_rollout_metadata(self, steps: int) -> dict[str, np.ndarray]:
+            scenes = self.rollout_scenes[:steps]
+            progress = self.rollout_progress[:steps]
+            events = self.rollout_events[:steps]
+            self.rollout_scenes.clear()
+            self.rollout_progress.clear()
+            self.rollout_events.clear()
+            if len(scenes) < steps:
+                missing = steps - len(scenes)
+                scenes.extend([""] * missing)
+                progress.extend([0.0] * missing)
+                events.extend(["[]"] * missing)
+            return {
+                "meta__scene": np.asarray(scenes, dtype="U256"),
+                "meta__progress": np.asarray(progress, dtype=np.float32),
+                "meta__events": np.asarray(events, dtype="U2048"),
+            }
 
         def _on_step(self) -> bool:
             if stop_file is not None and stop_file.is_file():
@@ -1409,6 +1461,32 @@ def run_shared_actor(
             if dones is not None:
                 self.resets += int(np.count_nonzero(dones))
             infos = self.locals.get("infos")
+            step_info = infos[0] if isinstance(infos, (list, tuple)) and infos and isinstance(infos[0], Mapping) else {}
+            scene_value = step_info.get("scene_name")
+            scene = scene_value if isinstance(scene_value, str) else ""
+            room_progress = step_info.get("max_progress_by_scene")
+            progress_value = max((float(value) for value in room_progress.values()
+                                  if isinstance(value, (int, float)) and not isinstance(value, bool)
+                                  and math.isfinite(float(value))), default=0.0) if isinstance(room_progress, Mapping) else 0.0
+            confirmed: set[str] = set()
+            source_events = step_info.get("milestone_events_since_last_frame", [])
+            if isinstance(source_events, list):
+                for event in source_events:
+                    if not isinstance(event, Mapping):
+                        continue
+                    category = event.get("category") or event.get("type")
+                    if isinstance(category, str) and category in {"shade_created", "shade_recovered", "shade_lost", "item", "bench", "scene"}:
+                        confirmed.add(category)
+            if scene and self.previous_scene and scene != self.previous_scene:
+                confirmed.add("scene_change")
+            help_history = step_info.get("help_request_history", [])
+            if isinstance(help_history, list) and any(isinstance(row, Mapping) and row.get("status") == "resolved_solo" for row in help_history):
+                confirmed.add("help_solo")
+            self.rollout_scenes.append(scene)
+            self.rollout_progress.append(progress_value)
+            self.rollout_events.append(json.dumps(sorted(confirmed), separators=(",", ":")))
+            if scene:
+                self.previous_scene = scene
             if isinstance(infos, (list, tuple)):
                 for info in infos:
                     if not isinstance(info, Mapping):
@@ -1693,6 +1771,7 @@ def run_shared_actor(
                 launch_id=launch_id,
                 buffer=model.rollout_buffer,
                 fingerprint=fingerprint,
+                metadata_arrays=callback.take_rollout_metadata(int(model.rollout_buffer.buffer_size if model.rollout_buffer.full else model.rollout_buffer.pos)),
             )
             publish_ms = (time.perf_counter() - publish_started) * 1000
             callback.step_profile_ms.update({

@@ -18,6 +18,7 @@
     <details id="status-technical" hidden><summary>Detalhes técnicos</summary><pre id="status-technical-detail"></pre></details>
     <details id="status-events" hidden><summary>Últimos eventos</summary><div id="status-event-list"></div></details>
     <button id="supervisor-restart" class="button secondary" type="button" hidden>Religar supervisor</button>
+    <button id="retry-status" class="button secondary" type="button" hidden>Tentar de novo</button>
   </section>
   <main>
     <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
@@ -40,6 +41,7 @@
           <label>Campanha a continuar<select id="resume-campaign"></select></label><button id="continue-training" class="button primary">Continuar de onde parou</button>
           <button id="repeat-training" class="button secondary">Repetir treino do zero</button>
         </div>
+        <p class="hint">“Continuar” usa o checkpoint mais recente da campanha selecionada acima.</p>
         <button id="stop-training" class="button danger large" disabled>Parar com segurança</button>
         <p id="action-message" class="message" aria-live="polite"></p>
       </article>

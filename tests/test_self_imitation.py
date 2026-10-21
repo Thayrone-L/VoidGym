@@ -43,6 +43,20 @@ def test_bank_respects_step_and_byte_caps(tmp_path) -> None:
     assert bank.summary()["sample_count"] == 1
 
 
+def test_bank_classifies_confirmed_scene_and_events_from_rollout_metadata(tmp_path) -> None:
+    bank = SelfImitationBank(tmp_path / "self-imitation")
+    rollout = _rollout()
+    rollout["meta__scene"] = np.asarray(["Tutorial_01"] * 32 + ["Town"] * 32, dtype="U256")
+    rollout["meta__progress"] = np.asarray([1.0] * 32 + [3.0] * 32, dtype=np.float32)
+    rollout["meta__events"] = np.asarray(["[]"] * 32 + ['["bench","scene_change"]'] * 32, dtype="U2048")
+
+    assert bank.ingest([rollout], round_number=8, gamma=0.99) == 2
+    summary = bank.summary()
+    assert summary["by_scene"] == {"Tutorial_01": 1, "Town": 1}
+    assert summary["by_event"] == {"high_return": 1, "bench": 1}
+    assert summary["best_progress"] == 3.0
+
+
 def test_sil_advantage_is_zero_when_return_does_not_beat_value() -> None:
     import torch
 

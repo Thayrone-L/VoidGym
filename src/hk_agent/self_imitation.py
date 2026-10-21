@@ -55,6 +55,25 @@ class SelfImitationBank:
                     continue
                 # Keep only above-expectation sequences; R is the discounted return at each step.
                 payload = {key: np.asarray(value[start:stop]).copy() for key, value in rollout.items() if key.startswith("obs__") or key in {"actions", "action_masks", "episode_starts", "returns", "log_probs"}}
+                scene_values = np.asarray(rollout.get("meta__scene", np.asarray([], dtype="U1")))[start:stop]
+                valid_scenes = [str(value) for value in scene_values if str(value)]
+                scene = max(set(valid_scenes), key=valid_scenes.count) if valid_scenes else "unknown"
+                event_values = np.asarray(rollout.get("meta__events", np.asarray([], dtype="U1")))[start:stop]
+                confirmed_events: list[str] = []
+                for raw_events in event_values:
+                    try:
+                        decoded = json.loads(str(raw_events))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(decoded, list):
+                        confirmed_events.extend(value for value in decoded if value in {
+                            "scene_change", "shade_created", "shade_recovered", "shade_lost",
+                            "item", "bench", "help_solo",
+                        })
+                event = max(set(confirmed_events), key=confirmed_events.count) if confirmed_events else "high_return"
+                for name in ("meta__scene", "meta__progress", "meta__events"):
+                    if name in rollout:
+                        payload[name] = np.asarray(rollout[name][start:stop]).copy()
                 for key in recurrent:
                     payload[key] = np.asarray(rollout[key][start]).copy()
                 filename = f"r{round_number:08d}-s{slot}-{start:08d}-{secrets.token_hex(3)}.npz"
@@ -66,7 +85,9 @@ class SelfImitationBank:
                 final = self.root / filename
                 os.replace(pending, final)
                 priority = max(0.0, float(np.max(advantage)))
-                samples.append({"file": filename, "steps": chunk, "bytes": final.stat().st_size, "priority": priority, "scene": "unknown", "event": "high_return", "round": round_number, "slot": slot, "start": start})
+                progress_values = np.asarray(rollout.get("meta__progress", np.asarray([], dtype=np.float32)))[start:stop]
+                best_progress = float(np.max(progress_values)) if len(progress_values) else 0.0
+                samples.append({"file": filename, "steps": chunk, "bytes": final.stat().st_size, "priority": priority, "scene": scene, "event": event, "best_progress": best_progress, "round": round_number, "slot": slot, "start": start})
                 added += 1
         # Evict lowest-priority items first while preserving diverse event/scene buckets.
         samples.sort(key=lambda item: (float(item.get("priority", 0)), str(item.get("scene")), str(item.get("event"))))
@@ -92,7 +113,14 @@ class SelfImitationBank:
 
     def summary(self) -> dict[str, Any]:
         rows = self._manifest()["samples"]
-        return {"sample_count": len(rows), "step_count": sum(int(row.get("steps", 0)) for row in rows), "by_event": {"high_return": len(rows)}, "by_scene": {"unknown": len(rows)} if rows else {}, "best_progress": None}
+        by_event: dict[str, int] = {}
+        by_scene: dict[str, int] = {}
+        for row in rows:
+            event, scene = str(row.get("event", "high_return")), str(row.get("scene", "unknown"))
+            by_event[event] = by_event.get(event, 0) + 1
+            by_scene[scene] = by_scene.get(scene, 0) + 1
+        progress = [float(row["best_progress"]) for row in rows if isinstance(row.get("best_progress"), (int, float))]
+        return {"sample_count": len(rows), "step_count": sum(int(row.get("steps", 0)) for row in rows), "by_event": by_event, "by_scene": by_scene, "best_progress": max(progress) if progress else None}
 
 
 def sil_positive_advantage(returns: Any, values: Any) -> Any:

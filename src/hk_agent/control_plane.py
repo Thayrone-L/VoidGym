@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from hk_agent.bridge_environment import clean_bridge_environment
 from hk_agent.playthrough import (
@@ -471,6 +471,13 @@ class ControlPlane:
         self._monotonic_clock = monotonic_clock
         self.csrf_token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
+        self._journey_cache_lock = threading.RLock()
+        self._journey_cache: dict[str, Any] = {}
+        self._launch_records_cache_lock = threading.RLock()
+        self._launch_records_cache: tuple[float, dict[str, list[dict[str, Any]]]] = (0.0, {})
+        self._campaigns_cache: tuple[float, tuple[tuple[str, int, int], ...], list[dict[str, object]]] = (0.0, (), [])
+        self._reports_cache: tuple[float, tuple[tuple[str, int, int], ...], list[dict[str, object]]] = (0.0, (), [])
+        self._checkpoint_candidate_cache: dict[tuple[bool, str | None], tuple[float, dict[str, object] | None]] = {}
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._jobs: dict[str, WindowsJob] = {}
         self._launches: dict[str, dict[str, object]] = {}
@@ -823,7 +830,13 @@ class ControlPlane:
         root = self.control_root / "campaigns"
         if not root.exists():
             return campaigns
-        for path in root.glob("*/*.json"):
+        paths = tuple(sorted(root.glob("*/*.json")))
+        signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size)
+                          for path in paths if path.exists())
+        cached_at, cached_signature, cached_campaigns = self._campaigns_cache
+        if signature == cached_signature and self._monotonic_clock() - cached_at < 10.0:
+            return [dict(row) for row in cached_campaigns]
+        for path in paths:
             try:
                 payload = json.loads(path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -841,11 +854,17 @@ class ControlPlane:
                             payload["operator_state"] = "not_started"
                             payload["operator_failure"] = str(latest.get("failure") or "Falha antes da primeira rodada")
                 campaigns.append(payload)
-        return sorted(campaigns, key=lambda item: str(item.get("created_at", "")), reverse=True)
+        campaigns = sorted(campaigns, key=lambda item: str(item.get("created_at", "")), reverse=True)
+        self._campaigns_cache = (self._monotonic_clock(), signature, campaigns)
+        return [dict(row) for row in campaigns]
 
     def _operator_checkpoint_candidate(
         self, *, allow_unknown_algorithm: bool = False, campaign_id: str | None = None,
     ) -> dict[str, object] | None:
+        cache_key = (allow_unknown_algorithm, campaign_id)
+        cached = self._checkpoint_candidate_cache.get(cache_key)
+        if cached and self._monotonic_clock() - cached[0] < 5.0:
+            return dict(cached[1]) if cached[1] is not None else None
         requested_campaign_id = campaign_id
         candidates: list[tuple[int, int, int, dict[str, object]]] = []
         for campaign in self.list_campaigns():
@@ -877,7 +896,9 @@ class ControlPlane:
                 "checkpoint": checkpoint, "round": round_number,
                 "algorithm": algorithm,
             }))
-        return min(candidates, key=lambda item: (item[0], item[1], item[2]))[3] if candidates else None
+        result = min(candidates, key=lambda item: (item[0], item[1], item[2]))[3] if candidates else None
+        self._checkpoint_candidate_cache[cache_key] = (self._monotonic_clock(), result)
+        return dict(result) if result is not None else None
 
     def _operator_system_resources(self) -> dict[str, object]:
         if os.name != "nt":
@@ -976,6 +997,51 @@ class ControlPlane:
             detail = detail[-500:]
         return detail
 
+    def _cached_journey_index(self, campaign_id: str, journey_root: Path) -> dict[str, Any]:
+        from hk_agent.run_journey import load_json
+
+        path = journey_root / "campaign-progress.json"
+        layout_path = journey_root / "map-layout.json"
+        try:
+            stat = path.stat()
+            layout_stat = layout_path.stat() if layout_path.exists() else None
+            signature = (stat.st_mtime_ns, stat.st_size,
+                         layout_stat.st_mtime_ns if layout_stat else 0,
+                         layout_stat.st_size if layout_stat else 0)
+        except OSError:
+            signature = (0, 0, 0, 0)
+        with self._journey_cache_lock:
+            cached = self._journey_cache.get(campaign_id)
+            if cached and cached.get("signature") == signature:
+                return cast(dict[str, Any], cached["index"])
+            index = load_json(path)
+            index["_layout_path"] = str(layout_path)
+            self._journey_cache[campaign_id] = {"signature": signature, "index": index}
+            return index
+
+    def journey_run(self, campaign_id: str, run_id: str, *, max_positions: int = 600) -> dict[str, Any]:
+        if not campaign_id or Path(campaign_id).name != campaign_id or not run_id:
+            raise ValueError("campaign and run are required")
+        index = self._cached_journey_index(campaign_id, self.runtime_root / "shared" / campaign_id / "journey")
+        runs = index.get("runs", [])
+        run = next((row for row in runs if isinstance(row, Mapping) and str(row.get("id")) == run_id), None) if isinstance(runs, list) else None
+        if run is None:
+            raise ValueError("journey run not found")
+        detail = dict(run)
+        positions = detail.get("positions", [])
+        if max_positions < 2:
+            raise ValueError("max_positions must be at least 2")
+        if isinstance(positions, list) and len(positions) > max_positions:
+            stride = max(1, math.ceil((len(positions) - 1) / (max_positions - 1)))
+            sampled = positions[::stride]
+            if positions[-1] not in sampled:
+                sampled.append(positions[-1])
+            detail["positions"] = sampled[:max_positions]
+        route_rows = detail.get("route", [])
+        route = [str(row["to"]) for row in route_rows if isinstance(row, Mapping) and isinstance(row.get("to"), str)] if isinstance(route_rows, list) else []
+        from hk_agent.run_journey import schematic_svg
+        return {"run": detail, "svg": schematic_svg(index, route=route)}
+
     def operator_snapshot(self) -> dict[str, object]:
         status = self.status()
         system_resources = self._operator_system_resources()
@@ -1033,28 +1099,30 @@ class ControlPlane:
         journey: dict[str, object] = {"svg": "", "runs": [], "milestones": [], "records": {}}
         if shared_root is not None:
             try:
-                from hk_agent.run_journey import load_json as load_journey
-                from hk_agent.run_journey import schematic_svg
-
                 journey_root = shared_root / "journey"
-                journey_index = load_journey(journey_root / "campaign-progress.json")
+                journey_index = self._cached_journey_index(campaign_id or "", journey_root)
                 runs = journey_index.get("runs", [])
                 best = max((row for row in runs if isinstance(row, Mapping)),
                            key=lambda row: (int(row.get("distinct_scenes", 0)), -int(row.get("deaths", 0))), default={})
                 route_records = best.get("route", []) if isinstance(best, Mapping) else []
                 route = [str(row["to"]) for row in route_records if isinstance(row, Mapping) and isinstance(row.get("to"), str)]
+                from hk_agent.run_journey import schematic_svg
                 journey_index["_layout_path"] = str(journey_root / "map-layout.json")
-                run_maps: dict[str, str] = {}
-                for run in runs[-100:] if isinstance(runs, list) else []:
-                    if isinstance(run, Mapping):
-                        route_rows = run.get("route", [])
-                        run_route = [str(row["to"]) for row in route_rows if isinstance(row, Mapping) and isinstance(row.get("to"), str)] if isinstance(route_rows, list) else []
-                        run_maps[str(run.get("id", ""))] = schematic_svg(journey_index, route=run_route)
-                journey = {"svg": schematic_svg(journey_index, route=route), "runs": runs[-100:],
+                # The overview only carries compact metadata. Position samples are fetched
+                # on demand by /api/journey/run.
+                summary_keys = {"id", "distinct_scenes", "deaths", "geo_collected", "grubs", "bosses",
+                                "items", "shade_recovered", "actor", "route"}
+                summary_runs = [{key: value for key, value in run.items() if key in summary_keys}
+                                for run in runs[-100:] if isinstance(run, Mapping)] if isinstance(runs, list) else []
+                cache_row = self._journey_cache.get(campaign_id or "", {})
+                journey_svg = cache_row.get("svg")
+                if not isinstance(journey_svg, str):
+                    journey_svg = schematic_svg(journey_index, route=route)
+                    cache_row["svg"] = journey_svg
+                journey = {"svg": journey_svg, "runs": summary_runs,
                            "milestones": journey_index.get("milestones", [])[-100:],
                            "records": journey_index.get("records", {}), "best_run": best.get("id") if isinstance(best, Mapping) else None,
                            "previous_comparison": journey_index.get("previous_comparison"),
-                           "run_maps": run_maps,
                            "source": "esquemático"}
             except (OSError, ValueError, TypeError):
                 pass
@@ -1232,6 +1300,7 @@ class ControlPlane:
             row.get("shared_group") for row in active_records
             if row.get("role") == "learner" and isinstance(row.get("shared_group"), str)
         }
+
         active_started_ns = min(
             (int(row.get("started_unix_ns", 0) or 0) for row in active_records
              if isinstance(row.get("started_unix_ns"), int)), default=0
@@ -1612,14 +1681,21 @@ class ControlPlane:
                 "restored_backup": restored.name, "playthrough": playthrough_status(root)}
 
     def _campaign_launch_records(self, campaign_id: str) -> list[dict[str, Any]]:
-        records = []
-        root = self.control_root / "launches"
-        if root.exists():
-            for path in root.glob("*/launch.json"):
-                item = self._read_json(path)
-                if item.get("campaign_id") == campaign_id:
-                    records.append(item)
-        return records
+        now = self._monotonic_clock()
+        with self._launch_records_cache_lock:
+            cached_at, cached_records = self._launch_records_cache
+            if now - cached_at < 10.0:
+                return cached_records.get(campaign_id, [])
+            records_by_campaign: dict[str, list[dict[str, Any]]] = {}
+            root = self.control_root / "launches"
+            if root.exists():
+                for path in root.glob("*/launch.json"):
+                    item = self._read_json(path)
+                    key = item.get("campaign_id")
+                    if isinstance(key, str):
+                        records_by_campaign.setdefault(key, []).append(item)
+            self._launch_records_cache = (now, records_by_campaign)
+            return records_by_campaign.get(campaign_id, [])
 
     def _campaign_scene_discoveries(self, campaign_id: str | None) -> list[dict[str, Any]]:
         if not campaign_id:
@@ -1669,7 +1745,13 @@ class ControlPlane:
         root = self.artifacts_root / "reports"
         reports = []
         if root.exists():
-            for path in root.glob("*/*.json"):
+            paths = tuple(sorted(root.glob("*/*.json")))
+            signature = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size)
+                              for path in paths if path.exists())
+            cached_at, cached_signature, cached_reports = self._reports_cache
+            if signature == cached_signature and self._monotonic_clock() - cached_at < 10.0:
+                return [dict(row) for row in cached_reports]
+            for path in paths:
                 item = self._read_json(path)
                 reports.append({"campaign_id": item.get("campaign_id", path.parent.name),
                                 "created_at": item.get("created_at"),
@@ -1678,7 +1760,10 @@ class ControlPlane:
                                 "training_steps": item.get("training_steps", 0),
                                 "learner_updates": item.get("learner_updates", 0),
                                 "last_finished_unix_ns": item.get("last_finished_unix_ns", 0)})
-        return sorted(reports, key=lambda row: str(row.get("created_at", "")), reverse=True)
+        reports = sorted(reports, key=lambda row: str(row.get("created_at", "")), reverse=True)
+        if root.exists():
+            self._reports_cache = (self._monotonic_clock(), signature, reports)
+        return [dict(row) for row in reports]
 
     def _campaign_report_data(self, campaign_id: str) -> dict[str, Any]:
         if not _IDENTIFIER.fullmatch(campaign_id):
