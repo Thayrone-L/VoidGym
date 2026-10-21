@@ -1113,7 +1113,7 @@ class ControlPlane:
                 summary_keys = {"id", "distinct_scenes", "deaths", "geo_collected", "grubs", "bosses",
                                 "items", "shade_recovered", "actor", "route"}
                 summary_runs = [{key: value for key, value in run.items() if key in summary_keys}
-                                for run in runs[-100:] if isinstance(run, Mapping)] if isinstance(runs, list) else []
+                                for run in runs[-50:] if isinstance(run, Mapping)] if isinstance(runs, list) else []
                 cache_row = self._journey_cache.get(campaign_id or "", {})
                 journey_svg = cache_row.get("svg")
                 if not isinstance(journey_svg, str):
@@ -1452,8 +1452,23 @@ class ControlPlane:
                                   "message": reason, "technical_detail": detail})
             if len(recent_events) >= 8:
                 break
+        status_completion = status.get("last_completion")
+        status_completion_safe = (
+            bool(status_completion.get("safe"))
+            if isinstance(status_completion, Mapping)
+            else False
+        )
         return {
-            "status": status, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
+            "status": {
+                "active_count": len(active_records),
+                "active_launches": [
+                    {"role": row.get("role"), "status": row.get("status")}
+                    for row in active_records
+                ],
+                "last_completion": {
+                    "safe": status_completion_safe
+                } if isinstance(status_completion, Mapping) else None,
+            }, "campaign_id": campaign_id, "elapsed_seconds": elapsed_seconds,
             "actor_performance": actor_performance,
             "max_room_progress": max_room_progress,
             "remaining_seconds": remaining_seconds, "instances": instance_rows,
@@ -1463,8 +1478,8 @@ class ControlPlane:
             "self_imitation": manifest.get("self_imitation", {}),
             "deaths_per_hour": deaths / hours, "shade_recoveries_per_hour": recoveries / hours,
             "shade_losses": shade_losses, "average_steps_to_first_scene": sum(first_scene_steps) / len(first_scene_steps) if first_scene_steps else None,
-            "episode_progress": progress_rows[-100:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-100:]],
-            "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-100:], "evaluation_trend": manifest.get("evaluation_trend", []),
+            "episode_progress": progress_rows[-40:], "scene_trend": [{"episode": row.get("episode"), "distinct_scenes": row.get("distinct_scenes", 0)} for row in progress_rows[-40:]],
+            "scenes_discovered": scene_rows, "evaluations": evaluation_rows[-50:], "evaluation_trend": manifest.get("evaluation_trend", []),
             "journey": journey,
             "challenge_practice_enabled": selected_campaign.get("challenge_practice_enabled") is True,
             "help_requests_enabled": selected_campaign.get("help_requests_enabled") is True,
@@ -1488,8 +1503,10 @@ class ControlPlane:
                                     "checkpoint": Path(str(resume_candidate["checkpoint"])).name,
                                     "algorithm": resume_candidate["algorithm"]}
                                    if resume_candidate is not None else None),
-            "last_completion": last_completion,
-            "checkpoints": manifest.get("checkpoints", []), "reward_version": next((row.get("reward_version") for row in campaigns if row.get("campaign_id") == campaign_id), None),
+            "last_completion": ({key: last_completion.get(key) for key in ("safe", "status", "reason")}
+                                if isinstance(last_completion, Mapping) else None),
+            "checkpoints": [Path(str(row)).name for row in manifest.get("checkpoints", [])[-5:]] if isinstance(manifest.get("checkpoints", []), list) else [],
+            "reward_version": next((row.get("reward_version") for row in campaigns if row.get("campaign_id") == campaign_id), None),
             "advanced": {"launch_ids": [row.get("launch_id") for row in active_records], "shared_root": str(shared_root) if shared_root else None,
                          "artifact_path": str(shared_root) if shared_root else None},
             "system": system_resources, "reports": self.list_reports()[:10],
@@ -3965,7 +3982,10 @@ class ControlPlane:
                     for value in (wait_ms, train_ms, straggler_ms)
                     if isinstance(value, (int, float)) and not isinstance(value, bool)
                 )
-                stale_after = max(120.0, 2.0 * expected_round) if expected_round else 300.0
+                # Shared CPU PPO updates can occasionally exceed five minutes on
+                # memory-constrained machines. Keep the launch alive through one
+                # long update while still failing a genuinely silent learner.
+                stale_after = max(600.0, 2.0 * expected_round) if expected_round else 600.0
                 launch_started = learner.get("started_unix_ns")
                 now_ns = time.time_ns()
                 beat_belongs_to_launch = (
