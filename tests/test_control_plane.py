@@ -139,8 +139,8 @@ def test_shared_learner_ignores_prelaunch_heartbeat_during_startup(
     shared.mkdir(parents=True)
     now = time.time_ns()
     (shared / "learner.json").write_text(json.dumps({
-        "status": "TRAINING", "heartbeat_unix_ns": now - 3_600_000_000_000,
-        "last_wait_rollouts_ms": 1000,
+        "status": "FAILED", "failure": "failure from previous launch",
+        "heartbeat_unix_ns": now - 3_600_000_000_000, "last_wait_rollouts_ms": 1000,
     }), encoding="utf-8")
     control._launches = {
         "learner-new": {"role": "learner", "campaign_id": "campaign",

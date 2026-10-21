@@ -3971,8 +3971,6 @@ class ControlPlane:
                         or not isinstance(shared_root, str) or group in self._shared_failed_learners):
                     continue
                 learner_status = self._read_json(Path(shared_root) / "learner.json")
-                failure = learner.get("failure") or learner_status.get("failure")
-                failed = learner.get("status") == "FAILED" or learner_status.get("status") == "FAILED"
                 beat = learner_status.get("heartbeat_unix_ns")
                 wait_ms = learner_status.get("last_wait_rollouts_ms", 0.0)
                 train_ms = learner_status.get("last_train_ms", 0.0)
@@ -3992,6 +3990,12 @@ class ControlPlane:
                     isinstance(beat, int) and not isinstance(beat, bool)
                     and isinstance(launch_started, int) and not isinstance(launch_started, bool)
                     and beat >= launch_started
+                )
+                failure = learner.get("failure") or (
+                    learner_status.get("failure") if beat_belongs_to_launch else None
+                )
+                failed = learner.get("status") == "FAILED" or (
+                    beat_belongs_to_launch and learner_status.get("status") == "FAILED"
                 )
                 startup_expired = (
                     isinstance(launch_started, int) and not isinstance(launch_started, bool)
