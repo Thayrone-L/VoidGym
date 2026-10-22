@@ -1,6 +1,6 @@
 """Componentes de recompensa genéricos, independentes do jogo concreto."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Protocol
 
 from voidgym.core.config import RewardConfig
@@ -13,9 +13,17 @@ class GameReward(Protocol):
 class UniversalReward:
     """Novidade, progresso e custo temporal sem tetos arbitrários por episódio."""
 
-    def __init__(self, config: RewardConfig | None = None) -> None:
+    def __init__(self, config: RewardConfig | None = None, *, world_cell_size: float | None = None,
+                 novelty_cap_per_room: float | None = None) -> None:
         self.config = config or RewardConfig()
+        if world_cell_size is not None and world_cell_size <= 0:
+            raise ValueError("world_cell_size must be positive")
+        if novelty_cap_per_room is not None and novelty_cap_per_room < 0:
+            raise ValueError("novelty_cap_per_room cannot be negative")
+        self.world_cell_size = world_cell_size
+        self.novelty_cap_per_room = novelty_cap_per_room
         self.visits: Counter[tuple[str, int, int]] = Counter()
+        self.novelty_paid: dict[str, float] = defaultdict(float)
         self.best: dict[str, float] = {}
         self.stuck: Counter[tuple[str, int, int]] = Counter()
         self.steps = 0
@@ -25,11 +33,20 @@ class UniversalReward:
         self.steps += 1
         room = str(after.get("room_id", "unknown"))
         position = after.get("player_pos_room", (0.5, 0.5))
-        cell = (int(float(position[0]) * 20), int(float(position[1]) * 12))
+        world_position = after.get("player_pos_world")
+        if self.world_cell_size is not None and isinstance(world_position, (tuple, list)):
+            cell = (int(float(world_position[0]) // self.world_cell_size),
+                    int(float(world_position[1]) // self.world_cell_size))
+        else:
+            cell = (int(float(position[0]) * 20), int(float(position[1]) * 12))
         key = (room, *cell)
         value = 0.0
         if not self.visits[key]:
-            value += self.config.novelty
+            novelty = self.config.novelty
+            if self.novelty_cap_per_room is not None:
+                novelty = min(novelty, max(0.0, self.novelty_cap_per_room - self.novelty_paid[room]))
+                self.novelty_paid[room] += novelty
+            value += novelty
         self.visits[key] += 1
         progress = float(after.get("progress", position[0]))
         if progress > self.best.get(room, -1.0):

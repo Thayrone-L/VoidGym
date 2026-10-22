@@ -10,7 +10,7 @@ from voidgym.core.errors import VoidGymValueError as ValueError
 UNIVERSAL_IMAGE_HW = (108, 192)
 FRAME_STACK = 4
 MODEL_CONTRACT_VERSION = "2.0"
-STEP_GAME_MS = 80  # lease v1 observado; calibrar formalmente no prompt 84.
+STEP_GAME_MS = 80  # Um timestep do learner v1 usa lease-base 80 ms; action_repeat=3 só vale para o probe (3 passos = 240 ms).
 UNIVERSAL_IMAGE_KEY = "pixels"  # nome real do Hollow Knight.
 UNIVERSAL_ACTION_HISTORY_KEY = "action_history"
 

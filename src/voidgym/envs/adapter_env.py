@@ -52,6 +52,9 @@ class AdapterEnv(gym.Env[dict[str, np.ndarray], int]):
         self._frames.clear()
         self._frames.extend([frame] * self.frame_stack)
         self._history = deque([0] * self.history_len, maxlen=self.history_len)
+        reset_reward = getattr(self.reward_fn, "reset", None)
+        if callable(reset_reward):
+            reset_reward()
         return self._observation(), self._info()
 
     def action_masks(self) -> np.ndarray:
@@ -68,4 +71,5 @@ class AdapterEnv(gym.Env[dict[str, np.ndarray], int]):
         self._frames.append(fit_to_universal(self.adapter.frame_rgb()))
         after = dict(self.adapter.signals())
         self._history.append(int(action))
-        return self._observation(), float(self.reward_fn(before, after)), False, False, self._info()
+        return (self._observation(), float(self.reward_fn(before, after)), bool(after.get("terminated", False)),
+                bool(after.get("truncated", False)), self._info())

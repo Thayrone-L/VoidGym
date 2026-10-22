@@ -1,0 +1,202 @@
+"""Procedural platform rooms with actual traversal challenges at each level."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from voidgym.gyms.platform_gym.params import PhysicsParams
+from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
+from voidgym.gyms.platform_gym.world import (
+    Breakable,
+    Door,
+    Enemy,
+    Exit,
+    Hazard,
+    Interactive,
+    Pickup,
+    Rect,
+    Room,
+    Solid,
+)
+
+
+def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
+    rng = np.random.default_rng(seed)
+    physics = PhysicsParams.sample(rng)
+    vertical_rate = .02 if level == 5 else .08 if level in {0, 1, 2, 3, 4, 6} else 0.0
+    vertical_variant = allow_vertical and vertical_rate > 0 and rng.random() < vertical_rate
+    width = float(rng.uniform(14, 17) if vertical_variant else
+                  rng.uniform(24, 36) if level == 0 else rng.uniform(22, 30))
+    height = float(rng.uniform(22, 28) if vertical_variant else rng.uniform(10, 17))
+    floor = 0.6
+    if level == 2:
+        floor = 3.0
+    floor_y = floor
+    spawn_y = floor
+    solids: list[Solid]
+    if level == 2:
+        reach = physics.run_speed * (physics.jump_hold_max_seconds + 2 * physics.jump_v0 / physics.gravity)
+        gap_width = float(rng.uniform(.3, .7) * reach)
+        gap_left = width * .42
+        pit_width = gap_width * .62
+        solids = [Solid(Rect(0, floor - .6, gap_left, .6)),
+                  Solid(Rect(gap_left, 0, pit_width, .5)),
+                  Solid(Rect(gap_left + gap_width, floor - .6, width - gap_left - gap_width, .6))]
+    elif level == 4:
+        pit_floor = .6
+        ledge_x = 4.5
+        spawn_y = pit_floor
+        solids = [Solid(Rect(0, pit_floor - .6, ledge_x, .6)),
+                  Solid(Rect(0, pit_floor, .55, 3.6)),
+                  Solid(Rect(ledge_x, pit_floor, .65, 3.0)),
+                  Solid(Rect(ledge_x + .65, 3.0, width - ledge_x - .65, floor))]
+        floor_y = 3.6
+    else:
+        solids = [Solid(Rect(0, 0, width, floor))]
+    hazards, breakables, enemies, pickups, interactives, doors = _make_entities(
+        level, rng, physics, width, height, floor, solids,
+    )
+    exit_rect = _make_exit(level, rng, vertical_variant and level != 4, width, floor_y, solids)
+    spawn_x = 2.2 if level == 4 else 1.5
+    room = Room(level, width, height, solids, hazards, breakables, enemies, pickups,
+                interactives, [Exit(exit_rect, level + 1)], doors, (spawn_x, spawn_y), physics, seed)
+    if level != 4 and rng.random() < .25:
+        room = _mirror_room(room)
+    return room
+
+
+def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
+                   width: float, height: float, floor: float, solids: list[Solid]
+                   ) -> tuple[list[Hazard], list[Breakable], list[Enemy], list[Pickup],
+                              list[Interactive], list[Door]]:
+    hazards: list[Hazard] = []
+    breakables: list[Breakable] = []
+    enemies: list[Enemy] = []
+    pickups: list[Pickup] = []
+    interactives: list[Interactive] = []
+    doors: list[Door] = []
+    if level == 1:
+        for fraction in (.27, .48, .70):
+            height_u = float(rng.uniform(.5, .6) * physics.jump_short_height)
+            solids.append(Solid(Rect(width * fraction, floor, 1.2, height_u)))
+    if level == 2:
+        # Optional one-way stepping stones sit inside/near the gap.
+        gap_left = next(s.rect.right for s in solids if s.rect.x == 0)
+        gap_right = next(s.rect.x for s in solids if s.rect.x > gap_left)
+        for fraction in (.35, .68):
+            x = gap_left + (gap_right - gap_left) * fraction
+            solids.append(Solid(Rect(x, floor + .8, 1.5, .22), "platform"))
+    if level == 3:
+        high = float(rng.uniform(.6, .82) * physics.jump_max_height)
+        solids.append(Solid(Rect(width * .48, floor, .55, high)))
+    if level >= 5:
+        hazards.append(Hazard(Rect(width * .4, floor, 1.4, .35), "spikes"))
+        for _ in range(int(rng.integers(1, 4))):
+            x = float(rng.uniform(width * .22, width * .78))
+            enemies.append(Enemy(Rect(x, floor, .8, .8), kind=str(rng.choice(("walker", "orb", "spiky", "eye"))),
+                                 hp=2, patrol_left=max(0, x - 1),
+                                 patrol_right=min(width, x + 2.8), speed=float(rng.uniform(.7, 1.6))))
+    if level == 6:
+        block_x = width * .68
+        breakables.append(Breakable(Rect(block_x, floor, .75, height - floor), hp=3, reveals="passage",
+                                    cue=bool(rng.random() < .7)))
+        pickups.append(Pickup(Rect(width * .2, floor, .4, .5), "coin"))
+    if level == 7:
+        pickups.append(Pickup(Rect(width * .2, floor, .5, .5), "ability_double_jump"))
+        doors.append(Door(Rect(width * .62, floor, .8, 2.2), "ability_double_jump"))
+        interactives.append(Interactive(Rect(width * .4, floor, 1.0, .8)))
+        # Multi-room topology is recorded as forward links; the adapter can advance the set.
+    if rng.random() < .7:
+        # Decorative one-way shelf: it changes routes and silhouettes without sealing the exit.
+        shelf_x = float(rng.uniform(width * .12, width * .28))
+        solids.append(Solid(Rect(shelf_x, floor + float(rng.uniform(2.0, 3.5)), 2.0, .22), "platform"))
+    if rng.random() < .4:
+        ceiling_x = float(rng.uniform(width * .12, width * .3))
+        solids.append(Solid(Rect(ceiling_x, height - 1.0, float(rng.uniform(3.0, 5.0)), .5)))
+    return hazards, breakables, enemies, pickups, interactives, doors
+
+
+def _make_exit(level: int, rng: np.random.Generator, vertical_variant: bool, width: float,
+               floor: float, solids: list[Solid]) -> Rect:
+    exit_rect = Rect(width - 1, floor, 1, 2)
+    if vertical_variant:
+        solids.extend((Solid(Rect(width * .28, floor + 1.9, 3.2, .22), "platform"),
+                       Solid(Rect(width * .56, floor + 3.6, 4.2, .22), "platform")))
+        exit_rect = Rect(width - 2.5, floor + 3.0, 2.5, 1.4)
+    elif level == 0:
+        exit_variant = rng.choice(("right", "right", "up", "down"))
+        if exit_variant == "up":
+            solids.append(Solid(Rect(width - 3.2, floor + 1.8, 2.7, .22), "platform"))
+            exit_rect = Rect(width - 2.0, floor + 1.2, 2.0, 1.2)
+        elif exit_variant == "down":
+            solids[0] = Solid(Rect(0, floor - .6, width - 3.2, .6))
+            exit_rect = Rect(width - 2.0, -1.5, 2.0, 2.2)
+    return exit_rect
+
+
+def _mirror_rect(rect: Rect, width: float) -> Rect:
+    return Rect(width - rect.right, rect.y, rect.w, rect.h)
+
+
+def _mirror_room(room: Room) -> Room:
+    """Reflect all geometry and patrol direction around the room's vertical axis."""
+    width = room.width
+    for solid in room.solids:
+        solid.rect = _mirror_rect(solid.rect, width)
+    for hazard in room.hazards:
+        hazard.rect = _mirror_rect(hazard.rect, width)
+    for block in room.breakables:
+        block.rect = _mirror_rect(block.rect, width)
+    for enemy in room.enemies:
+        old_left, old_right = enemy.patrol_left, enemy.patrol_right
+        enemy.rect = _mirror_rect(enemy.rect, width)
+        enemy.patrol_left, enemy.patrol_right = width - old_right, width - old_left
+        enemy.speed *= -1
+    for pickup in room.pickups:
+        pickup.rect = _mirror_rect(pickup.rect, width)
+    for item in room.interactives:
+        item.rect = _mirror_rect(item.rect, width)
+    for exit_ in room.exits:
+        exit_.rect = _mirror_rect(exit_.rect, width)
+        exit_.to_entry = "right"
+    for door in room.doors:
+        door.rect = _mirror_rect(door.rect, width)
+    room.spawn = (width - room.spawn[0], room.spawn[1])
+    return room
+
+
+def generate_room(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
+    """Generate a seeded level and retain it only when the physics solver completes it."""
+    if not 0 <= level <= 7:
+        raise ValueError("level must be in [0, 7]")
+    for attempt in range(20):
+        room = _make(level, seed + 1000 * attempt, allow_vertical=allow_vertical)
+        if solve_room(room, require_breakables=level == 6):
+            return room
+    raise RuntimeError(f"could not solve level {level} room within 20 seed attempts")
+
+
+def generate_room_set(seed: int) -> list[Room]:
+    """Create and solve a 3–6 room metroidvania chain with a remote key ability."""
+    rng = np.random.default_rng(seed)
+    count = int(rng.integers(3, 7))
+    levels = [3, *[int(rng.integers(1, 6)) for _ in range(count - 2)], 5]
+    rooms = [generate_room(level, seed + i * 7919, allow_vertical=False)
+             for i, level in enumerate(levels)]
+    for room_id, room in enumerate(rooms):
+        room.id = room_id
+        room.exits[0].to_room = (room_id + 1) % count
+        room.exits[0].to_entry = "left"
+    first = rooms[0]
+    rooms[0].pickups.append(Pickup(Rect(first.spawn[0] - .25, first.spawn[1], .5, .5),
+                                   "ability_double_jump"))
+    last = rooms[-1]
+    direction = 1 if last.exits[0].rect.x > last.spawn[0] else -1
+    door_x = last.width * (.84 if direction > 0 else .16)
+    rooms[-1].doors.append(Door(Rect(door_x, last.exits[0].rect.y, .8, 2.2),
+                                "ability_double_jump"))
+    middle = rooms[count // 2]
+    middle.interactives.append(Interactive(Rect(middle.width * .5, .6, 1.0, .8)))
+    if not solve_room_set(rooms):
+        raise RuntimeError("generated room-set route failed its physics proof")
+    return rooms

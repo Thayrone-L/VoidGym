@@ -45,9 +45,10 @@ def _finish(process: subprocess.Popen[str]) -> None:
 
 
 @pytest.mark.e2e
-def test_campaign_process_restart_safe_stop_and_resume(tmp_path: Path) -> None:
+@pytest.mark.parametrize("game_id,adapter_name", [("fake_platformer", "fake"), ("platform_gym", "platform_gym")])
+def test_campaign_process_restart_safe_stop_and_resume(tmp_path: Path, game_id: str, adapter_name: str) -> None:
     campaign = config_from_dict({"schema_version": 1, "campaign_id": "e2e",
-                                 "kind": "e2e", "game_id": "fake_platformer"})
+                                 "kind": "e2e", "game_id": game_id})
     root = tmp_path / "campaign"
     save_campaign_config(campaign, root / "config.json")
     profile = HardwareProfile(8, 16, 16, 12, None, None, None, None, 100, "test")
@@ -59,16 +60,16 @@ def test_campaign_process_restart_safe_stop_and_resume(tmp_path: Path) -> None:
                          "--stop-after-round", "4")
         processes.append(learner)
         actor_a = _start(ACTOR, "--root", str(root), "--actor-id", "actor-a",
-                         "--first-round", "1", "--last-round", "4", "--pause-after", "3")
+                         "--first-round", "1", "--last-round", "4", "--pause-after", "3", "--adapter", adapter_name)
         actor_b = _start(ACTOR, "--root", str(root), "--actor-id", "actor-b",
-                         "--first-round", "1", "--last-round", "3", "--pause-after", "3")
+                         "--first-round", "1", "--last-round", "3", "--pause-after", "3", "--adapter", adapter_name)
         processes.extend((actor_a, actor_b))
         _wait_checkpoint(checkpoint, 3)
         actor_b.terminate()
         actor_b.communicate(timeout=10)
         assert actor_b.returncode != 0  # encerrado pelo supervisor de teste para simular falha.
         actor_b_restarted = _start(ACTOR, "--root", str(root), "--actor-id", "actor-b",
-                                   "--first-round", "4", "--last-round", "4")
+                                   "--first-round", "4", "--last-round", "4", "--adapter", adapter_name)
         processes.append(actor_b_restarted)
         (root / "resume").mkdir(parents=True, exist_ok=True)
         (root / "resume" / "actor-a").write_text("resume", encoding="utf-8")
@@ -81,9 +82,9 @@ def test_campaign_process_restart_safe_stop_and_resume(tmp_path: Path) -> None:
         learner_resume = _start(LEARNER, "--root", str(root), "--checkpoint", str(checkpoint),
                                 "--stop-after-round", "5")
         actor_a_resume = _start(ACTOR, "--root", str(root), "--actor-id", "actor-a",
-                                "--first-round", "5", "--last-round", "5")
+                                "--first-round", "5", "--last-round", "5", "--adapter", adapter_name)
         actor_b_resume = _start(ACTOR, "--root", str(root), "--actor-id", "actor-b",
-                                "--first-round", "5", "--last-round", "5")
+                                "--first-round", "5", "--last-round", "5", "--adapter", adapter_name)
         processes.extend((learner_resume, actor_a_resume, actor_b_resume))
         resumed = _wait_checkpoint(checkpoint, 5)
         assert resumed["updates"] == 5
