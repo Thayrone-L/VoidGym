@@ -8,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 
 from voidgym.core.adapter import GameAdapter
+from voidgym.core.errors import VoidGymValueError as ValueError
 from voidgym.core.observation import FRAME_STACK, fit_to_universal, universal_observation_space
 
 

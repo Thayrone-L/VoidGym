@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from voidgym.core.errors import VoidGymValueError as ValueError
+
 
 class Duration(str, Enum):
     """Duração semântica de uma intenção, em tempo de jogo."""

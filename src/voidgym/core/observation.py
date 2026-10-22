@@ -5,6 +5,8 @@ from collections.abc import Mapping
 import gymnasium as gym
 import numpy as np
 
+from voidgym.core.errors import VoidGymValueError as ValueError
+
 UNIVERSAL_IMAGE_HW = (108, 192)
 FRAME_STACK = 4
 MODEL_CONTRACT_VERSION = "2.0"

@@ -11,6 +11,7 @@ from hk_agent.temporal_actions import (  # V1-SHIM: portar no prompt 86
     TEMPORAL_COMBAT_ACTIONS,
 )
 from voidgym.core.actions import UNIVERSAL_ACTIONS, UniversalAction
+from voidgym.core.errors import VoidGymRuntimeError as RuntimeError
 
 _TEMPLATES = TEMPORAL_COMBAT_ACTIONS + PLAYER_INTERACTION_ACTIONS
 _NAMES = tuple(template.name for template in _TEMPLATES)

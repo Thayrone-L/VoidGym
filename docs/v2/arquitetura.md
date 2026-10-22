@@ -23,3 +23,8 @@ O inventário detalhado da v1 está em `relatorios/83_inventario.md`.
 
 O contrato inicial do adaptador, observação e ambiente genérico chegou no prompt 83. Ginásio,
 política e campanhas estão previstos nos prompts 84–87 e são incrementos posteriores.
+
+O prompt 83b acrescentou configuração congelada, detecção de hardware, plano de recursos,
+armazenamento de experiência, recompensa universal e verificação de regras. O E2E atual cobre
+um ciclo sintético sem processos externos; o supervisor de campanhas será completado nos
+prompts 86–87.

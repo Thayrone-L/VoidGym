@@ -48,10 +48,22 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["e2e: teste integrado do fluxo VoidGym sem jogo real"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["B", "C901", "I", "N"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+"src/hk_agent/**/*.py" = ["B", "C901", "I", "N"]
+"tests/**/*.py" = ["B", "C901", "I", "N"]
+"tools/**/*.py" = ["B", "C901", "I", "N"]
 
 [tool.mypy]
 python_version = "3.12"

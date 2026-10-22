@@ -1,5 +1,7 @@
 """Conversões de duração entre relógio de jogo e relógio real."""
 
+from voidgym.core.errors import VoidGymValueError as ValueError
+
 
 def _scale(value: float) -> float:
     if not 0.25 <= value <= 4.0:

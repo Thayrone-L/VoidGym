@@ -1,5 +1,7 @@
 import numpy as np
+import pytest
 
+from voidgym.core.errors import VoidGymError
 from voidgym.core.observation import fit_to_universal, split_observation
 
 
@@ -24,3 +26,8 @@ def test_split_observation_is_lossless() -> None:
     assert all(np.array_equal(rebuilt[key], value) for key, value in original.items())
     assert universal.keys() == {"pixels", "action_history"}
     assert specific.keys() == {"game_specific"}
+
+
+def test_invalid_observation_raises_voidgym_error() -> None:
+    with pytest.raises(VoidGymError):
+        fit_to_universal(np.zeros((0, 0, 3), dtype=np.uint8))
