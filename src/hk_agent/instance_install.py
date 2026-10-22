@@ -36,6 +36,14 @@ class InstanceInstallError(RuntimeError):
     """An installation cannot be provisioned safely."""
 
 
+class InstanceMarkerMismatch(InstanceInstallError):
+    """The marker identifies a different managed instance than the caller selected."""
+
+    def __init__(self, instance_index: int, message: str) -> None:
+        self.instance_index = instance_index
+        super().__init__(message)
+
+
 class ProductNameEditor(Protocol):
     def read(self, path: Path) -> tuple[str, str]: ...
 
@@ -268,8 +276,11 @@ def refresh_instance_bridge_marker(
         raise InstanceInstallError(f"Managed instance marker is invalid: {marker_path}") from error
     if not isinstance(marker, dict) or set(marker) != set(InstanceMarker.__dataclass_fields__):
         raise InstanceInstallError(f"Managed instance marker has an invalid schema: {marker_path}")
-    if marker.get("schema_version") != 1 or marker.get("index") != expected_index:
-        raise InstanceInstallError("Managed instance marker index or schema does not match")
+    if marker.get("index") != expected_index:
+        actual_index = marker.get("index")
+        raise InstanceMarkerMismatch(expected_index, f"Instance {expected_index} marker records index {actual_index}")
+    if marker.get("schema_version") != 1:
+        raise InstanceInstallError("Managed instance marker schema does not match")
     if marker.get("product_name") != f"Hollow Knight AI {expected_index}" or marker.get("company_name") != COMPANY_NAME:
         raise InstanceInstallError("Managed instance marker Unity identity does not match")
     hashes = installation_hashes(root)
@@ -284,7 +295,6 @@ def refresh_instance_bridge_marker(
         raise InstanceInstallError("Installed bridge DLL does not match the requested build")
     updated = dict(marker)
     updated["bridge_dll_sha256"] = bridge_hash
-    updated["created_unix_ns"] = time.time_ns()
     temporary = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(json.dumps(updated, indent=2), encoding="utf-8")

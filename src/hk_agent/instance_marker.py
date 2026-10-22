@@ -10,6 +10,7 @@ from hk_agent.instance_install import (
     MARKER_NAME,
     MODDING_API_VERSION,
     TOOL_VERSION,
+    InstanceMarkerMismatch,
     installation_hashes,
     sha256_file,
 )
@@ -45,7 +46,9 @@ def load_instance_marker(install_root: Path, *, expected_index: int) -> Instance
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid instance marker: {marker_path}: {error}") from error
     index = expected_index
-    if marker.schema_version != 1 or marker.index != index:
+    if marker.index != index:
+        raise InstanceMarkerMismatch(index, f"Instance {index} marker records index {marker.index}")
+    if marker.schema_version != 1:
         raise ValueError("Instance marker schema version or index does not match")
     if marker.product_name != f"Hollow Knight AI {index}" or marker.company_name != COMPANY_NAME:
         raise ValueError("Instance marker Unity identity does not match its index")

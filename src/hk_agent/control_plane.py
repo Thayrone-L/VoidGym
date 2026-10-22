@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,6 +35,22 @@ from hk_agent.runtime_paths import (
     validate_runtime_root,
 )
 from hk_agent.win_job import WindowsJob, process_identity, resume_process
+
+
+@lru_cache(maxsize=16)
+def _cached_game_map_layout(path_text: str, mtime_ns: int, size: int) -> Mapping[str, object]:
+    from hk_agent.map_layout import load_game_map_layout
+
+    return load_game_map_layout(Path(path_text))
+
+
+@lru_cache(maxsize=16)
+def _cached_scene_calibrations(
+    path_text: str, mtime_ns: int, size: int, map_sha256: str
+) -> Mapping[str, object]:
+    from hk_agent.run_journey import load_scene_calibration
+
+    return load_scene_calibration(Path(path_text), map_sha256=map_sha256)
 
 _REAL_POPEN = subprocess.Popen
 
@@ -1153,7 +1170,7 @@ class ControlPlane:
             except (OSError, ValueError, TypeError):
                 pass
         try:
-            journey["map_art"] = self.map_art_status()
+            journey["map_art"] = self.map_art_status(include_details=False)
         except RuntimeError:
             journey["map_art"] = {"cached": False, "attribution": "Mapa: The Embraced One — hallownest.net. Hollow Knight © Team Cherry."}
         if shared_root is not None and not manifest.get("evaluations"):
@@ -1370,13 +1387,15 @@ class ControlPlane:
         ]
         failed_record = max(failed_records, key=lambda row: int(row.get("finished_unix_ns", 0) or 0), default=None)
         status_banner: dict[str, object]
-        marker_warning = "A instância 1 está com a DLL diferente do registro — rode a implantação da DLL"
+        marker_warning: str | None = None
         marker_error: Exception | None = None
         marker_failure_text = " ".join(
             str(row.get("failure", "")) + " " + str(row.get("stop_reason", ""))
             for row in relevant_records
         ).casefold()
         if "managed instance marker" in marker_failure_text or "bridge dll hash differs from marker" in marker_failure_text:
+            # Older launch records did not include a typed instance index.
+            marker_warning = "A instância 1 está com a DLL diferente do registro — rode a implantação da DLL"
             alerts.append(marker_warning)
         if active_records and alerts:
             running_text = (f" · Treinando — rodada {learner_round}, "
@@ -1486,19 +1505,29 @@ class ControlPlane:
             marker_error = error
             chain: BaseException | None = error
             marker_mismatch = False
+            from hk_agent.instance_install import InstanceMarkerMismatch
             while chain is not None:
                 detail = str(chain).casefold()
+                if isinstance(chain, InstanceMarkerMismatch):
+                    marker_warning = (
+                        f"A instância {chain.instance_index} está com o marcador da DLL inconsistente — "
+                        "rode a implantação da DLL"
+                    )
+                    marker_mismatch = True
                 marker_mismatch = marker_mismatch or (
                     "bridge dll hash differs from marker" in detail
                     or "managed instance marker is missing or invalid" in detail
                 )
                 chain = chain.__cause__
             if marker_mismatch:
-                if marker_warning not in alerts:
+                if marker_warning is None:
+                    # Legacy exception text has no typed index; keep its historical fallback.
+                    marker_warning = "A instância 1 está com a DLL diferente do registro — rode a implantação da DLL"
+                if marker_warning is not None and marker_warning not in alerts:
                     alerts.append(marker_warning)
             else:
                 alerts.append(f"Jogadas contínuas indisponíveis: {type(error).__name__}: {error}")
-        if marker_warning in alerts:
+        if marker_warning is not None and marker_warning in alerts:
             status_banner = {
                 "kind": "error",
                 "message": marker_warning,
@@ -1568,7 +1597,8 @@ class ControlPlane:
                                     "name": resume_campaign.get("name", resume_candidate["campaign_id"]),
                                     "round": resume_candidate["round"],
                                     "checkpoint": Path(str(resume_candidate["checkpoint"])).name,
-                                    "algorithm": resume_candidate["algorithm"]}
+                                    "algorithm": resume_candidate["algorithm"],
+                                    "actors": resume_campaign.get("actors", 1)}
                                    if resume_candidate is not None else None),
             "last_completion": ({key: last_completion.get(key) for key in ("safe", "status", "reason")}
                                 if isinstance(last_completion, Mapping) else None),
@@ -2012,7 +2042,7 @@ class ControlPlane:
             raise RuntimeError("cache local do mapa não está disponível nesta máquina")
         return Path(local) / "VoidLab"
 
-    def map_art_status(self) -> dict[str, object]:
+    def map_art_status(self, *, include_details: bool = True) -> dict[str, object]:
         root = self.map_art_runtime_root() / "cache" / "map-art"
         reference = root / "reference.json"
         value = self._read_json(reference)
@@ -2029,10 +2059,13 @@ class ControlPlane:
         calibrations: Mapping[str, object] = {}
         global_calibration: Mapping[str, object] = {}
         room_offsets: Mapping[str, object] = {}
-        if digest:
-            from hk_agent.run_journey import load_scene_calibration
-
-            calibrations = load_scene_calibration(root / str(digest) / "calibration.json", map_sha256=digest)
+        if digest and include_details:
+            calibration_path = root / str(digest) / "calibration.json"
+            calibration_stat = calibration_path.stat() if calibration_path.is_file() else None
+            calibrations = _cached_scene_calibrations(
+                str(calibration_path), calibration_stat.st_mtime_ns if calibration_stat else 0,
+                calibration_stat.st_size if calibration_stat else 0, digest,
+            )
             global_value = self._read_json(root / str(digest) / "global-calibration.json")
             if global_value.get("map_sha256") == digest and global_value.get("schema_version") == 1:
                 global_calibration = global_value
@@ -2040,23 +2073,31 @@ class ControlPlane:
             if offsets_value.get("map_sha256") == digest and offsets_value.get("schema_version") == 1:
                 raw_offsets = offsets_value.get("offsets")
                 room_offsets = raw_offsets if isinstance(raw_offsets, Mapping) else {}
-        layout_path = self.runtime_root / "map-layout" / "game-map-layout.json"
-        try:
-            from hk_agent.map_layout import load_game_map_layout
-            game_layout: Mapping[str, object] = load_game_map_layout(layout_path)
-            layout_error = None
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-            game_layout = {}
-            layout_error = str(error)
-        return {"cached": bool(digest), "sha256": digest,
-                "reference_changed": value.get("sha256") != digest if value else False,
-                "tiles_ready": metadata.get("complete") is True,
-                "tiles": metadata if metadata.get("complete") is True else None,
-                "progress": progress,
+        result: dict[str, object] = {
+            "cached": bool(digest), "sha256": digest,
+            "reference_changed": value.get("sha256") != digest if value else False,
+            "tiles_ready": metadata.get("complete") is True,
+            "tiles": metadata if metadata.get("complete") is True else None,
+            "progress": progress,
+            "attribution": "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry",
+        }
+        if include_details:
+            layout_path = self.runtime_root / "map-layout" / "game-map-layout.json"
+            try:
+                layout_stat = layout_path.stat()
+                game_layout = _cached_game_map_layout(
+                    str(layout_path), layout_stat.st_mtime_ns, layout_stat.st_size,
+                )
+                layout_error = None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                game_layout = {}
+                layout_error = str(error)
+            result.update({
                 "calibrations": calibrations,
                 "game_layout": game_layout, "game_layout_error": layout_error,
                 "global_calibration": global_calibration, "room_offsets": room_offsets,
-                "attribution": "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry"}
+            })
+        return result
 
     def save_global_map_calibration(self, payload: Mapping[str, object]) -> dict[str, object]:
         from hk_agent.map_layout import fit_global_calibration
@@ -2557,7 +2598,13 @@ class ControlPlane:
             if actor_count > min(3, config.instance_count):
                 raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
             data["actors"] = actor_count
-            data["checkpoint_interval"] = 512 * actor_count
+            rollout_steps = _bounded_int(data.get("rollout_steps", 512), "rollout_steps", 1, 1_048_576)
+            checkpoint_interval = _bounded_int(
+                data.get("checkpoint_interval", rollout_steps * actor_count),
+                "checkpoint_interval", 1, 2**31 - 1,
+            )
+            checkpoint_unit = rollout_steps * actor_count
+            data["checkpoint_interval"] = math.ceil(checkpoint_interval / checkpoint_unit) * checkpoint_unit
         zero_start_warning = source_version == "explore_v3" and candidate.get("algorithm") is None
         if source_version == "explore_v3" and not zero_start_warning:
             data["warm_start_checkpoint"] = str(checkpoints[-1])

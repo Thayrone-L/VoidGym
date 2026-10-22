@@ -91,7 +91,8 @@ def test_continue_operator_campaign_uses_requested_actor_count(tmp_path: Path) -
     checkpoint.write_bytes(b"synthetic checkpoint")
     prior = {"campaign_id": campaign_id, "name": "Night run", "campaign_type": "exploration_training",
              "reward_version": "explore_v4", "shared_learner": True, "seed": 7,
-             "actors": 1, "version": 2, "created_at": "old", "spec_path": "old.json"}
+             "actors": 1, "rollout_steps": 256, "checkpoint_interval": 513,
+             "version": 2, "created_at": "old", "spec_path": "old.json"}
     with (patch("hk_agent.config.load_config", return_value=SimpleNamespace(instance_count=2)),
           patch.object(plane, "_operator_checkpoint_candidate", return_value={
               "campaign_id": campaign_id, "campaign": prior, "checkpoint": str(checkpoint),
@@ -102,6 +103,26 @@ def test_continue_operator_campaign_uses_requested_actor_count(tmp_path: Path) -
         plane.continue_operator_campaign(campaign_id=campaign_id, instances=2)
     assert create.call_args.args[0]["actors"] == 2
     assert create.call_args.args[0]["checkpoint_interval"] == 1024
+
+
+def test_continue_without_actor_override_preserves_resumable_count(tmp_path: Path) -> None:
+    plane = ControlPlane(tmp_path, allow_execute=True)
+    campaign_id = "shared-campaign"
+    shared_root = plane.runtime_root / "shared" / campaign_id
+    (shared_root / "checkpoints").mkdir(parents=True)
+    checkpoint = shared_root / "checkpoints" / "round-0003.zip"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    prior = {"campaign_id": campaign_id, "name": "Night run", "campaign_type": "exploration_training",
+             "reward_version": "explore_v4", "shared_learner": True, "seed": 7,
+             "actors": 2, "version": 2}
+    with (patch.object(plane, "_operator_checkpoint_candidate", return_value={
+              "campaign_id": campaign_id, "campaign": prior, "checkpoint": str(checkpoint),
+              "round": 3, "algorithm": "MaskablePPO",
+          }),
+          patch.object(plane, "create_campaign", side_effect=lambda data: {**data, "version": 3}) as create,
+          patch.object(plane, "launch", return_value={"launch_id": "next"})):
+        plane.continue_operator_campaign(campaign_id=campaign_id)
+    assert create.call_args.args[0]["actors"] == 2
 
 
 def test_operator_start_uses_latest_compatible_policy_for_jogada1(tmp_path: Path) -> None:
@@ -192,6 +213,23 @@ def test_operator_snapshot_keeps_dashboard_and_explains_instance_dll_marker_mism
     assert phrase in snapshot["alerts"]
     assert snapshot["playthroughs"] == []
     assert "reports" in snapshot and "journey" in snapshot
+
+
+def test_operator_snapshot_reports_typed_instance_two_marker_mismatch(tmp_path: Path) -> None:
+    from hk_agent.instance_install import InstanceMarkerMismatch
+
+    plane = ControlPlane(tmp_path)
+    with (patch.object(plane, "status", return_value={"active_count": 0, "active_launches": [], "capacity": 2}),
+          patch.object(plane, "_ensure_auto_reports"),
+          patch.object(plane, "list_campaigns", return_value=[]),
+          patch.object(plane, "_campaign_scene_discoveries", return_value=[]),
+          patch.object(plane, "_operator_playthroughs",
+                       side_effect=InstanceMarkerMismatch(2, "Instance 2 marker records index 1")),
+          patch.object(plane, "_operator_system_resources", return_value={}),
+          patch.object(plane, "map_art_status", return_value={}),
+          patch.object(plane, "list_reports", return_value=[])):
+        snapshot = plane.operator_snapshot()
+    assert any("instância 2" in alert for alert in snapshot["alerts"])
 
 
 def test_operator_snapshot_explains_failed_group_and_cancelled_actor(tmp_path: Path) -> None:
@@ -344,6 +382,16 @@ def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None
         assert "unknown fields" not in result["error"]
         connection.close()
 
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        body = json.dumps({"campaign_id": "synthetic-run", "weights": {"progress": 9}})
+        connection.request("POST", "/api/operator/continue", body=body,
+                           headers={"Content-Type": "application/json", "X-Control-Token": plane.csrf_token})
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        assert response.status == 400
+        assert "continue only accepts" in result["error"]
+        connection.close()
+
         with patch.object(plane, "_operator_system_resources", return_value={}):
             connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
             connection.request("GET", "/api/operator")
@@ -363,7 +411,7 @@ def test_map_calibration_api_supports_bounds_captures_and_removal(tmp_path: Path
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     plane = ControlPlane(tmp_path)
     digest = "a" * 64
-    monkeypatch.setattr(plane, "map_art_status", lambda: {
+    monkeypatch.setattr(plane, "map_art_status", lambda **_kwargs: {
         "sha256": digest, "tiles_ready": True, "tiles": {"width": 500, "height": 400},
     })
     server = ControlPlaneHTTPServer(("127.0.0.1", 0), plane, tmp_path)
@@ -371,6 +419,12 @@ def test_map_calibration_api_supports_bounds_captures_and_removal(tmp_path: Path
     thread.start()
     headers = {"Content-Type": "application/json", "X-Control-Token": plane.csrf_token}
     try:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        connection.request("GET", "/api/journey/map/status")
+        response = connection.getresponse()
+        status = json.loads(response.read())
+        assert response.status == 200 and status["tiles_ready"] is True
+        connection.close()
         for mode, anchors in (("bounds", [
             {"world_x": -20, "world_y": 10, "map_x": 100, "map_y": 200},
             {"world_x": 180, "world_y": 10, "map_x": 300, "map_y": 200},

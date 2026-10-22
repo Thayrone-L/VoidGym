@@ -232,7 +232,7 @@ def test_operator_snapshot_surfaces_persisted_actor_restart(
         {"campaign_id": "campaign", "launch_id": "learner-old", "role": "learner",
          "shared_group": "campaign-v0000", "status": "FAILED", "failure": "old failure"},
     ])
-    monkeypatch.setattr(control, "map_art_status", lambda: {"cached": False})
+    monkeypatch.setattr(control, "map_art_status", lambda **_kwargs: {"cached": False})
 
     snapshot = control.operator_snapshot()
     assert not any(alert.startswith("learner caiu:") for alert in snapshot["alerts"])
@@ -2238,3 +2238,16 @@ def test_shared_actor_restart_is_bounded_and_recorded(tmp_path: Path) -> None:
     rows = (tmp_path / "shared" / "actor-restarts.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 3
     assert json.loads(rows[-1])["restart_number_in_hour"] == 3
+
+
+def test_map_detail_cache_keys_include_path_mtime_and_size(tmp_path: Path) -> None:
+    from hk_agent.control_plane import _cached_game_map_layout
+
+    path = tmp_path / "game-map-layout.json"
+    with patch("hk_agent.map_layout.load_game_map_layout", side_effect=[{"value": 1}, {"value": 2}]) as load:
+        first = _cached_game_map_layout(str(path), 10, 100)
+        assert _cached_game_map_layout(str(path), 10, 100) is first
+        refreshed = _cached_game_map_layout(str(path), 11, 100)
+    assert first == {"value": 1}
+    assert refreshed == {"value": 2}
+    assert load.call_count == 2

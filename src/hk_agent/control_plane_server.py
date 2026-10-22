@@ -51,6 +51,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 ))
             except (OSError, ValueError, TypeError) as error:
                 self._error(HTTPStatus.NOT_FOUND, str(error))
+        elif path == "/api/journey/map/status":
+            self._json(HTTPStatus.OK, self.server.control_plane.map_art_status(include_details=True))
         elif self.server.upstream_port is not None and path.startswith("/api/"):
             self._relay("GET")
             return
@@ -273,16 +275,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":
-                if set(payload) not in (
-                    {}, {"help_stuck_count"}, {"help_stuck_count", "help_stuck_minutes"},
-                    {"campaign_id"}, {"campaign_id", "help_stuck_count"},
-                    {"campaign_id", "help_stuck_count", "help_stuck_minutes"},
-                    {"instances"}, {"instances", "campaign_id"},
-                    {"instances", "help_stuck_count"},
-                    {"instances", "help_stuck_count", "help_stuck_minutes"},
-                    {"instances", "campaign_id", "help_stuck_count"},
-                    {"instances", "campaign_id", "help_stuck_count", "help_stuck_minutes"},
-                ):
+                if not set(payload) <= {"campaign_id", "instances", "help_stuck_count", "help_stuck_minutes"}:
                     raise ValueError("continue only accepts campaign id and help trigger settings")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")

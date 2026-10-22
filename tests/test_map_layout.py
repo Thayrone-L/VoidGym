@@ -47,6 +47,28 @@ def test_legacy_room_calibration_migration_keeps_pixel_delta() -> None:
     assert offsets["Tutorial_01"] == [1, 0]
 
 
+def test_shared_world_to_game_map_fixtures() -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "map_transform_cases.json"
+    cases = json.loads(fixture_path.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        result = world_to_game_map(
+            case["scene"], *case["point"], case["world_bounds"], case["layout"]
+        )
+        expected = case["expected"]
+        assert result == (tuple(expected) if expected is not None else None), case["name"]
+
+
+def test_map_status_omits_layout_from_lightweight_snapshot(tmp_path: Path) -> None:
+    from hk_agent.control_plane import ControlPlane
+
+    plane = ControlPlane(tmp_path, observer=True)
+    summary = plane.map_art_status(include_details=False)
+    assert "game_layout" not in summary
+    assert "calibrations" not in summary
+    detailed = plane.map_art_status(include_details=True)
+    assert "game_layout" in detailed
+
+
 def test_control_plane_saves_global_calibration_and_room_offsets(tmp_path: Path, monkeypatch) -> None:
     from hk_agent.control_plane import ControlPlane
 
