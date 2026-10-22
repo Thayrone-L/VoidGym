@@ -182,6 +182,33 @@ def test_sb3_maskable_recurrent_ppo_collects_and_updates_a_rollout() -> None:
     vector.close()
 
 
+def test_random_shift_is_training_only_and_shared_across_each_lstm_sequence(monkeypatch) -> None:
+    import gymnasium as gym
+    import torch
+    from sb3_contrib.common.recurrent.type_aliases import RNNStates
+
+    from hk_agent.recurrent_sb3 import MaskableRecurrentActorCriticPolicy
+
+    policy = MaskableRecurrentActorCriticPolicy(
+        gym.spaces.Dict({"pixels": gym.spaces.Box(0, 255, (2, 8, 8, 3), dtype=np.uint8)}),
+        gym.spaces.Discrete(2), lstm_hidden_size=8, n_lstm_layers=1,
+        augment_random_shift=True, lr_schedule=lambda _progress: 1e-3,
+    )
+    pixels = torch.arange(8 * 8 * 3, dtype=torch.uint8).reshape(1, 1, 8, 8, 3).repeat(4, 2, 1, 1, 1)
+    obs = {"pixels": pixels}
+    states = RNNStates(
+        (torch.zeros(1, 2, 8), torch.zeros(1, 2, 8)),
+        (torch.zeros(1, 2, 8), torch.zeros(1, 2, 8)),
+    )
+    monkeypatch.setattr(torch, "randint", lambda _low, _high, size, **kwargs: torch.ones(size, **kwargs))
+    policy.train()
+    shifted = policy._training_observation(obs, states)["pixels"]
+    assert torch.equal(shifted[0], shifted[1]) and torch.equal(shifted[2], shifted[3])
+    assert not torch.equal(shifted[0], pixels[0])
+    policy.eval()
+    assert policy._training_observation(obs, states) is obs
+
+
 def test_sb3_recurrent_policy_normalizes_numpy_observation_dimensions() -> None:
     import gymnasium as gym
     from stable_baselines3.common.vec_env import DummyVecEnv

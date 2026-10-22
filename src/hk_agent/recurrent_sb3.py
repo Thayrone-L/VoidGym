@@ -110,9 +110,40 @@ class MaskableRecurrentActorCriticPolicy(RecurrentMultiInputActorCriticPolicy):
     def __init__(self, observation_space: spaces.Space, action_space: spaces.Space, *args: Any, **kwargs: Any):
         if not isinstance(action_space, spaces.Discrete):
             raise TypeError("MaskableRecurrentPPO currently supports Discrete actions only")
+        self.augment_random_shift = bool(kwargs.pop("augment_random_shift", False))
         kwargs.setdefault("features_extractor_class", IntDimensionCombinedExtractor)
         super().__init__(observation_space, action_space, *args, **kwargs)
         self.action_dist = make_masked_proba_distribution(action_space)
+
+    def _training_observation(self, obs: Any, states: RNNStates) -> Any:
+        if not self.augment_random_shift or not self.training or not isinstance(obs, dict):
+            return obs
+        pixels = obs.get("pixels")
+        if not isinstance(pixels, Tensor) or pixels.ndim != 5:
+            return obs
+        sequence_count = int(states.pi[0].shape[1])
+        if sequence_count < 1 or pixels.shape[0] % sequence_count:
+            raise ValueError("recurrent pixel batch does not align with LSTM sequences")
+        sequence_length = pixels.shape[0] // sequence_count
+        shift_y = torch.randint(-4, 5, (sequence_count,), device=pixels.device).repeat_interleave(sequence_length)
+        shift_x = torch.randint(-4, 5, (sequence_count,), device=pixels.device).repeat_interleave(sequence_length)
+        batch, frames, height, width, channels = pixels.shape
+        if channels != 3:
+            raise ValueError("random shift expects RGB frame stacks")
+        packed = pixels.permute(0, 1, 4, 2, 3).reshape(batch, frames * channels, height, width)
+        working_dtype = packed.dtype
+        packed = packed.to(dtype=torch.float32)
+        padded = torch.nn.functional.pad(packed, (4, 4, 4, 4), mode="replicate")
+        y = torch.arange(height, device=pixels.device)[None, :] + 4 + shift_y[:, None]
+        x = torch.arange(width, device=pixels.device)[None, :] + 4 + shift_x[:, None]
+        grid_y = (2.0 * y / (height + 7) - 1.0)[:, :, None].expand(batch, height, width)
+        grid_x = (2.0 * x / (width + 7) - 1.0)[:, None, :].expand(batch, height, width)
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+        shifted = torch.nn.functional.grid_sample(
+            padded, grid, mode="nearest", padding_mode="border", align_corners=True
+        ).to(dtype=working_dtype)
+        augmented = shifted.reshape(batch, frames, channels, height, width).permute(0, 1, 3, 4, 2)
+        return {**obs, "pixels": augmented}
 
     def _get_action_dist_from_latent(self, latent_pi: Tensor) -> Any:  # type: ignore[override]
         logits = self.action_net(latent_pi)
@@ -126,6 +157,9 @@ class MaskableRecurrentActorCriticPolicy(RecurrentMultiInputActorCriticPolicy):
         deterministic: bool = False,
         action_masks: NDArray[np.bool_] | Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, RNNStates]:
+        # Rollout collection and prediction both use ``forward``. Keep the
+        # collected trajectory faithful to the real observations; augmentation
+        # is applied only by evaluate_actions during PPO/SIL updates.
         features = self.extract_features(obs)
         if self.share_features_extractor:
             pi_features = vf_features = features
@@ -157,7 +191,7 @@ class MaskableRecurrentActorCriticPolicy(RecurrentMultiInputActorCriticPolicy):
         episode_starts: Tensor,
         action_masks: NDArray[np.bool_] | Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        features = self.extract_features(obs)
+        features = self.extract_features(self._training_observation(obs, lstm_states))
         if self.share_features_extractor:
             pi_features = vf_features = features
         else:

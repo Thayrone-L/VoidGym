@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warm-start-policy-manifest-id")
     parser.add_argument("--calibration-samples", type=int, default=5)
     parser.add_argument("--lease-ms", type=int, default=80)
+    parser.add_argument("--game-speed", type=float, choices=(1.0, 1.5, 2.0), default=1.0)
+    parser.add_argument("--augment-random-shift", action="store_true")
+    parser.add_argument("--aux-losses", action="store_true")
+    parser.add_argument("--asymmetric-critic", action="store_true")
+    parser.add_argument("--mask-interact-without-prompt", action="store_true")
     parser.add_argument("--window-width", type=int, default=960)
     parser.add_argument("--window-height", type=int, default=540)
     parser.add_argument("--height", type=int, default=338)
@@ -348,6 +353,11 @@ def main() -> int:
         clip_range=args.clip_range if args.clip_range is not None else (0.2 if args.task == "exploration" else None),
         shared_actors=(int(os.environ.get("HK_AGENT_SHARED_ACTORS", "1"))
                        if os.environ.get("HK_AGENT_SHARED_ROLE") == "actor" else 1),
+        game_speed=args.game_speed,
+        augment_random_shift=args.augment_random_shift,
+        aux_losses=args.aux_losses,
+        asymmetric_critic=args.asymmetric_critic,
+        mask_interact_without_prompt=args.mask_interact_without_prompt,
     )
     training_config.validate()
     dependency_state = {

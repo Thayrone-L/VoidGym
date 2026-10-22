@@ -68,6 +68,34 @@ def test_launch_commands_use_project_virtual_environment(tmp_path: Path) -> None
     assert command[0] == str(python)
 
 
+def test_prompt_82_campaign_flags_have_documented_safe_defaults_and_validation() -> None:
+    payload = _payload("exploration_training")
+    payload["weights"] = {}
+    default = CampaignSpec.from_payload(payload)
+    assert default.game_speed == 1.0
+    assert not default.augment_random_shift
+    assert not default.aux_losses
+    assert not default.asymmetric_critic
+    assert not default.mask_interact_without_prompt
+
+    payload["augment_random_shift"] = True
+    configured = CampaignSpec.from_payload(payload)
+    assert configured.game_speed == 1.0
+    assert configured.augment_random_shift
+    for option, value in (
+        ("game_speed", 1.5),
+        ("aux_losses", True),
+        ("asymmetric_critic", True),
+        ("mask_interact_without_prompt", True),
+    ):
+        unsupported = dict(payload, **{option: value})
+        with pytest.raises(ValueError, match="not implemented end-to-end"):
+            CampaignSpec.from_payload(unsupported)
+    payload["game_speed"] = 1.25
+    with pytest.raises(ValueError, match="1.0, 1.5 or 2.0"):
+        CampaignSpec.from_payload(payload)
+
+
 def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     control = ControlPlane(_project(tmp_path))
     first = control.create_campaign(_payload())
@@ -76,7 +104,7 @@ def test_campaign_specs_are_validated_and_versioned(tmp_path: Path) -> None:
     assert second["version"] == 2
     assert first["campaign_id"] == "kings-pass-exploration"
     assert len(control.list_campaigns()) == 2
-    assert first["schema_version"] == 11
+    assert first["schema_version"] == 12
     assert first["save_source"] == "existing_save"
     assert first["save_slot"] == 1
 

@@ -190,7 +190,12 @@ class CampaignSpec:
     help_requests_per_hour: int = 3
     help_failed_attempts: int = 100
     help_stalled_hours: float = 6.0
-    schema_version: int = 11
+    game_speed: float = 1.0
+    augment_random_shift: bool = False
+    aux_losses: bool = False
+    asymmetric_critic: bool = False
+    mask_interact_without_prompt: bool = False
+    schema_version: int = 12
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> CampaignSpec:
@@ -207,6 +212,25 @@ class CampaignSpec:
         help_requests_enabled = payload.get("help_requests_enabled", False)
         if not isinstance(challenge_practice_enabled, bool) or not isinstance(help_requests_enabled, bool):
             raise TypeError("challenge_practice_enabled and help_requests_enabled must be booleans")
+        feature_toggles = {
+            key: payload.get(key, False)
+            for key in ("augment_random_shift", "aux_losses", "asymmetric_critic", "mask_interact_without_prompt")
+        }
+        if any(not isinstance(value, bool) for value in feature_toggles.values()):
+            raise TypeError("prompt 82 feature toggles must be booleans")
+        raw_game_speed = payload.get("game_speed", 1.0)
+        game_speed = _bounded_float(raw_game_speed, "game_speed", 1.0, 2.0)
+        if game_speed not in {1.0, 1.5, 2.0}:
+            raise ValueError("game_speed must be 1.0, 1.5 or 2.0")
+        unsupported_82 = []
+        if game_speed != 1.0:
+            unsupported_82.append("game_speed != 1.0")
+        unsupported_82.extend(key for key in ("aux_losses", "asymmetric_critic", "mask_interact_without_prompt") if feature_toggles[key])
+        if unsupported_82:
+            raise ValueError(
+                "prompt 82 options are not implemented end-to-end yet: "
+                + ", ".join(unsupported_82)
+            )
         if (challenge_practice_enabled or help_requests_enabled) and campaign_type != "exploration_training":
             raise ValueError("challenge practice and help requests require exploration_training")
         if shared_learner and campaign_type not in {"visual_motion_training", "exploration_training"}:
@@ -411,6 +435,11 @@ class CampaignSpec:
             help_requests_per_hour=_bounded_int(payload.get("help_requests_per_hour", 3), "help_requests_per_hour", 1, 100),
             help_failed_attempts=_bounded_int(payload.get("help_failed_attempts", 100), "help_failed_attempts", 1, 10000),
             help_stalled_hours=_bounded_float(payload.get("help_stalled_hours", 6.0), "help_stalled_hours", 0.1, 720.0),
+            game_speed=game_speed,
+            augment_random_shift=cast(bool, feature_toggles["augment_random_shift"]),
+            aux_losses=cast(bool, feature_toggles["aux_losses"]),
+            asymmetric_critic=cast(bool, feature_toggles["asymmetric_critic"]),
+            mask_interact_without_prompt=cast(bool, feature_toggles["mask_interact_without_prompt"]),
         )
         if spec.rollout_steps * spec.actors % spec.batch_size:
             raise ValueError("batch_size must divide rollout_steps times actors")
@@ -2734,6 +2763,15 @@ class ControlPlane:
             ]
             if spec.campaign_type in {"visual_motion_training", "exploration_training"}:
                 command += ["--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size)]
+                command += ["--game-speed", str(spec.game_speed)]
+                if spec.augment_random_shift:
+                    command.append("--augment-random-shift")
+                if spec.aux_losses:
+                    command.append("--aux-losses")
+                if spec.asymmetric_critic:
+                    command.append("--asymmetric-critic")
+                if spec.mask_interact_without_prompt:
+                    command.append("--mask-interact-without-prompt")
             if spec.campaign_type == "exploration_training":
                 command += ["--task", "exploration", "--reward-version", spec.reward_version, "--ent-coef", str(spec.ent_coef), "--gamma", str(spec.gamma),
                             "--gae-lambda", str(spec.gae_lambda), "--n-epochs", str(spec.n_epochs), "--target-kl", str(spec.target_kl),
@@ -2919,6 +2957,8 @@ class ControlPlane:
             "--torch-interop-threads", str(self.torch_interop_threads),
             "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
         ]
+        if spec.augment_random_shift:
+            command.append("--augment-random-shift")
         if spec.warm_start_checkpoint:
             warm_path = Path(spec.warm_start_checkpoint).resolve(strict=True)
             allowed_warm_root = (self.runtime_root / "shared").resolve(strict=False)

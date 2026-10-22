@@ -1958,6 +1958,7 @@ def run_shared_learner(
     straggler_timeout_seconds: float = DEFAULT_STRAGGLER_TIMEOUT_SECONDS,
     warm_start_checkpoint: Path | None = None,
     warm_start_source_campaign: str | None = None,
+    augment_random_shift: bool = False,
 ) -> dict[str, Any]:
     """Train one PPO learner from all valid actor files in each policy round."""
     if rollout_steps < 1 or actors < 1 or batch_size < 1 or rollout_steps % batch_size:
@@ -1968,6 +1969,8 @@ def run_shared_learner(
         raise ValueError("checkpoint_interval must be a multiple of rollout_steps times actors")
     if not continuous and total_timesteps < 1:
         raise ValueError("total_timesteps must be positive")
+    if not isinstance(augment_random_shift, bool):
+        raise TypeError("augment_random_shift must be boolean")
     import importlib
 
     torch = importlib.import_module("torch")
@@ -2010,6 +2013,8 @@ def run_shared_learner(
     task_contract = task_contract if isinstance(task_contract, Mapping) else {}
     recurrent_config = task_contract.get("recurrent_policy")
     recurrent_enabled = isinstance(recurrent_config, Mapping) and recurrent_config.get("name") == "maskable_recurrent_v1"
+    if augment_random_shift and not recurrent_enabled:
+        raise ValueError("augment_random_shift currently requires the recurrent sequence policy")
     if recurrent_enabled:
         from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
         recurrent_settings = cast(Mapping[str, Any], recurrent_config)
@@ -2017,7 +2022,11 @@ def run_shared_learner(
             "MultiInputLstmPolicy", environment, seed=seed, n_steps=rollout_steps,
             batch_size=batch_size, sequence_length=int(recurrent_settings["sequence_length"]),
             verbose=0, device="cpu",
-            policy_kwargs={"lstm_hidden_size": int(recurrent_settings["hidden_size"]), "n_lstm_layers": int(recurrent_settings["layers"])},
+            policy_kwargs={
+                "lstm_hidden_size": int(recurrent_settings["hidden_size"]),
+                "n_lstm_layers": int(recurrent_settings["layers"]),
+                "augment_random_shift": augment_random_shift,
+            },
             **_shared_ppo_parameters(task_contract),
         )
         model_class = MaskableRecurrentPPO
@@ -2088,6 +2097,8 @@ def run_shared_learner(
         if restored is None:
             raise SharedLearnerError("no valid shared-learner checkpoint is available to resume")
         model, current_round, completed = restored
+        if hasattr(model.policy, "augment_random_shift"):
+            model.policy.augment_random_shift = augment_random_shift
     model._setup_learn(
         total_timesteps=max(1, total_timesteps),
         callback=lambda _locals, _globals: True,

@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--straggler-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--warm-start-checkpoint", type=Path)
     parser.add_argument("--warm-start-source-campaign")
+    parser.add_argument("--augment-random-shift", action="store_true")
     args = parser.parse_args()
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, str(args.torch_threads))
@@ -50,6 +51,7 @@ def main() -> int:
         straggler_timeout_seconds=args.straggler_timeout_seconds,
         warm_start_checkpoint=args.warm_start_checkpoint,
         warm_start_source_campaign=args.warm_start_source_campaign,
+        augment_random_shift=args.augment_random_shift,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("status") in {"COMPLETED", "CANCELLED"} else 1

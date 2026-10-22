@@ -231,6 +231,17 @@ def test_training_resource_defaults_and_ranges() -> None:
             config.validate()
 
 
+def test_prompt_82_rejects_features_that_are_not_implemented_end_to_end() -> None:
+    for config in (
+        FirstTrainingConfig(game_speed=1.5),
+        FirstTrainingConfig(aux_losses=True),
+        FirstTrainingConfig(asymmetric_critic=True),
+        FirstTrainingConfig(mask_interact_without_prompt=True),
+    ):
+        with pytest.raises(ValueError, match="not implemented end-to-end"):
+            config.validate()
+
+
 def test_training_applies_and_records_effective_resources_without_mutating_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

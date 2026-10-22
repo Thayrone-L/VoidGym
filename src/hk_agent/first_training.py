@@ -57,8 +57,34 @@ class FirstTrainingConfig:
     shared_actors: int = 1
     lstm_hidden_size: int = 256
     lstm_layers: int = 1
+    game_speed: float = 1.0
+    augment_random_shift: bool = False
+    aux_losses: bool = False
+    asymmetric_critic: bool = False
+    mask_interact_without_prompt: bool = False
 
     def validate(self) -> None:
+        if self.game_speed not in {1.0, 1.5, 2.0}:
+            raise ValueError("game_speed must be 1.0, 1.5 or 2.0")
+        if not all(isinstance(value, bool) for value in (
+            self.augment_random_shift, self.aux_losses, self.asymmetric_critic,
+            self.mask_interact_without_prompt,
+        )):
+            raise TypeError("prompt 82 feature toggles must be booleans")
+        unsupported = []
+        if self.game_speed != 1.0:
+            unsupported.append("game_speed != 1.0")
+        if self.aux_losses:
+            unsupported.append("aux_losses")
+        if self.asymmetric_critic:
+            unsupported.append("asymmetric_critic")
+        if self.mask_interact_without_prompt:
+            unsupported.append("mask_interact_without_prompt")
+        if unsupported:
+            raise ValueError(
+                "prompt 82 options are not implemented end-to-end yet: "
+                + ", ".join(unsupported)
+            )
         if not 1 <= self.total_timesteps <= 10_000_000:
             raise ValueError("total_timesteps is outside the safe range")
         if not 1 <= self.checkpoint_interval <= 1_000_000:
@@ -318,6 +344,8 @@ def train_ppo(
             else:
                 raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
             manifest["algorithm"] = algorithm
+            if hasattr(model.policy, "augment_random_shift"):
+                model.policy.augment_random_shift = config.augment_random_shift
             completed = int(model.num_timesteps)
             manifest["resumed_from"] = {
                 "path": str(resume_path),
@@ -333,7 +361,11 @@ def train_ppo(
                     "MultiInputLstmPolicy", environment, seed=config.seed,
                     n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=1,
                     device=config.training_device,
-                    policy_kwargs={"lstm_hidden_size": config.lstm_hidden_size, "n_lstm_layers": config.lstm_layers},
+                    policy_kwargs={
+                        "lstm_hidden_size": config.lstm_hidden_size,
+                        "n_lstm_layers": config.lstm_layers,
+                        "augment_random_shift": config.augment_random_shift,
+                    },
                     **{name: getattr(config, name) for name in (
                         "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
                     ) if getattr(config, name) is not None},
