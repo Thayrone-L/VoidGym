@@ -55,3 +55,10 @@ observação. `STEP_GAME_MS=240` replica lease 80 ms × repetição 3 da v1. A p
 encoder compartilhado, cabeça semântica, LSTM, ator mascarado e crítico assimétrico opcional.
 Gabarito, movimento do herói e dinâmica inversa são perdas auxiliares de treino e nunca entradas
 do ator.
+
+O encoder IMPALA reduz `(B,12,108,192)` a `(B,32,14,24)` e projeta em 256. A política concatena
+um embedding de histórico de 64 dimensões, processa sequências com LSTM de 256 e mascara ações
+inválidas antes do softmax. A percepção produz logits `(B,10,27,48)`; cabeças de dinâmica inversa
+e movimento são auxiliares. Treino usa PPO clipped, GAE, sequências truncadas, gabarito
+semântico e aumento acoplado de imagem/rótulo. Checkpoints em diretório validam os 43 nomes de
+ação antes de carregar.

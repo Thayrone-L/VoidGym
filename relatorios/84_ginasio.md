@@ -20,11 +20,11 @@ detalhada, blur/parallax multicamada ou todos os pós-processamentos opcionais.
 
 ## Desempenho e evidências
 
-Benchmark BELOW_NORMAL com 2.000 passos por worker: 1.259 passos/s em um processo e 3.144
-passos/s no total com seis workers (multiprocessing Windows); não havia processo v1 para medir.
-O resultado single-process ficou abaixo da meta de 1.500; o profiler aponta física e desenho como
-principais custos. A amostra curta de 400 passos variou, portanto os 2.000 passos são o número
-registrado.
+Benchmark corrigido para distribuir exatamente 2.000 passos: com prioridade `BELOW_NORMAL`, sem
+treino concorrente, mediu 3.501 passos/s em um processo e 3.615 passos/s agregados em seis
+workers. Não havia processo v1 para medir. A amostra de 400/396 passos sob treino concorrente
+(912/749 passos/s) fica registrada como comparação histórica; as medidas anteriores à correção
+da prioridade (1.259/3.144 passos/s) foram descartadas.
 
 - `relatorios/84_amostras/mosaico.png`
 - `relatorios/84_amostras/gabarito.png`

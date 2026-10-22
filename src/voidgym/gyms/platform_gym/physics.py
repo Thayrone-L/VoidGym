@@ -124,7 +124,7 @@ def _attack(room: Room, player: Player, buttons: dict[str, bool], physics: Physi
             block.hp -= 1
             if block.hp <= 0:
                 block.broken = True
-                events.append(Event("break", block.reveals))
+                events.append(Event("break", f"{block.reveals}:{block.rect.x:.2f}"))
                 if block.reveals == "pickup":
                     room.pickups.append(Pickup(Rect(block.rect.x, block.rect.y, .6, .6), "coin"))
     for enemy in room.enemies:
@@ -162,11 +162,11 @@ def _interactions(room: Room, player: Player, buttons: dict[str, bool], events: 
             room.pickups.remove(pickup)
             if pickup.kind.startswith("ability_"):
                 player.abilities.add(pickup.kind)
-                events.append(Event("ability", pickup.kind))
+                events.append(Event("ability", f"{pickup.kind}:{pickup.rect.x:.2f}"))
             else:
                 if pickup.kind == "heal":
                     player.hp = player.max_hp
-                events.append(Event("pickup", pickup.kind))
+                events.append(Event("pickup", f"{pickup.kind}:{pickup.rect.x:.2f}"))
     for bench in room.interactives:
         if buttons.get("interact") and body.expanded(.5).intersects(bench.rect):
             player.hp = player.max_hp

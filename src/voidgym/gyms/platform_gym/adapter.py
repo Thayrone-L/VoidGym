@@ -20,7 +20,9 @@ class PlatformGymAdapter:
     def __init__(self, room: Room | None = None, *, split: str = "train") -> None:
         from voidgym.gyms.platform_gym.generator import generate_room
 
-        self.room = room or generate_room(0, 1)
+        self.rooms = [room] if room is not None else [generate_room(0, 1)]
+        self.room_index = 0
+        self.room = self.rooms[0]
         self.player = Player(*self.room.spawn)
         self.player.last_safe_pos = self.room.spawn
         self.style: RenderStyle = make_style(self.room.style_seed, split)
@@ -49,14 +51,16 @@ class PlatformGymAdapter:
         return render(self.room, self.player, self.style)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> None:
-        from voidgym.gyms.platform_gym.generator import generate_room
+        from voidgym.gyms.platform_gym.generator import generate_metroidvania_set, generate_room
 
         level = int((options or {}).get("level", 0))
         chosen_seed = seed if seed is not None else self.room.style_seed
-        self.room = generate_room(level, chosen_seed)
+        self.rooms = generate_metroidvania_set(chosen_seed) if level == 7 else [generate_room(level, chosen_seed)]
+        self.room_index = 0
+        self.room = self.rooms[0]
         self.player = Player(*self.room.spawn)
         self.player.last_safe_pos = self.room.spawn
-        self.style = make_style(chosen_seed, self.style.style_params.split)
+        self.style = make_style(self.room.style_seed, self.style.style_params.split)
         self.events = []
         self.steps = 0
         self._last_cell = (int(self.player.x), int(self.player.y))
@@ -87,6 +91,17 @@ class PlatformGymAdapter:
         self._last_cell = cell
         self.terminated = any(event.kind == "exit" for event in self.events)
         self.truncated = self.steps >= 1500 or self._stuck_steps >= 300
+        if self.terminated and self.room_index + 1 < len(self.rooms):
+            abilities = set(self.player.abilities)
+            hp = self.player.hp
+            self.room_index += 1
+            self.room = self.rooms[self.room_index]
+            self.player = Player(*self.room.spawn)
+            self.player.abilities = abilities
+            self.player.hp = hp
+            self.player.last_safe_pos = self.room.spawn
+            self.style = make_style(self.room.style_seed, self.style.style_params.split)
+            self.terminated = False
 
     def action_mask(self) -> NDArray[np.bool_]:
         mask = np.ones(len(self._names), dtype=np.bool_)
@@ -104,7 +119,9 @@ class PlatformGymAdapter:
                 "hp": self.player.hp, "max_hp": self.player.max_hp, "died": any(e.kind == "death" for e in self.events),
                 "room_changed": any(e.kind == "exit" for e in self.events), "progress": self.player.x / self.room.width,
                 "player_pos_world": [self.player.x, self.player.y],
-                "events": [event.kind for event in self.events], "terminated": self.terminated, "truncated": self.truncated}
+                "events": [event.kind for event in self.events],
+                "event_details": [(event.kind, event.detail) for event in self.events],
+                "terminated": self.terminated, "truncated": self.truncated}
 
     def training_labels(self) -> Mapping[str, Any]:
         from voidgym.gyms.platform_gym.labels import labels

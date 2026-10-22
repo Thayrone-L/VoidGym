@@ -1,1 +1,1 @@
-"""Treino universal da v2; preenchido nos prompts 85 a 87."""
+"""Rotinas de treino da política universal."""

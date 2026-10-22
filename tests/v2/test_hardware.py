@@ -51,3 +51,11 @@ def test_real_machine_detection_and_overrides() -> None:
     assert plan.train_device == "cpu"
     with pytest.raises(ValueError, match="train_device"):
         plan_resources(profile, "evaluation", ResourceOverrides(train_device="tpu"))
+
+
+def test_platform_pretraining_does_not_reserve_cores_for_live_games() -> None:
+    profile = _profile(8, 16, 16, None)
+    plan = plan_resources(profile, "pretrain_platform")
+    assert plan.game_instances == 0
+    assert plan.gym_envs == 14
+    assert plan.torch_threads_learner == 7

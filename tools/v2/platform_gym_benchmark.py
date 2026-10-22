@@ -13,6 +13,9 @@ from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
 
 def _lower_priority() -> None:
     if os.name == "nt":
+        from ctypes import wintypes
+        ctypes.windll.kernel32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        ctypes.windll.kernel32.SetPriorityClass.restype = wintypes.BOOL
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
 
 
@@ -29,8 +32,9 @@ def _worker(steps: int) -> int:
 
 def _process_rate(steps: int, workers: int) -> float:
     started = time.perf_counter()
+    tasks = [steps // workers + int(index < steps % workers) for index in range(workers)]
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        total = sum(pool.map(_worker, [steps // workers] * workers))
+        total = sum(pool.map(_worker, tasks))
     return total / (time.perf_counter() - started)
 
 

@@ -37,3 +37,14 @@ def test_curriculum_promotes_persists_and_reloads(tmp_path) -> None:
     loaded = Curriculum(tmp_path / "curriculum.json")
     loaded.load()
     assert loaded.level == 7
+
+
+def test_level_seven_adapter_transitions_between_connected_rooms() -> None:
+    adapter = PlatformGymAdapter()
+    adapter.reset(seed=120, options={"level": 7})
+    assert len(adapter.rooms) >= 3
+    adapter.player.x = adapter.room.width - 1.5
+    adapter.player.y = 2
+    adapter.apply(adapter.action_table().index("NOOP"))
+    assert adapter.room_index == 1
+    assert not adapter.terminated

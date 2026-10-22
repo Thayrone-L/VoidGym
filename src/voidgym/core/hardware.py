@@ -93,7 +93,6 @@ def plan_resources(
     configured_storage_gb: float = 100.0,
 ) -> ResourcePlan:
     """Planeja recursos; sobrescritas validadas substituem os padrões."""
-    del kind
     physical = profile.physical_cores or profile.logical_cores or 2
     logical = profile.logical_cores or physical
     ram = profile.ram_total_gb or 8.0
@@ -102,6 +101,11 @@ def plan_resources(
     envs = max(2, logical - 2 - 2 * instances)
     device = "cuda" if gpu else "cpu"
     threads = 2 if gpu else max(1, physical - 2 * instances - 1)
+    if kind == "pretrain_platform":
+        # This workload has no live game processes to reserve CPU for.
+        instances = 0
+        envs = max(2, logical - 2)
+        threads = 2 if gpu else max(1, physical - 1)
     batch = 2048 if gpu and (profile.gpu_memory_total_gb or 0) >= 8 else 1024 if gpu else 512
     disk_budget = configured_storage_gb
     if profile.disk_free_gb is not None:
