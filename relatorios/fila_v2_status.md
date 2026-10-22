@@ -15,7 +15,7 @@
 | 83 | ✅ pronto | `8610ca7` | smoke real da v1 e comparação de checkpoint |
 | 83b | ✅ pronto nesta máquina | `5ffd6ba` | executar CUDA com RTX 3060/VRAM e conferir Actions |
 | 84 | ✅ pronto nesta máquina | `35de599` | confirmar `STEP_GAME_MS` no jogo real; benchmark local sem concorrência: 3.501/s serial e 3.615/s (6 workers) |
-| 85 | 🟡 parcial | — | Treino 8 h/20 M com CUDA na RTX 3060, medir VRAM/throughput, e confirmar STEP_GAME_MS e transferência no jogo real |
+| 85 | 🟡 parcial | `7c31c70` | Treino 8 h/20 M com CUDA na RTX 3060, medir VRAM/throughput, e confirmar STEP_GAME_MS e transferência no jogo real |
 
 ## Bloqueios observados
 
