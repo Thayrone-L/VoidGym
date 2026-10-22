@@ -5,7 +5,10 @@ from typing import Any, cast
 
 import numpy as np
 
-from hk_agent.action_masking import build_action_mask  # V1-SHIM: portar no prompt 86
+from hk_agent.action_masking import (  # V1-SHIM: portar no prompt 86
+    availability_dict,
+    build_action_mask,
+)
 from hk_agent.temporal_actions import (  # V1-SHIM: portar no prompt 86
     PLAYER_INTERACTION_ACTIONS,
     TEMPORAL_COMBAT_ACTIONS,
@@ -46,8 +49,13 @@ class HollowKnightAdapter:
 
     def __init__(self, env: Any) -> None:
         self.env = env
+        self._last_info: dict[str, Any] = {}
         if set(_HK_TO_UNIVERSAL) != set(_NAMES):
             raise RuntimeError("Mapeamento universal de ações do HK incompleto")
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> None:
+        _observation, info = self.env.reset(seed=seed, options=options)
+        self._last_info = dict(info)
 
     def action_table(self) -> tuple[str, ...]:
         return _NAMES
@@ -71,7 +79,10 @@ class HollowKnightAdapter:
 
     def apply(self, game_action_index: int) -> None:
         template = _TEMPLATES[game_action_index]
-        self.env.step(template.raw_action_index, lease_ms=template.resolve_lease_ms(80))
+        _observation, _reward, _terminated, _truncated, info = self.env.step(
+            template.raw_action_index, lease_ms=template.resolve_lease_ms(80)
+        )
+        self._last_info = dict(info)
 
     def action_mask(self) -> np.ndarray:
         availability = self.env.latest_action_availability
@@ -81,14 +92,42 @@ class HollowKnightAdapter:
         if not self.env._frames:
             return {}
         frame = self.env._frames[-1]
-        return {
-            "scene": frame.scene_name,
-            "position": frame.operator_telemetry,
-            "hp_lost": frame.hp_lost_since_last_frame,
-            "died": frame.player_dead,
-            "enemy_kills": frame.enemy_kills_since_last_frame,
-            "geo_gained": frame.geo_gained_since_last_frame,
+        signal_names = {
+            "enemy_kills_since_last_frame", "hp_lost_since_last_frame",
+            "geo_gained_since_last_frame", "geo_spent_since_last_frame",
+            "hp_restored_since_last_frame", "shade_hits_since_last_frame",
+            "shade_distance", "scene_name", "shade_pending", "enemy_events_since_last_frame",
+            "bestiary_events_since_last_frame", "run_failed", "supervisor",
+            "operator_telemetry", "map_zone", "x", "y", "camera_x", "camera_y",
+            "scene_bounds", "milestone_events_since_last_frame",
         }
+        result = {key: value for key, value in self._last_info.items() if key in signal_names}
+        result.update({
+            "scene_name": frame.scene_name,
+            "scene_transition": frame.scene_transition,
+            "shade_pending": frame.shade_pending,
+            "shade_recovered": frame.shade_recovered,
+            "run_failed": frame.run_failed,
+            "enemy_kills_since_last_frame": frame.enemy_kills_since_last_frame,
+            "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
+            "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
+            "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
+            "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
+            "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
+            "shade_distance": frame.shade_distance,
+            "enemy_events_since_last_frame": frame.enemy_events_since_last_frame,
+            "bestiary_events_since_last_frame": frame.bestiary_events,
+            "action_availability": availability_dict(frame.action_availability),
+        })
+        if frame.operator_telemetry is not None:
+            telemetry = dict(frame.operator_telemetry)
+            result["operator_telemetry"] = telemetry
+            result["position"] = telemetry
+            for key in ("map_zone", "x", "y", "camera_x", "camera_y", "scene_bounds",
+                        "milestone_events_since_last_frame"):
+                if key in telemetry:
+                    result[key] = telemetry[key]
+        return result
 
     def training_labels(self) -> None:
         return None

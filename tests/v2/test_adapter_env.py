@@ -4,6 +4,12 @@ from tests.v2.fake_adapter import FakeAdapter
 from voidgym.envs.adapter_env import AdapterEnv
 
 
+def test_fake_adapter_action_mapping_round_trips() -> None:
+    adapter = FakeAdapter()
+    for index in range(len(adapter.action_table())):
+        assert adapter.from_universal(adapter.to_universal(index)) == index
+
+
 def test_reset_step_keep_signals_out_of_observation() -> None:
     env = AdapterEnv(FakeAdapter(), lambda before, after: after["position"] - before["position"])
     observation, info = env.reset(seed=1)

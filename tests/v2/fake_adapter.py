@@ -4,6 +4,16 @@ from typing import Any
 
 import numpy as np
 
+from voidgym.core.actions import Duration, UniversalAction
+
+_FAKE_ACTIONS = (
+    UniversalAction("NOOP"),
+    UniversalAction("MOVE_LEFT", move=-1),
+    UniversalAction("MOVE_RIGHT", move=1),
+    UniversalAction("JUMP_SHORT", jump=Duration.SHORT, game_time_ms=50),
+    UniversalAction("INTERACT", interact=True, game_time_ms=50),
+)
+
 
 class FakeAdapter:
     game_id = "fake_platformer"
@@ -36,12 +46,8 @@ class FakeAdapter:
     def game_time_scale(self) -> float:
         return 1.0
 
-    def to_universal(self, game_action_index: int) -> Any:
-        from voidgym.core.actions import UNIVERSAL_ACTIONS
-        return UNIVERSAL_ACTIONS[game_action_index]
+    def to_universal(self, game_action_index: int) -> UniversalAction:
+        return _FAKE_ACTIONS[game_action_index]
 
-    def from_universal(self, action: Any) -> int | None:
-        return next((index for index, item in enumerate(UNIVERSAL_ACTIONS[:5]) if item == action), None)
-
-
-from voidgym.core.actions import UNIVERSAL_ACTIONS
+    def from_universal(self, action: UniversalAction) -> int | None:
+        return next((index for index, item in enumerate(_FAKE_ACTIONS) if item == action), None)

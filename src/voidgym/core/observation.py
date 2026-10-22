@@ -16,7 +16,7 @@ UNIVERSAL_ACTION_HISTORY_KEY = "action_history"
 
 
 def fit_to_universal(frame_rgb: np.ndarray) -> np.ndarray:
-    """Redimensiona com letterbox preto para RGB 108×192, por amostragem bilinear."""
+    """Redimensiona com letterbox preto para RGB 108×192 por amostragem uniforme."""
     if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3 or frame_rgb.dtype != np.uint8:
         raise ValueError("frame_rgb deve ter shape (H,W,3) e dtype uint8")
     height, width = frame_rgb.shape[:2]

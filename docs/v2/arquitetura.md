@@ -16,8 +16,12 @@ independente e não importa `voidgym`.
 | bridge e mod HK | `adapters/hollow_knight/` | 86 |
 | painel, supervisor e bandeja | `operator/` | posterior |
 
-Não portar código morto, compatibilidade de exploração antiga nem atalhos específicos do HK.
-O inventário detalhado da v1 está em `relatorios/83_inventario.md`.
+O inventário da v1 está em `relatorios/83_inventario.md`. Ele encontrou vários caminhos legados
+que não devem virar dependências do núcleo: versões antigas de recompensa `explore_v1`–
+`explore_v3`, a tarefa `visual_motion` de calibração, a tabela de botões brutos com bitmasks,
+formatos antigos de disponibilidade de ação e os caminhos de bootstrap/saves de Hollow Knight.
+Eles podem continuar na v1 por compatibilidade; só a semântica reutilizável deve ser portada.
+Não portar código morto nem atalhos de prompts antigos sem um requisito universal explícito.
 
 ## Estado de implementação
 
