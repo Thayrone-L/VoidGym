@@ -7,6 +7,7 @@ from collections.abc import Callable
 import numpy as np
 
 from voidgym.core.semantics import SEM_GRID, Sem
+from voidgym.gyms.platform_gym.params import Split
 from voidgym.gyms.platform_gym.physics import interaction_prompt
 from voidgym.gyms.platform_gym.render import player_pixel_mask
 from voidgym.gyms.platform_gym.styles import sample_style
@@ -36,8 +37,9 @@ def _stamp_entities(room: Room, stamp: Callable[[Rect, Sem], None]) -> None:
 
 
 def labels(room: Room, player: Player,
-           camera: tuple[float, float, float] | None = None) -> dict[str, np.ndarray | float | int]:
-    style, _ = sample_style(room.style_seed, split="train")
+           camera: tuple[float, float, float] | None = None,
+           *, split: Split = "train") -> dict[str, np.ndarray | float | int]:
+    style, _ = sample_style(room.style_seed, split=split)
     scale = 192 / style.camera_width if camera is None else camera[2]
     cx, cy = (player.x, player.y + 1.0) if camera is None else camera[:2]
     sem = np.full(SEM_GRID, int(Sem.EMPTY), dtype=np.uint8)
@@ -50,7 +52,7 @@ def labels(room: Room, player: Player,
         sem[max(0, y0):min(27, y1), max(0, x0):min(48, x1)] = int(klass)
 
     _stamp_entities(room, stamp)
-    hero_mask = player_pixel_mask(room, player, (cx, cy, scale))
+    hero_mask = player_pixel_mask(room, player, (cx, cy, scale), split=split)
     player_cells = hero_mask.reshape(27, 4, 48, 4).any(axis=(1, 3))
     sem[player_cells] = int(Sem.PLAYER)
     x_norm = float(np.clip((player.x - cx) * scale / 192 + .5, 0, 1))

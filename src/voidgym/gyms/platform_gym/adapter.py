@@ -11,7 +11,7 @@ import numpy as np
 from voidgym.core.actions import UNIVERSAL_ACTIONS, UniversalAction
 from voidgym.gyms.platform_gym.generator import generate_room, generate_room_set
 from voidgym.gyms.platform_gym.labels import labels
-from voidgym.gyms.platform_gym.params import PHYSICS_DT_SECONDS
+from voidgym.gyms.platform_gym.params import PHYSICS_DT_SECONDS, Split
 from voidgym.gyms.platform_gym.physics import Event, interaction_prompt, step_physics
 from voidgym.gyms.platform_gym.render import render_room
 from voidgym.gyms.platform_gym.world import Player
@@ -48,8 +48,8 @@ _HK_ACTIONS = tuple(_ACTIONS[_NAME_TO_UNIVERSAL.get(name, name)] for name in _NA
 class PlatformGymAdapter:
     game_id = "platform_gym"
 
-    def __init__(self, *, level: int = 0, seed: int = 0) -> None:
-        self.level, self.seed = level, seed
+    def __init__(self, *, level: int = 0, seed: int = 0, split: Split = "train") -> None:
+        self.level, self.seed, self.split = level, seed, split
         self._rooms = generate_room_set(seed) if level == 7 else [generate_room(level, seed)]
         self._room_index = 0
         self.room = self._rooms[0]
@@ -94,7 +94,7 @@ class PlatformGymAdapter:
         return next((i for i in range(len(_NAMES)) if self.to_universal(i) == action), None)
 
     def frame_rgb(self) -> np.ndarray:
-        return render_room(self.room, self.player)
+        return render_room(self.room, self.player, split=self.split)
 
     def apply(self, game_action_index: int) -> None:
         action = self.to_universal(game_action_index)
@@ -168,7 +168,7 @@ class PlatformGymAdapter:
                 "stuck": self._steps_since_new_cell >= 300}
 
     def training_labels(self) -> Mapping[str, Any]:
-        return labels(self.room, self.player)
+        return labels(self.room, self.player, split=self.split)
 
     def game_time_scale(self) -> float:
         return 1.0

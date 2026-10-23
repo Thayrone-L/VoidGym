@@ -52,6 +52,12 @@ def test_metroidvania_rooms_include_linked_ability_and_bench() -> None:
         assert solve_room_set(rooms)
 
 
+def test_metroidvania_retries_a_seed_whose_first_room_set_is_not_solvable() -> None:
+    rooms = generate_room_set(155230)
+    assert 3 <= len(rooms) <= 6
+    assert solve_room_set(rooms)
+
+
 def test_pit_and_gap_levels_have_recoverable_lower_routes_and_level_six_requires_breaking() -> None:
     gap = generate_room(2, 31)
     lower = next(s.rect for s in gap.solids if s.rect.y < 0.1 and s.rect.h < .6)

@@ -38,6 +38,8 @@ def test_labels_prioritize_player_and_are_style_independent() -> None:
     assert a["sem"].shape == SEM_GRID
     assert int(Sem.PLAYER) in a["sem"]
     assert np.array_equal(a["sem"], b["sem"]) and np.array_equal(a["sem"], c["sem"])
+    held_out = labels(room, player, camera, split="test")["sem"]
+    assert np.array_equal(a["sem"], held_out)
     sprite_cells = player_pixel_mask(room, player, camera).reshape(27, 4, 48, 4).any(axis=(1, 3))
     labeled_cells = a["sem"] == int(Sem.PLAYER)
     assert labeled_cells.sum() > 0

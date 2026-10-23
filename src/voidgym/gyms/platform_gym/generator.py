@@ -178,25 +178,27 @@ def generate_room(level: int, seed: int, *, allow_vertical: bool = True) -> Room
 
 def generate_room_set(seed: int) -> list[Room]:
     """Create and solve a 3–6 room metroidvania chain with a remote key ability."""
-    rng = np.random.default_rng(seed)
-    count = int(rng.integers(3, 7))
-    levels = [3, *[int(rng.integers(1, 6)) for _ in range(count - 2)], 5]
-    rooms = [generate_room(level, seed + i * 7919, allow_vertical=False)
-             for i, level in enumerate(levels)]
-    for room_id, room in enumerate(rooms):
-        room.id = room_id
-        room.exits[0].to_room = (room_id + 1) % count
-        room.exits[0].to_entry = "left"
-    first = rooms[0]
-    rooms[0].pickups.append(Pickup(Rect(first.spawn[0] - .25, first.spawn[1], .5, .5),
-                                   "ability_double_jump"))
-    last = rooms[-1]
-    direction = 1 if last.exits[0].rect.x > last.spawn[0] else -1
-    door_x = last.width * (.84 if direction > 0 else .16)
-    rooms[-1].doors.append(Door(Rect(door_x, last.exits[0].rect.y, .8, 2.2),
-                                "ability_double_jump"))
-    middle = rooms[count // 2]
-    middle.interactives.append(Interactive(Rect(middle.width * .5, .6, 1.0, .8)))
-    if not solve_room_set(rooms):
-        raise RuntimeError("generated room-set route failed its physics proof")
-    return rooms
+    for attempt in range(20):
+        attempt_seed = seed + attempt * 100_003
+        rng = np.random.default_rng(attempt_seed)
+        count = int(rng.integers(3, 7))
+        levels = [3, *[int(rng.integers(1, 6)) for _ in range(count - 2)], 5]
+        rooms = [generate_room(level, attempt_seed + i * 7919, allow_vertical=False)
+                 for i, level in enumerate(levels)]
+        for room_id, room in enumerate(rooms):
+            room.id = room_id
+            room.exits[0].to_room = (room_id + 1) % count
+            room.exits[0].to_entry = "left"
+        first = rooms[0]
+        rooms[0].pickups.append(Pickup(Rect(first.spawn[0] - .25, first.spawn[1], .5, .5),
+                                       "ability_double_jump"))
+        last = rooms[-1]
+        direction = 1 if last.exits[0].rect.x > last.spawn[0] else -1
+        door_x = last.width * (.84 if direction > 0 else .16)
+        rooms[-1].doors.append(Door(Rect(door_x, last.exits[0].rect.y, .8, 2.2),
+                                    "ability_double_jump"))
+        middle = rooms[count // 2]
+        middle.interactives.append(Interactive(Rect(middle.width * .5, .6, 1.0, .8)))
+        if solve_room_set(rooms):
+            return rooms
+    raise RuntimeError("generated room-set route failed its physics proof within 20 attempts")

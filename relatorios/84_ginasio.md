@@ -35,4 +35,4 @@ As paletas, texturas, fundos, personagens e objetos têm variação visível ent
 
 ## Estado do repositório e pendências
 
-As mudanças estão sem commit. Nenhum arquivo de `src/hk_agent/` foi alterado. O PR #8 ainda não foi atualizado. A variação visual de cenário foi ampliada e a meta de throughput e a suíte completa passaram. A frequência baixa de salas altas permanece como limitação documentada. Falta revisar e registrar o checkpoint em commit e atualizar o PR #8.
+O checkpoint do Prompt 84 foi revisado e registrado no commit `a2e0767` (`v2: procedural platform gym with domain randomization and semantic labels`), já enviado ao PR #8. Nenhum arquivo de `src/hk_agent/` foi alterado. A variação visual de cenário foi ampliada e a meta de throughput e a suíte completa passaram. A frequência baixa de salas altas permanece como limitação documentada.

@@ -63,6 +63,12 @@ class AdapterEnv(gym.Env[dict[str, np.ndarray], int]):
             raise ValueError("A máscara do adaptador tem tamanho incompatível com as ações")
         return mask
 
+    def set_level(self, level: int) -> None:
+        """Atualiza o nível do adaptador antes do próximo reset pelo currículo."""
+        if not hasattr(self.adapter, "level"):
+            raise ValueError("O adaptador não oferece níveis de currículo")
+        self.adapter.level = int(level)
+
     def step(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if not self.action_space.contains(action):
             raise ValueError("Índice de ação fora da tabela do adaptador")
