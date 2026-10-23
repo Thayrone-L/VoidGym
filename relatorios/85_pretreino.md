@@ -19,7 +19,7 @@ Curvas: `85_curvas.png`.
 
 A primeira tentativa avaliou os níveis 0–6 em modo determinístico e chegou à campanha 24 do nível 7 antes de encontrar uma composição sem rota solucionável (seed `155230`). Os GIFs de níveis 3, 4 e 6 foram salvos. A causa era a ausência de nova tentativa para a composição conectada, embora cada sala individual tivesse prova válida. `generate_room_set` agora tenta até 20 composições; o seed que falhou passa na prova e há teste de regressão.
 
-A nova avaliação usa split `test`, 100 episódios por nível 0–6 e 30 campanhas no nível 7, modos determinístico e estocástico, limite de 1.500 passos por episódio e até 5.000 quadros para percepção. Ela salva o progresso após cada par modo/nível em `progress_eval.json` para permitir retomada após interrupções. A tabela final e a matriz serão acrescentadas aqui quando a execução terminar.
+A nova avaliação usa split `test`, 100 episódios por nível 0–6 e 30 campanhas no nível 7, modos determinístico e estocástico, limite de 1.500 passos por episódio e até 5.000 quadros para percepção. Ela salva o progresso após cada par modo/nível em `progress_eval.json` para permitir retomada após interrupções. Em 23/10, o primeiro nível concluído teve 76% de sucesso determinístico, média de 275,76 passos e 15 episódios marcados como travados. A tabela completa e a matriz serão acrescentadas quando a execução terminar.
 
 ### Inspeção visual preliminar dos GIFs
 
@@ -31,7 +31,7 @@ A nova avaliação usa split `test`, 100 episódios por nível 0–6 e 30 campan
 
 ## Validação
 
-- Suíte completa: **783 passaram, 3 ignorados, 3 avisos e 8 subtestes passaram** (`242,37 s`). Os avisos remanescentes são conversões de tensores do Stable-Baselines3.
+- Suíte completa após a correção do gerador: **784 passaram, 3 ignorados, 3 avisos e 8 subtestes passaram** (`243,45 s`). Os avisos remanescentes são conversões de tensores do Stable-Baselines3.
 - `ruff check src tools tests`: passou.
 - `mypy src`: passou (98 arquivos).
 - `git diff --check`: passou.
