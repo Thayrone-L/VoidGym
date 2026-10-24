@@ -19,6 +19,11 @@ from torch import Tensor
 DEMONSTRATION_SCHEMA = 1
 
 
+def context_artifact_directory(shared_root: Path, context: str) -> Path:
+    digest = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+    return shared_root / "demonstrations" / digest
+
+
 @dataclass(frozen=True, slots=True)
 class HelpTriggerConfig:
     failed_attempts: int = 100
@@ -350,4 +355,141 @@ def combine_ppo_and_imitation(ppo_loss: Tensor, imitation_loss: Tensor, *, weigh
     if weight < 0:
         raise ValueError("imitation weight must be non-negative")
     return ppo_loss + weight * imitation_loss
+
+
+def train_demonstration_update(
+    policy: Any, optimizer: Any, batch: dict[str, NDArray[Any]], *,
+    game_id: str, weight: float, max_grad_norm: float = 0.5,
+    max_samples: int = 256,
+) -> dict[str, float]:
+    """Apply one masked BC update to a verified universal-policy demonstration."""
+    if weight <= 0 or max_samples < 1:
+        raise ValueError("imitation weight and sample limit must be positive")
+    import torch
+
+    count = min(len(batch["actions"]), max_samples)
+    if count < 1:
+        raise ValueError("demonstration batch is empty")
+    device = next(policy.parameters()).device
+    observations = {
+        "pixels": torch.as_tensor(batch["pixels"][:count][None], device=device),
+        "action_history": torch.as_tensor(batch["action_history"][:count][None], device=device),
+        "game_extras": torch.as_tensor(batch["game_extras"][:count][None], device=device),
+    }
+    actions = torch.as_tensor(batch["actions"][:count][None], dtype=torch.long, device=device)
+    masks = torch.as_tensor(batch["action_masks"][:count][None], dtype=torch.bool, device=device)
+    starts = torch.zeros((1, count), dtype=torch.bool, device=device)
+    starts[:, 0] = True
+    privileged = torch.zeros((1, count, 4), dtype=torch.float32, device=device)
+    output = policy(
+        observations, policy.initial_state(1, device), starts, masks,
+        privileged=privileged, game_id=game_id,
+        game_extras=observations["game_extras"],
+    )
+    logits = output["logits"].reshape(-1, policy.action_count)
+    loss = masked_behavioral_cloning_loss(
+        logits, actions.reshape(-1), masks.reshape(-1, policy.action_count),
+    )
+    weighted_loss = weight * loss
+    optimizer.zero_grad(set_to_none=True)
+    weighted_loss.backward()  # type: ignore[no-untyped-call]
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+    optimizer.step()
+    return {"loss": float(loss.detach().cpu()), "weight": weight,
+            "samples": float(count)}
+
+
+def apply_verified_demonstrations(
+    root: Path, policy: Any, optimizer: Any, *, actions: Sequence[str],
+    game_id: str, round_number: int, max_grad_norm: float = 0.5,
+) -> dict[str, float]:
+    """Train once on demonstrations authorized by resolved help-ledger entries."""
+    from types import SimpleNamespace
+
+    from voidgym.core.observation import universal_observation_space
+    from voidgym.training.shared_rollouts import publish_json
+
+    requests: dict[str, dict[str, Any]] = {}
+    for path in sorted((root / "help-requests").glob("slot-*.json")):
+        rows = _read_json(path).get("requests", [])
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and isinstance(row.get("request_id"), str):
+                    requests[row["request_id"]] = row
+    records_path = root / "demonstration-training.json"
+    records = _read_json(records_path)
+    trained = set(records.get("trained_artifacts", []))
+    extras_layer = policy.game_extras[game_id][0]
+    extras_dim = int(extras_layer.in_features)
+    space = universal_observation_space()
+    observation_space = SimpleNamespace(spaces={
+        "pixels": space.spaces["pixels"],
+        "action_history": space.spaces["action_history"],
+        "game_extras": SimpleNamespace(shape=(extras_dim,)),
+    })
+    totals = {"demo_active": 0.0, "demo_samples": 0.0, "demo_loss": 0.0}
+    for artifact in sorted((root / "demonstrations").rglob("*.npz")):
+        try:
+            result = _train_one_demonstration(
+            artifact, root, observation_space, policy, optimizer, requests,
+            trained, actions=actions, game_id=game_id, round_number=round_number,
+            max_grad_norm=max_grad_norm,
+        )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if result is None:
+            continue
+        totals["demo_active"] += 1
+        totals["demo_samples"] += result["samples"]
+        totals["demo_loss"] += result["loss"]
+        trained.add(result["sha256"])
+    if trained != set(records.get("trained_artifacts", [])):
+        publish_json(records_path, {"schema_version": 1,
+                                    "trained_artifacts": sorted(trained)})
+    return totals
+
+
+def _train_one_demonstration(
+    artifact: Path, root: Path, observation_space: Any, policy: Any, optimizer: Any,
+    requests: dict[str, Any], trained: set[str], *, actions: Sequence[str],
+    game_id: str, round_number: int, max_grad_norm: float,
+) -> dict[str, Any] | None:
+    metadata = json.loads(artifact.with_suffix(".json").read_text(encoding="utf-8"))
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    authorization = metadata.get("authorization")
+    if digest in trained or not isinstance(authorization, str) or not authorization.startswith("help_request:"):
+        return None
+    request_id = authorization.removeprefix("help_request:")
+    request = requests.get(request_id)
+    if not isinstance(request, dict) or request.get("status") != "resolved_with_help":
+        return None
+    context, version = metadata.get("context"), metadata.get("game_version")
+    if not isinstance(context, str) or not isinstance(version, str):
+        raise TypeError("demonstration context or game version is missing")
+    expected_folder = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+    if artifact.parent.name != expected_folder or request.get("context") != context:
+        raise ValueError("demonstration is not bound to its resolved help request")
+    extras_dim = int(policy.game_extras[game_id][0].in_features)
+    batch = demonstration_batch(
+        artifact, expected_game_version=version, expected_context=context,
+        observation_space=observation_space, action_count=len(actions),
+        game_extras_mask=np.zeros(extras_dim, dtype=np.bool_),
+    )
+    weight = imitation_schedule(
+        initial_weight=0.25, decay_rounds=20, round_number=round_number,
+        samples_in_bank=len(batch["actions"]), minimum_bank_size=64,
+    )
+    update = train_demonstration_update(
+        policy, optimizer, batch, game_id=game_id, weight=weight,
+        max_grad_norm=max_grad_norm,
+    )
+    return {**update, "sha256": digest}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 

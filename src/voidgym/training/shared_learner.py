@@ -53,6 +53,20 @@ def _self_imitation_update(
     return {**bank.summary(), **result}
 
 
+def _demonstration_update(
+    root: Path, model: UniversalPolicy, trainer: RecurrentPPOTrainer, *,
+    actions: tuple[str, ...], game_id: str | None, round_id: int,
+) -> dict[str, float]:
+    if game_id is None or game_id not in model.game_extras:
+        return {"demo_active": 0.0, "demo_samples": 0.0, "demo_loss": 0.0}
+    from voidgym.training.demonstrations import apply_verified_demonstrations
+
+    return apply_verified_demonstrations(
+        root, model, trainer.optimizer, actions=actions, game_id=game_id,
+        round_number=round_id, max_grad_norm=trainer.max_grad_norm,
+    )
+
+
 def _read_latest(root: Path) -> tuple[int, Path] | None:
     try:
         data = json.loads((root / "latest.json").read_text(encoding="utf-8"))
@@ -155,6 +169,10 @@ def _train_shared_round(
                                  round_id=next_round, game_id=game_id)
     metrics.update({f"sil_{key}": float(value) for key, value in sil.items()
                     if isinstance(value, (int, float)) and value is not None})
+    demonstrations = _demonstration_update(
+        root, model, trainer, actions=actions, game_id=game_id, round_id=next_round,
+    )
+    metrics.update(demonstrations)
     completed_steps += rollout_steps * len(actors)
     metrics.update({"shared_round": float(next_round),
                     "steps_per_update": float(rollout_steps * len(actors)),
