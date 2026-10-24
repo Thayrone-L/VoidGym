@@ -1,0 +1,6 @@
+# Optional operator map-art extra, Python 3.12 / Windows x64 validated.
+pyvips==3.1.0
+pyvips-binary==8.18.7
+Pillow==12.3.0
+cffi==2.1.1
+pycparser==3.11

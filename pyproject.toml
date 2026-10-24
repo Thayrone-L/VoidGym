@@ -9,7 +9,7 @@ description = "Local, experience-driven Hollow Knight agent environment"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = ["Pillow>=10,<13"]
 
 [project.urls]
 Homepage = "https://github.com/Thayrone-L/VoidGym"
@@ -24,13 +24,20 @@ environment = [
 ]
 training = [
     "safetensors>=0.8,<1",
-    "stable-baselines3>=2.7,<3",
+    "stable-baselines3==2.9.0",
+    "sb3-contrib==2.9.0",
 ]
 development = [
     "pytest>=8,<10",
     "ruff>=0.12,<1",
     "safetensors>=0.8,<1",
     "mypy>=1.17,<2",
+]
+instances = [
+    "UnityPy>=1.20,<2",
+]
+map = [
+    "pyvips[binary]>=3.1,<4",
 ]
 
 [project.scripts]
@@ -41,10 +48,22 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["e2e: teste integrado do fluxo VoidGym sem jogo real"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["B", "C901", "I", "N"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+"src/hk_agent/**/*.py" = ["B", "C901", "I", "N"]
+"tests/**/*.py" = ["B", "C901", "I", "N"]
+"tools/**/*.py" = ["B", "C901", "I", "N"]
 
 [tool.mypy]
 python_version = "3.12"

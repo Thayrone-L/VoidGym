@@ -4,13 +4,18 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import json
+import math
 import os
+import re
 import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from hk_agent.action_masking import ActionAvailability, parse_action_availability
 from hk_agent.protocol import PROTOCOL_VERSION, Envelope, ProtocolError, read_message, write_message
 from hk_agent.session import SessionError, SessionMachine, SessionState
 
@@ -23,12 +28,15 @@ class AcceptedBridge:
     game_version: str
     effective_save_root: str | None
     writer: asyncio.StreamWriter = field(repr=False)
+    persistent_data_path: str | None = None
+    product_name: str | None = None
     heartbeats_received: int = 0
     last_heartbeat_ns: int | None = None
     machine: SessionMachine = field(default_factory=SessionMachine)
     outbound_seq: int = 1
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     pending: dict[str, asyncio.Future[Envelope]] = field(default_factory=dict, repr=False)
+    capabilities: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +62,67 @@ class CapturedFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    hp_restored_since_last_frame: int = 0
+    shade_hits_since_last_frame: int = 0
+    shade_distance: float | None = None
+    scene_name: str | None = None
+    operator_telemetry: dict[str, Any] | None = None
+    enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
+    bestiary_events: tuple[dict[str, Any], ...] = ()
+    # Optional diagnostics from the bridge (name, value); never used as observation.
+    bridge_timing: tuple[tuple[str, float], ...] = ()
+    action_availability: ActionAvailability | None = None
+    human_buttons: tuple[str, ...] = ()
+    human_duration_ms: int = 0
+    human_mode: bool = False
+    human_input_test: bool = False
+    semantic_labels_u4: bytes | None = None
+    hero_motion: tuple[float, float, bool] | None = None
+    interact_prompt: bool = False
+    interact_prompt_valid: bool = False
+
+
+def require_png_frame(frame: CapturedFrame) -> None:
+    """Reject raw observations at code paths that persist .png artifacts."""
+    if frame.encoding != "png":
+        raise ProtocolError("PNG artifact writer requires FRAME encoding=png")
+
+
+# Optional, diagnostic-only FRAME fields emitted by the bridge's capture backend.
+BRIDGE_TIMING_FIELDS = (
+    "queued_to_start_ms",
+    "capture_ms",
+    "encode_ms",
+    "png_bytes",
+    "payload_bytes",
+    "log_ms",
+    "unity_fps",
+    "target_frame_rate",
+    "vsync_count",
+    "semantic_capture_ms",
+)
+def parse_bridge_timing(payload: dict[str, object]) -> tuple[tuple[str, float], ...]:
+    """Keep only well-formed optional metrics; malformed values are dropped, not fatal.
+
+    Every value is non-negative, because the environment rejects negative timings.
+    Unity reports target_frame_rate = -1 for "platform default"; that becomes the
+    flag target_frame_rate_default = 1.
+    """
+    metrics: list[tuple[str, float]] = []
+    for name in BRIDGE_TIMING_FIELDS:
+        value = payload.get(name)
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = float(value)
+        if not math.isfinite(number):
+            continue
+        if name == "target_frame_rate" and number < 0:
+            metrics.append(("target_frame_rate_default", 1.0))
+            continue
+        if number < 0:
+            continue
+        metrics.append((name, number))
+    return tuple(metrics)
 
 
 class SupervisorServer:
@@ -64,6 +133,10 @@ class SupervisorServer:
         game_profile: str = "development",
         heartbeat_timeout_seconds: float = 2.0,
         expected_save_root: Path | None = None,
+        expected_persistent_data_path: Path | None = None,
+        forbidden_personal_root: Path | None = None,
+        expected_product_name: str | None = None,
+        forbidden_instance_data_roots: tuple[Path, ...] = (),
     ) -> None:
         if heartbeat_timeout_seconds <= 0:
             raise ValueError("heartbeat_timeout_seconds must be positive")
@@ -72,6 +145,17 @@ class SupervisorServer:
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.expected_save_root = (
             _canonical_path(expected_save_root) if expected_save_root is not None else None
+        )
+        self.expected_persistent_data_path = (
+            _canonical_path(expected_persistent_data_path or Path(os.environ["HK_AGENT_INSTANCE_DATA_ROOT"]))
+            if expected_persistent_data_path is not None or os.environ.get("HK_AGENT_INSTANCE_DATA_ROOT") else None
+        )
+        self.forbidden_personal_root = _canonical_path(forbidden_personal_root or Path(os.environ["HK_AGENT_PERSONAL_ROOT"])) if forbidden_personal_root is not None or os.environ.get("HK_AGENT_PERSONAL_ROOT") else None
+        self.expected_product_name = expected_product_name or os.environ.get("HK_AGENT_PRODUCT_NAME")
+        raw_forbidden = os.environ.get("HK_AGENT_OTHER_INSTANCE_DATA_ROOTS", "")
+        self.forbidden_instance_data_roots = tuple(_canonical_path(path) for path in forbidden_instance_data_roots) or tuple(_canonical_path(Path(path)) for path in raw_forbidden.split(os.pathsep) if path)
+        self.forbidden_personal_root = (
+            _canonical_path(forbidden_personal_root) if forbidden_personal_root is not None else None
         )
         self.run_id = str(uuid.uuid4())
         self.port: int | None = None
@@ -192,10 +276,27 @@ class SupervisorServer:
         timeout: float = 5.0,
         bridge: AcceptedBridge | None = None,
         episode_id: str | None = None,
+        encoding: str = "png",
+        semantic_labels: bool = False,
     ) -> CapturedFrame:
+        if type(semantic_labels) is not bool:
+            raise TypeError("semantic_labels must be bool")
+        if encoding not in {"png", "raw_rgb8"}:
+            raise ValueError("encoding must be png or raw_rgb8")
+        if semantic_labels and (bridge is None or "semantic_labels_v1" not in bridge.capabilities):
+            raise ProtocolError("bridge does not advertise semantic_labels_v1")
+        effective_encoding = encoding
+        if effective_encoding == "raw_rgb8" and (
+            bridge is None or "frame_raw_rgb8" not in bridge.capabilities
+        ):
+            effective_encoding = "png"
         payload: dict[str, object] = {}
         if episode_id is not None:
             payload["episode_id"] = episode_id
+        if semantic_labels:
+            payload["semantic_labels"] = True
+        if effective_encoding == "raw_rgb8":
+            payload["encoding"] = effective_encoding
         response = await self.send_command(
             "CAPTURE_ONCE", payload, timeout=timeout, bridge=bridge
         )
@@ -205,6 +306,10 @@ class SupervisorServer:
             raise ProtocolError(f"Expected FRAME, received {response.message_type}")
 
         payload = response.payload
+        if semantic_labels and not isinstance(payload.get("semantic_labels"), dict):
+            raise ProtocolError("FRAME omitted requested semantic_labels_v1 data")
+        if not semantic_labels and payload.get("semantic_labels") is not None:
+            raise ProtocolError("FRAME returned semantic labels that were not requested")
         frame_id = payload.get("frame_id")
         capture_monotonic_ns = payload.get("capture_monotonic_ns")
         width = payload.get("width")
@@ -227,11 +332,11 @@ class SupervisorServer:
         if width == 0 or height == 0:
             raise ProtocolError("FRAME dimensions must be positive")
         pixel_format = payload.get("pixel_format")
-        encoding = payload.get("encoding")
+        frame_encoding = payload.get("encoding")
         if channels != 3 or pixel_format != "RGB8":
             raise ProtocolError("FRAME must contain RGB8 pixels")
-        if encoding != "png":
-            raise ProtocolError("FRAME encoding must be png")
+        if not isinstance(frame_encoding, str) or frame_encoding not in {"png", "raw_rgb8"}:
+            raise ProtocolError("FRAME encoding must be png or raw_rgb8")
         scene_transition = payload.get("scene_transition")
         if not isinstance(scene_transition, bool):
             raise ProtocolError("Invalid FRAME field: scene_transition")
@@ -261,14 +366,71 @@ class SupervisorServer:
         hp_lost_since_last_frame = payload.get("hp_lost_since_last_frame", 0)
         geo_gained_since_last_frame = payload.get("geo_gained_since_last_frame", 0)
         geo_spent_since_last_frame = payload.get("geo_spent_since_last_frame", 0)
+        hp_restored_since_last_frame = payload.get("hp_restored_since_last_frame", 0)
+        shade_hits_since_last_frame = payload.get("shade_hits_since_last_frame", 0)
+        shade_distance = payload.get("shade_distance")
+        scene_name = payload.get("scene_name")
+        operator_telemetry = payload.get("operator_telemetry")
+        if operator_telemetry is not None:
+            if not isinstance(operator_telemetry, dict) or len(operator_telemetry) > 32:
+                raise ProtocolError("Invalid FRAME field: operator_telemetry")
+            try:
+                telemetry_bytes = json.dumps(operator_telemetry, allow_nan=False).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise ProtocolError("Invalid FRAME operator telemetry") from error
+            if len(telemetry_bytes) > 16_384:
+                raise ProtocolError("FRAME operator telemetry exceeds its limit")
+        raw_enemy_events = payload.get("enemy_events_since_last_frame", [])
+        if not isinstance(raw_enemy_events, list) or len(raw_enemy_events) > 128:
+            raise ProtocolError("Invalid FRAME field: enemy_events_since_last_frame")
+        enemy_events: list[tuple[str, str]] = []
+        bestiary_events: list[dict[str, Any]] = []
+        for event in raw_enemy_events:
+            if not isinstance(event, dict):
+                raise ProtocolError("Invalid FRAME enemy event")
+            enemy_type, event_scene = event.get("enemy_type"), event.get("scene_name")
+            if not isinstance(enemy_type, str) or not enemy_type or len(enemy_type) > 128 or not isinstance(event_scene, str) or not event_scene or len(event_scene) > 256:
+                raise ProtocolError("Invalid FRAME enemy event fields")
+            enemy_events.append((event_scene, enemy_type))
+            enemy_type_id = event.get("enemy_type_id")
+            hits_dealt = event.get("hits_dealt", 0)
+            geo_awarded = event.get("geo_awarded", 0)
+            boss_confirmed = event.get("boss_confirmed", False)
+            boss_key, boss_version = event.get("boss_key"), event.get("boss_version")
+            if enemy_type_id is not None:
+                if not isinstance(enemy_type_id, str) or not re.fullmatch(r"e_[0-9a-f]{10}", enemy_type_id):
+                    raise ProtocolError("Invalid FRAME enemy type id")
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (hits_dealt, geo_awarded)):
+                    raise ProtocolError("Invalid FRAME bestiary event metrics")
+                if not isinstance(boss_confirmed, bool):
+                    raise ProtocolError("Invalid FRAME boss classification")
+                if boss_confirmed and (
+                    not isinstance(boss_key, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", boss_key)
+                    or not isinstance(boss_version, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", boss_version)
+                ):
+                    raise ProtocolError("Invalid FRAME boss identity")
+                event_payload = {
+                    "enemy_type_id": enemy_type_id, "hits_dealt": min(hits_dealt, 100_000),
+                    "geo_awarded": min(geo_awarded, 999_999), "item_awarded": event.get("item_awarded") is True,
+                    "killed_player": event.get("killed_player") is True, "boss_confirmed": boss_confirmed,
+                }
+                if boss_confirmed:
+                    event_payload.update({"boss_key": boss_key, "boss_version": boss_version})
+                bestiary_events.append(event_payload)
         for name, value in (
             ("enemy_kills_since_last_frame", enemy_kills_since_last_frame),
             ("hp_lost_since_last_frame", hp_lost_since_last_frame),
             ("geo_gained_since_last_frame", geo_gained_since_last_frame),
             ("geo_spent_since_last_frame", geo_spent_since_last_frame),
+            ("hp_restored_since_last_frame", hp_restored_since_last_frame),
+            ("shade_hits_since_last_frame", shade_hits_since_last_frame),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ProtocolError(f"Invalid FRAME field: {name}")
+        if shade_distance is not None and (isinstance(shade_distance, bool) or not isinstance(shade_distance, (int, float)) or not math.isfinite(float(shade_distance)) or shade_distance < 0):
+            raise ProtocolError("Invalid FRAME field: shade_distance")
+        if scene_name is not None and (not isinstance(scene_name, str) or len(scene_name) > 256):
+            raise ProtocolError("Invalid FRAME field: scene_name")
         assert isinstance(shade_pending, bool)
         assert isinstance(shade_recovered, bool)
         assert isinstance(run_failed, bool)
@@ -276,6 +438,10 @@ class SupervisorServer:
         assert isinstance(hp_lost_since_last_frame, int)
         assert isinstance(geo_gained_since_last_frame, int)
         assert isinstance(geo_spent_since_last_frame, int)
+        assert isinstance(hp_restored_since_last_frame, int)
+        assert isinstance(shade_hits_since_last_frame, int)
+        assert shade_distance is None or isinstance(shade_distance, (int, float))
+        assert scene_name is None or isinstance(scene_name, str)
         assert isinstance(pixel_format, str)
         assert isinstance(encoding, str)
 
@@ -286,8 +452,62 @@ class SupervisorServer:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as error:
             raise ProtocolError("FRAME data_base64 is invalid") from error
-        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ProtocolError("FRAME payload is not a PNG")
+        semantic_labels_u4: bytes | None = None
+        raw_semantics = payload.get("semantic_labels")
+        if raw_semantics is not None:
+            if not isinstance(raw_semantics, dict):
+                raise ProtocolError("FRAME semantic_labels must be an object")
+            if (raw_semantics.get("codec") != "u4-v1"
+                    or raw_semantics.get("width") != 48
+                    or raw_semantics.get("height") != 27):
+                raise ProtocolError("FRAME semantic_labels has an unsupported grid or codec")
+            packed = raw_semantics.get("data_base64")
+            if not isinstance(packed, str):
+                raise ProtocolError("FRAME semantic_labels data must be base64")
+            try:
+                semantic_labels_u4 = base64.b64decode(packed, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ProtocolError("FRAME semantic_labels data is invalid") from error
+            if len(semantic_labels_u4) != (48 * 27 + 1) // 2:
+                raise ProtocolError("FRAME semantic_labels payload size is invalid")
+        raw_motion = payload.get("hero_motion")
+        hero_motion: tuple[float, float, bool] | None = None
+        if raw_motion is not None:
+            if not isinstance(raw_motion, dict):
+                raise ProtocolError("FRAME hero_motion must be an object")
+            vx, vy, on_ground = (raw_motion.get("vx"), raw_motion.get("vy"),
+                                 raw_motion.get("on_ground"))
+            if (isinstance(vx, bool) or not isinstance(vx, (int, float))
+                    or isinstance(vy, bool) or not isinstance(vy, (int, float))
+                    or not math.isfinite(float(vx)) or not math.isfinite(float(vy))
+                    or not isinstance(on_ground, bool)):
+                raise ProtocolError("FRAME hero_motion fields are invalid")
+            hero_motion = (float(vx), float(vy), on_ground)
+        raw_interact_prompt = payload.get("interact_prompt", False)
+        raw_interact_valid = payload.get("interact_prompt_valid", False)
+        if not isinstance(raw_interact_prompt, bool) or not isinstance(raw_interact_valid, bool):
+            raise ProtocolError("FRAME interact_prompt fields are invalid")
+        payload_bytes = payload.get("payload_bytes")
+        if frame_encoding == "png":
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ProtocolError("FRAME payload is not a PNG")
+            if payload_bytes is not None and (
+                not isinstance(payload_bytes, int)
+                or isinstance(payload_bytes, bool)
+                or payload_bytes != len(data)
+            ):
+                raise ProtocolError("FRAME payload_bytes does not match PNG data")
+        else:
+            if width > 600 or height > 338:
+                raise ProtocolError("raw RGB8 FRAME dimensions exceed 600x338")
+            expected_bytes = width * height * 3
+            if (
+                not isinstance(payload_bytes, int)
+                or isinstance(payload_bytes, bool)
+                or payload_bytes != expected_bytes
+                or len(data) != expected_bytes
+            ):
+                raise ProtocolError("raw RGB8 FRAME payload size is invalid")
 
         duplicate_of = payload.get("duplicate_of")
         last_action = payload.get("last_applied_action_id")
@@ -307,6 +527,22 @@ class SupervisorServer:
         assert duplicate_of is None or isinstance(duplicate_of, int)
         assert last_action is None or isinstance(last_action, int)
 
+        raw_human_buttons = payload.get("human_buttons", [])
+        human_buttons = tuple(button for button in raw_human_buttons if isinstance(button, str)) \
+            if isinstance(raw_human_buttons, list) else ()
+        raw_human_duration = payload.get("human_duration_ms", 0)
+        human_duration = raw_human_duration if isinstance(raw_human_duration, int) and not isinstance(raw_human_duration, bool) else 0
+        human_mode = payload.get("human_mode", False)
+        if not isinstance(human_mode, bool) or human_duration < 0 or human_duration > 2_000:
+            raise ProtocolError("FRAME human input metadata is malformed")
+        allowed_human_buttons = {
+            "LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "DASH", "CAST",
+            "SUPER_DASH", "DREAM_NAIL", "PAUSE", "MENU_SUBMIT", "MENU_CANCEL",
+        }
+        if len(human_buttons) > len(allowed_human_buttons) or any(
+            button not in allowed_human_buttons for button in human_buttons
+        ):
+            raise ProtocolError("FRAME human buttons are invalid")
         return CapturedFrame(
             episode_id=frame_episode_id,
             frame_id=frame_id,
@@ -315,7 +551,7 @@ class SupervisorServer:
             height=height,
             channels=channels,
             pixel_format=pixel_format,
-            encoding=encoding,
+            encoding=frame_encoding,
             data=data,
             scene_transition=scene_transition,
             duplicate_of=duplicate_of,
@@ -329,6 +565,23 @@ class SupervisorServer:
             hp_lost_since_last_frame=hp_lost_since_last_frame,
             geo_gained_since_last_frame=geo_gained_since_last_frame,
             geo_spent_since_last_frame=geo_spent_since_last_frame,
+            hp_restored_since_last_frame=hp_restored_since_last_frame,
+            shade_hits_since_last_frame=shade_hits_since_last_frame,
+            shade_distance=None if shade_distance is None else float(shade_distance),
+            scene_name=scene_name,
+            operator_telemetry=operator_telemetry,
+            enemy_events_since_last_frame=tuple(enemy_events),
+            bestiary_events=tuple(bestiary_events),
+            bridge_timing=parse_bridge_timing(payload),
+            action_availability=parse_action_availability(payload.get("action_availability")),
+            human_buttons=human_buttons,
+            human_duration_ms=human_duration,
+            human_mode=human_mode,
+            human_input_test=payload.get("human_input_test") is True,
+            semantic_labels_u4=semantic_labels_u4,
+            hero_motion=hero_motion,
+            interact_prompt=raw_interact_prompt,
+            interact_prompt_valid=raw_interact_valid,
         )
 
     async def _handle_client(
@@ -361,6 +614,24 @@ class SupervisorServer:
                     raise ProtocolError("HELLO requires effective_save_root")
                 if _canonical_path(Path(effective_save_root)) != self.expected_save_root:
                     raise ProtocolError("Effective save root mismatch")
+            if self.expected_persistent_data_path is not None:
+                persistent = hello.payload.get("persistent_data_path")
+                if not isinstance(persistent, str):
+                    raise ProtocolError("HELLO requires persistent_data_path")
+                canonical_persistent = _canonical_path(Path(persistent))
+                if canonical_persistent != self.expected_persistent_data_path:
+                    raise ProtocolError("Persistent data path mismatch")
+                if self.forbidden_personal_root is not None and canonical_persistent == self.forbidden_personal_root:
+                    raise ProtocolError("Persistent data path resolves to personal saves")
+                if canonical_persistent in self.forbidden_instance_data_roots:
+                    raise ProtocolError("Persistent data path resolves to another instance")
+            if self.expected_product_name is not None and hello.payload.get("product_name") != self.expected_product_name:
+                raise ProtocolError("Product name mismatch")
+            raw_capabilities = hello.payload.get("capabilities", [])
+            if not isinstance(raw_capabilities, list) or any(
+                not isinstance(item, str) for item in raw_capabilities
+            ):
+                raise ProtocolError("HELLO capabilities must be an array of strings")
 
             accepted = AcceptedBridge(
                 instance_id=hello.instance_id,
@@ -369,6 +640,17 @@ class SupervisorServer:
                 game_version=game_version,
                 effective_save_root=effective_save_root,
                 writer=writer,
+                persistent_data_path=(
+                    hello.payload.get("persistent_data_path")
+                    if isinstance(hello.payload.get("persistent_data_path"), str)
+                    else None
+                ),
+                product_name=(
+                    hello.payload.get("product_name")
+                    if isinstance(hello.payload.get("product_name"), str)
+                    else None
+                ),
+                capabilities=frozenset(raw_capabilities),
                 machine=machine,
             )
             machine.transition(SessionState.READY)

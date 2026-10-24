@@ -13,6 +13,7 @@ import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
 
+from hk_agent.action_masking import ActionAvailability
 from hk_agent.shade_run_lifecycle import ShadeRunTracker, ShadeRunUpdate
 
 BUTTON_ORDER: tuple[str, ...] = (
@@ -26,6 +27,9 @@ BUTTON_ORDER: tuple[str, ...] = (
     "CAST",
     "SUPER_DASH",
     "DREAM_NAIL",
+    "PAUSE",
+    "MENU_SUBMIT",
+    "MENU_CANCEL",
 )
 RAW_ACTIONS: tuple[tuple[str, ...], ...] = tuple(
     tuple(button for bit, button in enumerate(BUTTON_ORDER) if mask & (1 << bit))
@@ -71,6 +75,24 @@ class PixelFrame:
     hp_lost_since_last_frame: int = 0
     geo_gained_since_last_frame: int = 0
     geo_spent_since_last_frame: int = 0
+    hp_restored_since_last_frame: int = 0
+    shade_hits_since_last_frame: int = 0
+    shade_distance: float | None = None
+    scene_name: str | None = None
+    operator_telemetry: dict[str, Any] | None = None
+    enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
+    bestiary_events: tuple[dict[str, Any], ...] = ()
+    decode_ms: float = 0.0
+    bridge_timing: tuple[tuple[str, float], ...] = ()
+    action_availability: ActionAvailability | None = None
+    human_buttons: tuple[str, ...] = ()
+    human_duration_ms: int = 0
+    human_mode: bool = False
+    human_input_test: bool = False
+    semantic_labels: NDArray[np.uint8] | None = None
+    hero_motion: tuple[float, float, bool] | None = None
+    interact_prompt: bool = False
+    interact_prompt_valid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +141,24 @@ class EnvironmentBackend(Protocol):
     def close(self) -> None: ...
 
 
+def extended_length_path(path: str, *, os_name: str = os.name) -> str:
+    """Return a Windows extended-length path (\\\\?\\...) for deep experience trees.
+
+    Per-launch runtime roots plus instance/episode identifiers exceed MAX_PATH
+    (260 for files, 248 for directories), which made the experience writer fail
+    with WinError 206. Extended-length paths lift that limit without requiring the
+    system-wide LongPathsEnabled setting. Other platforms are returned unchanged.
+    """
+    if os_name != "nt":
+        return path
+    if path.startswith("\\\\?\\"):
+        return path
+    absolute = os.path.abspath(path)
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
 class AtomicJsonlWriter:
     """Append complete JSON records durably, without a partially buffered line."""
 
@@ -126,12 +166,12 @@ class AtomicJsonlWriter:
         self.path = path
 
     def append(self, record: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(extended_length_path(str(self.path.parent)), exist_ok=True)
         payload = (
             json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
         ).encode("utf-8")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        descriptor = os.open(self.path, flags, 0o600)
+        descriptor = os.open(extended_length_path(str(self.path)), flags, 0o600)
         try:
             written = os.write(descriptor, payload)
             if written != len(payload):
@@ -198,6 +238,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._actions: list[int] = []
         self._episode_id: str | None = None
         self._transition_id = 0
+        self._last_step_timing_ms: dict[str, float] = {}
         self._next_action_id = 1
         self._episode_steps = 0
         self._episode_done = True
@@ -205,6 +246,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._seen_episode_ids: set[str] = set()
         self._shade_runs = ShadeRunTracker()
         self._shade_run_update: ShadeRunUpdate | None = None
+
+    @property
+    def latest_action_availability(self) -> ActionAvailability | None:
+        """Availability metadata from the latest accepted frame, for action masking only."""
+        return self._frames[-1].action_availability if self._frames else None
 
     def reset(
         self,
@@ -222,6 +268,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         self._episode_done = True
         self._frames = []
         self._actions = []
+        self._last_step_timing_ms = {}
         try:
             result = self.backend.reset(seed=seed, options=options)
             if not result.episode_id:
@@ -250,7 +297,11 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         return self._observation(), self._info(frame_ids=self._frame_ids())
 
     def step(
-        self, action: int, *, lease_ms: int | None = None
+        self,
+        action: int,
+        *,
+        lease_ms: int | None = None,
+        action_audit: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, NDArray[np.generic]], float, bool, bool, dict[str, Any]]:
         self._ensure_open()
         if self._episode_id is None or self._episode_done:
@@ -286,6 +337,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             )
             self._shade_run_update = self._observe_shade_lifecycle(frame)
             timing_ms = self._validate_timing(result.timing_ms)
+            timing_ms["env_step"] = (time.monotonic_ns() - started_ns) / 1_000_000
+            self._last_step_timing_ms = dict(timing_ms)
             if type(result.terminated) is not bool or type(result.truncated) is not bool:
                 raise ValueError("terminated and truncated must be bool values")
             if result.terminated and result.truncated:
@@ -344,6 +397,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 reason=reason,
                 timing_ms=timing_ms,
                 frame=frame,
+                action_audit=action_audit,
             )
         except Exception as error:  # noqa: BLE001 - persistence is an operational boundary
             self._best_effort_release()
@@ -384,6 +438,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
     def _validate_frame(
         self,
         frame: PixelFrame,
+        action_audit: Mapping[str, Any] | None = None,
         *,
         previous: PixelFrame | None,
         expected_action_id: int | None,
@@ -420,6 +475,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             ("hp_lost_since_last_frame", frame.hp_lost_since_last_frame),
             ("geo_gained_since_last_frame", frame.geo_gained_since_last_frame),
             ("geo_spent_since_last_frame", frame.geo_spent_since_last_frame),
+            ("hp_restored_since_last_frame", frame.hp_restored_since_last_frame),
+            ("shade_hits_since_last_frame", frame.shade_hits_since_last_frame),
         ):
             if (
                 isinstance(combat_value, bool)
@@ -440,6 +497,18 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 raise FrameValidationError("capture timestamp moved backwards")
         if expected_action_id is not None and frame.last_applied_action_id != expected_action_id:
             raise FrameValidationError("frame is not correlated with the requested action")
+        operator_telemetry = frame.operator_telemetry
+        if operator_telemetry is not None:
+            if not isinstance(operator_telemetry, dict) or len(operator_telemetry) > 32:
+                raise FrameValidationError("operator_telemetry must be a bounded object")
+            try:
+                telemetry_bytes = json.dumps(operator_telemetry, allow_nan=False).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise FrameValidationError(
+                    "operator_telemetry must contain finite JSON values"
+                ) from error
+            if len(telemetry_bytes) > 16_384:
+                raise FrameValidationError("operator_telemetry exceeds its size limit")
         return PixelFrame(
             episode_id=frame.episode_id,
             frame_id=frame.frame_id,
@@ -457,6 +526,27 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
             geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
             geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+            # Reward-only lifecycle metadata, never inserted in the pixel observation.
+            hp_restored_since_last_frame=frame.hp_restored_since_last_frame,
+            shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
+            shade_distance=frame.shade_distance,
+            scene_name=frame.scene_name,
+            operator_telemetry=dict(operator_telemetry) if operator_telemetry is not None else None,
+            enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
+            decode_ms=frame.decode_ms,
+            bridge_timing=frame.bridge_timing,
+            action_availability=frame.action_availability,
+            human_buttons=frame.human_buttons,
+            human_duration_ms=frame.human_duration_ms,
+            human_mode=frame.human_mode,
+            human_input_test=frame.human_input_test,
+            semantic_labels=(
+                np.ascontiguousarray(frame.semantic_labels).copy()
+                if frame.semantic_labels is not None else None
+            ),
+            hero_motion=frame.hero_motion,
+            interact_prompt=frame.interact_prompt,
+            interact_prompt_valid=frame.interact_prompt_valid,
         )
 
     def _validate_applied_action(
@@ -507,7 +597,8 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         if not self._frames:
             return {}
         frame = self._frames[-1]
-        if not (
+        last_step_timing_ms = getattr(self, "_last_step_timing_ms", {})
+        if not last_step_timing_ms and not (
             frame.player_dead
             or frame.death_persisted
             or frame.shade_pending
@@ -517,14 +608,34 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             or frame.hp_lost_since_last_frame
             or frame.geo_gained_since_last_frame
             or frame.geo_spent_since_last_frame
+            or frame.hp_restored_since_last_frame
+            or frame.shade_hits_since_last_frame
+            or frame.shade_distance is not None
+            or frame.scene_name is not None
+            or frame.enemy_events_since_last_frame
+            or frame.operator_telemetry
         ):
             return {}
         lifecycle = self._shade_run_update
-        return {
+        result: dict[str, Any] = {
             "enemy_kills_since_last_frame": frame.enemy_kills_since_last_frame,
             "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
             "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
             "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
+            "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
+            "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
+            "shade_distance": frame.shade_distance,
+            "scene_name": frame.scene_name,
+            "human_buttons": list(frame.human_buttons),
+            "human_duration_ms": frame.human_duration_ms,
+            "human_mode": frame.human_mode,
+            "human_input_test": frame.human_input_test,
+            "shade_pending": frame.shade_pending,
+            "enemy_events_since_last_frame": [
+                {"scene_name": scene, "enemy_type": enemy_type}
+                for scene, enemy_type in frame.enemy_events_since_last_frame
+            ],
+            "bestiary_events_since_last_frame": list(frame.bestiary_events),
             "run_failed": lifecycle.run_failed if lifecycle is not None else frame.run_failed,
             "supervisor": {
                 "player_dead": frame.player_dead,
@@ -536,17 +647,36 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "hp_lost_since_last_frame": frame.hp_lost_since_last_frame,
                 "geo_gained_since_last_frame": frame.geo_gained_since_last_frame,
                 "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
-                "gameplay_run_index": (
-                    lifecycle.logical_run_index if lifecycle is not None else 1
-                ),
+                "hp_restored_since_last_frame": frame.hp_restored_since_last_frame,
+                "shade_hits_since_last_frame": frame.shade_hits_since_last_frame,
+                "enemy_events_since_last_frame": [
+                    {"scene_name": scene, "enemy_type": enemy_type}
+                    for scene, enemy_type in frame.enemy_events_since_last_frame
+                ],
+                "bestiary_events_since_last_frame": list(frame.bestiary_events),
+                "gameplay_run_index": (lifecycle.logical_run_index if lifecycle is not None else 1),
                 "recovery_required": (
                     lifecycle.recovery_required if lifecycle is not None else False
                 ),
-                "failed_gameplay_runs": (
-                    lifecycle.failed_runs if lifecycle is not None else 0
-                ),
-            }
+                "failed_gameplay_runs": (lifecycle.failed_runs if lifecycle is not None else 0),
+            },
         }
+        if last_step_timing_ms:
+            result["timing_ms"] = dict(last_step_timing_ms)
+        if frame.operator_telemetry:
+            result["operator_telemetry"] = dict(frame.operator_telemetry)
+            for name in (
+                "map_zone",
+                "x",
+                "y",
+                "camera_x",
+                "camera_y",
+                "scene_bounds",
+                "milestone_events_since_last_frame",
+            ):
+                if name in frame.operator_telemetry:
+                    result[name] = frame.operator_telemetry[name]
+        return result
 
     def _observe_shade_lifecycle(self, frame: PixelFrame) -> ShadeRunUpdate:
         return self._shade_runs.observe(
@@ -571,6 +701,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
         reason: str | None,
         timing_ms: Mapping[str, float],
         frame: PixelFrame,
+        action_audit: Mapping[str, Any] | None = None,
     ) -> None:
         writer = self._transition_writer()
         if writer is None:
@@ -612,6 +743,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
                     "geo_spent_since_last_frame": frame.geo_spent_since_last_frame,
                 },
                 "timing_ms": dict(timing_ms),
+                **(dict(action_audit) if action_audit is not None else {}),
                 "valid": True,
             }
         )

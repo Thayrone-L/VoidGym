@@ -1,0 +1,28 @@
+name: VoidGym v2
+
+on:
+  push:
+    branches: ["codex/parallel-instances-isolation", "v2/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  v2:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install -r requirements-training.lock
+          python -m pip install -e ".[environment,development]"
+      - name: Ruff
+        run: ruff check src/voidgym tests/v2
+      - name: Mypy
+        run: mypy src/voidgym
+      - name: Unit tests
+        run: pytest tests/v2 -m "not e2e"
+      - name: End-to-end tests
+        run: pytest -m e2e

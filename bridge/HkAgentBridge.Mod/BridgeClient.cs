@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -21,10 +22,12 @@ internal sealed class BridgeClient : IDisposable
     private readonly Action<string> _log;
     private readonly Action<string> _logError;
     private readonly Action _releaseAll;
+    private readonly Action<bool> _setHumanMode;
     private readonly Func<IEnumerable<string>, int, string[]> _applyAction;
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
-    private readonly Func<CancellationToken, Task<CapturedFrame>> _captureOnce;
+    private readonly Func<string, bool, CancellationToken, Task<CapturedFrame>> _captureOnce;
     private readonly Func<EpisodeLifecycleSnapshot> _lifecycleSnapshot;
+    private readonly Func<Dictionary<string, object?>> _operatorTelemetrySnapshot;
     private readonly Action _beginEpisodeLifecycle;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -40,10 +43,12 @@ internal sealed class BridgeClient : IDisposable
         Action<string> log,
         Action<string> logError,
         Action releaseAll,
+        Action<bool> setHumanMode,
         Func<IEnumerable<string>, int, string[]> applyAction,
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
-        Func<CancellationToken, Task<CapturedFrame>> captureOnce,
+        Func<string, bool, CancellationToken, Task<CapturedFrame>> captureOnce,
         Func<EpisodeLifecycleSnapshot> lifecycleSnapshot,
+        Func<Dictionary<string, object?>> operatorTelemetrySnapshot,
         Action beginEpisodeLifecycle
     )
     {
@@ -51,10 +56,12 @@ internal sealed class BridgeClient : IDisposable
         _log = log;
         _logError = logError;
         _releaseAll = releaseAll;
+        _setHumanMode = setHumanMode;
         _applyAction = applyAction;
         _applyMenuAction = applyMenuAction;
         _captureOnce = captureOnce;
         _lifecycleSnapshot = lifecycleSnapshot;
+        _operatorTelemetrySnapshot = operatorTelemetrySnapshot;
         _beginEpisodeLifecycle = beginEpisodeLifecycle;
     }
 
@@ -82,17 +89,23 @@ internal sealed class BridgeClient : IDisposable
                         ["token"] = _configuration.Token,
                         ["game_profile"] = _configuration.GameProfile,
                         ["game_version"] = Constants.GAME_VERSION,
-                        ["effective_save_root"] = _configuration.SaveRoot,
+                        ["effective_save_root"] = _configuration.SaveRoot!,
+                        ["instance_mode"] = _configuration.InstanceMode,
+                        ["persistent_data_path"] = UnityEngine.Application.persistentDataPath,
+                        ["product_name"] = UnityEngine.Application.productName,
                         ["bridge_version"] = "0.0.0-dev",
                         ["capabilities"] = new[]
                         {
                             "capture_once",
                             "frame_png_rgb8",
+                            "frame_raw_rgb8",
                             "begin_episode",
                             "apply_action",
                             "apply_menu_action",
                             "player_death_terminal",
                             "shade_run_lifecycle",
+                            "action_availability_v1",
+                            "semantic_labels_v1",
                         },
                     }
                 );
@@ -235,6 +248,20 @@ internal sealed class BridgeClient : IDisposable
                     _releaseAll();
                     payload = new { command_type = messageType, status = "released" };
                     break;
+                case "SET_HUMAN_MODE":
+                    bool? humanEnabled = (bool?)command["payload"]?["enabled"];
+                    if (humanEnabled == null)
+                    {
+                        responseType = "ERROR";
+                        payload = new { command_type = messageType, error_code = "invalid_human_mode", recoverable = true };
+                    }
+                    else
+                    {
+                        _releaseAll();
+                        _setHumanMode(humanEnabled.Value);
+                        payload = new { command_type = messageType, status = "accepted", enabled = humanEnabled.Value };
+                    }
+                    break;
                 case "APPLY_ACTION":
                     try
                     {
@@ -345,6 +372,38 @@ internal sealed class BridgeClient : IDisposable
                 case "CAPTURE_ONCE":
                     try
                     {
+                        JToken? encodingToken = command["payload"]?["encoding"];
+                        string requestedEncoding = encodingToken == null
+                            ? "png"
+                            : encodingToken.Type == JTokenType.String
+                                ? encodingToken.Value<string>() ?? string.Empty
+                                : string.Empty;
+                        if (requestedEncoding != "png" && requestedEncoding != "raw_rgb8")
+                        {
+                            responseType = "ERROR";
+                            payload = new
+                            {
+                                command_type = messageType,
+                                error_code = "invalid_capture_encoding",
+                                recoverable = true,
+                                detail = "encoding must be png or raw_rgb8",
+                            };
+                            break;
+                        }
+                        JToken? labelsToken = command["payload"]?["semantic_labels"];
+                        if (labelsToken != null && labelsToken.Type != JTokenType.Boolean)
+                        {
+                            responseType = "ERROR";
+                            payload = new
+                            {
+                                command_type = messageType,
+                                error_code = "invalid_semantic_labels_request",
+                                recoverable = true,
+                                detail = "semantic_labels must be a boolean",
+                            };
+                            break;
+                        }
+                        bool requestSemanticLabels = labelsToken?.Value<bool>() ?? false;
                         string? requestedEpisodeId =
                             (string?)command["payload"]?["episode_id"];
                         CorrelationSnapshot correlation =
@@ -353,34 +412,113 @@ internal sealed class BridgeClient : IDisposable
                             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                         {
                             captureCancellation.CancelAfter(CaptureTimeoutMilliseconds);
-                            CapturedFrame frame = await _captureOnce(captureCancellation.Token)
-                                .ConfigureAwait(false);
+                            CapturedFrame frame = await _captureOnce(
+                                requestedEncoding,
+                                requestSemanticLabels,
+                                captureCancellation.Token
+                            ).ConfigureAwait(false);
                             EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot();
+                            Dictionary<string, object?> operatorTelemetry = _operatorTelemetrySnapshot();
+                            operatorTelemetry["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame;
+                            operatorTelemetry["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame;
                             responseType = "FRAME";
-                            payload = new
+                            var framePayload = new Dictionary<string, object?>
                             {
-                                frame_id = frame.FrameId,
-                                episode_id = correlation.EpisodeId,
-                                capture_monotonic_ns = frame.CaptureMonotonicNanoseconds,
-                                width = frame.Width,
-                                height = frame.Height,
-                                channels = 3,
-                                pixel_format = "RGB8",
-                                encoding = "png",
-                                data_base64 = Convert.ToBase64String(frame.PngBytes),
-                                scene_transition = false,
-                                player_dead = lifecycle.PlayerDead,
-                                death_persisted = lifecycle.PlayerDead,
-                                shade_pending = lifecycle.ShadePending,
-                                shade_recovered = lifecycle.ShadeRecovered,
-                                run_failed = lifecycle.RunFailed,
-                                enemy_kills_since_last_frame = lifecycle.EnemyKillsSinceLastFrame,
-                                hp_lost_since_last_frame = lifecycle.HealthLostSinceLastFrame,
-                                geo_gained_since_last_frame = lifecycle.GeoGainedSinceLastFrame,
-                                geo_spent_since_last_frame = lifecycle.GeoSpentSinceLastFrame,
-                                duplicate_of = (long?)null,
-                                last_applied_action_id = correlation.LastAppliedActionId,
+                                ["frame_id"] = frame.FrameId,
+                                ["episode_id"] = correlation.EpisodeId,
+                                ["capture_monotonic_ns"] = frame.CaptureMonotonicNanoseconds,
+                                ["width"] = frame.Width,
+                                ["height"] = frame.Height,
+                                ["channels"] = 3,
+                                ["pixel_format"] = "RGB8",
+                                ["encoding"] = frame.Encoding,
+                                ["data_base64"] = Convert.ToBase64String(frame.Data),
+                                ["human_buttons"] = frame.HumanMode ? frame.HumanButtons : Array.Empty<string>(),
+                                ["human_duration_ms"] = frame.HumanMode ? frame.HumanDurationMilliseconds : 0,
+                                ["human_mode"] = frame.HumanMode,
+                                ["human_input_test"] = frame.HumanInputTest,
+                                ["payload_bytes"] = frame.PayloadByteCount,
+                                ["queued_to_start_ms"] = frame.QueuedToStartMs,
+                                ["capture_ms"] = frame.CaptureMs,
+                                ["encode_ms"] = frame.EncodeMs,
+                                ["log_ms"] = frame.LogMs,
+                                ["unity_fps"] = frame.UnityFps,
+                                ["target_frame_rate"] = frame.TargetFrameRate,
+                                ["vsync_count"] = frame.VSyncCount,
+                                ["action_availability"] = frame.ActionAvailability == null ? null : new Dictionary<string, object>
+                                {
+                                    ["mp_charge"] = frame.ActionAvailability.mp_charge,
+                                    ["spell_cost"] = frame.ActionAvailability.spell_cost,
+                                    ["focus_cost"] = frame.ActionAvailability.focus_cost,
+                                    ["fireball_level"] = frame.ActionAvailability.fireball_level,
+                                    ["quake_level"] = frame.ActionAvailability.quake_level,
+                                    ["scream_level"] = frame.ActionAvailability.scream_level,
+                                    ["has_nail_art"] = frame.ActionAvailability.has_nail_art,
+                                    ["has_cyclone"] = frame.ActionAvailability.has_cyclone,
+                                    ["has_dash_slash"] = frame.ActionAvailability.has_dash_slash,
+                                    ["has_upward_slash"] = frame.ActionAvailability.has_upward_slash,
+                                    ["has_dash"] = frame.ActionAvailability.has_dash,
+                                    ["has_walljump"] = frame.ActionAvailability.has_walljump,
+                                    ["has_double_jump"] = frame.ActionAvailability.has_double_jump,
+                                    ["has_super_dash"] = frame.ActionAvailability.has_super_dash,
+                                    ["has_dream_nail"] = frame.ActionAvailability.has_dream_nail,
+                                    ["has_dashmaster"] = frame.ActionAvailability.has_dashmaster,
+                                },
+                                ["scene_transition"] = false,
+                                ["player_dead"] = lifecycle.PlayerDead,
+                                ["death_persisted"] = lifecycle.PlayerDead,
+                                ["shade_pending"] = lifecycle.ShadePending,
+                                ["shade_recovered"] = lifecycle.ShadeRecovered,
+                                ["run_failed"] = lifecycle.RunFailed,
+                                ["enemy_kills_since_last_frame"] = lifecycle.EnemyKillsSinceLastFrame,
+                                ["hp_lost_since_last_frame"] = lifecycle.HealthLostSinceLastFrame,
+                                ["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame,
+                                ["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame,
+                                ["hp_restored_since_last_frame"] = lifecycle.HealthRestoredSinceLastFrame,
+                                ["shade_hits_since_last_frame"] = lifecycle.ShadeHitsSinceLastFrame,
+                                ["shade_distance"] = lifecycle.ShadeDistance,
+                                ["scene_name"] = lifecycle.SceneName,
+                                ["operator_telemetry"] = operatorTelemetry,
+                                ["enemy_events_since_last_frame"] = lifecycle.EnemyEventsSinceLastFrame.Select(item => new Dictionary<string, object?>
+                                {
+                                    ["enemy_type"] = item.EnemyType,
+                                    ["enemy_type_id"] = EnemyObservationState.TypeId(item.EnemyType),
+                                    ["scene_name"] = item.SceneName,
+                                    ["hits_dealt"] = item.HitsDealt,
+                                    ["boss_confirmed"] = item.BossConfirmed,
+                                    ["boss_key"] = item.BossKey,
+                                    ["boss_version"] = item.BossVersion,
+                                    ["geo_awarded"] = lifecycle.EnemyEventsSinceLastFrame.Count == 1
+                                        ? lifecycle.GeoGainedSinceLastFrame : 0,
+                                }).ToArray(),
+                                ["duplicate_of"] = (long?)null,
+                                ["last_applied_action_id"] = correlation.LastAppliedActionId,
                             };
+                            if (frame.PngByteCount is int pngBytes)
+                            {
+                                framePayload["png_bytes"] = pngBytes;
+                            }
+                            if (requestSemanticLabels && frame.SemanticLabels != null)
+                            {
+                                framePayload["semantic_labels"] = new Dictionary<string, object>
+                                {
+                                    ["codec"] = "u4-v1",
+                                    ["width"] = SemanticRasterizer.Width,
+                                    ["height"] = SemanticRasterizer.Height,
+                                    ["data_base64"] = Convert.ToBase64String(frame.SemanticLabels.PackedGrid),
+                                };
+                                framePayload["hero_motion"] = new Dictionary<string, object>
+                                {
+                                    ["vx"] = frame.SemanticLabels.Vx,
+                                    ["vy"] = frame.SemanticLabels.Vy,
+                                    ["on_ground"] = frame.SemanticLabels.OnGround,
+                                };
+                                // Prompt 82's visual interaction-prompt detector is not implemented yet.
+                                framePayload["interact_prompt"] = false;
+                                framePayload["interact_prompt_valid"] = false;
+                                framePayload["semantic_capture_ms"] = frame.SemanticCaptureMs;
+                            }
+                            payload = framePayload;
                         }
                     }
                     catch (OperationCanceledException)

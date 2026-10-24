@@ -1,0 +1,29 @@
+ETAPA 60 — BESTIÁRIO PESSOAL
+Data: 2026-10-19
+Workspace: C:\VoidGym
+Estado: VERDE
+
+Implementação
+- Bridge envia até seis inimigos ativos no campo da câmera, com posição normalizada, ID anônimo e golpes sofridos. Não transmite HP ou atributos internos.
+- Memória por tipo deriva de encontros e eventos vividos; alimenta o vetor da política e persiste no conhecimento da jogada.
+- Painel inclui a tabela “Bestiário da IA”; os nomes amigáveis são exibidos apenas no operador.
+- O modo de controle interativo agora inicia um episode_id antes de ações de gameplay. O scanner captura HealthManager ativos mesmo quando o componente está desabilitado e não aborta o restante do scan por uma entrada inválida.
+- Expiração de inimigos após dez frames ausentes não muta o dicionário durante a iteração. O roteiro de King's Pass é reutilizável em tools\scripted_validation\.
+
+Validação
+- Ruff: passou.
+- mypy src: passou, 49 arquivos.
+- Pytest completo: 592 passed, 2 skipped, 8 subtests, 69,86 s; inclui regressão da expiração do encontro e do episode_id interativo.
+- Bridge Release: 0 avisos, 0 erros; HkAgentBridge.CorrelationTests passou.
+- DLL implantada em hk-ai-1 e hk-ai-2 com SHA-256 idêntico: 3E9BADFEE4B3B38CFB34C1BEF3BEFF8E96F0539961C99A091F34D7B46E5490D2.
+
+Teste com jogo
+- Roteiro kings-pass-first-crawlid-v1 rodou em hk-ai-1 na cena Tutorial_01 usando cópia isolada do save. Capturas do bootstrap e de cada ação estão em artifacts\scripted-validation\60\final\.
+- Slot do Crawlid apareceu em seis capturas; posição e golpes aumentaram. Um evento de derrota registrou dois golpes. Após dez frames ausente, a memória fechou o encontro: encontrado 1, derrotado 1, golpes médios 2, dano recebido 0, mortes causadas ao jogador 0, geo médio 0, item false, combate 1.
+- Resultado: artifacts\scripted-validation\60\final\memory\route-result.json. Frame representativo: artifacts\scripted-validation\60\final\frames\0015-action-0014.png.
+- Sessão encerrada com client_close, RELEASE_ALL e exit code 0. Saves de hk-ai-1 restaurados e hashes conferidos; personal saves e baseline preservados. Nenhuma campanha, ator ou jogo ficou ativo.
+
+Nota de telemetria
+- Este Crawlid não gerou geo ou item, e não houve morte do jogador; por isso essas métricas permaneceram zero. Os campos correspondentes são cobertos por testes sintéticos.
+
+Próximo passo: etapa 61 — gerenciamento de amuletos no banco.

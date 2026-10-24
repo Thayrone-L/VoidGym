@@ -1,6 +1,7 @@
 using System;
 using System.Reflection;
 using System.IO;
+using System.Globalization;
 using System.Threading;
 using Modding;
 using UnityEngine;
@@ -13,13 +14,26 @@ public sealed class HkAgentBridgeMod : Mod
     private AgentInputBackend? _input;
     private VisualCaptureBackend? _capture;
     private readonly EpisodeLifecycleState _lifecycle = new();
+    private readonly OperatorTelemetryState _operatorTelemetry = new();
+    private readonly object _operatorSnapshotLock = new();
+    private System.Collections.Generic.Dictionary<string, object?> _operatorSnapshot = new();
+    private readonly EnemyObservationState _enemyObservations = new();
     private int _lastObservedHealth = -1;
+    private int _episodeActive;
+    private int _operatorTelemetryDiagnosticLogged;
+    private int _enemyObservationDiagnosticLogged;
+    private int _boundsSceneHandle = int.MinValue;
+    private float[]? _cachedSceneBounds;
+    private float _lastDetailedOperatorSnapshot = float.NegativeInfinity;
+    private bool? _shadePending;
+    private static readonly MemberInfo[] ProgressFlagMembers = ReadProgressFlagMembers();
 
     public override string GetVersion() =>
         Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
 
     public override void Initialize()
     {
+        MapLayoutDump.Register();
         BridgeConfiguration configuration;
         try
         {
@@ -39,7 +53,25 @@ public sealed class HkAgentBridgeMod : Mod
 
         try
         {
-            ApplySaveRoot(configuration.SaveRoot);
+            if (configuration.InstanceMode)
+            {
+                BridgeConfiguration.ValidateInstanceRuntime(
+                    configuration.ExpectedProductName!,
+                    configuration.ExpectedDataRoot!,
+                    Application.productName,
+                    Application.persistentDataPath,
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "Low",
+                        "Team Cherry",
+                        "Hollow Knight"
+                    )
+                );
+            }
+            else
+            {
+                ApplySaveRoot(configuration.SaveRoot!);
+            }
             Application.runInBackground = true;
         }
         catch (Exception exception)
@@ -50,7 +82,7 @@ public sealed class HkAgentBridgeMod : Mod
         }
 
         var input = new AgentInputBackend(message => Log(message));
-        var capture = new VisualCaptureBackend(message => Log(message));
+        var capture = new VisualCaptureBackend(message => Log(message), input.ReadHumanSnapshot);
         _input = input;
         _capture = capture;
         _client = new BridgeClient(
@@ -58,12 +90,15 @@ public sealed class HkAgentBridgeMod : Mod
             message => Log(message),
             message => LogError(message),
             ReleaseAll,
+            input.SetHumanMode,
             (buttons, leaseMilliseconds) =>
                 input.ApplyAction(buttons, leaseMilliseconds),
             (buttons, leaseMilliseconds) =>
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
-            cancellationToken => capture.CaptureOnceAsync(cancellationToken),
-            _lifecycle.Snapshot,
+            (encoding, semanticLabels, cancellationToken) =>
+                capture.CaptureOnceAsync(encoding, semanticLabels, cancellationToken),
+            SnapshotRewardSignals,
+            SnapshotOperatorTelemetry,
             BeginEpisodeLifecycle
         );
         ModHooks.HeroUpdateHook += OnHeroUpdate;
@@ -72,6 +107,7 @@ public sealed class HkAgentBridgeMod : Mod
         ModHooks.SetPlayerBoolHook += OnSetPlayerBool;
         ModHooks.OnReceiveDeathEventHook += OnReceiveDeathEvent;
         ModHooks.AfterTakeDamageHook += OnAfterTakeDamage;
+        On.HealthManager.TakeDamage += OnHealthManagerTakeDamage;
         On.GeoControl.OnTriggerEnter2D += OnGeoPickupTrigger;
         On.HeroController.TakeGeo += OnHeroTakeGeo;
         ModHooks.ApplicationQuitHook += OnApplicationQuit;
@@ -124,8 +160,318 @@ public sealed class HkAgentBridgeMod : Mod
         PlayerData? playerData = PlayerData.instance;
         if (playerData != null)
         {
-            Interlocked.Exchange(ref _lastObservedHealth, playerData.GetInt("health"));
+            int current = playerData.GetInt("health");
+            int previous = Interlocked.Exchange(ref _lastObservedHealth, current);
+            bool atBench = playerData.GetBool("atBench");
+            int restored = EpisodeLifecycleState.CountHealthRestored(
+                previous, current, Volatile.Read(ref _episodeActive) != 0,
+                _lifecycle.IsDeathStarted, atBench
+            );
+            _lifecycle.RecordHealthRestored(restored);
+            ObserveOperatorTelemetry(playerData);
+            RefreshOperatorSnapshotIfDue();
         }
+    }
+
+    private void ObserveOperatorTelemetry(PlayerData playerData)
+    {
+        HeroController? hero = HeroController.instance;
+        var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+        string? zone = ReadStringMember(playerData, "mapZone");
+        float? x = hero == null ? null : hero.transform.position.x;
+        float? y = hero == null ? null : hero.transform.position.y;
+        Camera? camera = Camera.main;
+        float? cameraX = camera == null ? null : camera.transform.position.x;
+        float? cameraY = camera == null ? null : camera.transform.position.y;
+        if (_boundsSceneHandle != scene.handle)
+        {
+            _cachedSceneBounds = ReadSceneBounds(scene);
+            _boundsSceneHandle = scene.handle;
+        }
+        float[]? bounds = _cachedSceneBounds;
+        int grubs = SafeGetInt(playerData, "grubsCollected");
+        int geo = SafeGetInt(playerData, "geo");
+        var flags = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, bool>>();
+        foreach (MemberInfo member in ProgressFlagMembers)
+        {
+            try
+            {
+                bool value = member is FieldInfo field ? (bool)field.GetValue(playerData)! : (bool)((PropertyInfo)member).GetValue(playerData, null)!;
+                flags.Add(new System.Collections.Generic.KeyValuePair<string, bool>(member.Name, value));
+            }
+            catch (Exception) { }
+        }
+        var charmCosts = new System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal);
+        var equippedCharms = new System.Collections.Generic.Dictionary<string, bool>(StringComparer.Ordinal);
+        for (int charmId = 1; charmId <= 40; charmId++)
+        {
+            string flag = "gotCharm_" + charmId.ToString(CultureInfo.InvariantCulture);
+            if (SafeProgressFlag(playerData, flag))
+                charmCosts[flag] = Math.Min(6, SafeGetInt(playerData, "charmCost_" + charmId.ToString(CultureInfo.InvariantCulture)));
+            equippedCharms["equippedCharm_" + charmId.ToString(CultureInfo.InvariantCulture)] =
+                SafeProgressFlag(playerData, "equippedCharm_" + charmId.ToString(CultureInfo.InvariantCulture));
+        }
+        BridgeUiState ui = VisualCaptureBackend.ReadUiState();
+        _operatorTelemetry.Observe(scene.name, zone, x, y, cameraX, cameraY, bounds, grubs, geo, flags,
+            playerData.GetBool("atBench"), charmCosts, equippedCharms,
+            SafeGetInt(playerData, "charmSlotsFilled"), SafeGetInt(playerData, "charmSlots"),
+            ui.CharmMenuOpen, ui.CharmCursor);
+        if (!scene.name.StartsWith("Menu_", StringComparison.Ordinal) && hero != null && camera != null &&
+            Interlocked.CompareExchange(ref _operatorTelemetryDiagnosticLogged, 1, 0) == 0)
+        {
+            Log($"Operator telemetry gameplay sample: scene={scene.name}; x={x?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; y={y?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; camera_x={cameraX?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; camera_y={cameraY?.ToString("R", CultureInfo.InvariantCulture) ?? "null"}; geo={geo}; bounds={(bounds != null)}");
+        }
+    }
+
+    private static bool IsProgressFlag(string name)
+    {
+        string lower = name.ToLowerInvariant();
+        return lower.StartsWith("has", StringComparison.Ordinal) || lower.StartsWith("got", StringComparison.Ordinal)
+            || lower.StartsWith("met", StringComparison.Ordinal) || lower.StartsWith("opened", StringComparison.Ordinal)
+            || lower.StartsWith("entered", StringComparison.Ordinal)
+            || lower.Contains("boss") || lower.Contains("defeated") || lower.Contains("killed");
+    }
+
+    private static MemberInfo[] ReadProgressFlagMembers()
+    {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        var result = new System.Collections.Generic.List<MemberInfo>();
+        foreach (FieldInfo field in typeof(PlayerData).GetFields(members))
+            if (field.FieldType == typeof(bool) && IsProgressFlag(field.Name)) result.Add(field);
+        foreach (PropertyInfo property in typeof(PlayerData).GetProperties(members))
+            if (property.PropertyType == typeof(bool) && property.GetIndexParameters().Length == 0 && property.GetMethod != null && IsProgressFlag(property.Name)) result.Add(property);
+        return result.ToArray();
+    }
+
+    private static string? ReadStringMember(object source, string name)
+    {
+        const BindingFlags members = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        try
+        {
+            object? value = source.GetType().GetField(name, members)?.GetValue(source)
+                ?? source.GetType().GetProperty(name, members)?.GetValue(source, null);
+            return value as string;
+        }
+        catch (Exception) { return null; }
+    }
+
+    private static int SafeGetInt(PlayerData playerData, string name)
+    {
+        try { return Math.Max(0, playerData.GetInt(name)); }
+        catch (Exception) { return 0; }
+    }
+
+    private static bool SafeProgressFlag(PlayerData playerData, string name)
+    {
+        try { return playerData.GetBool(name); }
+        catch (Exception) { return false; }
+    }
+
+    private static float[]? ReadSceneBounds(UnityEngine.SceneManagement.Scene scene)
+    {
+        try
+        {
+            bool found = false;
+            float minX = 0, minY = 0, maxX = 0, maxY = 0;
+            foreach (GameObject root in scene.GetRootGameObjects())
+            foreach (Collider2D collider in root.GetComponentsInChildren<Collider2D>(true))
+            {
+                if (collider == null || !collider.enabled || !collider.gameObject.activeInHierarchy) continue;
+                Bounds b = collider.bounds;
+                if (!found) { minX = b.min.x; minY = b.min.y; maxX = b.max.x; maxY = b.max.y; found = true; }
+                else { minX = Math.Min(minX, b.min.x); minY = Math.Min(minY, b.min.y); maxX = Math.Max(maxX, b.max.x); maxY = Math.Max(maxY, b.max.y); }
+            }
+            return found ? new[] { minX, minY, maxX, maxY } : null;
+        }
+        catch (Exception) { return null; }
+    }
+
+    private System.Collections.Generic.Dictionary<string, object?> SnapshotOperatorTelemetry()
+    {
+        lock (_operatorSnapshotLock)
+            return new System.Collections.Generic.Dictionary<string, object?>(_operatorSnapshot);
+    }
+
+    private void RefreshOperatorSnapshotIfDue()
+    {
+        if (Time.unscaledTime - _lastDetailedOperatorSnapshot < 0.25f)
+            return;
+        _lastDetailedOperatorSnapshot = Time.unscaledTime;
+        var snapshot = _operatorTelemetry.Snapshot();
+        BridgeUiState ui = VisualCaptureBackend.ReadUiState();
+        snapshot["dialog_open"] = ui.DialogOpen;
+        snapshot["menu_open"] = ui.MenuOpen;
+        snapshot["charm_menu_open"] = ui.CharmMenuOpen;
+        snapshot["charm_cursor"] = ui.CharmCursor;
+        snapshot["dialogue_id"] = ui.DialogueId;
+        snapshot["visible_places"] = ReadVisiblePlaces();
+        snapshot["visible_enemies"] = ReadVisibleEnemies();
+        snapshot["shop_prices_visible"] = ReadVisibleShopPrices(ui.MenuOpen || ui.DialogOpen);
+        lock (_operatorSnapshotLock)
+            _operatorSnapshot = snapshot;
+    }
+
+    private System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisibleEnemies()
+    {
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        Camera? camera = Camera.main;
+        HeroController? hero = HeroController.instance;
+        if (camera == null || hero == null) return result;
+        var seenRoots = new System.Collections.Generic.HashSet<int>();
+        HealthManager[] managers;
+        try { managers = UnityEngine.Object.FindObjectsOfType<HealthManager>(true); }
+        catch (Exception error)
+        {
+            if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+                LogDebug($"Enemy visibility scan failed: {error.GetType().Name}");
+            return result;
+        }
+        foreach (HealthManager manager in managers)
+        {
+            try
+            {
+                if (manager == null || !manager.gameObject.activeInHierarchy) continue;
+                Transform root = manager.transform;
+                if (root == null || root.root == hero.transform.root) continue;
+                string name = EpisodeLifecycleState.NormalizeEnemyType(manager.gameObject.name);
+                if (name.Length == 0 || string.Equals(name, "Hollow Shade", StringComparison.OrdinalIgnoreCase)) continue;
+                int instanceId = manager.gameObject.GetInstanceID();
+                if (!seenRoots.Add(instanceId)) continue;
+                bool bossConfirmed = BossCatalog.TryGet(name, out ConfirmedBoss boss);
+                Vector3 point = camera.WorldToViewportPoint(manager.transform.position);
+                if (point.z <= 0 || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) continue;
+                result.Add(new System.Collections.Generic.Dictionary<string, object?>
+                {
+                    ["enemy_type_id"] = EnemyObservationState.TypeId(name),
+                    ["instance_id"] = instanceId,
+                    ["screen_x"] = point.x,
+                    ["screen_y"] = point.y,
+                    ["struck_this_encounter"] = _enemyObservations.Hits(instanceId),
+                    ["boss_confirmed"] = bossConfirmed,
+                    ["boss_key"] = bossConfirmed ? boss.Key : null,
+                    ["boss_version"] = bossConfirmed ? boss.Version : null,
+                });
+            }
+            catch (Exception error)
+            {
+                if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+                    LogDebug($"Enemy visibility entry skipped: {error.GetType().Name}");
+            }
+        }
+        if (Interlocked.CompareExchange(ref _enemyObservationDiagnosticLogged, 1, 0) == 0)
+            LogDebug($"Enemy visibility scan found {managers.Length} health managers and {result.Count} visible enemies");
+        result.Sort((left, right) =>
+        {
+            float lx = (float)left["screen_x"]! - 0.5f, ly = (float)left["screen_y"]! - 0.5f;
+            float rx = (float)right["screen_x"]! - 0.5f, ry = (float)right["screen_y"]! - 0.5f;
+            return (lx * lx + ly * ly).CompareTo(rx * rx + ry * ry);
+        });
+        if (result.Count > 6) result.RemoveRange(6, result.Count - 6);
+        return result;
+    }
+
+    private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisiblePlaces()
+    {
+        var places = new System.Collections.Generic.List<(float Distance, System.Collections.Generic.Dictionary<string, object?> Value)>();
+        Camera? camera = Camera.main;
+        if (camera == null) return new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        void AddPlace(string kind, Transform transform)
+        {
+            Vector3 point = camera.WorldToViewportPoint(transform.position);
+            if (point.z <= 0 || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
+            float dx = point.x - 0.5f, dy = point.y - 0.5f;
+            places.Add((dx * dx + dy * dy, new System.Collections.Generic.Dictionary<string, object?>
+            { ["kind"] = kind, ["x"] = point.x, ["y"] = point.y,
+              ["world_x"] = transform.position.x, ["world_y"] = transform.position.y }));
+        }
+        try
+        {
+            foreach (RestBench bench in UnityEngine.Object.FindObjectsOfType<RestBench>())
+                if (bench != null && bench.isActiveAndEnabled) AddPlace("bench", bench.transform);
+            foreach (SpawnStagMenu station in UnityEngine.Object.FindObjectsOfType<SpawnStagMenu>())
+                if (station != null && station.isActiveAndEnabled) AddPlace("stag_station", station.transform);
+            foreach (ShopMenuStock shop in UnityEngine.Object.FindObjectsOfType<ShopMenuStock>())
+                if (shop != null && shop.isActiveAndEnabled)
+                {
+                    bool mapShop = PlayerData.instance != null &&
+                        (SafeProgressFlag(PlayerData.instance, "metCornifer") || SafeProgressFlag(PlayerData.instance, "openedMapperShop"));
+                    AddPlace(mapShop ? "map_shop" : "shop", shop.transform);
+                }
+        }
+        catch (Exception) { }
+        places.Sort((left, right) => left.Distance.CompareTo(right.Distance));
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        foreach (var place in places)
+        {
+            if (result.Count >= 8) break;
+            result.Add(place.Value);
+        }
+        return result;
+    }
+
+    private static System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisibleShopPrices(bool menuOpen)
+    {
+        var result = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>>();
+        if (!menuOpen) return result;
+        try
+        {
+            foreach (ShopItemStats item in UnityEngine.Object.FindObjectsOfType<ShopItemStats>())
+            {
+                if (item == null || !item.isActiveAndEnabled || result.Count >= 64) continue;
+                result.Add(new System.Collections.Generic.Dictionary<string, object?>
+                { ["item_id"] = item.itemNumber.ToString(CultureInfo.InvariantCulture), ["geo"] = Math.Max(0, item.cost) });
+            }
+        }
+        catch (Exception) { }
+        return result;
+    }
+
+    private void OnHealthManagerTakeDamage(
+        On.HealthManager.orig_TakeDamage original,
+        HealthManager self,
+        HitInstance hitInstance
+    )
+    {
+        if (self == null)
+        {
+            original(self, hitInstance);
+            return;
+        }
+        GameObject? source = hitInstance.Source;
+        HeroController? hero = HeroController.instance;
+        if (hero != null && source != null && self != null &&
+            source.transform.root == hero.transform.root &&
+            self.transform.root != hero.transform.root)
+            _enemyObservations.RecordHit(self.gameObject.GetInstanceID());
+        string objectName = self!.gameObject!.name!.Replace("(Clone)", "").Trim();
+        if (hero != null && source != null && objectName == "Hollow Shade" &&
+            source.transform.root == hero.transform.root)
+        {
+            _lifecycle.RecordShadeHit();
+        }
+        original(self, hitInstance);
+    }
+
+    private EpisodeLifecycleSnapshot SnapshotRewardSignals()
+    {
+        string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        float? distance = null;
+        HeroController? hero = HeroController.instance;
+        if (hero != null && _lifecycle.ShadePending)
+        {
+            GameObject[] objects = UnityEngine.Object.FindObjectsOfType<GameObject>();
+            foreach (GameObject item in objects)
+            {
+                if (item != null && item.activeInHierarchy &&
+                    item.name.Replace("(Clone)", "").Trim() == "Hollow Shade" &&
+                    item.scene.handle == hero.gameObject.scene.handle)
+                {
+                    distance = Vector2.Distance(hero.transform.position, item.transform.position);
+                    break;
+                }
+            }
+        }
+        return _lifecycle.Snapshot(scene, distance);
     }
 
     private void OnGeoPickupTrigger(
@@ -165,7 +511,15 @@ public sealed class HkAgentBridgeMod : Mod
     {
         if (!eventAlreadyReceived && enemyDeathEffects != null)
         {
-            _lifecycle.RecordConfirmedEnemyKill();
+            HealthManager? healthManager = enemyDeathEffects.gameObject.GetComponentInParent<HealthManager>();
+            string enemyType = EpisodeLifecycleState.NormalizeEnemyType(
+                healthManager == null ? enemyDeathEffects.gameObject.name : healthManager.gameObject.name
+            );
+            _lifecycle.RecordConfirmedEnemyKill(
+                enemyType,
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
+                healthManager == null ? 0 : _enemyObservations.Hits(healthManager.gameObject.GetInstanceID())
+            );
         }
     }
 
@@ -190,12 +544,25 @@ public sealed class HkAgentBridgeMod : Mod
         if (string.Equals(name, "soulLimited", StringComparison.Ordinal))
         {
             _lifecycle.ObserveShadePresence(value);
+            if (_shadePending.HasValue && _shadePending.Value != value && Volatile.Read(ref _episodeActive) != 0)
+            {
+                HeroController? hero = HeroController.instance;
+                _operatorTelemetry.RecordEvent(value ? "shade_created" : "shade_recovered", "shade",
+                    hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
+            }
+            _shadePending = value;
         }
         return value;
     }
 
     private void OnPlayerDead()
     {
+        HeroController? hero = HeroController.instance;
+        _operatorTelemetry.RecordEvent("death", "player_death",
+            hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
+        if (_shadePending == true)
+            _operatorTelemetry.RecordEvent("shade_lost", "shade_lost",
+                hero == null ? null : hero.transform.position.x, hero == null ? null : hero.transform.position.y);
         _lifecycle.MarkPlayerDead();
         ReleaseAll();
         LogDebug("Player death marked as episode terminal");
@@ -224,6 +591,7 @@ public sealed class HkAgentBridgeMod : Mod
         ModHooks.AfterTakeDamageHook -= OnAfterTakeDamage;
         On.GeoControl.OnTriggerEnter2D -= OnGeoPickupTrigger;
         On.HeroController.TakeGeo -= OnHeroTakeGeo;
+        On.HealthManager.TakeDamage -= OnHealthManagerTakeDamage;
         BridgeClient? client = Interlocked.Exchange(ref _client, null);
         client?.Dispose();
         AgentInputBackend? input = Interlocked.Exchange(ref _input, null);
@@ -246,6 +614,8 @@ public sealed class HkAgentBridgeMod : Mod
             );
         }
         _lifecycle.BeginEpisode(playerData.GetBool("soulLimited"));
+        _shadePending = playerData.GetBool("soulLimited");
+        Interlocked.Exchange(ref _episodeActive, 1);
         Interlocked.Exchange(ref _lastObservedHealth, playerData.GetInt("health"));
     }
 

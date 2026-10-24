@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ class FakeBackend:
         self.hp_lost = 0
         self.geo_gained = 0
         self.geo_spent = 0
+        self.semantic_labels: np.ndarray | None = None
 
     def _frame(self, last_action: int | None = None) -> PixelFrame:
         self.frame_id += 1
@@ -60,6 +62,10 @@ class FakeBackend:
             hp_lost_since_last_frame=self.hp_lost,
             geo_gained_since_last_frame=self.geo_gained,
             geo_spent_since_last_frame=self.geo_spent,
+            semantic_labels=self.semantic_labels,
+            hero_motion=(0.25, -0.5, True) if self.semantic_labels is not None else None,
+            interact_prompt=self.semantic_labels is not None,
+            interact_prompt_valid=self.semantic_labels is not None,
         )
 
     def reset(self, *, seed: int | None, options: Mapping[str, Any] | None) -> ResetResult:
@@ -108,6 +114,21 @@ def test_env_checker_and_observation_contract(tmp_path: Path) -> None:
     assert observation["pixels"].dtype == np.uint8
     assert observation["action_history"].tolist() == [0, 0]
     assert info == {}
+    env.close()
+
+
+def test_frame_validation_preserves_opt_in_training_labels(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    backend.semantic_labels = np.full((27, 48), 255, dtype=np.uint8)
+    backend.semantic_labels[12, 20] = 5
+    env = make_env(backend, tmp_path)
+
+    env.reset()
+
+    np.testing.assert_array_equal(env._frames[-1].semantic_labels, backend.semantic_labels)
+    assert env._frames[-1].hero_motion == (0.25, -0.5, True)
+    assert env._frames[-1].interact_prompt is True
+    assert env._frames[-1].interact_prompt_valid is True
     env.close()
 
 
@@ -243,6 +264,17 @@ def test_observation_is_detached_from_backend_buffer(tmp_path: Path) -> None:
     observation["pixels"].fill(99)
     next_observation, *_ = env.step(0)
     assert np.all(next_observation["pixels"][0] == 7)
+    env.close()
+
+
+def test_step_exposes_backend_and_total_timing_in_info(tmp_path: Path) -> None:
+    env = make_env(FakeBackend(), tmp_path)
+    env.reset()
+
+    *_, info = env.step(0)
+
+    assert info["timing_ms"]["backend"] == pytest.approx(1.25)
+    assert info["timing_ms"]["env_step"] >= 0
     env.close()
 
 
@@ -467,3 +499,41 @@ def test_transition_log_failure_truncates_before_observation_advances(
     assert np.array_equal(after["pixels"], before["pixels"])
     assert backend.releases == 1
     env.close()
+
+
+
+def test_extended_length_path_is_a_noop_off_windows_and_idempotent() -> None:
+    from hk_agent.gym_env import extended_length_path
+
+    assert extended_length_path("/tmp/x", os_name="posix") == "/tmp/x"
+    prefixed = "\\\\?\\C:\\already\\long"
+    assert extended_length_path(prefixed, os_name="nt") == prefixed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH behaviour")
+def test_extended_length_path_prefixes_drive_and_unc_paths() -> None:
+    from hk_agent.gym_env import extended_length_path
+
+    assert extended_length_path("C:\\data\\file.jsonl") == "\\\\?\\C:\\data\\file.jsonl"
+    assert extended_length_path("\\\\server\\share\\f.jsonl") == "\\\\?\\UNC\\server\\share\\f.jsonl"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MAX_PATH behaviour")
+def test_jsonl_writer_survives_paths_beyond_max_path(tmp_path: Path) -> None:
+    """Regression: per-launch runtime roots made the experience tree exceed
+    MAX_PATH (WinError 206) and every transition was rejected."""
+    from hk_agent.gym_env import AtomicJsonlWriter
+
+    deep = tmp_path
+    for index in range(8):
+        deep = deep / f"episode-51042e97-4d58-4dab-a796-b5502883b9cf-{index}"
+    target = deep / "transitions.jsonl"
+    assert len(str(target)) > 300
+    writer = AtomicJsonlWriter(target)
+    writer.append({"step": 1})
+    writer.append({"step": 2})
+    with open("\\\\?\\" + str(target), encoding="utf-8") as stream:
+        assert [line for line in stream.read().splitlines() if line] == [
+            '{"step":1}',
+            '{"step":2}',
+        ]
