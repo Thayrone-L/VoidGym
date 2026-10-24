@@ -27,16 +27,42 @@ class AdapterEnv(gym.Env[dict[str, np.ndarray], int]):
         if not self.actions:
             raise ValueError("O adaptador precisa declarar ao menos uma ação")
         self.action_space = gym.spaces.Discrete(len(self.actions))  # type: ignore[assignment]
-        self.observation_space = universal_observation_space(
-            frame_stack=frame_stack, history_len=history_len
-        )  # type: ignore[assignment]
+        base_space = universal_observation_space(frame_stack=frame_stack, history_len=history_len)
+        spaces = dict(base_space.spaces)
+        game_extras = getattr(adapter, "game_extras", None)
+        self._game_extras_provider = game_extras if callable(game_extras) else None
+        self._game_extras_size: int | None = None
+        if callable(game_extras):
+            size_provider = getattr(adapter, "game_extras_size", None)
+            if callable(size_provider):
+                size = size_provider()
+                if type(size) is not int or size < 1:
+                    raise ValueError("game_extras_size must return a positive integer")
+                self._game_extras_size = size
+            else:
+                sample = np.asarray(game_extras(), dtype=np.float32)
+                if sample.ndim != 1 or sample.size < 1 or not np.isfinite(sample).all():
+                    raise ValueError("game_extras must be a finite nonempty vector")
+                self._game_extras_size = int(sample.size)
+            spaces["game_extras"] = gym.spaces.Box(
+                -np.inf, np.inf, shape=(self._game_extras_size,), dtype=np.float32
+            )
+        self.observation_space = gym.spaces.Dict(spaces)  # type: ignore[assignment]
+        self._closed = False
         self._frames: deque[np.ndarray] = deque(maxlen=frame_stack)
         self._history: deque[int] = deque([0] * history_len, maxlen=history_len)
 
     def _observation(self) -> dict[str, np.ndarray]:
         frames = np.stack(tuple(self._frames), axis=0)
         image = frames.transpose(0, 3, 1, 2).reshape(-1, 108, 192)
-        return {"pixels": image, "action_history": np.asarray(self._history, dtype=np.int64)}
+        result = {"pixels": image, "action_history": np.asarray(self._history, dtype=np.int64)}
+        if self._game_extras_size is not None:
+            assert self._game_extras_provider is not None
+            value = np.asarray(self._game_extras_provider(), dtype=np.float32)
+            if value.shape != (self._game_extras_size,) or not np.isfinite(value).all():
+                raise ValueError("game_extras changed its schema or contains non-finite values")
+            result["game_extras"] = value
+        return result
 
     def _info(self) -> dict[str, Any]:
         return {"signals": dict(self.adapter.signals()),
@@ -79,3 +105,11 @@ class AdapterEnv(gym.Env[dict[str, np.ndarray], int]):
         self._history.append(int(action))
         return (self._observation(), float(self.reward_fn(before, after)), bool(after.get("terminated", False)),
                 bool(after.get("truncated", False)), self._info())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.adapter, "close", None)
+        if callable(close):
+            close()

@@ -23,6 +23,7 @@ from hk_agent.menu_bootstrap import (
     run_menu_bootstrap,
 )
 from hk_agent.protocol import ProtocolError
+from hk_agent.semantic_labels import unpack_u4
 from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer, require_png_frame
 
 _T = TypeVar("_T")
@@ -126,6 +127,7 @@ class SupervisorEnvironmentBackend:
         expected_save_root: Path | None = None,
         reuse_game_on_reset: bool = False,
         playthrough_root: Path | None = None,
+        request_semantic_labels: bool = False,
     ) -> None:
         if (
             bridge_timeout_seconds <= 0
@@ -156,6 +158,9 @@ class SupervisorEnvironmentBackend:
         )
         self._reset_process = reset_process
         self._reuse_game_on_reset = reuse_game_on_reset
+        if type(request_semantic_labels) is not bool:
+            raise TypeError("request_semantic_labels must be bool")
+        self._request_semantic_labels = request_semantic_labels
         self._playthrough_root = playthrough_root.resolve(strict=False) if playthrough_root else None
         self._shutdown_process = shutdown_process
         self._bridge_timeout = bridge_timeout_seconds
@@ -343,6 +348,7 @@ class SupervisorEnvironmentBackend:
                         bridge=bridge,
                         episode_id=episode_id,
                         encoding="raw_rgb8",
+                        semantic_labels=self._request_semantic_labels,
                     ),
                     timeout=self._command_timeout + 0.5,
                 )
@@ -557,6 +563,7 @@ class SupervisorEnvironmentBackend:
                 bridge=bridge,
                 episode_id=episode_id,
                 encoding="raw_rgb8",
+                semantic_labels=self._request_semantic_labels,
             ),
             timeout=self._command_timeout + 0.5,
         )
@@ -701,6 +708,12 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         raise ProtocolError(f"unsupported FRAME encoding: {frame.encoding}")
     if pixels.shape != (frame.height, frame.width, 3):
         raise ProtocolError("decoded PNG dimensions differ from FRAME metadata")
+    semantic_labels = None
+    if frame.semantic_labels_u4 is not None:
+        try:
+            semantic_labels = unpack_u4(frame.semantic_labels_u4, width=48, height=27)
+        except ValueError as error:
+            raise ProtocolError("FRAME semantic_labels encoding is invalid") from error
     return PixelFrame(
         episode_id=episode_id,
         frame_id=frame.frame_id,
@@ -732,6 +745,10 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         human_duration_ms=frame.human_duration_ms,
         human_mode=frame.human_mode,
         human_input_test=frame.human_input_test,
+        semantic_labels=semantic_labels,
+        hero_motion=frame.hero_motion,
+        interact_prompt=frame.interact_prompt,
+        interact_prompt_valid=frame.interact_prompt_valid,
     )
 
 

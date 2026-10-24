@@ -262,8 +262,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     {"instances", "duration_kind", "duration_value", "campaign_name"},
                     {"instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count"},
                     {"instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes"},
+                    {"instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes", "engine"},
                 ):
-                    raise ValueError("start accepts instances, duration, campaign_name, help_stuck_count, and help_stuck_minutes")
+                    raise ValueError("start accepts instances, duration, campaign_name, help trigger settings, and optional engine")
                 if not self.server.control_plane.allow_execute:
                     raise PermissionError("Start the panel with --allow-execute to open game windows")
                 result = self.server.control_plane.start_operator_campaign(
@@ -272,6 +273,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     campaign_name=payload.get("campaign_name"),
                     help_stuck_count=payload.get("help_stuck_count", 10),
                     help_stuck_minutes=payload.get("help_stuck_minutes", 60.0),
+                    engine=payload.get("engine", "v1"),
                 )
                 self._json(HTTPStatus.ACCEPTED, result)
             elif path == "/api/operator/continue":

@@ -15,6 +15,8 @@ public sealed class HkAgentBridgeMod : Mod
     private VisualCaptureBackend? _capture;
     private readonly EpisodeLifecycleState _lifecycle = new();
     private readonly OperatorTelemetryState _operatorTelemetry = new();
+    private readonly object _operatorSnapshotLock = new();
+    private System.Collections.Generic.Dictionary<string, object?> _operatorSnapshot = new();
     private readonly EnemyObservationState _enemyObservations = new();
     private int _lastObservedHealth = -1;
     private int _episodeActive;
@@ -22,6 +24,7 @@ public sealed class HkAgentBridgeMod : Mod
     private int _enemyObservationDiagnosticLogged;
     private int _boundsSceneHandle = int.MinValue;
     private float[]? _cachedSceneBounds;
+    private float _lastDetailedOperatorSnapshot = float.NegativeInfinity;
     private bool? _shadePending;
     private static readonly MemberInfo[] ProgressFlagMembers = ReadProgressFlagMembers();
 
@@ -92,7 +95,8 @@ public sealed class HkAgentBridgeMod : Mod
                 input.ApplyAction(buttons, leaseMilliseconds),
             (buttons, leaseMilliseconds) =>
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
-            (encoding, cancellationToken) => capture.CaptureOnceAsync(encoding, cancellationToken),
+            (encoding, semanticLabels, cancellationToken) =>
+                capture.CaptureOnceAsync(encoding, semanticLabels, cancellationToken),
             SnapshotRewardSignals,
             SnapshotOperatorTelemetry,
             BeginEpisodeLifecycle
@@ -165,6 +169,7 @@ public sealed class HkAgentBridgeMod : Mod
             );
             _lifecycle.RecordHealthRestored(restored);
             ObserveOperatorTelemetry(playerData);
+            RefreshOperatorSnapshotIfDue();
         }
     }
 
@@ -283,6 +288,15 @@ public sealed class HkAgentBridgeMod : Mod
 
     private System.Collections.Generic.Dictionary<string, object?> SnapshotOperatorTelemetry()
     {
+        lock (_operatorSnapshotLock)
+            return new System.Collections.Generic.Dictionary<string, object?>(_operatorSnapshot);
+    }
+
+    private void RefreshOperatorSnapshotIfDue()
+    {
+        if (Time.unscaledTime - _lastDetailedOperatorSnapshot < 0.25f)
+            return;
+        _lastDetailedOperatorSnapshot = Time.unscaledTime;
         var snapshot = _operatorTelemetry.Snapshot();
         BridgeUiState ui = VisualCaptureBackend.ReadUiState();
         snapshot["dialog_open"] = ui.DialogOpen;
@@ -293,7 +307,8 @@ public sealed class HkAgentBridgeMod : Mod
         snapshot["visible_places"] = ReadVisiblePlaces();
         snapshot["visible_enemies"] = ReadVisibleEnemies();
         snapshot["shop_prices_visible"] = ReadVisibleShopPrices(ui.MenuOpen || ui.DialogOpen);
-        return snapshot;
+        lock (_operatorSnapshotLock)
+            _operatorSnapshot = snapshot;
     }
 
     private System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, object?>> ReadVisibleEnemies()

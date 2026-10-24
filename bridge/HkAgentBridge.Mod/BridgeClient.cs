@@ -25,7 +25,7 @@ internal sealed class BridgeClient : IDisposable
     private readonly Action<bool> _setHumanMode;
     private readonly Func<IEnumerable<string>, int, string[]> _applyAction;
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
-    private readonly Func<string, CancellationToken, Task<CapturedFrame>> _captureOnce;
+    private readonly Func<string, bool, CancellationToken, Task<CapturedFrame>> _captureOnce;
     private readonly Func<EpisodeLifecycleSnapshot> _lifecycleSnapshot;
     private readonly Func<Dictionary<string, object?>> _operatorTelemetrySnapshot;
     private readonly Action _beginEpisodeLifecycle;
@@ -46,7 +46,7 @@ internal sealed class BridgeClient : IDisposable
         Action<bool> setHumanMode,
         Func<IEnumerable<string>, int, string[]> applyAction,
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
-        Func<string, CancellationToken, Task<CapturedFrame>> captureOnce,
+        Func<string, bool, CancellationToken, Task<CapturedFrame>> captureOnce,
         Func<EpisodeLifecycleSnapshot> lifecycleSnapshot,
         Func<Dictionary<string, object?>> operatorTelemetrySnapshot,
         Action beginEpisodeLifecycle
@@ -105,6 +105,7 @@ internal sealed class BridgeClient : IDisposable
                             "player_death_terminal",
                             "shade_run_lifecycle",
                             "action_availability_v1",
+                            "semantic_labels_v1",
                         },
                     }
                 );
@@ -389,6 +390,20 @@ internal sealed class BridgeClient : IDisposable
                             };
                             break;
                         }
+                        JToken? labelsToken = command["payload"]?["semantic_labels"];
+                        if (labelsToken != null && labelsToken.Type != JTokenType.Boolean)
+                        {
+                            responseType = "ERROR";
+                            payload = new
+                            {
+                                command_type = messageType,
+                                error_code = "invalid_semantic_labels_request",
+                                recoverable = true,
+                                detail = "semantic_labels must be a boolean",
+                            };
+                            break;
+                        }
+                        bool requestSemanticLabels = labelsToken?.Value<bool>() ?? false;
                         string? requestedEpisodeId =
                             (string?)command["payload"]?["episode_id"];
                         CorrelationSnapshot correlation =
@@ -399,6 +414,7 @@ internal sealed class BridgeClient : IDisposable
                             captureCancellation.CancelAfter(CaptureTimeoutMilliseconds);
                             CapturedFrame frame = await _captureOnce(
                                 requestedEncoding,
+                                requestSemanticLabels,
                                 captureCancellation.Token
                             ).ConfigureAwait(false);
                             EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot();
@@ -481,6 +497,26 @@ internal sealed class BridgeClient : IDisposable
                             if (frame.PngByteCount is int pngBytes)
                             {
                                 framePayload["png_bytes"] = pngBytes;
+                            }
+                            if (requestSemanticLabels && frame.SemanticLabels != null)
+                            {
+                                framePayload["semantic_labels"] = new Dictionary<string, object>
+                                {
+                                    ["codec"] = "u4-v1",
+                                    ["width"] = SemanticRasterizer.Width,
+                                    ["height"] = SemanticRasterizer.Height,
+                                    ["data_base64"] = Convert.ToBase64String(frame.SemanticLabels.PackedGrid),
+                                };
+                                framePayload["hero_motion"] = new Dictionary<string, object>
+                                {
+                                    ["vx"] = frame.SemanticLabels.Vx,
+                                    ["vy"] = frame.SemanticLabels.Vy,
+                                    ["on_ground"] = frame.SemanticLabels.OnGround,
+                                };
+                                // Prompt 82's visual interaction-prompt detector is not implemented yet.
+                                framePayload["interact_prompt"] = false;
+                                framePayload["interact_prompt_valid"] = false;
+                                framePayload["semantic_capture_ms"] = frame.SemanticCaptureMs;
                             }
                             payload = framePayload;
                         }

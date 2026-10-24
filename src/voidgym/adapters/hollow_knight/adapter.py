@@ -50,12 +50,20 @@ class HollowKnightAdapter:
     def __init__(self, env: Any) -> None:
         self.env = env
         self._last_info: dict[str, Any] = {}
+        self._last_reward = 0.0
+        self._task_mode = hasattr(env, "environment") and hasattr(env, "config") and hasattr(env, "action_masks")
+        if self._task_mode and tuple(getattr(env, "_action_names", ())) != _NAMES:
+            raise RuntimeError("explore_v4 action table differs from the universal HK adapter")
         if set(_HK_TO_UNIVERSAL) != set(_NAMES):
             raise RuntimeError("Mapeamento universal de ações do HK incompleto")
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> None:
         _observation, info = self.env.reset(seed=seed, options=options)
         self._last_info = dict(info)
+        self._last_reward = 0.0
+
+    def _game_env(self) -> Any:
+        return self.env.environment if self._task_mode else self.env
 
     def action_table(self) -> tuple[str, ...]:
         return _NAMES
@@ -73,25 +81,61 @@ class HollowKnightAdapter:
         return None
 
     def frame_rgb(self) -> np.ndarray:
-        if not self.env._frames:
+        game_env = self._game_env()
+        if not game_env._frames:
             raise RuntimeError("Hollow Knight ainda não forneceu um quadro")
-        return cast(np.ndarray, self.env._frames[-1].pixels)
+        return cast(np.ndarray, game_env._frames[-1].pixels)
 
     def apply(self, game_action_index: int) -> None:
         template = _TEMPLATES[game_action_index]
-        _observation, _reward, _terminated, _truncated, info = self.env.step(
-            template.raw_action_index, lease_ms=template.resolve_lease_ms(80)
-        )
+        if self._task_mode:
+            _observation, reward, terminated, truncated, info = self.env.step(
+                game_action_index
+            )
+            info = {**info, "terminated": bool(terminated), "truncated": bool(truncated)}
+        else:
+            _observation, reward, _terminated, _truncated, info = self.env.step(
+                template.raw_action_index, lease_ms=template.resolve_lease_ms(80)
+            )
+        self._last_reward = float(reward)
         self._last_info = dict(info)
 
     def action_mask(self) -> np.ndarray:
+        if self._task_mode:
+            return np.asarray(self.env.action_masks(), dtype=np.bool_)
         availability = self.env.latest_action_availability
         return build_action_mask(_NAMES, availability)
 
     def signals(self) -> dict[str, Any]:
-        if not self.env._frames:
+        game_env = self._game_env()
+        if not game_env._frames:
             return {}
-        frame = self.env._frames[-1]
+        if self._task_mode:
+            frame = game_env._frames[-1]
+            result = {"scene_name": frame.scene_name,
+                      "terminated": bool(self._last_info.get("terminated", False)),
+                      "truncated": bool(self._last_info.get("truncated", False)),
+                      "room_changed": bool(self._last_info.get("scene_change_event", False)),
+                      "died": self._last_info.get("termination_reason") == "player_dead",
+                      "progress": max((float(value) for value in self._last_info.get("max_progress_by_scene", {}).values()), default=0.0)
+                      if isinstance(self._last_info.get("max_progress_by_scene"), dict) else 0.0}
+            telemetry = frame.operator_telemetry
+            if telemetry:
+                result["operator_telemetry"] = dict(telemetry)
+                bounds = telemetry.get("scene_bounds")
+                x, y = telemetry.get("x"), telemetry.get("y")
+                if (isinstance(bounds, (list, tuple)) and len(bounds) == 4
+                        and all(isinstance(item, (int, float)) for item in bounds)
+                        and isinstance(x, (int, float)) and isinstance(y, (int, float))):
+                    left, bottom, right, top = (float(item) for item in bounds)
+                    result["player_pos_room"] = (
+                        min(1.0, max(0.0, (float(x) - left) / max(1e-6, right - left))),
+                        min(1.0, max(0.0, (float(y) - bottom) / max(1e-6, top - bottom))),
+                    )
+                if "hp" in telemetry:
+                    result["hp"] = telemetry["hp"]
+            return result
+        frame = game_env._frames[-1]
         signal_names = {
             "enemy_kills_since_last_frame", "hp_lost_since_last_frame",
             "geo_gained_since_last_frame", "geo_spent_since_last_frame",
@@ -129,8 +173,50 @@ class HollowKnightAdapter:
                     result[key] = telemetry[key]
         return result
 
-    def training_labels(self) -> None:
-        return None
+    def training_labels(self) -> dict[str, Any] | None:
+        """Return optional bridge oracle labels; these never enter observations."""
+        game_env = self._game_env()
+        if not game_env._frames:
+            return None
+        frame = game_env._frames[-1]
+        sem = getattr(frame, "semantic_labels", None)
+        if sem is None:
+            return None
+        labels: dict[str, Any] = {
+            "sem": sem,
+            "interact_prompt": int(bool(getattr(frame, "interact_prompt", False))),
+            "interact_prompt_valid": bool(getattr(frame, "interact_prompt_valid", False)),
+        }
+        motion = getattr(frame, "hero_motion", None)
+        if motion is not None:
+            labels["hero_velocity"] = np.asarray(motion[:2], dtype=np.float32)
+            labels["on_ground"] = int(motion[2])
+        return labels
+
+    def game_extras(self) -> np.ndarray:
+        """GameExtrasAdapter[hollow_knight]: private player/bestiary knowledge."""
+        if not self._task_mode:
+            return np.zeros(1, dtype=np.float32)
+        knowledge = getattr(self.env, "_player_knowledge", None)
+        if knowledge is None:
+            raise RuntimeError("explore_v4 has not initialized player knowledge")
+        return np.asarray(knowledge.vector(hint_level=self.env.config.tutorial_hint_level),
+                          dtype=np.float32)
+
+    @staticmethod
+    def game_extras_size() -> int:
+        from hk_agent.player_knowledge import PlayerKnowledge
+
+        return int(PlayerKnowledge.space().shape[0])
 
     def game_time_scale(self) -> float:
         return 1.0
+
+    @property
+    def last_reward(self) -> float:
+        return self._last_reward
+
+    def close(self) -> None:
+        close = getattr(self.env, "close", None)
+        if callable(close):
+            close()

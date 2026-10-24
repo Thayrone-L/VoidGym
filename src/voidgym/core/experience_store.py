@@ -73,9 +73,11 @@ class ExperienceWriter:
         temporary = target.with_suffix(".npz.tmp")
         names = set.intersection(*(set(item) for item in block))
         dtypes = {"frame": np.uint8, "action": np.int16, "action_mask": np.bool_,
+                  "action_history": np.int16,
                   "reward_universal": np.float32, "reward_game": np.float32,
                   "done": np.bool_, "truncated": np.bool_, "discontinuity": np.bool_,
-                  "sem": np.uint8, "hero_motion": np.float32, "privileged": np.float32}
+                  "sem": np.uint8, "hero_motion": np.float32, "privileged": np.float32,
+                  "interact_prompt": np.int8, "interact_prompt_valid": np.bool_}
         arrays: dict[str, np.ndarray] = {}
         for name in names - {"scene", "tags", "priority"}:
             if name not in dtypes and not name.startswith("extra_"):

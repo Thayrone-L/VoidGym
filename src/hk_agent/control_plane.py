@@ -144,6 +144,11 @@ def _project_python_executable(project_root: Path) -> str:
     return sys.executable
 
 
+def _project_training_python_executable(project_root: Path) -> str:
+    cuda = project_root / ".venv-cuda" / "Scripts" / "python.exe"
+    return str(cuda) if cuda.is_file() else _project_python_executable(project_root)
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignSpec:
     campaign_id: str
@@ -156,6 +161,7 @@ class CampaignSpec:
     horizon: int
     action_repeat: int
     lease_ms: int
+    engine: str = "v1"
     window_width: int = 960
     window_height: int = 540
     duration_mode: str = "limited"
@@ -202,6 +208,9 @@ class CampaignSpec:
         campaign_type = str(payload.get("campaign_type", ""))
         if campaign_type not in CAMPAIGN_TO_TOOL:
             raise ValueError("campaign_type is not allowlisted")
+        engine = payload.get("engine", "v1")
+        if engine not in {"v1", "v2"}:
+            raise ValueError("engine must be v1 or v2")
         shared_learner = payload.get(
             "shared_learner",
             campaign_type == "exploration_training" and payload.get("reward_version", "explore_v3") in {"explore_v3", "explore_v4"},
@@ -238,6 +247,9 @@ class CampaignSpec:
         reward_version = payload.get("reward_version", "explore_v3")
         if campaign_type == "exploration_training" and reward_version not in {"explore_v1", "explore_v2", "explore_v3", "explore_v4"}:
             raise ValueError("unsupported exploration reward version")
+        if engine == "v2" and (campaign_type != "exploration_training" or not shared_learner
+                                or reward_version != "explore_v4"):
+            raise ValueError("v2 Hollow Knight campaigns require shared exploration_training with explore_v4")
         warm_start_checkpoint = payload.get("warm_start_checkpoint")
         warm_start_source_campaign = payload.get("warm_start_source_campaign")
         if warm_start_checkpoint is not None and (not isinstance(warm_start_checkpoint, str) or len(warm_start_checkpoint) > 2048):
@@ -394,6 +406,7 @@ class CampaignSpec:
             horizon=_bounded_int(payload.get("horizon", 3000 if campaign_type == "exploration_training" else 512), "horizon", 8, 100_000),
             action_repeat=_bounded_int(payload.get("action_repeat", 3), "action_repeat", 1, 32),
             lease_ms=_bounded_int(payload.get("lease_ms", 80), "lease_ms", 20, 5_000),
+            engine=str(engine),
             window_width=_bounded_int(payload.get("window_width", 960), "window_width", 320, 7680),
             window_height=_bounded_int(
                 payload.get("window_height", 540), "window_height", 320, 7680
@@ -2510,12 +2523,14 @@ class ControlPlane:
     def start_operator_campaign(
         self, *, instances: object, duration_kind: object, duration_value: object,
         campaign_name: object = None, help_stuck_count: object = 10,
-        help_stuck_minutes: object = 60.0,
+        help_stuck_minutes: object = 60.0, engine: object = "v1",
     ) -> dict[str, object]:
         from hk_agent.config import load_config
 
         config = load_config(self.project_root / "config.training.local.toml", allow_training=True)
         count = _bounded_int(instances, "instances", 1, 3)
+        if engine not in {"v1", "v2"}:
+            raise ValueError("engine must be v1 or v2")
         if count > min(3, config.instance_count):
             raise ValueError(f"This computer has {config.instance_count} managed game instance(s) configured")
         limit_seconds = self._operator_duration(duration_kind, duration_value)
@@ -2539,12 +2554,13 @@ class ControlPlane:
                        else f"explore-{now_slug}-{secrets.token_hex(2)}")
         candidate = self._operator_checkpoint_candidate()
         warm_start: tuple[str, str] | None = None
-        if candidate is not None:
+        if candidate is not None and engine == "v1":
             warm_start = (str(candidate["checkpoint"]), str(candidate["campaign_id"]))
         payload: dict[str, object] = {
             "campaign_id": campaign_id,
             "name": name,
             "campaign_type": "exploration_training",
+            "engine": engine,
             "reward_version": "explore_v4",
             "shared_learner": True,
             "actors": count,
@@ -2707,8 +2723,11 @@ class ControlPlane:
         slot_id: int | None = None,
     ) -> list[str]:
         tool_name = CAMPAIGN_TO_TOOL[spec.campaign_type]
+        if spec.engine == "v2":
+            tool_name = "v2/run_actor.py"
         tool_path = (self.project_root / "tools" / tool_name).resolve(strict=True)
-        if tool_path.parent != (self.project_root / "tools").resolve():
+        allowed_tool_dir = self.project_root / "tools" / ("v2" if spec.engine == "v2" else "")
+        if tool_path.parent != allowed_tool_dir.resolve():
             raise RuntimeError("tool escaped the allowlisted directory")
         command = [
             _project_python_executable(self.project_root),
@@ -2832,9 +2851,47 @@ class ControlPlane:
             command += ["--" + key.replace("_", "-"), str(value)]
         if stop_file is not None:
             command += ["--stop-file", str(stop_file)]
+        if spec.engine == "v2":
+            checkpoint = self._v2_pretrain_checkpoint()
+            shared_root = self.runtime_root / "shared" / spec.campaign_id
+            actor_id = f"actor-slot-{slot_id if slot_id is not None else 0}"
+            command += [
+                "--mode", "hollow_knight", "--shared-root", str(shared_root),
+                "--experience-root", str(self.runtime_root / "v2" / "experience"),
+                "--campaign-id", spec.campaign_id, "--actor-id", actor_id,
+                "--universal-checkpoint", str(checkpoint), "--sequence-length", "32",
+                "--device", "cpu",
+            ]
         if execute:
             command.append("--execute")
         return command
+
+    def _v2_pretrain_checkpoint(self) -> Path:
+        roots = (
+            (self.project_root / "runtime" / "v2" / "pretrain").resolve(strict=False),
+            (self.runtime_root / "v2" / "pretrain").resolve(strict=False),
+        )
+        valid: list[tuple[int, Path]] = []
+        for root in roots:
+            for path in root.glob("*/universal-*"):
+                manifest_path = path / "manifest.json"
+                if not path.is_dir() or not manifest_path.is_file():
+                    continue
+                try:
+                    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    steps = data.get("trained_steps")
+                    actions = data.get("action_table")
+                    if (type(steps) is int and steps >= 0 and isinstance(actions, list)
+                            and actions and all(isinstance(item, str) for item in actions)):
+                        valid.append((steps, path.resolve(strict=True)))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+        if not valid:
+            raise RuntimeError("no valid universal pretrain checkpoint exists under runtime/v2/pretrain")
+        checkpoint = max(valid, key=lambda item: item[0])[1]
+        if not any(checkpoint.is_relative_to(root) for root in roots):
+            raise RuntimeError("universal pretrain checkpoint escaped its configured runtime")
+        return checkpoint
 
     @staticmethod
     def _effective_seed(spec: CampaignSpec, slot_id: int | None) -> int:
@@ -2908,11 +2965,17 @@ class ControlPlane:
             # Actors wait for the shared task contract. Start them first so their
             # fresh launch identities replace terminal slot state before the
             # learner begins polling old rollout/status files on resume.
+            actor_ids: list[str] = []
+            for actor_record in actors:
+                actor_resources = actor_record.get("resources")
+                slot = actor_resources.get("slot_id", 0) if isinstance(actor_resources, dict) else 0
+                actor_ids.append(f"actor-slot-{slot}")
             learner = self._launch_shared_learner(
                 spec,
                 version=version_number,
                 group_id=group_id,
                 shared_root=shared_root,
+                actor_ids=tuple(actor_ids),
             )
         except BaseException:
             for record in [*actors, *([learner] if learner is not None else [])]:
@@ -2938,6 +3001,7 @@ class ControlPlane:
         version: int,
         group_id: str,
         shared_root: Path,
+        actor_ids: tuple[str, ...] = (),
     ) -> dict[str, object]:
         self._require_owner()
         launch_id = time.strftime("launch-%Y%m%dT%H%M%S", time.gmtime()) + f"-{secrets.token_hex(3)}"
@@ -2946,8 +3010,50 @@ class ControlPlane:
         launch_root.mkdir(parents=True, exist_ok=False)
         stop_file = launch_root / "stop.request"
         log_path = launch_root / "process.log"
-        tool_path = self.project_root / "tools" / "run_shared_learner.py"
-        command = [
+        if spec.engine == "v2":
+            tool_path = self.project_root / "tools" / "v2" / "run_learner.py"
+            checkpoint = self._v2_pretrain_checkpoint()
+            campaign_config = shared_root / "campaign-config.json"
+            atomic_json(campaign_config, {
+                "schema_version": 1, "campaign_id": spec.campaign_id,
+                "kind": "game_training", "game_id": "hollow_knight",
+                "ppo": {
+                    "learning_rate": spec.learning_rate or 0.00025,
+                    "gamma": spec.gamma or 0.995,
+                    "gae_lambda": spec.gae_lambda or 0.95,
+                    "clip_range": spec.clip_range or 0.2,
+                    "entropy_coef": spec.ent_coef or 0.01,
+                    "epochs": spec.n_epochs or 4, "batch_size": spec.batch_size,
+                    "sequence_length": 32,
+                },
+                "aux": {"c_sem": 0.5, "c_inv": 0.1, "c_mot": 0.1,
+                        "augment_random_shift": True},
+                "reward": {"game_reward": "explore_v4"},
+                "resources": {"game_instances": spec.actors, "train_device": None},
+                "storage": {"root": str(self.runtime_root / "v2" / "experience")},
+                "start_from": {"mode": "checkpoint", "checkpoint": str(checkpoint)},
+            })
+            command = [
+                _project_training_python_executable(self.project_root), str(tool_path),
+                "--mode", "universal", "--shared-root", str(shared_root),
+                "--universal-checkpoint", str(checkpoint),
+                "--actors", ",".join(actor_ids), "--campaign-id", spec.campaign_id,
+                "--experience-root", str(self.runtime_root / "v2" / "experience"),
+                "--campaign-config", str(campaign_config),
+                "--timesteps", str(spec.timesteps), "--rollout-steps", str(spec.rollout_steps),
+                "--sequence-length", "32", "--batch-size", str(spec.batch_size),
+                "--learning-rate", str(spec.learning_rate or 0.00025),
+                "--gamma", str(spec.gamma or 0.995), "--gae-lambda", str(spec.gae_lambda or 0.95),
+                "--clip-range", str(spec.clip_range or 0.2),
+                "--entropy-coef", str(spec.ent_coef or 0.01), "--epochs", str(spec.n_epochs or 4),
+                "--seed", str(spec.seed), "--device", "auto",
+                "--stop-file", str(stop_file),
+            ]
+            if spec.duration_mode == "continuous":
+                command.append("--continuous")
+        else:
+            tool_path = self.project_root / "tools" / "run_shared_learner.py"
+            command = [
             _project_python_executable(self.project_root), str(tool_path), "--shared-root", str(shared_root),
             "--stop-file", str(stop_file), "--actors", str(spec.actors),
             "--rollout-steps", str(spec.rollout_steps), "--batch-size", str(spec.batch_size),
@@ -2956,7 +3062,7 @@ class ControlPlane:
             "--seed", str(spec.seed), "--torch-threads", str(self.torch_threads),
             "--torch-interop-threads", str(self.torch_interop_threads),
             "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
-        ]
+            ]
         if spec.augment_random_shift:
             command.append("--augment-random-shift")
         if spec.warm_start_checkpoint:

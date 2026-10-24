@@ -36,6 +36,7 @@ class FakeBackend:
         self.hp_lost = 0
         self.geo_gained = 0
         self.geo_spent = 0
+        self.semantic_labels: np.ndarray | None = None
 
     def _frame(self, last_action: int | None = None) -> PixelFrame:
         self.frame_id += 1
@@ -61,6 +62,10 @@ class FakeBackend:
             hp_lost_since_last_frame=self.hp_lost,
             geo_gained_since_last_frame=self.geo_gained,
             geo_spent_since_last_frame=self.geo_spent,
+            semantic_labels=self.semantic_labels,
+            hero_motion=(0.25, -0.5, True) if self.semantic_labels is not None else None,
+            interact_prompt=self.semantic_labels is not None,
+            interact_prompt_valid=self.semantic_labels is not None,
         )
 
     def reset(self, *, seed: int | None, options: Mapping[str, Any] | None) -> ResetResult:
@@ -109,6 +114,21 @@ def test_env_checker_and_observation_contract(tmp_path: Path) -> None:
     assert observation["pixels"].dtype == np.uint8
     assert observation["action_history"].tolist() == [0, 0]
     assert info == {}
+    env.close()
+
+
+def test_frame_validation_preserves_opt_in_training_labels(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    backend.semantic_labels = np.full((27, 48), 255, dtype=np.uint8)
+    backend.semantic_labels[12, 20] = 5
+    env = make_env(backend, tmp_path)
+
+    env.reset()
+
+    np.testing.assert_array_equal(env._frames[-1].semantic_labels, backend.semantic_labels)
+    assert env._frames[-1].hero_motion == (0.25, -0.5, True)
+    assert env._frames[-1].interact_prompt is True
+    assert env._frames[-1].interact_prompt_valid is True
     env.close()
 
 

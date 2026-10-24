@@ -20,9 +20,22 @@ class RecurrentPPOTrainer:
                  clip: float = .2, entropy_coef: float = .01, value_coef: float = .5,
                  c_sem: float = .5, c_inv: float = .1, c_mot: float = .1,
                  augment: bool = True, max_grad_norm: float = .5,
-                 semantic_weights: Tensor | None = None) -> None:
+                 semantic_weights: Tensor | None = None,
+                 lr_encoder_scale: float = 1.0,
+                 game_id: str | None = None) -> None:
+        if not 0 < lr_encoder_scale <= 10:
+            raise ValueError("lr_encoder_scale must be in (0, 10]")
         self.policy = policy
-        self.optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate, eps=1e-5)
+        self.game_id = game_id
+        encoder_ids = {id(parameter) for parameter in policy.encoder.parameters()}
+        encoder_parameters = [parameter for parameter in policy.parameters()
+                              if id(parameter) in encoder_ids]
+        other_parameters = [parameter for parameter in policy.parameters()
+                            if id(parameter) not in encoder_ids]
+        self.optimizer = torch.optim.Adam([
+            {"params": encoder_parameters, "lr": learning_rate * lr_encoder_scale},
+            {"params": other_parameters, "lr": learning_rate},
+        ], eps=1e-5)
         self.clip = clip
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
@@ -55,8 +68,13 @@ class RecurrentPPOTrainer:
             assert shifted is not None
             sem = shifted
         self.policy.train()
-        output = self.policy(observations, batch.initial_state, batch.episode_starts,
-                             batch.action_masks, privileged=batch.privileged)
+        game_extras = observations.get("game_extras")
+        output = self.policy(
+            observations, batch.initial_state, batch.episode_starts, batch.action_masks,
+            privileged=batch.privileged,
+            game_id=self.game_id if game_extras is not None else None,
+            game_extras=game_extras,
+        )
         logits = output["logits"]
         values = output["values"]
         features = output["features"]

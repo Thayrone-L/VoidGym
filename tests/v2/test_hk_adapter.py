@@ -2,6 +2,8 @@ import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from tests.test_gym_env import FakeBackend, make_env
 from voidgym.adapters.hollow_knight.adapter import HollowKnightAdapter
 from voidgym.core.observation import split_observation
@@ -93,6 +95,61 @@ def test_hk_adapter_exposes_reward_signals_separately_from_policy_input() -> Non
     assert signals["position"]["y"] == 34.0
     assert signals["milestone_events_since_last_frame"][0]["confirmed"] is True
     assert adapter.training_labels() is None
+
+
+def test_hk_adapter_reads_and_steps_through_explore_task() -> None:
+    names = HollowKnightAdapter(EmptyEnv()).action_table()
+    frame = SimpleNamespace(
+        pixels=np.zeros((8, 12, 3), dtype=np.uint8),
+        scene_name="Crossroads_01", operator_telemetry=None,
+    )
+
+    class Task:
+        _action_names = names
+        config = SimpleNamespace(tutorial_hint_level=0)
+        _player_knowledge = SimpleNamespace(vector=lambda *, hint_level: np.asarray([hint_level]))
+
+        def __init__(self) -> None:
+            self.environment = SimpleNamespace(_frames=[frame])
+
+        def action_masks(self):
+            return np.ones(len(names), dtype=np.bool_)
+
+        def step(self, action):
+            assert action == 3
+            return {}, 1.25, True, False, {"scene_name": "Crossroads_01"}
+
+    task = Task()
+    adapter = HollowKnightAdapter(task)
+
+    np.testing.assert_array_equal(adapter.frame_rgb(), frame.pixels)
+    adapter.apply(3)
+
+    assert adapter.last_reward == 1.25
+    assert adapter.signals()["scene_name"] == "Crossroads_01"
+    assert adapter.signals()["terminated"] is True
+
+
+def test_hk_adapter_exposes_opt_in_labels_only_as_training_targets() -> None:
+    env = EmptyEnv()
+    sem = np.zeros((27, 48), dtype=np.uint8)
+    sem[4, 8] = 5
+    env._frames = [SimpleNamespace(
+        semantic_labels=sem, hero_motion=(0.25, -0.5, True),
+        interact_prompt=False, interact_prompt_valid=False,
+    )]
+    adapter = HollowKnightAdapter(env)
+
+    labels = adapter.training_labels()
+
+    assert labels is not None
+    np.testing.assert_array_equal(labels["sem"], sem)
+    np.testing.assert_array_equal(
+        labels["hero_velocity"], np.asarray([0.25, -0.5], dtype=np.float32)
+    )
+    assert labels["on_ground"] == 1
+    assert labels["interact_prompt"] == 0
+    assert labels["interact_prompt_valid"] is False
 
 
 def test_latest_campaign_checkpoint_contract(tmp_path) -> None:

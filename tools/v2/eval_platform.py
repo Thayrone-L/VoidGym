@@ -111,7 +111,7 @@ def _save_progress(path: Path, stats: list[dict[str, Any]], confusion: np.ndarra
         preview_data[f"frame_{index}"] = frame
         preview_data[f"pred_{index}"] = predicted
         preview_data[f"target_{index}"] = target
-    np.savez_compressed(preview_path, **preview_data)
+    np.savez_compressed(preview_path, **preview_data)  # type: ignore[arg-type]
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"stats": stats, "confusion": confusion.tolist(),
                                      "perception_count": perception_count}, indent=2) + "\n",

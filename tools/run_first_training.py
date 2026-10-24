@@ -7,7 +7,7 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ from hk_agent.training_task import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run diagnostic PPO against Hollow Knight")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.training.local.toml")
     parser.add_argument("--task", choices=("visual_motion", "exploration"), default="visual_motion")
@@ -141,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--stop-file", type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def build_task(
@@ -153,7 +153,8 @@ def build_task(
     task_config: Any,
     args: argparse.Namespace,
     phase: str,
-) -> tuple[VisualMotionTask, IsolatedEpisodeProcessOwner]:
+    request_semantic_labels: bool = False,
+) -> tuple[Any, IsolatedEpisodeProcessOwner]:
     phase_root = output_root / phase
     checkpoint_reload_plan_provider = None
     if args.save_source == "continuous_playthrough":
@@ -193,6 +194,7 @@ def build_task(
             menu_bootstrap_artifact_root=phase_root / "bootstrap",
             bridge_timeout_seconds=30.0,
             process_timeout_seconds=30.0,
+            request_semantic_labels=request_semantic_labels,
         )
         environment = HollowKnightEnv(
             backend,
@@ -254,7 +256,9 @@ def calibrate(
     return noop, active, stop_file is not None and stop_file.is_file()
 
 
-def calibrate_exploration(task: ExplorationTask, *, seed: int, stop_file: Path | None = None):
+def calibrate_exploration(
+    task: ExplorationTask, *, seed: int, stop_file: Path | None = None
+) -> tuple[list[list[float]], list[list[float]], bool]:
     task.reset(seed=seed)
     noop: list[list[float]] = []
     active: list[list[float]] = []
@@ -517,6 +521,8 @@ def main() -> int:
     run_root = args.output_root.resolve(strict=False) / (
         time.strftime("run-%Y%m%dT%H%M%S") + f"-{secrets.token_hex(3)}"
     )
+    base_task_config: Any
+    calibrated: Any
     if args.task == "exploration":
         base_task_config = ExplorationTaskConfig(
             reward_version=reward_version,
@@ -571,6 +577,9 @@ def main() -> int:
         args=args,
         phase="calibration",
     )
+    noop_motion: Any
+    active_motion: Any
+    cancelled: bool
     try:
         if args.task == "exploration":
             noop_motion, active_motion, cancelled = calibrate_exploration(

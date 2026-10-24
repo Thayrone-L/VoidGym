@@ -1627,6 +1627,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 "farm_alerts": farm_alerts,
                 "episode_progress": episode_progress,
                 "actor_step_profile_ms": step_profile,
+                "timing_ms": dict(timing_profile) if isinstance(timing_profile, Mapping) else {},
                 "player_knowledge_events": tutorial_events,
                 **audit,
             }

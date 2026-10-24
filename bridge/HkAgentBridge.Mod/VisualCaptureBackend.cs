@@ -41,6 +41,7 @@ internal sealed class VisualCaptureBackend : IDisposable
 
     public Task<CapturedFrame> CaptureOnceAsync(
         string encoding,
+        bool semanticLabels,
         CancellationToken cancellationToken
     )
     {
@@ -57,7 +58,7 @@ internal sealed class VisualCaptureBackend : IDisposable
             throw new InvalidOperationException("A capture is already pending");
         }
 
-        var request = new CaptureRequest(encoding, cancellationToken);
+        var request = new CaptureRequest(encoding, semanticLabels, cancellationToken);
         request.Completion.Task.ContinueWith(
             _ => Interlocked.Exchange(ref _outstanding, 0),
             CancellationToken.None,
@@ -155,6 +156,14 @@ internal sealed class VisualCaptureBackend : IDisposable
             long frameId = Interlocked.Increment(ref _nextFrameId);
             ActionAvailability? availability = ReadActionAvailability();
             var human = _humanSnapshot();
+            SemanticLabelFrame? semanticFrame = null;
+            double semanticCaptureMs = 0;
+            if (request.SemanticLabels)
+            {
+                long semanticStarted = Stopwatch.GetTimestamp();
+                semanticFrame = SemanticLabelCapture.Capture();
+                semanticCaptureMs = ElapsedMilliseconds(semanticStarted);
+            }
             long logStarted = Stopwatch.GetTimestamp();
             _log($"Captured diagnostic frame {frameId}: {output.width}x{output.height}, {frameBytes.Length} bytes ({request.Encoding})");
             double logMs = ElapsedMilliseconds(logStarted);
@@ -164,7 +173,8 @@ internal sealed class VisualCaptureBackend : IDisposable
                     request.Encoding, frameBytes, frameBytes.Length, pngBytes,
                     queuedToStartMs, captureMs, encodeMs, logMs,
                     AverageFps(), Application.targetFrameRate, QualitySettings.vSyncCount,
-                    availability, human.Buttons, human.DurationMilliseconds, human.Enabled, human.TestSource
+                    availability, human.Buttons, human.DurationMilliseconds, human.Enabled,
+                    human.TestSource, semanticFrame, semanticCaptureMs
                 )
             );
         }
@@ -373,9 +383,10 @@ internal sealed class VisualCaptureBackend : IDisposable
     {
         private readonly CancellationTokenRegistration _registration;
 
-        public CaptureRequest(string encoding, CancellationToken cancellationToken)
+        public CaptureRequest(string encoding, bool semanticLabels, CancellationToken cancellationToken)
         {
             Encoding = encoding;
+            SemanticLabels = semanticLabels;
             Completion = new TaskCompletionSource<CapturedFrame>(
                 TaskCreationOptions.RunContinuationsAsynchronously
             );
@@ -390,6 +401,7 @@ internal sealed class VisualCaptureBackend : IDisposable
 
         public TaskCompletionSource<CapturedFrame> Completion { get; }
         public string Encoding { get; }
+        public bool SemanticLabels { get; }
         public long QueuedTimestamp { get; } = Stopwatch.GetTimestamp();
         public bool IsCompleted => Completion.Task.IsCompleted;
         public void TrySetResult(CapturedFrame frame) => Completion.TrySetResult(frame);
@@ -419,7 +431,9 @@ internal sealed class CapturedFrame
         string[] humanButtons,
         int humanDurationMilliseconds,
         bool humanMode,
-        bool humanInputTest
+        bool humanInputTest,
+        SemanticLabelFrame? semanticLabels = null,
+        double semanticCaptureMs = 0
     )
     {
         FrameId = frameId;
@@ -442,6 +456,8 @@ internal sealed class CapturedFrame
         HumanDurationMilliseconds = humanDurationMilliseconds;
         HumanMode = humanMode;
         HumanInputTest = humanInputTest;
+        SemanticLabels = semanticLabels;
+        SemanticCaptureMs = semanticCaptureMs;
     }
 
     public long FrameId { get; }
@@ -464,6 +480,8 @@ internal sealed class CapturedFrame
     public int HumanDurationMilliseconds { get; }
     public bool HumanMode { get; }
     public bool HumanInputTest { get; }
+    public SemanticLabelFrame? SemanticLabels { get; }
+    public double SemanticCaptureMs { get; }
 }
 
 internal sealed record BridgeUiState(bool DialogOpen, bool MenuOpen, string? DialogueId,

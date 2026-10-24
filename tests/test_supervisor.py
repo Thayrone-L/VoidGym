@@ -205,6 +205,7 @@ class SupervisorTests(unittest.TestCase):
                 capture = await read_message(reader)
                 self.assertEqual(capture.message_type, "CAPTURE_ONCE")
                 self.assertNotIn("encoding", capture.payload)
+                self.assertNotIn("semantic_labels", capture.payload)
                 frame = Envelope(
                     protocol_version=PROTOCOL_VERSION,
                     message_type="FRAME",
@@ -346,6 +347,73 @@ class SupervisorTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual((await fallback_task).encoding, "png")
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                await supervisor.close()
+
+        asyncio.run(scenario())
+
+    def test_capture_requests_and_decodes_semantic_labels_only_when_enabled(self) -> None:
+        async def scenario() -> None:
+            import numpy as np
+            from hk_agent.semantic_labels import pack_u4
+
+            supervisor = SupervisorServer(token="test-token")
+            await supervisor.start()
+            assert supervisor.port is not None
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", supervisor.port)
+                session_id = str(uuid.uuid4())
+                await write_message(writer, Envelope(
+                    protocol_version=PROTOCOL_VERSION, message_type="HELLO",
+                    run_id=supervisor.run_id, instance_id="hk-labels",
+                    session_id=session_id, seq=0, trace_id=str(uuid.uuid4()),
+                    sent_monotonic_ns=time.monotonic_ns(),
+                    payload={
+                        "token": "test-token", "game_profile": "development",
+                        "game_version": "bridge-harness",
+                        "capabilities": ["semantic_labels_v1"],
+                    },
+                ))
+                await read_message(reader)
+                bridge = await supervisor.wait_for_bridge(1.0)
+                labels = np.zeros((27, 48), dtype=np.uint8)
+                labels[3, 7] = 5
+                labels[8, 9] = 255
+                packed = pack_u4(labels)
+
+                capture_task = asyncio.create_task(supervisor.capture_once(
+                    bridge=bridge, episode_id="label-episode", encoding="raw_rgb8",
+                    semantic_labels=True,
+                ))
+                capture = await read_message(reader)
+                self.assertEqual(capture.message_type, "CAPTURE_ONCE")
+                self.assertIs(capture.payload.get("semantic_labels"), True)
+                frame = Envelope(
+                    protocol_version=PROTOCOL_VERSION, message_type="FRAME",
+                    run_id=supervisor.run_id, instance_id="hk-labels",
+                    session_id=session_id, seq=1, trace_id=capture.trace_id,
+                    sent_monotonic_ns=time.monotonic_ns(), payload={
+                        "frame_id": 1, "episode_id": "label-episode",
+                        "capture_monotonic_ns": time.monotonic_ns(),
+                        "width": 1, "height": 1, "channels": 3,
+                        "pixel_format": "RGB8", "encoding": "raw_rgb8",
+                        "payload_bytes": 3, "data_base64": base64.b64encode(b"123").decode(),
+                        "scene_transition": False,
+                        "semantic_labels": {
+                            "codec": "u4-v1", "width": 48, "height": 27,
+                            "data_base64": base64.b64encode(packed).decode(),
+                        },
+                        "hero_motion": {"vx": 0.5, "vy": -0.25, "on_ground": True},
+                        "interact_prompt": False, "interact_prompt_valid": False,
+                    },
+                )
+                await write_message(writer, frame)
+                captured = await capture_task
+                self.assertEqual(captured.semantic_labels_u4, packed)
+                self.assertEqual(captured.hero_motion, (0.5, -0.25, True))
+                self.assertFalse(captured.interact_prompt_valid)
                 writer.close()
                 await writer.wait_closed()
             finally:

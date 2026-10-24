@@ -32,7 +32,11 @@ def _wait_checkpoint(path: Path, expected_round: int, timeout: float = 60.0) -> 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.is_file():
-            value = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except PermissionError:
+                time.sleep(0.02)
+                continue
             if value.get("round") == expected_round:
                 return value
         time.sleep(0.02)

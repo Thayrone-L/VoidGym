@@ -1,5 +1,8 @@
 from time import perf_counter
 
+import numpy as np
+import pytest
+
 from tests.v2.fake_adapter import FakeAdapter
 from voidgym.envs.adapter_env import AdapterEnv
 
@@ -21,6 +24,19 @@ def test_reset_step_keep_signals_out_of_observation() -> None:
     assert reward == 1
     assert not terminated and not truncated
     assert env.action_masks().tolist() == [True, True, False, True, True]
+
+
+def test_game_extras_are_in_observation_and_validated() -> None:
+    adapter = FakeAdapter()
+    extras = [0.25, 0.75]
+    adapter.game_extras = lambda: np.asarray(extras, dtype=np.float32)
+    env = AdapterEnv(adapter, lambda _before, _after: 0.0)
+    observation, _ = env.reset(seed=1)
+    assert observation["game_extras"].tolist() == [0.25, 0.75]
+    assert env.observation_space.contains(observation)
+    extras[:] = [1.0]
+    with pytest.raises(ValueError, match="changed its schema"):
+        env.step(0)
 
 
 def test_thousand_steps_under_two_seconds() -> None:

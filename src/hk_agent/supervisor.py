@@ -76,6 +76,10 @@ class CapturedFrame:
     human_duration_ms: int = 0
     human_mode: bool = False
     human_input_test: bool = False
+    semantic_labels_u4: bytes | None = None
+    hero_motion: tuple[float, float, bool] | None = None
+    interact_prompt: bool = False
+    interact_prompt_valid: bool = False
 
 
 def require_png_frame(frame: CapturedFrame) -> None:
@@ -95,6 +99,7 @@ BRIDGE_TIMING_FIELDS = (
     "unity_fps",
     "target_frame_rate",
     "vsync_count",
+    "semantic_capture_ms",
 )
 def parse_bridge_timing(payload: dict[str, object]) -> tuple[tuple[str, float], ...]:
     """Keep only well-formed optional metrics; malformed values are dropped, not fatal.
@@ -272,9 +277,14 @@ class SupervisorServer:
         bridge: AcceptedBridge | None = None,
         episode_id: str | None = None,
         encoding: str = "png",
+        semantic_labels: bool = False,
     ) -> CapturedFrame:
+        if type(semantic_labels) is not bool:
+            raise TypeError("semantic_labels must be bool")
         if encoding not in {"png", "raw_rgb8"}:
             raise ValueError("encoding must be png or raw_rgb8")
+        if semantic_labels and (bridge is None or "semantic_labels_v1" not in bridge.capabilities):
+            raise ProtocolError("bridge does not advertise semantic_labels_v1")
         effective_encoding = encoding
         if effective_encoding == "raw_rgb8" and (
             bridge is None or "frame_raw_rgb8" not in bridge.capabilities
@@ -283,6 +293,8 @@ class SupervisorServer:
         payload: dict[str, object] = {}
         if episode_id is not None:
             payload["episode_id"] = episode_id
+        if semantic_labels:
+            payload["semantic_labels"] = True
         if effective_encoding == "raw_rgb8":
             payload["encoding"] = effective_encoding
         response = await self.send_command(
@@ -294,6 +306,10 @@ class SupervisorServer:
             raise ProtocolError(f"Expected FRAME, received {response.message_type}")
 
         payload = response.payload
+        if semantic_labels and not isinstance(payload.get("semantic_labels"), dict):
+            raise ProtocolError("FRAME omitted requested semantic_labels_v1 data")
+        if not semantic_labels and payload.get("semantic_labels") is not None:
+            raise ProtocolError("FRAME returned semantic labels that were not requested")
         frame_id = payload.get("frame_id")
         capture_monotonic_ns = payload.get("capture_monotonic_ns")
         width = payload.get("width")
@@ -436,6 +452,41 @@ class SupervisorServer:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as error:
             raise ProtocolError("FRAME data_base64 is invalid") from error
+        semantic_labels_u4: bytes | None = None
+        raw_semantics = payload.get("semantic_labels")
+        if raw_semantics is not None:
+            if not isinstance(raw_semantics, dict):
+                raise ProtocolError("FRAME semantic_labels must be an object")
+            if (raw_semantics.get("codec") != "u4-v1"
+                    or raw_semantics.get("width") != 48
+                    or raw_semantics.get("height") != 27):
+                raise ProtocolError("FRAME semantic_labels has an unsupported grid or codec")
+            packed = raw_semantics.get("data_base64")
+            if not isinstance(packed, str):
+                raise ProtocolError("FRAME semantic_labels data must be base64")
+            try:
+                semantic_labels_u4 = base64.b64decode(packed, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ProtocolError("FRAME semantic_labels data is invalid") from error
+            if len(semantic_labels_u4) != (48 * 27 + 1) // 2:
+                raise ProtocolError("FRAME semantic_labels payload size is invalid")
+        raw_motion = payload.get("hero_motion")
+        hero_motion: tuple[float, float, bool] | None = None
+        if raw_motion is not None:
+            if not isinstance(raw_motion, dict):
+                raise ProtocolError("FRAME hero_motion must be an object")
+            vx, vy, on_ground = (raw_motion.get("vx"), raw_motion.get("vy"),
+                                 raw_motion.get("on_ground"))
+            if (isinstance(vx, bool) or not isinstance(vx, (int, float))
+                    or isinstance(vy, bool) or not isinstance(vy, (int, float))
+                    or not math.isfinite(float(vx)) or not math.isfinite(float(vy))
+                    or not isinstance(on_ground, bool)):
+                raise ProtocolError("FRAME hero_motion fields are invalid")
+            hero_motion = (float(vx), float(vy), on_ground)
+        raw_interact_prompt = payload.get("interact_prompt", False)
+        raw_interact_valid = payload.get("interact_prompt_valid", False)
+        if not isinstance(raw_interact_prompt, bool) or not isinstance(raw_interact_valid, bool):
+            raise ProtocolError("FRAME interact_prompt fields are invalid")
         payload_bytes = payload.get("payload_bytes")
         if frame_encoding == "png":
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -527,6 +578,10 @@ class SupervisorServer:
             human_duration_ms=human_duration,
             human_mode=human_mode,
             human_input_test=payload.get("human_input_test") is True,
+            semantic_labels_u4=semantic_labels_u4,
+            hero_motion=hero_motion,
+            interact_prompt=raw_interact_prompt,
+            interact_prompt_valid=raw_interact_valid,
         )
 
     async def _handle_client(

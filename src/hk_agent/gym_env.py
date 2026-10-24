@@ -89,6 +89,10 @@ class PixelFrame:
     human_duration_ms: int = 0
     human_mode: bool = False
     human_input_test: bool = False
+    semantic_labels: NDArray[np.uint8] | None = None
+    hero_motion: tuple[float, float, bool] | None = None
+    interact_prompt: bool = False
+    interact_prompt_valid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +540,13 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             human_duration_ms=frame.human_duration_ms,
             human_mode=frame.human_mode,
             human_input_test=frame.human_input_test,
+            semantic_labels=(
+                np.ascontiguousarray(frame.semantic_labels).copy()
+                if frame.semantic_labels is not None else None
+            ),
+            hero_motion=frame.hero_motion,
+            interact_prompt=frame.interact_prompt,
+            interact_prompt_valid=frame.interact_prompt_valid,
         )
 
     def _validate_applied_action(
