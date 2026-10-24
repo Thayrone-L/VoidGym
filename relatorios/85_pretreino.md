@@ -1,6 +1,6 @@
 # Prompt 85 — política universal e pré-treino v2
 
-**Estado:** implementação e pré-treino concluídos; a avaliação completa held-out está em execução após correção de uma semente inválida do nível 7.
+**Estado:** implementação, pré-treino e avaliação held-out completos. A avaliação documenta metas não alcançadas; o checkpoint ainda não deve ser considerado pronto para promoção sem decisão explícita sobre essas limitações.
 
 ## Modelo e treinamento
 
@@ -17,19 +17,32 @@ Curvas: `85_curvas.png`.
 
 ## Avaliação
 
-A primeira tentativa avaliou os níveis 0–6 em modo determinístico e chegou à campanha 24 do nível 7 antes de encontrar uma composição sem rota solucionável (seed `155230`). Os GIFs de níveis 3, 4 e 6 foram salvos. A causa era a ausência de nova tentativa para a composição conectada, embora cada sala individual tivesse prova válida. `generate_room_set` agora tenta até 20 composições; o seed que falhou passa na prova e há teste de regressão.
+Avaliação completa no split `test`: 100 episódios por nível 0–6 e 30 campanhas no nível 7, em modos determinístico e estocástico, limite de 1.500 passos. A tabela completa está em `85_eval/tabela.md`.
 
-A nova avaliação usa split `test`, 100 episódios por nível 0–6 e 30 campanhas no nível 7, modos determinístico e estocástico e limite de 1.500 passos por episódio. Ela salva o progresso após cada par modo/nível em `progress_eval.json` para permitir retomada após interrupções. Os resultados completos de ação serão registrados ao fim.
+| Nível | Sucesso determinístico | Sucesso estocástico |
+|---:|---:|---:|
+| 0 | 76% | 81% |
+| 1 | 69% | 78% |
+| 2 | 62% | 62% |
+| 3 | 10% | 46% |
+| 4 | 1% | 45% |
+| 5 | 74% | 69% |
+| 6 | 18% | 72% |
+| 7 | 0% | 3,3% |
 
-A primeira implementação da matriz semântica concentrou os 5.000 quadros no nível 0; por isso a matriz resultante não representa todas as classes. A nova ferramenta `tools/v2/eval_perception_platform.py` coleta até 625 quadros por nível no split `test` e substituirá `confusion.csv`, `percepcao.png` e `perception_manifest.json` com a amostra balanceada após a avaliação de ações.
+Percepção semântica foi reavaliada com 5.000 quadros de teste, 625 de cada nível, em vez de concentrar a amostra no nível 0. IoU: EMPTY 0,893; SOLID 0,377; PLATFORM 0,168; HAZARD 0,000; ENEMY 0,000; PLAYER 0,297; BREAKABLE 0,000; PICKUP 0,000; INTERACTIVE sem suporte na amostra; EXIT 0,066. A matriz balanceada está em `85_eval/confusion.csv`, com prévia em `85_eval/percepcao.png` e contagens em `85_eval/perception_manifest.json`.
 
-### Inspeção visual preliminar dos GIFs
+### Inspeção visual dos GIFs
 
 - Nível 3: o agente avança até a parede/obstáculo elevado e parece ficar preso ali, sem demonstrar salto consistente para superar a estrutura.
 - Nível 4: o personagem permanece no fundo do buraco e não completa a subida pela borda.
 - Nível 6: aproxima-se da parede quebrável, mas não há evidência visual de que ataque e atravesse o bloqueio.
 - Nos três GIFs, o progresso é pequeno ou ausente; não há evidência de desvio consistente de perigos.
-- Essas gravações vêm da primeira avaliação interrompida no nível 7 e serão substituídas/confirmadas pela execução retomável.
+- Os GIFs estão em `85_eval/gifs/nivel_3.gif`, `nivel_4.gif` e `nivel_6.gif`.
+
+### Limites observados
+
+As metas de sucesso do Prompt 85 não foram atingidas uniformemente: níveis 0–2 ficam abaixo de 90%; níveis 3–4 ficam abaixo de 75% mesmo no modo estocástico; nível 7 fica abaixo de 30%. A percepção também fica abaixo das metas para SOLID, HAZARD, ENEMY e PLAYER. O nível 6 oscila muito entre modos, com 18% determinístico e 72% estocástico. O pré-treino terminou pelo limite de 8 horas, em 697.088 passos, bem antes dos 20 milhões configurados, e usou CPU apesar da RTX 3060 disponível; não houve medição de pico de VRAM nem comparação CUDA/AMP.
 
 ## Validação
 
@@ -42,7 +55,7 @@ A primeira implementação da matriz semântica concentrou os 5.000 quadros no n
 
 ## Limitações e próximos passos
 
-A campanha ficou aquém de 20M passos e avançou apenas até o nível de currículo 1; portanto, não há evidência suficiente para afirmar que a política passa com folga nos níveis 0–6. O modelo foi treinado em CPU apesar da RTX 3060 prevista pelo perfil de hardware, e a avaliação CUDA/AMP ainda não foi feita. A decisão de promover o checkpoint para os prompts 86/87 deve considerar os resultados held-out abaixo e essas limitações.
+A campanha ficou aquém de 20M passos e avançou apenas até o nível de currículo 1; portanto, não há evidência suficiente para afirmar que a política passa com folga nos níveis 0–6. O modelo foi treinado em CPU apesar da RTX 3060 prevista pelo perfil de hardware, e a avaliação CUDA/AMP ainda não foi feita. Os prompts 86/87 devem tratar este checkpoint como baseline experimental: os critérios de desempenho do 85 não foram alcançados.
 
 ## Arquitetura e hiperparâmetros
 
