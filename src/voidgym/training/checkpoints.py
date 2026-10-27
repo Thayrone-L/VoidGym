@@ -103,8 +103,42 @@ def load_universal(path: Path, model: UniversalPolicy,
             model.add_game_extras(name, input_dim)
         _load_state(path / "game_extras" / f"{name}.pt", model.game_extras[name])
     if optimizer is not None and (path / "optimizer.pt").is_file():
-        optimizer.load_state_dict(_load_state(path / "optimizer.pt"))
+        optimizer.load_state_dict(_compatible_optimizer_state(
+            optimizer, _load_state(path / "optimizer.pt")
+        ))
     return cast(dict[str, Any], manifest)
+
+
+def _compatible_optimizer_state(optimizer: torch.optim.Optimizer,
+                                saved_state: dict[str, Any]) -> dict[str, Any]:
+    """Split an older single optimizer group while retaining Adam moments."""
+    current_groups = optimizer.state_dict()["param_groups"]
+    saved_groups = saved_state["param_groups"]
+    if len(saved_groups) == len(current_groups):
+        return saved_state
+    current_total = sum(len(group["params"]) for group in current_groups)
+    saved_total = sum(len(group["params"]) for group in saved_groups)
+    if len(saved_groups) != 1 or saved_total != current_total:
+        raise ValueError("checkpoint optimizer parameter groups are incompatible")
+
+    saved_ids = list(saved_groups[0]["params"])
+    parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    for saved_id, parameter in zip(saved_ids, parameters, strict=True):
+        state = saved_state["state"].get(saved_id, {})
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            moment = state.get(name)
+            if moment is not None and tuple(moment.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"checkpoint optimizer {name} shape is incompatible with current parameters"
+                )
+
+    offset = 0
+    migrated_groups = []
+    for group in current_groups:
+        count = len(group["params"])
+        migrated_groups.append({**saved_groups[0], "params": saved_ids[offset:offset + count]})
+        offset += count
+    return {**saved_state, "param_groups": migrated_groups}
 
 
 def prune_checkpoints(root: Path, *, keep: int = 5) -> None:

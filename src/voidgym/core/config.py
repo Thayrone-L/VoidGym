@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import json
 import math
+import os
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -12,6 +13,11 @@ from typing import Any
 from voidgym.core.errors import VoidGymTypeError as TypeError
 from voidgym.core.errors import VoidGymValueError as ValueError
 from voidgym.core.observation import MODEL_CONTRACT_VERSION
+
+
+def process_environment() -> dict[str, str]:
+    """Return a snapshot of process environment for OS integration adapters."""
+    return dict(os.environ)
 
 
 @dataclass(frozen=True, slots=True)
