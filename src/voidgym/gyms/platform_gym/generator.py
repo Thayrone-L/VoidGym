@@ -23,7 +23,8 @@ from voidgym.gyms.platform_gym.world import (
 def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     rng = np.random.default_rng(seed)
     physics = PhysicsParams.sample(rng)
-    vertical_rate = .02 if level == 5 else .08 if level in {0, 1, 2, 3, 4, 6} else 0.0
+    vertical_rate = .005 if level in {1, 5, 6} else \
+        .08 if level in {0, 2, 3, 4} else 0.0
     vertical_variant = allow_vertical and vertical_rate > 0 and rng.random() < vertical_rate
     width = float(rng.uniform(14, 17) if vertical_variant else
                   rng.uniform(24, 36) if level == 0 else rng.uniform(22, 30))
@@ -36,12 +37,15 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     solids: list[Solid]
     if level == 2:
         reach = physics.run_speed * (physics.jump_hold_max_seconds + 2 * physics.jump_v0 / physics.gravity)
-        gap_width = float(rng.uniform(.3, .7) * reach)
+        gap_width = float(rng.uniform(.75, .95) * reach)
         gap_left = width * .42
         pit_width = gap_width * .62
         solids = [Solid(Rect(0, floor - .6, gap_left, .6)),
                   Solid(Rect(gap_left, 0, pit_width, .5)),
                   Solid(Rect(gap_left + gap_width, floor - .6, width - gap_left - gap_width, .6))]
+        # A short jump clears many gaps by luck; this mandatory raised barrier
+        # after the pit requires using the variable-height jump deliberately.
+        solids.append(Solid(Rect(gap_left + gap_width + 1.8, floor, .65, 2.0)))
     elif level == 4:
         pit_floor = .6
         ledge_x = 4.5
@@ -79,16 +83,19 @@ def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
         for fraction in (.27, .48, .70):
             height_u = float(rng.uniform(.5, .6) * physics.jump_short_height)
             solids.append(Solid(Rect(width * fraction, floor, 1.2, height_u)))
-    if level == 2:
-        # Optional one-way stepping stones sit inside/near the gap.
-        gap_left = next(s.rect.right for s in solids if s.rect.x == 0)
-        gap_right = next(s.rect.x for s in solids if s.rect.x > gap_left)
-        for fraction in (.35, .68):
-            x = gap_left + (gap_right - gap_left) * fraction
-            solids.append(Solid(Rect(x, floor + .8, 1.5, .22), "platform"))
     if level == 3:
         high = float(rng.uniform(.6, .82) * physics.jump_max_height)
         solids.append(Solid(Rect(width * .48, floor, .55, high)))
+    if level == 4:
+        wall_x = width * .68
+        wall_height = float(rng.uniform(.82, .92) * physics.jump_max_height)
+        solids.append(Solid(Rect(wall_x, floor, .65, wall_height)))
+    if level == 5:
+        # Level 5 needs a deliberate full jump; short-tap policies used to
+        # walk to the exit too often.
+        wall_x = width * .68
+        wall_height = float(rng.uniform(1.9, min(2.6, physics.jump_max_height - .2)))
+        solids.append(Solid(Rect(wall_x, floor, .65, wall_height)))
     if level >= 5:
         hazards.append(Hazard(Rect(width * .4, floor, 1.4, .35), "spikes"))
         for _ in range(int(rng.integers(1, 4))):
