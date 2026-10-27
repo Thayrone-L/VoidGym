@@ -12,6 +12,25 @@ internal static class SemanticRasterizer
 
     public static byte[] NewPriorityGrid() => new byte[Width * Height];
 
+    public static void StampCell(byte[] labels, byte[] priorities, int x, int y,
+        byte label, byte priority)
+    {
+        if (labels == null || priorities == null || labels.Length != Width * Height ||
+            priorities.Length != Width * Height)
+            throw new ArgumentException("semantic grids must be 27x48");
+        if ((uint)x >= Width || (uint)y >= Height)
+            throw new ArgumentOutOfRangeException(nameof(x), "cell is outside the semantic grid");
+        if (label > 9 && label != Ignore)
+            throw new ArgumentOutOfRangeException(nameof(label));
+        if (label == Ignore) return;
+        int index = y * Width + x;
+        if (priority >= priorities[index])
+        {
+            labels[index] = label;
+            priorities[index] = priority;
+        }
+    }
+
     public static void StampViewportRect(
         byte[] labels,
         byte[] priorities,

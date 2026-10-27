@@ -66,6 +66,21 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     rows = _collect(args.experience_root, args.scene, args.count)
     if len(rows) < args.count:
         raise RuntimeError(f"found {len(rows)}/{args.count} labeled frames in scene {args.scene}")
+    class_counts = np.zeros(len(Sem), dtype=np.int64)
+    ignored = 0
+    for _, labels in rows:
+        valid = labels != IGNORE
+        ignored += int((~valid).sum())
+        class_counts += np.bincount(labels[valid].astype(np.int64), minlength=len(Sem))[:len(Sem)]
+    total_cells = len(rows) * 27 * 48
+    fractions = {item.name: float(class_counts[index] / total_cells)
+                 for index, item in enumerate(Sem)}
+    fractions["IGNORE"] = float(ignored / total_cells)
+    print("Fração das classes no gabarito:")
+    for name, fraction in fractions.items():
+        print(f"  {name}: {fraction:.1%}")
+    if fractions.get("SOLID", 0.0) > 0.70:
+        print("\033[91mAVISO: SOLID excede 70% das células médias; confira o gabarito.\033[0m")
     tile_w, tile_h, columns = 384, 448, 6
     canvas = Image.new("RGB", (columns * tile_w, ((len(rows) + columns - 1) // columns) * tile_h),
                        (12, 12, 16))
@@ -80,7 +95,8 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(args.output)
     return {"output": str(args.output), "scene": args.scene, "frames": len(rows),
-            "classes": [item.name for item in Sem], "ignore_id": IGNORE}
+            "classes": [item.name for item in Sem], "class_fractions": fractions,
+            "ignore_id": IGNORE}
 
 
 def main() -> int:
