@@ -32,6 +32,8 @@ if (packed.Length != SemanticRasterizer.Width * SemanticRasterizer.Height / 2)
 
 TestLShapedColliderDoesNotFillItsBoundingBox();
 TestDiagonalEdgeOnlyStampsCrossedCells();
+TestOpenFloorEdgeLeavesSolidLineAndIgnoredBacking();
+TestClosedTerrainContourFillsInterior();
 Console.WriteLine("semantic rasterizer shape and priority checks passed");
 
 static void TestLShapedColliderDoesNotFillItsBoundingBox()
@@ -73,6 +75,43 @@ static void TestDiagonalEdgeOnlyStampsCrossedCells()
         throw new InvalidOperationException("diagonal edge endpoints were not stamped");
     if (grid[SemanticRasterizer.Width / 2] != 0)
         throw new InvalidOperationException("diagonal edge stamped a non-crossed cell");
+}
+
+static void TestOpenFloorEdgeLeavesSolidLineAndIgnoredBacking()
+{
+    byte[] grid = SemanticRasterizer.NewGrid();
+    byte[] priorities = SemanticRasterizer.NewPriorityGrid();
+    int lineRow = SemanticRasterizer.Height / 2;
+    for (int x = 0; x < SemanticRasterizer.Width; x++)
+        SemanticRasterizer.StampCell(grid, priorities, x, lineRow, 1, 10);
+    SemanticRasterizer.StampOpenHorizontalBacking(grid, priorities, 0f, 1f, .5f,
+        terrainBelow: true, solidPriority: 10);
+    for (int x = 0; x < SemanticRasterizer.Width; x++)
+    {
+        if (grid[lineRow * SemanticRasterizer.Width + x] != 1)
+            throw new InvalidOperationException("open floor edge was not kept SOLID");
+        for (int y = lineRow + 1; y < SemanticRasterizer.Height; y++)
+            if (grid[y * SemanticRasterizer.Width + x] != SemanticRasterizer.Ignore)
+                throw new InvalidOperationException("cells below the open floor were left EMPTY");
+    }
+    int hazard = (lineRow + 1) * SemanticRasterizer.Width;
+    SemanticRasterizer.StampCell(grid, priorities, 0, lineRow + 1, 3, 60);
+    SemanticRasterizer.StampIgnoreCell(grid, priorities, 0, lineRow + 1, 10);
+    if (grid[hazard] != 3)
+        throw new InvalidOperationException("terrain IGNORE erased an overlapping hazard");
+}
+
+static void TestClosedTerrainContourFillsInterior()
+{
+    byte[] grid = SemanticRasterizer.NewGrid();
+    byte[] priorities = SemanticRasterizer.NewPriorityGrid();
+    SemanticRasterizer.StampClosedContour(grid, priorities,
+        [.25f, .25f, .75f, .25f, .75f, .75f, .25f, .75f], 1, 10);
+    byte center = grid[(SemanticRasterizer.Height / 2) * SemanticRasterizer.Width +
+                       SemanticRasterizer.Width / 2];
+    byte outside = grid[0];
+    if (center != 1 || outside != 0)
+        throw new InvalidOperationException("closed terrain contour was not filled precisely");
 }
 
 static void StampPolygon(byte[] grid, byte[] priorities, (float X, float Y)[] vertices,

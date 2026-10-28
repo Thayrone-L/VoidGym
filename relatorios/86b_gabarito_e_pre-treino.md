@@ -1,8 +1,8 @@
 # Prompt 86b — gabarito semântico e pré-treino CUDA
 
-## Resultado até 2026-10-27 11:24 -03
+## Resultado final da campanha 86b — 2026-10-27
 
-O trabalho de gabarito, currículo, proteções do pré-treino, smoke tests, validações e deployment está concluído. A campanha principal está **em andamento**; os resultados finais de treinamento e a avaliação pós-treino serão acrescentados quando ela terminar.
+O gabarito estacionário, o pré-treino CUDA e as validações de 86b foram concluídos. A campanha principal terminou inesperadamente antes de alcançar o nível de currículo 6 ou o limite de 24 horas. A investigação e as proteções para retomada estão sendo feitas no prompt 86c.
 
 ## Gabarito semântico
 
@@ -20,7 +20,9 @@ O trabalho de gabarito, currículo, proteções do pré-treino, smoke tests, val
 - Smoke de retomada partiu de `universal-000717568` e avançou até **720.128**: mais **2.560 passos em 14,73 s (173,74 passos/s)**, em CUDA.
 - Foi feita uma tentativa inicial de smoke com `--total-steps 20480`, menor que o contador do checkpoint. Como o alvo é absoluto, ela encerrou sem novos passos; a tentativa correta subsequente confirmou o avanço acima.
 - Campanha principal `pretrain-86b-gpu-2026-10-27`, runtime em `E:\VoidGymRuntime\v2\pretrain\pretrain-86b-gpu-2026-10-27`, retomada **diretamente** do checkpoint original `universal-000697088`. Alvo de 100 milhões de passos, limite de 24 horas, parar ao alcançar nível de currículo 6. O runtime plan confirma 10 ambientes e dispositivos `cuda` para treino e ator.
-- Último log consultado às 11:24:05 -03: **725.248 passos totais**, ou **28.160 além do checkpoint inicial**; currículo 2, sucesso recente 1,0. As duas últimas linhas registraram 215,75 e 217,61 passos/s. Processo ativo, sem conteúdo no `stderr.log`. O último checkpoint íntegro disponível para retomada é o original `C:\VoidGym\runtime\v2\pretrain\pretrain-resume-2026-10-23\universal-000697088`; ainda não houve checkpoint periódico novo da campanha principal (salvamento a cada 250 mil passos).
+- Campanha principal `pretrain-86b-gpu-2026-10-27`, runtime em `E:\VoidGymRuntime\v2\pretrain\pretrain-86b-gpu-2026-10-27`, retomada diretamente de `universal-000697088`, terminou em 27/10. O último registro do `log.csv` foi às **16:01:47 -03**, em **4.526.848 passos totais** (3.829.760 passos efetivos), nível 2, `success_rate_100=0,57`, throughput 228,06 passos/s. Métricas finais: `L_ppo=0,000259`, `L_semantic=0,251379`, `L_inverse_dynamics=1,538961`, `L_hero_motion=0,210138`, entropia 1,7342, KL 0,007326 e explained variance 0,97984. A execução durou aproximadamente **4h40** desde 11:21:45.
+- O checkpoint íntegro mais recente foi `universal-004460288` (4.460.288 passos); os 66.560 passos seguintes só aparecem no log. O log do launcher aponta ao PID 15692 e o worker Python ao PID 19672. O Windows registrou `Application Error` 1000 às 16:01:53 para esse `python.exe`, módulo `VCRUNTIME140.dll`, exceção `0xc0000005` (access violation), seguido de WER 1001 às 16:01:58. Não foram encontrados eventos System 41, 6008, 1074 ou 4101 nesse intervalo. A evidência aponta para uma falha do worker Python, mas não determina sua causa interna.
+- A observação de 86c de que `quick_eval_success` estava vazio não corresponde ao CSV completo: havia quatro avaliações em 1.001.728 (0,3571), 2.000.128 (0,7143), 3.001.088 (0,7143) e 4.002.048 (0,5). O intervalo original de 1M funcionou. 86c tornou o intervalo configurável e acrescentou um teste de 12 mil passos com intervalo de 5 mil para proteger essa funcionalidade.
 
 ## Validação das políticas simples
 
@@ -43,4 +45,4 @@ No nível 7, a porta sem a habilidade falhou em **200/200** tentativas. Os níve
 - Ruff: passou nos arquivos alterados. Mypy: sem erros nos nove arquivos verificados.
 - Testes semânticos C# e build Release do mod passaram durante a implementação.
 - Deployment oficial já validado na instância isolada `hk-ai-1`: SHA-256 `76e446d47d5e896cf4106a66149e6167296ac33078bc3559cb3e3a422cd25480`; backup em `C:\VoidGym\artifacts\bridge-deploy-backups\bridge-20261027-095355-37e352d7\hk-ai-1`.
-- O relatório final receberá as métricas de encerramento, último checkpoint íntegro e avaliação/zero-shot pós-treino depois que a campanha parar por nível 6 ou pelo limite de 24 horas.
+- A campanha foi interrompida antes do critério de conclusão; nenhum resultado pós-treino deve ser inferido. A retomada só ocorrerá com autorização do operador na hora, conforme o prompt 86c.

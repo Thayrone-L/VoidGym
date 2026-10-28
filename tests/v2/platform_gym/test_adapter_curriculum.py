@@ -73,3 +73,23 @@ def test_curriculum_progress_and_save_resume(tmp_path) -> None:
     resumed = Curriculum.load(path)
     assert resumed.level == 7 and resumed.episodes == 800
     assert resumed.style_split(10) == "test"
+
+
+def test_curriculum_samples_next_level_with_sixty_percent_current_level_success() -> None:
+    curriculum = Curriculum(seed=11)
+    curriculum.level = 2
+    for index in range(100):
+        curriculum.record(index < 60, level=2)
+    sampled = {curriculum.sample_level(seed) for seed in range(10_000)}
+    assert curriculum.level == 2
+    assert 3 in sampled
+    assert curriculum.success_rate(2) == .6
+
+
+def test_curriculum_load_migrates_older_current_window_to_level_history(tmp_path) -> None:
+    path = tmp_path / "old-curriculum.json"
+    path.write_text('{"level":2,"seed":4,"episodes":3,"current":[true,false,true]}',
+                    encoding="utf-8")
+    curriculum = Curriculum.load(path)
+    assert list(curriculum.history[2]) == [True, False, True]
+    assert curriculum.success_rate(2) == 2 / 3

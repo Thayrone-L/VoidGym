@@ -1,0 +1,99 @@
+{
+  "rooms_per_level": 200,
+  "policies": [
+    "RIGHT",
+    "RIGHT+JUMP_TAP",
+    "RANDOM_UNIFORM"
+  ],
+  "levels": {
+    "2": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 4,
+        "RIGHT+JUMP_TAP": 10,
+        "RANDOM_UNIFORM": 2
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.98,
+        "RIGHT+JUMP_TAP": 0.95,
+        "RANDOM_UNIFORM": 0.99
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "3": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 33,
+        "RIGHT+JUMP_TAP": 19,
+        "RANDOM_UNIFORM": 18
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.835,
+        "RIGHT+JUMP_TAP": 0.905,
+        "RANDOM_UNIFORM": 0.91
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "4": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 0,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 38
+      },
+      "policy_failure_rates": {
+        "RIGHT": 1.0,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 0.81
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "5": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 31,
+        "RIGHT+JUMP_TAP": 9,
+        "RANDOM_UNIFORM": 2
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.845,
+        "RIGHT+JUMP_TAP": 0.955,
+        "RANDOM_UNIFORM": 0.99
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "6": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 0,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 1
+      },
+      "policy_failure_rates": {
+        "RIGHT": 1.0,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 0.995
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "7": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 0,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 0
+      },
+      "policy_failure_rates": {
+        "RIGHT": 1.0,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 1.0
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    }
+  },
+  "level7_door_without_ability": {
+    "solver_successes": 0,
+    "sets": 200,
+    "failure_rate": 1.0
+  }
+}

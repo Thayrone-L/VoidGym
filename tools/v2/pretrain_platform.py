@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import ctypes
 import copy
@@ -14,7 +15,9 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -39,6 +42,71 @@ from voidgym.training.checkpoints import load_universal, save_universal
 from voidgym.training.checkpoints import prune_checkpoints
 from voidgym.models.perception import load_class_weights
 from voidgym.training.recurrent_ppo import RecurrentPPOTrainer
+
+_ACTIVE_RUN_ROOT: Path | None = None
+_ACTIVE_RUN_STARTED: str | None = None
+_ACTIVE_RUN_MONOTONIC: float | None = None
+_ACTIVE_STOP_REQUESTED = False
+_ACTIVE_RUN_INITIALIZED = False
+_RUN_CLEANUPS: list[Callable[[], None]] = []
+
+
+def _register_cleanup(callback: Callable[[], None]) -> None:
+    _RUN_CLEANUPS.append(callback)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_terminal_status(state: str, reason: str) -> None:
+    if _ACTIVE_RUN_ROOT is None:
+        return
+    payload: dict[str, Any] = {
+        "status": state, "reason": reason, "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "started_at": _ACTIVE_RUN_STARTED,
+        "duration_seconds": (time.monotonic() - _ACTIVE_RUN_MONOTONIC
+                             if _ACTIVE_RUN_MONOTONIC is not None else None),
+    }
+    heartbeat = _ACTIVE_RUN_ROOT / "heartbeat.json"
+    if heartbeat.is_file():
+        payload["last_heartbeat"] = json.loads(heartbeat.read_text(encoding="utf-8"))
+    _atomic_json(_ACTIVE_RUN_ROOT / "status.json", payload)
+
+
+def _ensure_csv_header(path: Path, fields: list[str]) -> None:
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        previous_fields = reader.fieldnames or []
+        if previous_fields == fields:
+            return
+        previous_rows = list(reader)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in previous_rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    temporary.replace(path)
+
+
+def _mark_unclean_exit() -> None:
+    if _ACTIVE_RUN_ROOT is None or not _ACTIVE_RUN_INITIALIZED:
+        return
+    status_path = _ACTIVE_RUN_ROOT / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.is_file() else {}
+    if status.get("status") == "RUNNING" or (
+        (_ACTIVE_RUN_ROOT / "heartbeat.json").exists() and status.get("status") not in
+        {"COMPLETED", "STOPPED", "FAILED"}
+    ):
+        _write_terminal_status("FAILED", "process exited without writing terminal status")
+
+
+atexit.register(_mark_unclean_exit)
 
 
 def _priority_below_normal() -> None:
@@ -81,6 +149,8 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hours-limit", type=float)
     parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 8),
                         help="stop after a completed round once the curriculum reaches this level")
+    parser.add_argument("--quick-eval-interval-steps", type=int, default=1_000_000,
+                        help="run quick evaluation whenever this many new steps are crossed")
     parser.add_argument("--priority", choices=("below_normal",), default="below_normal")
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--allow-cpu", action="store_true",
@@ -92,8 +162,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run(args: argparse.Namespace) -> Path:
-    if args.total_steps < 1 or args.rollout_steps < 1 or args.seq_len < 1:
+def _run_impl(args: argparse.Namespace) -> Path:
+    if (args.total_steps < 1 or args.rollout_steps < 1 or args.seq_len < 1
+            or args.quick_eval_interval_steps < 1):
         raise ValueError("step counts and sequence length must be positive")
     _priority_below_normal()
     random.seed(args.seed)
@@ -126,6 +197,14 @@ def run(args: argparse.Namespace) -> Path:
     torch.set_num_interop_threads(1)
     root: Path = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
     root.mkdir(parents=True, exist_ok=True)
+    global _ACTIVE_RUN_INITIALIZED
+    _ACTIVE_RUN_INITIALIZED = True
+    status_path = root / "status.json"
+    if status_path.exists():
+        (root / "status.previous.json").write_bytes(status_path.read_bytes())
+    _atomic_json(status_path, {
+        "status": "RUNNING", "started_at": _ACTIVE_RUN_STARTED,
+    })
     config = config_from_dict({
         "schema_version": 1, "campaign_id": args.run_name, "kind": "pretrain_platform",
         "game_id": "platform_gym",
@@ -155,6 +234,7 @@ def run(args: argparse.Namespace) -> Path:
         [partial(_make_env, level=0, seed=args.seed + index) for index in range(env_count)],
         start_method="spawn",
     )
+    _register_cleanup(environments.close)
     environments.seed(args.seed)
     observations = cast(dict[str, np.ndarray], environments.reset())
     infos = list(environments.reset_infos)
@@ -182,16 +262,20 @@ def run(args: argparse.Namespace) -> Path:
     experience_writer = ExperienceWriter(root / "experience", "platform_gym", args.run_name,
                                         source="platform_gym", block_steps=1024,
                                         action_table=action_table)
+    _register_cleanup(experience_writer.close)
     log_path = root / "log.csv"
     log_mode = "a" if log_path.exists() and global_step else "w"
     fieldnames = ["steps", "L_ppo", "L_semantic", "L_inverse_dynamics", "L_hero_motion",
                   "entropy", "kl", "explained_variance", "steps_per_second", "curriculum_level",
-                  "success_rate_100", "quick_eval_success"]
+                  "success_rate_100", "quick_eval_success",
+                  *[f"success_rate_level_{level}" for level in range(8)]]
+    if log_mode == "a":
+        _ensure_csv_header(log_path, fieldnames)
     started = time.monotonic()
     started_wall = time.time()
     started_step = global_step
     last_checkpoint = global_step
-    last_eval_million = global_step // 1_000_000
+    last_eval_interval = global_step // args.quick_eval_interval_steps
     stop_requested = [False]
     phase_totals: defaultdict[str, float] = defaultdict(float)
     profile_path = root / "phase_profile.csv"
@@ -200,11 +284,29 @@ def run(args: argparse.Namespace) -> Path:
                       "cuda_peak_allocated_mb", "cuda_peak_reserved_mb"]
     profile_mode = "a" if profile_path.exists() and global_step else "w"
     profile_stream = profile_path.open(profile_mode, newline="", encoding="utf-8")
+    _register_cleanup(profile_stream.close)
     profile_writer = csv.DictWriter(profile_stream, fieldnames=profile_fields)
     if profile_mode == "w":
         profile_writer.writeheader()
     previous_sigint = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, lambda _signum, _frame: stop_requested.__setitem__(0, True))
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        global _ACTIVE_STOP_REQUESTED
+        _ACTIVE_STOP_REQUESTED = True
+        stop_requested[0] = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+        def restore_sigterm() -> None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        _register_cleanup(restore_sigterm)
+
+    def restore_sigint() -> None:
+        signal.signal(signal.SIGINT, previous_sigint)
+
+    _register_cleanup(restore_sigint)
     with log_path.open(log_mode, newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         if log_mode == "w":
@@ -274,7 +376,7 @@ def run(args: argparse.Namespace) -> Path:
                             "scene": f"platform_gym_level_{current_levels[index]}",
                             "tags": ["pretrain_sample", f"step:{global_step}"]})
                     if dones[index]:
-                        curriculum.record(episode_had_exit[index])
+                        curriculum.record(episode_had_exit[index], current_levels[index])
                         episode_had_exit[index] = False
                         level = curriculum.sample_level(args.seed + global_step + index)
                         environments.env_method("set_level", level, indices=[index])
@@ -313,13 +415,13 @@ def run(args: argparse.Namespace) -> Path:
             phase_round["update_seconds"] += time.perf_counter() - update_started
             quick_eval: float | str = ""
             quick_eval_seconds = 0.0
-            if global_step // 1_000_000 > last_eval_million:
+            if global_step // args.quick_eval_interval_steps > last_eval_interval:
                 actor_policy.load_state_dict({key: value.detach().cpu()
                                               for key, value in policy.state_dict().items()})
                 eval_started = time.perf_counter()
                 quick_eval = _quick_eval(actor_policy, args.seed + global_step)
                 quick_eval_seconds = time.perf_counter() - eval_started
-                last_eval_million = global_step // 1_000_000
+                last_eval_interval = global_step // args.quick_eval_interval_steps
             round_seconds = time.perf_counter() - round_started
             phase_round["quick_eval_seconds"] += quick_eval_seconds
             for phase_name, phase_value in phase_round.items():
@@ -345,18 +447,22 @@ def run(args: argparse.Namespace) -> Path:
                         "success_rate_100": (sum(curriculum.current) / len(curriculum.current)
                                              if curriculum.current else 0.0),
                         "quick_eval_success": quick_eval})
+            row.update({f"success_rate_level_{level}": curriculum.success_rate(level)
+                        for level in range(8)})
             writer.writerow(row)
             stream.flush()
+            _atomic_json(root / "heartbeat.json", {
+                "steps": global_step, "curriculum_level": curriculum.level,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "success_by_level": {str(level): curriculum.success_rate(level)
+                                     for level in range(8)},
+            })
             if global_step - last_checkpoint >= 250_000:
                 _save_checkpoint(root, policy, trainer, curriculum, global_step, metrics, action_table)
                 prune_checkpoints(root)
                 last_checkpoint = global_step
         _save_checkpoint(root, policy, trainer, curriculum, global_step, {}, action_table)
-    signal.signal(signal.SIGINT, previous_sigint)
     curriculum.save(curriculum_path)
-    experience_writer.close()
-    environments.close()
-    profile_stream.close()
     profile_seconds = sum(phase_totals.values())
     (root / "phase_profile.json").write_text(json.dumps({
         "phase_seconds": dict(phase_totals), "measured_seconds": profile_seconds,
@@ -376,6 +482,57 @@ def run(args: argparse.Namespace) -> Path:
                       "peak_vram_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else 0,
                       "run_root": str(root)}, indent=2))
     return root
+
+
+def run(args: argparse.Namespace) -> Path:
+    """Run training with persistent heartbeat and terminal status reporting."""
+    global _ACTIVE_RUN_ROOT, _ACTIVE_RUN_STARTED, _ACTIVE_RUN_MONOTONIC
+    global _ACTIVE_STOP_REQUESTED, _ACTIVE_RUN_INITIALIZED
+    root = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
+    heartbeat = root / "heartbeat.json"
+    status = root / "status.json"
+    previous_status: dict[str, Any] = {}
+    if status.is_file():
+        try:
+            previous_status = json.loads(status.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous_status = {}
+    if heartbeat.exists() and previous_status.get("status") in {None, "RUNNING"}:
+        warning = "Previous run stopped without a terminal status.\n"
+        print(warning.rstrip(), file=sys.stderr)
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / "stderr.log").open("a", encoding="utf-8") as stream:
+            stream.write(warning)
+    _ACTIVE_RUN_ROOT = root
+    _ACTIVE_RUN_STARTED = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    _ACTIVE_RUN_MONOTONIC = time.monotonic()
+    _ACTIVE_STOP_REQUESTED = False
+    _ACTIVE_RUN_INITIALIZED = False
+    _RUN_CLEANUPS.clear()
+    try:
+        result = _run_impl(args)
+    except BaseException as error:
+        if _ACTIVE_RUN_INITIALIZED:
+            with (root / "stderr.log").open("a", encoding="utf-8") as stream:
+                traceback.print_exc(file=stream)
+                stream.flush()
+            _write_terminal_status("FAILED", f"{type(error).__name__}: {error}")
+        raise
+    else:
+        _write_terminal_status("STOPPED" if _ACTIVE_STOP_REQUESTED else "COMPLETED",
+                               "termination signal received" if _ACTIVE_STOP_REQUESTED
+                               else "training loop finished")
+        return result
+    finally:
+        for cleanup in reversed(_RUN_CLEANUPS):
+            try:
+                cleanup()
+            except Exception as cleanup_error:  # noqa: BLE001 - preserve original training failure
+                print(f"Resource cleanup failed: {cleanup_error}", file=sys.stderr)
+        _RUN_CLEANUPS.clear()
+        _ACTIVE_RUN_ROOT = None
+        _ACTIVE_RUN_MONOTONIC = None
+        _ACTIVE_RUN_INITIALIZED = False
 
 
 def _nvidia_smi_available() -> bool:
@@ -452,9 +609,7 @@ def _save_checkpoint(root: Path, policy: UniversalPolicy, trainer: RecurrentPPOT
     checkpoint = root / name
     save_universal(checkpoint, policy, action_table, steps=steps,
                    metrics=metrics, optimizer=trainer.optimizer,
-                   curriculum={"level": curriculum.level, "seed": curriculum.seed,
-                               "episodes": curriculum.episodes,
-                               "current": list(curriculum.current)})
+                   curriculum=curriculum.to_dict())
 
 
 def main() -> int:

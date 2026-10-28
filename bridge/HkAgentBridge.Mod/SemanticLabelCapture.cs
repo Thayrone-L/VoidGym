@@ -76,16 +76,30 @@ internal static class SemanticLabelCapture
         int visibleCount = physicsScene.OverlapBox(viewCenter, viewSize, 0f, contactFilter,
             OverlapBuffer);
         bool[] candidateCells = new bool[SemanticRasterizer.Width * SemanticRasterizer.Height];
+        List<EdgeCollider2D> terrainEdges = new List<EdgeCollider2D>();
         for (int index = 0; index < visibleCount; index++)
         {
             Collider2D collider = OverlapBuffer[index];
             if (collider != null && collider.enabled && collider.gameObject.activeInHierarchy &&
                 (collider.gameObject.scene == scene ||
                  (hero != null && collider.GetComponentInParent<HeroController>() == hero)) &&
-                TryClassify(collider, hero, out byte label, out byte priority) &&
-                !StampColliderShape(camera, collider, label, priority, labels, priorities))
-                MarkCandidateCells(camera, collider.bounds, candidateCells);
+                TryClassify(collider, hero, out byte label, out byte priority))
+            {
+                if (collider is EdgeCollider2D edge && label == Solid)
+                {
+                    terrainEdges.Add(edge);
+                    continue;
+                }
+                if (!StampColliderShape(camera, collider, label, priority, labels, priorities))
+                    MarkCandidateCells(camera, collider.bounds, candidateCells);
+            }
         }
+
+        bool[] terrainLineCells = new bool[SemanticRasterizer.Width * SemanticRasterizer.Height];
+        foreach (EdgeCollider2D edge in terrainEdges)
+            StampTerrainEdge(camera, edge, labels, priorities, terrainLineCells);
+        foreach (EdgeCollider2D edge in terrainEdges)
+            StampTerrainBacking(camera, edge, labels, priorities, terrainLineCells);
 
         for (int y = 0; y < SemanticRasterizer.Height; y++)
         for (int x = 0; x < SemanticRasterizer.Width; x++)
@@ -242,6 +256,134 @@ internal static class SemanticLabelCapture
             return true;
         }
         return false;
+    }
+
+    private static void StampTerrainEdge(Camera camera, EdgeCollider2D edge, byte[] labels,
+        byte[] priorities, bool[] lineCells)
+    {
+        Vector2[] points = edge.points;
+        if (points.Length < 2) return;
+        bool closed = points.Length >= 4 && Vector2.Distance(points[0], points[points.Length - 1]) < .001f;
+        if (closed)
+        {
+            float[] contour = new float[(points.Length - 1) * 2];
+            for (int index = 0; index < points.Length - 1; index++)
+            {
+                Vector3 world = edge.transform.TransformPoint(edge.offset + points[index]);
+                Vector3 viewport = camera.WorldToViewportPoint(world);
+                contour[index * 2] = viewport.x;
+                contour[index * 2 + 1] = viewport.y;
+            }
+            SemanticRasterizer.StampClosedContour(labels, priorities, contour, Solid, PrioritySolid);
+        }
+        for (int index = 1; index < points.Length; index++)
+        {
+            Vector3 firstWorld = edge.transform.TransformPoint(edge.offset + points[index - 1]);
+            Vector3 secondWorld = edge.transform.TransformPoint(edge.offset + points[index]);
+            Vector3 first = camera.WorldToViewportPoint(firstWorld);
+            Vector3 second = camera.WorldToViewportPoint(secondWorld);
+            StampProjectedSegment(first, second, Solid, PrioritySolid, labels, priorities);
+            MarkTerrainLineCells(first, second, lineCells);
+        }
+    }
+
+    private static void StampTerrainBacking(Camera camera, EdgeCollider2D edge, byte[] labels,
+        byte[] priorities, bool[] lineCells)
+    {
+        Vector2[] points = edge.points;
+        if (points.Length < 2 || (points.Length >= 4 &&
+            Vector2.Distance(points[0], points[points.Length - 1]) < .001f))
+            return;
+        for (int index = 1; index < points.Length; index++)
+        {
+            Vector3 firstWorld = edge.transform.TransformPoint(edge.offset + points[index - 1]);
+            Vector3 secondWorld = edge.transform.TransformPoint(edge.offset + points[index]);
+            Vector3 first = camera.WorldToViewportPoint(firstWorld);
+            Vector3 second = camera.WorldToViewportPoint(secondWorld);
+            if (first.z <= 0f || second.z <= 0f) continue;
+            float dx = second.x - first.x;
+            float dy = second.y - first.y;
+            if (Mathf.Abs(dx) >= Mathf.Abs(dy) * 2f)
+            {
+                float y = (first.y + second.y) * .5f;
+                if (y >= 0f && y <= 1f)
+                    SemanticRasterizer.StampOpenHorizontalBacking(labels, priorities,
+                        Mathf.Clamp01(Mathf.Min(first.x, second.x)),
+                        Mathf.Clamp01(Mathf.Max(first.x, second.x)), y, y < .5f,
+                        PrioritySolid);
+                continue;
+            }
+            StampNormalBacking(first, second, labels, priorities, lineCells);
+        }
+    }
+
+    private static void MarkTerrainLineCells(Vector3 first, Vector3 second, bool[] lineCells)
+    {
+        if (first.z <= 0f || second.z <= 0f) return;
+        Vector2 a = new Vector2(first.x, first.y);
+        Vector2 b = new Vector2(second.x, second.y);
+        GetSegmentGridBounds(a, b, out int x0, out int x1, out int y0, out int y1);
+        for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+        {
+            float left = (float)x / SemanticRasterizer.Width;
+            float right = (float)(x + 1) / SemanticRasterizer.Width;
+            float bottom = 1f - (float)(y + 1) / SemanticRasterizer.Height;
+            float top = 1f - (float)y / SemanticRasterizer.Height;
+            if (SegmentIntersectsRect(a, b, left, bottom, right, top))
+                lineCells[y * SemanticRasterizer.Width + x] = true;
+        }
+    }
+
+    private static void GetSegmentGridBounds(Vector2 first, Vector2 second, out int x0,
+        out int x1, out int y0, out int y1)
+    {
+        x0 = Mathf.Clamp(Mathf.FloorToInt(Mathf.Min(first.x, second.x) * SemanticRasterizer.Width),
+            0, SemanticRasterizer.Width - 1);
+        x1 = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(first.x, second.x) * SemanticRasterizer.Width),
+            0, SemanticRasterizer.Width);
+        y0 = Mathf.Clamp(Mathf.FloorToInt((1f - Mathf.Max(first.y, second.y)) * SemanticRasterizer.Height),
+            0, SemanticRasterizer.Height - 1);
+        y1 = Mathf.Clamp(Mathf.CeilToInt((1f - Mathf.Min(first.y, second.y)) * SemanticRasterizer.Height),
+            0, SemanticRasterizer.Height);
+    }
+
+    private static void StampNormalBacking(Vector3 first, Vector3 second, byte[] labels,
+        byte[] priorities, bool[] lineCells)
+    {
+        Vector2 tangent = new Vector2(second.x - first.x, second.y - first.y).normalized;
+        Vector2 terrainNormal = new Vector2(-tangent.y, tangent.x);
+        const float cellStep = .5f;
+        int maxSteps = SemanticRasterizer.Width + SemanticRasterizer.Height;
+        GetSegmentGridBounds(new Vector2(first.x, first.y), new Vector2(second.x, second.y),
+            out int x0, out int x1, out int y0, out int y1);
+        for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+        {
+            float left = (float)x / SemanticRasterizer.Width;
+            float right = (float)(x + 1) / SemanticRasterizer.Width;
+            float bottom = 1f - (float)(y + 1) / SemanticRasterizer.Height;
+            float top = 1f - (float)y / SemanticRasterizer.Height;
+            if (!SegmentIntersectsRect(new Vector2(first.x, first.y),
+                new Vector2(second.x, second.y), left, bottom, right, top))
+                continue;
+            for (int step = 1; step <= maxSteps; step++)
+            {
+                float px = (x + .5f) / SemanticRasterizer.Width +
+                           terrainNormal.x * cellStep * step / SemanticRasterizer.Width;
+                float py = 1f - (y + .5f) / SemanticRasterizer.Height +
+                           terrainNormal.y * cellStep * step / SemanticRasterizer.Height;
+                int targetX = Mathf.FloorToInt(px * SemanticRasterizer.Width);
+                int targetY = Mathf.FloorToInt((1f - py) * SemanticRasterizer.Height);
+                if ((uint)targetX >= SemanticRasterizer.Width ||
+                    (uint)targetY >= SemanticRasterizer.Height)
+                    break;
+                int targetIndex = targetY * SemanticRasterizer.Width + targetX;
+                if (lineCells[targetIndex]) break;
+                SemanticRasterizer.StampIgnoreCell(labels, priorities, targetX, targetY,
+                    PrioritySolid);
+            }
+        }
     }
 
     private static void StampLocalPolygon(Camera camera, Transform transform, Vector2[] local,
@@ -403,8 +545,16 @@ internal static class SemanticLabelCapture
         if (collider.GetComponentInParent<TransitionPoint>() != null)
             SetCandidate(Exit, PriorityExit, ref label, ref priority);
 
-        if (layer == (int)GlobalEnums.PhysLayers.INTERACTIVE_OBJECT ||
-            collider.GetComponentInParent<RestBench>() != null)
+        if (IsGrassOrCuttable(collider) &&
+            collider.GetComponentInParent<DamageHero>() == null &&
+            collider.GetComponentInParent<HealthManager>() == null &&
+            (hero == null || collider.GetComponentInParent<HeroController>() != hero))
+            return false;
+
+        if (collider.GetComponentInParent<RestBench>() != null ||
+            collider.GetComponentInParent<BridgeLever>() != null ||
+            collider.GetComponentInParent<BossStatueLever>() != null ||
+            collider.GetComponentInParent<StagTravel>() != null)
             SetCandidate(Interactive, PriorityInteractive, ref label, ref priority);
 
         if (collider.GetComponentInParent<GeoControl>() != null)
@@ -435,6 +585,13 @@ internal static class SemanticLabelCapture
         collider.GetComponentInParent<BreakablePoleSimple>() != null ||
         collider.GetComponentInParent<BreakablePoleTopLand>() != null ||
         collider.GetComponentInParent<DestructibleProp>() != null;
+
+    private static bool IsGrassOrCuttable(Collider2D collider) =>
+        collider.GetComponentInParent<GrassBehaviour>() != null ||
+        collider.GetComponentInParent<GrassCut>() != null ||
+        collider.GetComponentInParent<GrassSpriteBehaviour>() != null ||
+        collider.GetComponentInParent<Grass>() != null ||
+        collider.GetComponentInParent<VinePlatformCut>() != null;
 
     private static void SetCandidate(byte candidate, byte candidatePriority,
         ref byte label, ref byte priority)

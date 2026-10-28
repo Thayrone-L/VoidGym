@@ -20,6 +20,27 @@ from voidgym.gyms.platform_gym.world import (
 )
 
 
+def _mandatory_jump_wall(rng: np.random.Generator, physics: PhysicsParams,
+                         minimum_ratio: float, maximum_ratio: float, x: float,
+                         floor: float) -> Solid:
+    """Build a required jump obstacle with a strict 85% physical-limit ceiling."""
+    if not 0 <= minimum_ratio <= maximum_ratio <= .85:
+        raise ValueError("mandatory jump obstacles must stay at or below 85% of jump height")
+    height = float(rng.uniform(minimum_ratio, maximum_ratio) * physics.jump_max_height)
+    return Solid(Rect(x, floor, .65, height))
+
+
+def _mandatory_gap_width(rng: np.random.Generator, physics: PhysicsParams,
+                        minimum_ratio: float, maximum_ratio: float) -> float:
+    """Build a required gap with the same strict 85% reach ceiling as jump walls."""
+    if not 0 <= minimum_ratio <= maximum_ratio <= .85:
+        raise ValueError("mandatory gaps must stay at or below 85% of jump reach")
+    reach = physics.run_speed * (
+        physics.jump_hold_max_seconds + 2 * physics.jump_v0 / physics.gravity
+    )
+    return float(rng.uniform(minimum_ratio, maximum_ratio) * reach)
+
+
 def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     rng = np.random.default_rng(seed)
     physics = PhysicsParams.sample(rng)
@@ -36,25 +57,28 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     spawn_y = floor
     solids: list[Solid]
     if level == 2:
-        reach = physics.run_speed * (physics.jump_hold_max_seconds + 2 * physics.jump_v0 / physics.gravity)
-        gap_width = float(rng.uniform(.75, .95) * reach)
+        gap_width = _mandatory_gap_width(rng, physics, .35, .70)
         gap_left = width * .42
         pit_width = gap_width * .62
         solids = [Solid(Rect(0, floor - .6, gap_left, .6)),
                   Solid(Rect(gap_left, 0, pit_width, .5)),
                   Solid(Rect(gap_left + gap_width, floor - .6, width - gap_left - gap_width, .6))]
-        # A short jump clears many gaps by luck; this mandatory raised barrier
-        # after the pit requires using the variable-height jump deliberately.
-        solids.append(Solid(Rect(gap_left + gap_width + 1.8, floor, .65, 2.0)))
+        # At least 3 units of run-up and a moderate wall teach a held jump
+        # without putting the required height near the physical limit.
+        wall_x = gap_left + gap_width + 3.0
+        solids.append(_mandatory_jump_wall(rng, physics, .55, .75, wall_x, floor))
     elif level == 4:
         pit_floor = .6
         ledge_x = 4.5
+        ledge_rise = float(rng.uniform(.55, .75) * physics.jump_max_height)
+        upper_floor = pit_floor + ledge_rise
         spawn_y = pit_floor
         solids = [Solid(Rect(0, pit_floor - .6, ledge_x, .6)),
                   Solid(Rect(0, pit_floor, .55, 3.6)),
-                  Solid(Rect(ledge_x, pit_floor, .65, 3.0)),
-                  Solid(Rect(ledge_x + .65, 3.0, width - ledge_x - .65, floor))]
-        floor_y = 3.6
+                  _mandatory_jump_wall(rng, physics, .65, .75, ledge_x, pit_floor),
+                  Solid(Rect(ledge_x + .65, upper_floor - .6,
+                             width - ledge_x - .65, .6))]
+        floor_y = upper_floor
     else:
         solids = [Solid(Rect(0, 0, width, floor))]
     hazards, breakables, enemies, pickups, interactives, doors = _make_entities(
@@ -84,18 +108,22 @@ def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
             height_u = float(rng.uniform(.5, .6) * physics.jump_short_height)
             solids.append(Solid(Rect(width * fraction, floor, 1.2, height_u)))
     if level == 3:
-        high = float(rng.uniform(.6, .82) * physics.jump_max_height)
-        solids.append(Solid(Rect(width * .48, floor, .55, high)))
+        solids.append(_mandatory_jump_wall(rng, physics, .6, .82, width * .48, floor))
     if level == 4:
         wall_x = width * .68
-        wall_height = float(rng.uniform(.82, .92) * physics.jump_max_height)
-        solids.append(Solid(Rect(wall_x, floor, .65, wall_height)))
+        solids.append(_mandatory_jump_wall(rng, physics, .65, .82, wall_x, floor))
+        # A second, moderate wall near the raised exit makes level 4 require
+        # two deliberate jumps instead of a single lucky traversal.
+        upper_wall_x = width * .82
+        upper_floor = max(solid.rect.top for solid in solids
+                          if solid.rect.x > 1.0 and solid.rect.h <= .7)
+        solids.append(_mandatory_jump_wall(rng, physics, .65, .75,
+                                           upper_wall_x, upper_floor))
     if level == 5:
         # Level 5 needs a deliberate full jump; short-tap policies used to
         # walk to the exit too often.
         wall_x = width * .68
-        wall_height = float(rng.uniform(1.9, min(2.6, physics.jump_max_height - .2)))
-        solids.append(Solid(Rect(wall_x, floor, .65, wall_height)))
+        solids.append(_mandatory_jump_wall(rng, physics, .55, .82, wall_x, floor))
     if level >= 5:
         hazards.append(Hazard(Rect(width * .4, floor, 1.4, .35), "spikes"))
         for _ in range(int(rng.integers(1, 4))):
