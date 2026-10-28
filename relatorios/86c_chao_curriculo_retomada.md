@@ -55,7 +55,7 @@ BREAKABLE, PICKUP e INTERACTIVE não têm classes positivas na amostra e ficam s
 
 ## Validação, build e deployment
 
-O pré-treino não foi retomado, logo não há avaliação final de política aprendida nem comparação com o split do 85. Nenhum treinamento foi iniciado ou interrompido por este trabalho.
+A retomada foi iniciada em 28/10 às 11:38 -03 no runtime `E:\VoidGymRuntime\v2\pretrain\pretrain-86c-resume-2026-10-28-cuda`, de `universal-004460288` (contador inicial 4.460.288), com 10 ambientes CUDA, limite de 24 h ou nível 6 e quick eval a cada 1M passos. A primeira tentativa foi bloqueada pela proteção CPU: o `.venv` continha PyTorch 2.14.1+cpu. Foi instalado o wheel oficial PyTorch 2.14.1+cu132 e validado um tensor na RTX 3060; depois a campanha iniciou com status RUNNING e ambos os dispositivos em CUDA. No primeiro acompanhamento (11:40:30 -03), o heartbeat estava em 4.478.208 passos totais (17.920 efetivos), nível 2, sucesso recente 0,59. RAM livre: 1,13 GiB; a execução continuava avançando. A campanha permanece em andamento, então ainda não há avaliação final de política aprendida nem comparação com o split do 85. O worker que foi iniciado e bloqueado pela proteção saiu sem treinar em CPU.
 
 Testes C# do rasterizador e build Release do mod passaram. DLL implantada pelo `tools/deploy_bridge.py` somente na instância isolada `hk-ai-1`; backup: `artifacts/bridge-deploy-backups/bridge-20261028-105213-8bfb98e7/hk-ai-1`. Suíte completa: 843 passaram, 4 ignorados, 8 subtests passaram em 264,79 s; três avisos existentes de conversão de tensor no Stable-Baselines3. Ruff: `All checks passed`. Mypy: sem erros nos quatro arquivos Python verificados (curriculum, generator, pretrain_platform e importador). `git diff --check`: passou. Testes C# semânticos passaram; build Release passou com zero avisos e zero erros.
 
@@ -64,4 +64,5 @@ Testes C# do rasterizador e build Release do mod passaram. DLL implantada pelo `
 1. Retomar de `universal-004460288` somente após autorização fresca do operador no momento do início; monitorar heartbeat e parar/investigar se um nível ficar sem progresso por 3M de passos.
 2. Fazer avaliação por nível ao longo do novo treino, curva PNG, avaliação no split de teste e IoU do ginásio.
 3. Capturar novamente uma amostra que alcance e rotule explicitamente espinhos e saída, sem sacrificar a restauração do save.
+
 
