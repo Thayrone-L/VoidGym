@@ -29,7 +29,7 @@ def _hsv(rng: np.random.Generator, low: float = .25, high: float = .9) -> tuple[
     return cast(tuple[int, int, int], tuple(round(c * 255) for c in colorsys.hsv_to_rgb(h, s, v)))
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=256)
 def sample_style(seed: int, *, split: Split = "train") -> tuple[StyleParams, Palette]:
     rng = np.random.default_rng(seed)
     style = StyleParams.sample(rng, split=split)

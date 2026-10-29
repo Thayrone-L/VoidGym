@@ -7,8 +7,10 @@ import atexit
 import csv
 import ctypes
 import copy
+import faulthandler
 from functools import partial
 import json
+import math
 import os
 import random
 import signal
@@ -16,26 +18,28 @@ import subprocess
 import sys
 import time
 import traceback
+from dataclasses import replace
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
 from torch.distributions import Categorical
-from stable_baselines3.common.vec_env import SubprocVecEnv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.core.config import config_from_dict, save_campaign_config
 from voidgym.core.experience_store import ExperienceWriter
-from voidgym.core.hardware import detect_hardware, plan_resources, save_resource_profile
+from voidgym.core.hardware import HardwareProfile, detect_hardware, plan_resources, save_resource_profile
+from voidgym.core.hardware import memory_commit_stats
 from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
 from voidgym.gyms.platform_gym.curriculum import Curriculum
-from voidgym.gyms.platform_gym.reward import CombinedPlatformReward
+from voidgym.gyms.platform_gym.vector_env import PlatformSubprocVecEnv
+from voidgym.gyms.platform_gym.vec_worker import make_platform_env
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.buffers import RecurrentRolloutBuffer
 from voidgym.training.checkpoints import load_universal, save_universal
@@ -49,6 +53,7 @@ _ACTIVE_RUN_MONOTONIC: float | None = None
 _ACTIVE_STOP_REQUESTED = False
 _ACTIVE_RUN_INITIALIZED = False
 _RUN_CLEANUPS: list[Callable[[], None]] = []
+_FAULT_HANDLE: Any = None
 
 
 def _register_cleanup(callback: Callable[[], None]) -> None:
@@ -128,6 +133,123 @@ def _tensor_observation(observations: list[dict[str, np.ndarray]] | dict[str, np
     return {key: torch.as_tensor(value, device=device) for key, value in batched.items()}
 
 
+def _enable_main_faulthandler(root: Path) -> None:
+    global _FAULT_HANDLE
+    if _FAULT_HANDLE is not None and not _FAULT_HANDLE.closed:
+        faulthandler.disable()
+        _FAULT_HANDLE.close()
+    _FAULT_HANDLE = (root / "faulthandler-main.log").open("a", encoding="utf-8")
+    faulthandler.enable(file=_FAULT_HANDLE, all_threads=True)
+
+    def close_handler() -> None:
+        global _FAULT_HANDLE
+        faulthandler.disable()
+        if _FAULT_HANDLE is not None:
+            _FAULT_HANDLE.close()
+            _FAULT_HANDLE = None
+
+    _register_cleanup(close_handler)
+
+
+def _measure_worker_private_gb(root: Path, seed: int) -> float:
+    """Spawn one torch-free environment and measure its private resident footprint."""
+    probe = PlatformSubprocVecEnv([
+        partial(make_platform_env, level=0, seed=seed, worker_index="probe",
+                diagnostics_dir=root),
+    ], start_method="spawn")
+    try:
+        probe.reset()
+        probe._refresh_worker_memory()
+        measured = probe.worker_startup[0].get("private_bytes")
+        if measured is None:
+            measured = probe.worker_startup[0].get("rss_bytes")
+        if measured is None or int(measured) <= 0:
+            raise RuntimeError("cannot measure private memory of a spawned environment worker")
+        return int(measured) / 2**30
+    finally:
+        probe.close()
+
+
+def _write_runtime_versions(root: Path, profile: HardwareProfile) -> None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    def installed(package: str) -> str | None:
+        try:
+            return version(package)
+        except PackageNotFoundError:
+            return None
+
+    try:
+        driver = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        driver_version = driver.stdout.strip() if driver.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        driver_version = None
+    _atomic_json(root / "versions.json", {
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "python": sys.version,
+        "torch": torch.__version__,
+        "torch_cuda_build": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "nvidia_driver": driver_version,
+        "numpy": np.__version__,
+        "pillow": installed("Pillow"),
+        "stable_baselines3": installed("stable-baselines3"),
+        "paging_file_total_gb": profile.paging_file_total_gb,
+        "commit_used_gb": profile.commit_used_gb,
+        "commit_limit_gb": profile.commit_limit_gb,
+        "commit_available_gb": profile.commit_available_gb,
+        "worker_private_gb": profile.worker_private_gb,
+    })
+
+
+def _memory_telemetry(device: torch.device,
+                      workers: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        import psutil
+
+        memory = psutil.virtual_memory()
+        root_process = psutil.Process(os.getpid())
+        processes = [root_process, *root_process.children(recursive=True)]
+        worker_by_pid = {int(row["pid"]): row for row in workers if row.get("pid")}
+        process_rows: list[dict[str, Any]] = []
+        for process in processes:
+            try:
+                rss = process.memory_info().rss
+                full = process.memory_full_info()
+                process_rows.append({
+                    "pid": process.pid,
+                    "role": "learner" if process.pid == os.getpid() else "environment_worker",
+                    "rss_bytes": int(rss),
+                    "private_bytes": int(getattr(full, "uss", rss)),
+                    "torch_imported": worker_by_pid.get(process.pid, {}).get("torch_imported"),
+                })
+            except (psutil.Error, OSError):
+                continue
+        ram_total = int(memory.total)
+        ram_available = int(memory.available)
+    except (ImportError, OSError):
+        ram_total = ram_available = 0
+        process_rows = []
+    telemetry: dict[str, Any] = {
+        "ram_total_bytes": ram_total or None,
+        "ram_available_bytes": ram_available or None,
+        **memory_commit_stats(),
+        "processes": process_rows,
+        "workers": workers,
+        "cuda_allocated_bytes": int(torch.cuda.memory_allocated(device))
+        if device.type == "cuda" else 0,
+        "cuda_reserved_bytes": int(torch.cuda.memory_reserved(device))
+        if device.type == "cuda" else 0,
+    }
+    telemetry["process_rss_total_bytes"] = sum(int(row["rss_bytes"]) for row in process_rows)
+    telemetry["process_private_total_bytes"] = sum(int(row["private_bytes"])
+                                                   for row in process_rows)
+    return telemetry
+
+
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", default="platform-pretrain")
@@ -151,6 +273,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
                         help="stop after a completed round once the curriculum reaches this level")
     parser.add_argument("--quick-eval-interval-steps", type=int, default=1_000_000,
                         help="run quick evaluation whenever this many new steps are crossed")
+    parser.add_argument("--quick-eval-episodes-per-level", type=int, default=50)
+    parser.add_argument("--microbatch-sequences", type=int, default=16,
+                        help="sequences per CUDA microbatch; effective batch is unchanged")
     parser.add_argument("--priority", choices=("below_normal",), default="below_normal")
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--allow-cpu", action="store_true",
@@ -164,7 +289,8 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _run_impl(args: argparse.Namespace) -> Path:
     if (args.total_steps < 1 or args.rollout_steps < 1 or args.seq_len < 1
-            or args.quick_eval_interval_steps < 1):
+            or args.quick_eval_interval_steps < 1 or args.quick_eval_episodes_per_level < 1
+            or args.microbatch_sequences < 1):
         raise ValueError("step counts and sequence length must be positive")
     _priority_below_normal()
     random.seed(args.seed)
@@ -181,22 +307,31 @@ def _run_impl(args: argparse.Namespace) -> Path:
     overrides: dict[str, Any] = {}
     if args.device is not None:
         overrides["train_device"] = args.device
-    plan = plan_resources(profile, "pretrain_platform", overrides)
     if args.envs is not None:
         overrides["gym_envs"] = args.envs
-        plan = plan_resources(profile, "pretrain_platform", overrides)
+    plan = plan_resources(profile, "pretrain_platform", overrides)
     env_count = plan.gym_envs
     if (nvidia_smi and plan.train_device == "cpu" and not args.allow_cpu):
         _cpu_fallback_warning("ResourcePlan selected CPU despite an NVIDIA GPU being present")
         raise SystemExit("CPU training not started; rerun with --allow-cpu to confirm")
     if (args.device == "cuda" and (profile.gpu_memory_free_gb or 0.0) < 6.0):
         raise SystemExit("CUDA requested but ResourcePlan requires at least 6 GiB of free VRAM")
+    root: Path = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
+    root.mkdir(parents=True, exist_ok=True)
+    _enable_main_faulthandler(root)
+    if profile.commit_available_gb is not None:
+        worker_private_gb = _measure_worker_private_gb(root, args.seed)
+        profile = replace(profile, worker_private_gb=worker_private_gb)
+        plan = plan_resources(profile, "pretrain_platform", overrides)
+        env_count = plan.gym_envs
+    requested_batch_size = args.batch_size or plan.batch_size
+    required_sequences = max(1, requested_batch_size // args.seq_len)
+    minimum_rollout_steps = math.ceil(required_sequences / env_count) * args.seq_len
+    args.rollout_steps = max(args.rollout_steps, minimum_rollout_steps)
     device = torch.device(plan.train_device)
     threads = min(free_cores, max(1, plan.torch_threads_learner))
     torch.set_num_threads(threads)
     torch.set_num_interop_threads(1)
-    root: Path = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
-    root.mkdir(parents=True, exist_ok=True)
     global _ACTIVE_RUN_INITIALIZED
     _ACTIVE_RUN_INITIALIZED = True
     status_path = root / "status.json"
@@ -218,6 +353,7 @@ def _run_impl(args: argparse.Namespace) -> Path:
     })
     save_campaign_config(config, root / "config.json")
     save_resource_profile(profile, plan, root)
+    _write_runtime_versions(root, profile)
     (root / "runtime_plan.json").write_text(json.dumps({
         "planned_envs": env_count, "free_physical_cores_reserved": free_cores,
         "torch_threads": threads, "train_device": plan.train_device,
@@ -225,18 +361,28 @@ def _run_impl(args: argparse.Namespace) -> Path:
         "priority": args.priority,
         "cuda_available": torch.cuda.is_available(), "nvidia_smi": nvidia_smi,
         "free_vram_gb": profile.gpu_memory_free_gb,
+        "commit_available_gb_at_plan": profile.commit_available_gb,
+        "worker_private_gb": profile.worker_private_gb,
+        "planned_commit_headroom_gb": plan.commit_headroom_gb,
+        "learner_commit_reserve_gb": 5.5,
+        "worker_memory_safety_factor": 3.0,
+        "warnings": list(plan.warnings),
+        "effective_batch_size": args.batch_size or plan.batch_size,
+        "microbatch_sequences": args.microbatch_sequences,
+        "rollout_steps_per_environment": args.rollout_steps,
     }, indent=2) + "\n", encoding="utf-8")
     curriculum_path = root / "curriculum.json"
     curriculum = Curriculum(seed=args.seed)
     if args.resume and (args.resume / "curriculum.json").is_file():
         curriculum = Curriculum.load(args.resume / "curriculum.json")
-    environments = SubprocVecEnv(
-        [partial(_make_env, level=0, seed=args.seed + index) for index in range(env_count)],
+    environments = PlatformSubprocVecEnv(
+        [partial(make_platform_env, level=0, seed=args.seed + index, worker_index=index,
+                 diagnostics_dir=root) for index in range(env_count)],
         start_method="spawn",
     )
     _register_cleanup(environments.close)
     environments.seed(args.seed)
-    observations = cast(dict[str, np.ndarray], environments.reset())
+    observations = environments.reset()
     infos = list(environments.reset_infos)
     action_table = environments.get_attr("actions")[0]
     current_levels = [0] * env_count
@@ -281,8 +427,16 @@ def _run_impl(args: argparse.Namespace) -> Path:
     profile_path = root / "phase_profile.csv"
     profile_fields = ["steps", "round_seconds", "collection_seconds", "inference_seconds",
                       "gae_seconds", "update_seconds", "quick_eval_seconds",
+                      "effective_batch_size", "microbatch_sequences",
+                      "gradient_accumulation_steps", "ram_available_gb",
+                      "commit_used_gb", "commit_limit_gb", "commit_available_gb",
+                      "process_rss_total_gb", "process_private_total_gb",
+                      "worker_private_total_gb", "workers_torch_imported",
+                      "cuda_allocated_mb", "cuda_reserved_mb",
                       "cuda_peak_allocated_mb", "cuda_peak_reserved_mb"]
     profile_mode = "a" if profile_path.exists() and global_step else "w"
+    if profile_mode == "a":
+        _ensure_csv_header(profile_path, profile_fields)
     profile_stream = profile_path.open(profile_mode, newline="", encoding="utf-8")
     _register_cleanup(profile_stream.close)
     profile_writer = csv.DictWriter(profile_stream, fieldnames=profile_fields)
@@ -343,14 +497,12 @@ def _run_impl(args: argparse.Namespace) -> Path:
                 phase_round["inference_seconds"] += inference_seconds
                 sampled_frames = (observations["pixels"][:, -3:, :, :].transpose(0, 2, 3, 1)
                                   if random.random() < .01 else None)
-                next_observations_raw, rewards, dones, next_infos = environments.step(
+                next_observations_raw, rewards, dones, next_infos_raw = environments.step(
                     actions.detach().cpu().numpy().astype(np.int64)
                 )
-                next_observations = {
-                    key: np.array(value, copy=True)
-                    for key, value in cast(dict[str, np.ndarray], next_observations_raw).items()
-                }
-                next_infos = list(next_infos)
+                next_observations = {key: np.array(value, copy=True)
+                                     for key, value in next_observations_raw.items()}
+                next_infos = list(next_infos_raw)
                 dones = np.asarray(dones, dtype=np.bool_)
                 truncations = np.asarray([bool(item.get("TimeLimit.truncated", False))
                                           for item in next_infos], dtype=np.bool_)
@@ -406,12 +558,13 @@ def _run_impl(args: argparse.Namespace) -> Path:
             phase_round["gae_seconds"] += time.perf_counter() - gae_started
             requested_sequences = (args.batch_size or plan.batch_size) // args.seq_len
             available_sequences = env_count * ((args.rollout_steps + args.seq_len - 1) // args.seq_len)
-            # Keep RTX 3060 activation memory bounded while avoiding the former
-            # four-sequence microbatches, which multiplied optimizer calls.
-            sequence_batch_size = max(1, min(16, requested_sequences, available_sequences))
+            sequence_batch_size = max(1, min(requested_sequences, available_sequences))
             update_started = time.perf_counter()
-            metrics = trainer.update(buffer.sequences(device), epochs=args.n_epochs,
-                                     sequence_batch_size=sequence_batch_size)
+            metrics = trainer.update(
+                buffer.sequences(torch.device("cpu")), epochs=args.n_epochs,
+                sequence_batch_size=sequence_batch_size,
+                microbatch_size=min(args.microbatch_sequences, sequence_batch_size),
+            )
             phase_round["update_seconds"] += time.perf_counter() - update_started
             quick_eval: float | str = ""
             quick_eval_seconds = 0.0
@@ -419,13 +572,37 @@ def _run_impl(args: argparse.Namespace) -> Path:
                 actor_policy.load_state_dict({key: value.detach().cpu()
                                               for key, value in policy.state_dict().items()})
                 eval_started = time.perf_counter()
-                quick_eval = _quick_eval(actor_policy, args.seed + global_step)
+                quick_eval = _quick_eval(
+                    actor_policy, args.seed + global_step,
+                    episodes_per_level=args.quick_eval_episodes_per_level,
+                    max_level=curriculum.level,
+                )
                 quick_eval_seconds = time.perf_counter() - eval_started
                 last_eval_interval = global_step // args.quick_eval_interval_steps
             round_seconds = time.perf_counter() - round_started
             phase_round["quick_eval_seconds"] += quick_eval_seconds
             for phase_name, phase_value in phase_round.items():
                 phase_totals[phase_name] += phase_value
+            memory_sample = _memory_telemetry(device, environments.worker_startup)
+            commit_available = memory_sample.get("commit_available_bytes")
+            if commit_available is not None and commit_available < 3 * 2**30:
+                _atomic_json(root / "memory_guard_failure.json", {
+                    "steps": global_step,
+                    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "commit_available_gb": _bytes_to_gib(commit_available),
+                    "memory_sample": memory_sample,
+                })
+                raise RuntimeError(
+                    "commit disponível caiu para "
+                    f"{_bytes_to_gib(commit_available):.2f} GiB; mínimo: 3 GiB"
+                )
+            private_worker_bytes = [
+                row.get("private_bytes") for row in memory_sample["processes"]
+                if row.get("role") == "environment_worker" and row.get("private_bytes") is not None
+            ]
+            effective_batch_size = sequence_batch_size * args.seq_len
+            microbatch_sequences = min(args.microbatch_sequences, sequence_batch_size)
+            accumulation_steps = (sequence_batch_size + microbatch_sequences - 1) // microbatch_sequences
             profile_writer.writerow({
                 "steps": global_step, "round_seconds": round_seconds,
                 "collection_seconds": phase_round["collection_seconds"],
@@ -433,6 +610,22 @@ def _run_impl(args: argparse.Namespace) -> Path:
                 "gae_seconds": phase_round["gae_seconds"],
                 "update_seconds": phase_round["update_seconds"],
                 "quick_eval_seconds": quick_eval_seconds,
+                "effective_batch_size": effective_batch_size,
+                "microbatch_sequences": microbatch_sequences,
+                "gradient_accumulation_steps": accumulation_steps,
+                "ram_available_gb": _bytes_to_gib(memory_sample.get("ram_available_bytes")),
+                "commit_used_gb": _bytes_to_gib(memory_sample.get("commit_used_bytes")),
+                "commit_limit_gb": _bytes_to_gib(memory_sample.get("commit_limit_bytes")),
+                "commit_available_gb": _bytes_to_gib(memory_sample.get("commit_available_bytes")),
+                "process_rss_total_gb": _bytes_to_gib(memory_sample.get("process_rss_total_bytes")),
+                "process_private_total_gb": _bytes_to_gib(
+                    memory_sample.get("process_private_total_bytes")),
+                "worker_private_total_gb": _bytes_to_gib(sum(int(value or 0)
+                                                               for value in private_worker_bytes)),
+                "workers_torch_imported": sum(1 for row in environments.worker_startup
+                                               if row.get("torch_imported") is True),
+                "cuda_allocated_mb": memory_sample["cuda_allocated_bytes"] / 2**20,
+                "cuda_reserved_mb": memory_sample["cuda_reserved_bytes"] / 2**20,
                 "cuda_peak_allocated_mb": (torch.cuda.max_memory_allocated(device) / 2**20
                                              if device.type == "cuda" else 0.0),
                 "cuda_peak_reserved_mb": (torch.cuda.max_memory_reserved(device) / 2**20
@@ -456,8 +649,9 @@ def _run_impl(args: argparse.Namespace) -> Path:
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "success_by_level": {str(level): curriculum.success_rate(level)
                                      for level in range(8)},
+                "system_memory": memory_sample,
             })
-            if global_step - last_checkpoint >= 250_000:
+            if global_step - last_checkpoint >= 100_000:
                 _save_checkpoint(root, policy, trainer, curriculum, global_step, metrics, action_table)
                 prune_checkpoints(root)
                 last_checkpoint = global_step
@@ -549,8 +743,8 @@ def _cpu_fallback_warning(reason: str) -> None:
           file=sys.stderr)
 
 
-def _make_env(level: int, seed: int) -> AdapterEnv:
-    return AdapterEnv(PlatformGymAdapter(level=level, seed=seed), CombinedPlatformReward())
+def _bytes_to_gib(value: Any) -> float | None:
+    return float(value) / 2**30 if isinstance(value, (int, float)) else None
 
 
 def _privileged_tensor(infos: list[dict[str, Any]], device: torch.device) -> torch.Tensor:
@@ -563,14 +757,14 @@ def _privileged_tensor(infos: list[dict[str, Any]], device: torch.device) -> tor
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
-def _quick_eval(policy: UniversalPolicy, seed: int, *, episodes_per_level: int = 2,
-                max_steps: int = 300) -> float:
+def _quick_eval(policy: UniversalPolicy, seed: int, *, episodes_per_level: int = 50,
+                max_level: int = 6, max_steps: int = 300) -> float:
     """Run a brief deterministic held-out evaluation once each million steps."""
     device = next(policy.parameters()).device
     successes = 0
     episodes = 0
     policy.eval()
-    for level in range(7):
+    for level in range(min(7, max_level + 1)):
         for episode in range(episodes_per_level):
             adapter = PlatformGymAdapter(level=level, seed=seed + level * 100 + episode * 10,
                                          split="test")

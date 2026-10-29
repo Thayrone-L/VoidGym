@@ -55,3 +55,39 @@ def test_overrides_warn_when_overcommitted() -> None:
     profile = HardwareProfile(4, 8, 8, 7, None, None, None, None, 40, "Windows")
     plan = plan_resources(profile, overrides={"game_instances": 2})
     assert any("excede" in warning for warning in plan.warnings)
+
+
+def test_platform_env_count_respects_commit_headroom_and_worker_measurement() -> None:
+    profile = HardwareProfile(
+        8, 16, 32, 20, "RTX", 12, 10, "8.6", 100, "Windows",
+        commit_used_gb=20, commit_limit_gb=30, commit_available_gb=10,
+        paging_file_total_gb=16, worker_private_gb=.5,
+    )
+    plan = plan_resources(profile, overrides={"gym_envs": 20})
+    assert plan.gym_envs == 9
+    assert plan.commit_headroom_gb >= 4
+    assert any("reduzidos" in warning for warning in plan.warnings)
+
+
+def test_platform_plan_refuses_to_consume_three_gib_commit_reserve() -> None:
+    profile = HardwareProfile(
+        8, 16, 32, 20, "RTX", 12, 10, "8.6", 100, "Windows",
+        commit_available_gb=4.2, worker_private_gb=.5,
+    )
+    with pytest.raises(ValueError, match="3 GiB"):
+        plan_resources(profile)
+
+
+def test_pretrain_plan_reserves_learner_and_worker_growth() -> None:
+    profile = HardwareProfile(
+        8, 16, 16, 8, "RTX", 12, 10, "8.6", 100, "Windows",
+        commit_available_gb=12.8, worker_private_gb=.1,
+    )
+    plan = plan_resources(profile, "pretrain_platform", {"gym_envs": 20})
+    assert plan.gym_envs == 11
+    assert plan.commit_headroom_gb is not None and plan.commit_headroom_gb >= 3
+    with pytest.raises(ValueError, match="3 GiB"):
+        plan_resources(profile.__class__(
+            8, 16, 16, 8, "RTX", 12, 10, "8.6", 100, "Windows",
+            commit_available_gb=8.39, worker_private_gb=.1,
+        ), "pretrain_platform")

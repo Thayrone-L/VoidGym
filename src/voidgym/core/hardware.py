@@ -1,5 +1,6 @@
 """Detecção tolerante do hardware e planejamento inicial de recursos."""
 
+import ctypes
 import json
 import os
 import platform
@@ -24,6 +25,11 @@ class HardwareProfile:
     disk_free_gb: float | None
     operating_system: str
     detection_warnings: tuple[str, ...] = ()
+    commit_used_gb: float | None = None
+    commit_limit_gb: float | None = None
+    commit_available_gb: float | None = None
+    paging_file_total_gb: float | None = None
+    worker_private_gb: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +44,7 @@ class ResourcePlan:
     amp: bool
     storage_budget_gb: float
     warnings: tuple[str, ...]
+    commit_headroom_gb: float | None = None
 
 
 def _optional_hardware() -> tuple[int | None, float | None, float | None]:
@@ -48,8 +55,77 @@ def _optional_hardware() -> tuple[int | None, float | None, float | None]:
         return None, None, None
 
 
+def _memory_commit() -> tuple[float | None, float | None, float | None, float | None]:
+    """Return committed, commit limit, available commit, and pagefile GiB."""
+    try:
+        import psutil
+        pagefile_total = psutil.swap_memory().total / 2**30
+        if os.name == "nt":
+            class PerformanceInformation(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("CommitTotal", ctypes.c_size_t),
+                    ("CommitLimit", ctypes.c_size_t),
+                    ("CommitPeak", ctypes.c_size_t),
+                    ("PhysicalTotal", ctypes.c_size_t),
+                    ("PhysicalAvailable", ctypes.c_size_t),
+                    ("SystemCache", ctypes.c_size_t),
+                    ("KernelTotal", ctypes.c_size_t),
+                    ("KernelPaged", ctypes.c_size_t),
+                    ("KernelNonpaged", ctypes.c_size_t),
+                    ("PageSize", ctypes.c_ulong),
+                    ("HandleCount", ctypes.c_ulong),
+                    ("ProcessCount", ctypes.c_ulong),
+                    ("ThreadCount", ctypes.c_ulong),
+                ]
+
+            info = PerformanceInformation()
+            info.cb = ctypes.sizeof(info)
+            if ctypes.windll.psapi.GetPerformanceInfo(ctypes.byref(info), info.cb):
+                used = info.CommitTotal * info.PageSize / 2**30
+                limit = info.CommitLimit * info.PageSize / 2**30
+                return used, limit, max(0.0, limit - used), pagefile_total
+
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                raise OSError("GetPerformanceInfo and GlobalMemoryStatusEx failed")
+            used = (status.ullTotalPageFile - status.ullAvailPageFile) / 2**30
+            limit = status.ullTotalPageFile / 2**30
+            return used, limit, status.ullAvailPageFile / 2**30, pagefile_total
+
+        memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        limit = (memory.total + swap.total) / 2**30
+        used = (memory.total - memory.available + swap.used) / 2**30
+        return used, limit, max(0.0, limit - used), pagefile_total
+    except Exception:  # noqa: BLE001 - diagnostics must degrade gracefully
+        return None, None, None, None
+
+
+def memory_commit_stats() -> dict[str, int | None]:
+    """Return Windows commit and pagefile counters as bytes for live telemetry."""
+    used, limit, available, pagefile = _memory_commit()
+    return {
+        "commit_used_bytes": int(used * 2**30) if used is not None else None,
+        "commit_limit_bytes": int(limit * 2**30) if limit is not None else None,
+        "commit_available_bytes": int(available * 2**30) if available is not None else None,
+        "paging_file_total_bytes": int(pagefile * 2**30) if pagefile is not None else None,
+    }
+
+
 def detect_hardware(runtime_root: Path = Path("runtime")) -> HardwareProfile:
     physical, total_ram, free_ram = _optional_hardware()
+    commit_used, commit_limit, commit_available, pagefile_total = _memory_commit()
     detection_warnings: list[str] = []
     gpu_name = None
     gpu_total = gpu_free = None
@@ -69,9 +145,33 @@ def detect_hardware(runtime_root: Path = Path("runtime")) -> HardwareProfile:
         disk = shutil.disk_usage(runtime_root.resolve()).free / 2**30
     except OSError:
         disk = None
-    return HardwareProfile(physical, os.cpu_count(), total_ram, free_ram, gpu_name,
-                           gpu_total, gpu_free, capability, disk, platform.platform(),
-                           tuple(detection_warnings))
+    return HardwareProfile(
+        physical, os.cpu_count(), total_ram, free_ram, gpu_name, gpu_total, gpu_free,
+        capability, disk, platform.platform(), tuple(detection_warnings),
+        commit_used, commit_limit, commit_available, pagefile_total,
+    )
+
+
+def _plan_environment_count(profile: HardwareProfile, requested: int, *,
+                            extra_learner_reserve_gb: float = 0.0,
+                            worker_safety_factor: float = 1.25
+                            ) -> tuple[int, float | None, tuple[str, ...]]:
+    available = profile.commit_available_gb
+    worker_memory = profile.worker_private_gb
+    if available is None or worker_memory is None or worker_memory <= 0:
+        return requested, available, ()
+    # Keep 3 GiB available, reserve 1 GiB for learner growth, and account for
+    # the pretrainer's measured learner footprint separately when requested.
+    worker_budget = max(0.0, available - 4.0 - extra_learner_reserve_gb)
+    worker_cost = worker_memory * worker_safety_factor
+    safe_count = int(worker_budget // worker_cost)
+    if safe_count < 1:
+        raise ValueError("commit disponível insuficiente para manter 3 GiB de folga")
+    chosen = min(requested, safe_count)
+    warnings = ((f"Ambientes reduzidos de {requested} para {chosen} para manter folga de commit.",)
+                if requested > safe_count else ())
+    headroom = (available - chosen * worker_cost - extra_learner_reserve_gb)
+    return chosen, headroom, warnings
 
 
 def plan_resources(profile: HardwareProfile, kind: str = "game_training",
@@ -86,9 +186,16 @@ def plan_resources(profile: HardwareProfile, kind: str = "game_training",
     v1_recommendation = max(1, cores // 4)
     instances = min(v2_capacity, v1_recommendation)
     gym_envs = max(2, logical - 2 - 2 * instances)
+    requested_envs = int(overrides.get("gym_envs", gym_envs))
+    learner_reserve = 5.5 if kind == "pretrain_platform" else 0.0
+    worker_factor = 3.0 if kind == "pretrain_platform" else 1.25
+    gym_envs, commit_headroom, commit_warnings = _plan_environment_count(
+        profile, requested_envs, extra_learner_reserve_gb=learner_reserve,
+        worker_safety_factor=worker_factor,
+    )
     threads = 2 if device == "cuda" else max(1, cores - 2 * instances - 1)
     batch = 2048 if profile.gpu_memory_total_gb and profile.gpu_memory_total_gb >= 8 else 1024 if gpu else 512
-    warnings: list[str] = list(profile.detection_warnings)
+    warnings = list(profile.detection_warnings) + list(commit_warnings)
     if profile.memory_total_gb and profile.memory_free_gb and profile.memory_free_gb < profile.memory_total_gb * 0.15:
         warnings.append("Mais de 85% da RAM está em uso.")
     if profile.disk_free_gb is not None and profile.disk_free_gb < 20:
@@ -103,7 +210,6 @@ def plan_resources(profile: HardwareProfile, kind: str = "game_training",
         if requested > max_instances:
             warnings.append(f"Pedido de {requested} instâncias excede o plano recomendado ({max_instances}).")
         instances = requested
-    gym_envs = int(overrides.get("gym_envs", gym_envs))
     if gym_envs < 1:
         raise ValueError("gym_envs deve ser positivo")
     device = str(overrides.get("train_device", device))
@@ -115,7 +221,7 @@ def plan_resources(profile: HardwareProfile, kind: str = "game_training",
     if profile.disk_free_gb is not None:
         budget = min(budget, 0.8 * profile.disk_free_gb)
     return ResourcePlan(device, "cpu", instances, gym_envs, threads, 1, batch, False,
-                        max(0.1, budget), tuple(warnings))
+                        max(0.1, budget), tuple(warnings), commit_headroom)
 
 
 def save_resource_profile(profile: HardwareProfile, plan: ResourcePlan, campaign_root: Path) -> None:

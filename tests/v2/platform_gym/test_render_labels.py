@@ -3,7 +3,9 @@ import numpy as np
 from voidgym.core.semantics import SEM_GRID, Sem
 from voidgym.gyms.platform_gym.generator import generate_room
 from voidgym.gyms.platform_gym.labels import labels
-from voidgym.gyms.platform_gym.render import player_pixel_mask, render_room
+from voidgym.gyms.platform_gym.render import (
+    _background_frame, _static_effects, player_pixel_mask, render_room,
+)
 from voidgym.gyms.platform_gym.styles import sample_style
 from voidgym.gyms.platform_gym.world import Player
 
@@ -16,6 +18,14 @@ def test_render_shape_dtype_and_seed_reproducibility() -> None:
     assert a.shape == (108, 192, 3) and a.dtype == np.uint8
     assert np.array_equal(a, b)
     assert np.mean(np.abs(a.astype(np.int16) - render_room(room, player, style_seed=43).astype(np.int16))) > 20
+
+
+def test_seeded_render_caches_remain_bounded() -> None:
+    for seed in range(10_000, 10_100):
+        _static_effects(seed, "train")
+        _background_frame(seed, "train", (20, 30, 40), (1, 2, 3))
+    assert _static_effects.cache_info().currsize <= 64
+    assert _background_frame.cache_info().currsize <= 128
 
 
 def test_train_split_never_uses_held_out_families() -> None:

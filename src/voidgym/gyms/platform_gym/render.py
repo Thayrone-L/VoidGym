@@ -17,7 +17,9 @@ _YGRID, _XGRID = np.mgrid[0:HEIGHT, 0:WIDTH]
 _Y_ROWS = np.arange(HEIGHT)[:, None]
 
 
-@lru_cache(maxsize=4096)
+# Episode seeds are intentionally unique. Keep only a small recent window so
+# persistent spawned workers do not retain every episode's image arrays.
+@lru_cache(maxsize=64)
 def _static_effects(seed: int, split: Split) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, bool]:
     """Precompute seeded particles, lighting, fog, noise and scanline for each room."""
     style, _ = sample_style(seed, split=split)
@@ -46,7 +48,7 @@ def _background_ridge(layer: int, offset: int) -> np.ndarray:
     return cast(np.ndarray, ridge)
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=128)
 def _background_frame(seed: int, split: Split, background: tuple[int, int, int],
                       offsets: tuple[int, ...]) -> np.ndarray:
     image = np.empty((HEIGHT, WIDTH, 3), dtype=np.uint8)
