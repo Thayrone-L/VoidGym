@@ -116,6 +116,27 @@ def test_round_trip_strictly_restores_policy_outputs(tmp_path: Path) -> None:
     assert imported["artifact"]["sha256"]
 
 
+def test_export_retries_windows_sharing_lock_on_artifact_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "policy.safetensors"
+    original = policy_artifact.os.replace
+    attempts = 0
+
+    def flaky_replace(source: Path, target: Path) -> None:
+        nonlocal attempts
+        if attempts == 0:
+            attempts += 1
+            raise PermissionError("simulated Windows reader lock")
+        original(source, target)
+
+    monkeypatch.setattr(policy_artifact.os, "replace", flaky_replace)
+    export_policy_artifact(TinyPolicy(), artifact, compatibility_fingerprint="a" * 64)
+    assert artifact.is_file()
+    assert artifact.with_suffix(".manifest.json").is_file()
+    assert attempts == 1
+
+
 @pytest.mark.parametrize(
     ("fingerprint", "match"),
     [("b" * 64, "compatibility"), ("invalid", "lowercase SHA-256")],
@@ -205,6 +226,38 @@ def test_import_rejects_identity_other_than_the_frozen_preflight(
             expected_compatibility_fingerprint="a" * 64,
             **{keyword: "f" * 64},
         )
+
+
+def test_import_retries_transient_stale_manifest_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "policy.safetensors"
+    exported = export_policy_artifact(
+        TinyPolicy(), artifact, compatibility_fingerprint="a" * 64
+    )
+    sidecar = artifact.with_suffix(".manifest.json")
+    expected_manifest_sha256 = policy_artifact.hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    original = Path.read_bytes
+    stale_reads = 0
+
+    def stale_once(path: Path) -> bytes:
+        nonlocal stale_reads
+        if path == sidecar and stale_reads == 0:
+            stale_reads += 1
+            return b"previous directory entry"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", stale_once)
+    imported = import_policy_artifact(
+        TinyPolicy(),
+        artifact,
+        expected_compatibility_fingerprint="a" * 64,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_manifest_id=exported["manifest_id"],
+    )
+
+    assert stale_reads == 1
+    assert imported == exported
 
 
 def test_export_rejects_unsupported_dtype_and_tensor_limit(

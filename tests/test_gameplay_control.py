@@ -6,7 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from hk_agent.gameplay_control import GameplayControlServer
+import pytest
+
+from hk_agent.gameplay_control import GameplayControlServer, _write_frame_atomic
+from hk_agent.protocol import ProtocolError
+from tools.smoke_game_bridge import _write_png_capture
 
 
 class FakeSupervisor:
@@ -17,6 +21,7 @@ class FakeSupervisor:
         self, message_type: str, payload: dict[str, object], **_: Any
     ) -> Any:
         if message_type == "APPLY_ACTION":
+            self.last_action_payload = dict(payload)
             self.events.append(f"action:{','.join(payload['buttons'])}")  # type: ignore[arg-type]
         elif message_type == "RELEASE_ALL":
             self.events.append("release")
@@ -27,6 +32,7 @@ class FakeSupervisor:
     async def capture_once(self, **_: Any) -> Any:
         self.events.append("capture")
         return SimpleNamespace(
+            encoding="png",
             data=b"\x89PNG\r\n\x1a\nframe",
             frame_id=7,
             capture_monotonic_ns=11,
@@ -61,6 +67,7 @@ def test_action_is_bounded_released_and_captured(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         try:
@@ -75,12 +82,25 @@ def test_action_is_bounded_released_and_captured(tmp_path: Path) -> None:
             )
             assert response["ok"] is True
             assert response["released"] is True
+            assert supervisor.last_action_payload["episode_id"] == "test-episode"
             assert supervisor.events == ["action:RIGHT,JUMP", "release", "capture"]
             assert Path(response["capture"]["path"]).is_file()
         finally:
             await server.close()
 
     asyncio.run(scenario())
+
+
+def test_gameplay_control_png_writer_refuses_raw_frame(tmp_path: Path) -> None:
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        _write_frame_atomic(tmp_path / "raw.png", SimpleNamespace(encoding="raw_rgb8"))  # type: ignore[arg-type]
+    assert not (tmp_path / "raw.png").exists()
+
+
+def test_smoke_capture_writer_refuses_raw_frame(tmp_path: Path) -> None:
+    with pytest.raises(ProtocolError, match="requires FRAME encoding=png"):
+        _write_png_capture(tmp_path / "raw.png", SimpleNamespace(encoding="raw_rgb8"))  # type: ignore[arg-type]
+    assert not (tmp_path / "raw.png").exists()
 
 
 def test_rejects_wrong_token_and_unsafe_action(tmp_path: Path) -> None:
@@ -93,6 +113,7 @@ def test_rejects_wrong_token_and_unsafe_action(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         try:
@@ -137,6 +158,7 @@ def test_close_releases_and_finishes_waiter(tmp_path: Path) -> None:
             idle_timeout_seconds=10,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         waiter = asyncio.create_task(server.wait_until_closed())
@@ -169,6 +191,7 @@ def test_close_wakes_waiter_after_delayed_release(tmp_path: Path) -> None:
             idle_timeout_seconds=2,
             settle_seconds=0,
             command_timeout_seconds=1,
+            episode_id="test-episode",
         )
         await server.start()
         waiter = asyncio.create_task(server.wait_until_closed())

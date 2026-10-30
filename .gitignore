@@ -1,11 +1,14 @@
 # Python
 .venv/
+.venv-cuda/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .pytest-*/
 .test-tmp/
+.test-tmp-*/
+.tmp/
 .mypy_cache/
 .ruff_cache/
 
@@ -17,12 +20,15 @@ obj/
 # Runtime data and local configuration
 artifacts/
 runs/
+runtime/
 artifacts/diagnostics/*.json
 artifacts/diagnostics/*.txt
 artifacts/diagnostics/*.png
 config.local.toml
 config.*.local.toml
 config.*.local.json
+*.local.toml
+*.local.json
 .env
 checkpoints/
 *.ckpt

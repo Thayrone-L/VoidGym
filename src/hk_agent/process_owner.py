@@ -8,16 +8,19 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
+from hk_agent.bridge_environment import clean_bridge_environment
 from hk_agent.supervisor_backend import (
     ProcessLaunchCancellation,
     ProcessLaunchCancelled,
     SupervisorEndpoint,
 )
+from hk_agent.win_job import WindowsJob
 
 EPISODE_REQUEST_ENV = "HK_AGENT_EPISODE_REQUEST"
 _EPISODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -52,6 +55,10 @@ class ProcessOwnerConfig:
     worker_close_timeout_seconds: float = 10.0
     maximum_episode_seconds: float | None = 3600.0
     state_root: Path = Path("artifacts/episodes")
+    instance_data_root: Path | None = None
+    expected_product_name: str | None = None
+    other_instance_data_roots: tuple[Path, ...] = ()
+    enable_breakable_labels: bool = False
 
     def validate(self, *, require_files: bool = True) -> None:
         if self.personal_root.resolve(strict=False) == self.experimental_root.resolve(
@@ -77,6 +84,16 @@ class ProcessOwnerConfig:
             raise ValueError(
                 "experimental save root must exist in redirected save mode"
             )
+        if self.instance_data_root is not None:
+            if self.instance_data_root.resolve(strict=False) == self.personal_root.resolve(strict=False):
+                raise ValueError("instance data root cannot be the personal save root")
+            if not self.expected_product_name:
+                raise ValueError("instance mode requires the marker product name")
+            if not self.redirected_save_mode:
+                raise ValueError("instance mode requires redirected save mode")
+        if type(self.enable_breakable_labels) is not bool:
+            raise TypeError("enable_breakable_labels must be bool")
+
         for value, label in (
             (self.shutdown_timeout_seconds, "shutdown timeout"),
             (self.worker_close_timeout_seconds, "worker close timeout"),
@@ -163,6 +180,9 @@ class IsolatedEpisodeProcessOwner:
         self._process: OwnedProcess | None = None
         self._launch: EpisodeLaunch | None = None
         self._closed = False
+        self._job = WindowsJob.create()
+        if os.name == "nt":
+            self._job.assign_pid(os.getpid())
 
     @property
     def active_episode_id(self) -> str | None:
@@ -171,9 +191,26 @@ class IsolatedEpisodeProcessOwner:
 
     @property
     def expected_save_root(self) -> Path | None:
-        if not self._config.redirected_save_mode:
+        if not self._config.redirected_save_mode or self._config.instance_data_root is not None:
             return None
         return self._config.experimental_root.resolve(strict=False)
+
+    @property
+    def expected_persistent_data_path(self) -> Path | None:
+        root = self._config.instance_data_root
+        return root.resolve(strict=False) if root is not None else None
+
+    @property
+    def forbidden_personal_root(self) -> Path | None:
+        return self._config.personal_root.resolve(strict=False) if self._config.instance_data_root else None
+
+    @property
+    def expected_product_name(self) -> str | None:
+        return self._config.expected_product_name
+
+    @property
+    def other_instance_data_roots(self) -> tuple[Path, ...]:
+        return self._config.other_instance_data_roots
 
     def start_episode(
         self,
@@ -214,8 +251,24 @@ class IsolatedEpisodeProcessOwner:
                 "close_timeout_seconds": self._config.worker_close_timeout_seconds,
                 "maximum_episode_seconds": self._config.maximum_episode_seconds,
                 "endpoint": asdict(endpoint),
+                # The worker selects the bridge mode only from this explicit
+                # contract, never from variables inherited by this process.
+                "bridge_mode": "instance" if self._config.instance_data_root else "legacy",
+                "instance_product_name": (
+                    self._config.expected_product_name
+                    if self._config.instance_data_root is not None
+                    else None
+                ),
+                "instance_data_root": (
+                    str(self._config.instance_data_root.resolve(strict=False))
+                    if self._config.instance_data_root is not None
+                    else None
+                ),
+                "enable_breakable_labels": self._config.enable_breakable_labels,
             }
-            environment = os.environ.copy()
+            environment = clean_bridge_environment(os.environ)
+            launch_nonce = os.environ.get("HK_AGENT_LAUNCH_ID") or uuid.uuid4().hex
+            environment["HK_AGENT_LAUNCH_ID"] = launch_nonce
             environment[EPISODE_REQUEST_ENV] = _encode_request(request)
             if not self._config.redirected_save_mode:
                 environment.update(
@@ -232,6 +285,8 @@ class IsolatedEpisodeProcessOwner:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
             process = self._factory(command, environment)
+            if os.name == "nt" and self._factory is _default_process_factory:
+                self._job.assign_pid(process.pid)
             launch = EpisodeLaunch(
                 episode_id=episode_id,
                 owner_pid=process.pid,

@@ -66,3 +66,10 @@ privileged_diagnostics_allowed = false
 [instances]
 count = 1
 parallel_enabled = false
+# Each configured copy must contain .hk-agent-instance.json from provisioning.
+install_roots = []
+# Keep runtime data outside OneDrive, for example:
+runtime_root = "C:/Users/<voce>/Games/HollowKnight-AI/runtime"
+training_device = "cpu"
+torch_threads = 3
+torch_interop_threads = 1

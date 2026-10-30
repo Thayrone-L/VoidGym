@@ -1,0 +1,38 @@
+PROMPT 73 — RELATÓRIO DE IMPLEMENTAÇÃO
+======================================
+
+Resumo
+------
+Separado o servidor do painel do processo supervisor que mantém o ControlPlane e os Job Objects. O painel ativo agora atua como proxy HTTP local para o supervisor destacado; a campanha continuou depois de fechar/reabrir o painel. Incluído modo claro/escuro/automático e pedidos de ajuda persistentes, sem dispensar ao adiar.
+
+Arquivos alterados
+------------------
+- src/hk_agent/control_plane_server.py: adiciona supervisor destacado, reconexão pelo endpoint local 127.0.0.1, proxy das rotas /api e preflight de configuração em modo observador.
+- src/hk_agent/control_plane.py: padrão de ajuda em 60 minutos, faixa 5–10080, retomada preserva pedidos em demonstração.
+- src/hk_agent/demonstrations.py: lock compartilhado, deduplicação por lugar entre atores, contador consolidado, adiamento por 30 minutos e resolução automática após progresso >=5 unidades ou mudança de cena.
+- src/hk_agent/control_plane_web/{index.html,app.css,app.js}: botão Auto/Claro/Escuro, preferência persistida com try/catch, Auto acompanha prefers-color-scheme; estilos de cartões, estados, gráficos, selects, calibração e pedidos de ajuda. A arte do mapa não foi alterada.
+- tests/test_challenge_practice.py: deduplicação, adiamento persistente e resolução por progresso/cena.
+- tests/test_control_plane_server.py: validação de configuração antes do supervisor e proxy autenticado.
+- tests/test_operator_dashboard.py: interface com padrão 60 e tema automático.
+
+Validação
+---------
+- pytest focado inicial: 115 passed (25.71s).
+- pytest final dos testes de interface, ajuda e servidor: 31 passed (8.91s).
+- ruff check src tools tests: passou.
+- mypy src: Success, sem erros em 54 arquivos.
+- node --check src/hk_agent/control_plane_web/app.js: passou.
+- git diff --check: passou; apenas avisos normais de conversão CRLF/LF do Git.
+- Capturas visuais clara e escura feitas e inspecionadas no painel local; preferência restaurada para Automático. Contraste WCAG calculado para banner idle/running, aviso e erro: claro 7.25:1, 6.49:1, 7.21:1; escuro 9.46:1, 9.30:1, 8.54:1.
+- Teste real de implantação: a campanha antiga parou cooperativamente (active_count 0; UI confirmou saves isolados restaurados); painel reiniciado pelo Iniciar-Painel.bat; supervisor iniciou em 127.0.0.1:8766; jogada-1-repeat-1c3b retomada do checkpoint round-00000096.zip, versão 2, 60 min.
+- Com a campanha ativa, o processo do painel foi encerrado: 8765 ficou offline, supervisor manteve os 2 atores e o learner RUNNING. Painel reaberto e reconectado à mesma campanha sem criar outro supervisor.
+- Job Object testado isoladamente com um processo Python de demonstração: ao fechar o handle, o filho terminou imediatamente (0.0 s). Não matei o supervisor real com jogos ativos; isso interromperia a campanha e não era necessário para validar o ciclo de reconexão.
+
+Estado ao terminar
+------------------
+Painel em http://127.0.0.1:8765/; supervisor em 127.0.0.1:8766; jogada-1-repeat-1c3b segue ativa. O painel exibe os dados da campanha reconectada. A campanha foi retomada com 2 atores e 1 learner.
+
+Limitações
+----------
+O teste de encerramento real da árvore por morte do supervisor não foi feito com a campanha ativa. O teste isolado confirmou o comportamento KILL_ON_JOB_CLOSE do Windows Job Object. As capturas foram inspecionadas durante a execução, mas não salvas como arquivos PNG separados.
+\nObservação operacional\n----------------------\nNo painel reaberto, a campanha reconectada seguia na rodada 97; duas instâncias estavam jogando e o learner ativo. A memória reportada pelo painel chegou a 14,7/15,8 GB (93%), com alerta de pressão de memória. Não alterei a quantidade de instâncias nem parei o treino.

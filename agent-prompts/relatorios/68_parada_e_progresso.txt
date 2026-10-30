@@ -1,0 +1,41 @@
+# Relatório 68 — parada segura, supervisão e progresso
+
+Data: 2026-10-20
+Branch: codex/parallel-instances-isolation
+Campanha: jogada-1, versão 19, grupo compartilhado jogada-1-v0019
+
+## Implementação
+
+- Continue agora retoma do checkpoint mais recente, usa `straggler_timeout_seconds=300` e não aplica warm start sobre a raiz de checkpoint compartilhada.
+- O learner tolera o cooldown do supervisor (timeout padrão de rollout 3900 s), continua aguardando quórum em vez de falhar imediatamente quando os slots ficam indisponíveis e detecta heartbeat obsoleto. Falha do learner pede parada cooperativa dos atores; o painel mostra `learner caiu: <erro>`. Ator em `WAITING_POLICY` por mais de 10 minutos gera alerta.
+- Episódio terminado por `stuck` trunca o fragmento PPO sem recarregar o checkpoint, mantendo a posição da sessão viva. O diário recebe IDs que não sobrescrevem episódios existentes após reinício de processo.
+- Novidade contínua só é creditada em células novas da posição real (grade 4×4 unidades de cena); sem x/y válido, não há novidade contínua. Telemetria e painel expõem progresso máximo por cena.
+- Não alterei os pesos do painel/recompensa.
+
+## Análise dos 74 rounds anteriores
+
+A evidência histórica cobre 62.976 ações. Entropia empírica: 2,621 nats (0,711 normalizada). 58,2% das ações incluíam movimento, 14,3% salto e 54,0% ataque. Mais frequentes: RIGHT+JUMP_TAP 14,1%, DOWN+ATTACK 12,6%, RIGHT+ATTACK 12,3%, LEFT+JUMP+ATTACK 9,7%, NOOP 8,9%. Há variedade de ações, sem colapso em uma única ação; a frequência de ataque merece acompanhamento, sem ajuste de pesos nesta etapa.
+
+Os diários antigos mostram episódios que terminavam em `stuck` perto de x≈110 e reiniciavam em x≈35,5, confirmando perda do progresso não salvo pelo comportamento antigo. Logs antigos registraram duas desconexões do Bridge durante `menu_bootstrap.capture_once`, seguidas de falha em RELEASE_ALL. A evidência aponta para desconexão do transporte/jogo, mas não identifica a causa raiz da desconexão. Também havia falha antiga `_commit_continuous_budget` por `UnboundLocalError`, já corrigida anteriormente.
+
+## Soak de 20 minutos
+
+Campanha retomada do checkpoint `round-00000074.zip`, em 2026-10-20 por volta de 11:56 UTC, sem warm start, com learner e duas instâncias isoladas. Janela observada: pelo menos 20 minutos, até depois de 12:16 UTC.
+
+- Evoluiu de round 74 / 62.464 passos para round 82 / 70.656 passos (mais 8 rounds e 8.192 passos). Checkpoints até `round-00000082.zip` foram criados.
+- Learner e ambos os atores permaneceram RUNNING, com heartbeats atuais no fim da observação. Houve uma espera prolongada: round 80 permaneceu visível por alguns minutos, com seis rollouts stale/rejeitados acumulados, antes de avançar para rounds 81 e 82. Portanto, houve avanço, mas a cadência não foi uniforme.
+- Em torno do minuto 10, velocidades medidas eram ~7,0–7,2 passos/s por ator; `env_step` ~132–136 ms e captura Bridge ~47 ms. Pico de progresso registrado: 78,56 unidades na cena Tutorial_01.
+- Ambos os atores encontraram `stuck` e iniciaram episódios seguintes da posição viva: slot 0 terminou perto de x=109,9 e o episódio seguinte começou perto de x=109,5; slot 1 terminou perto de x=111,7 e recomeçou perto de x=112,1. Isso confirma que `stuck` não recarregou a posição salva antiga (~35,5).
+- Ações atuais observadas durante o soak mantiveram variedade, com RIGHT+ATTACK em torno de 30–31%, NOOP ~15,5%, RIGHT+JUMP_TAP ~12–13% e LEFT+JUMP+ATTACK ~9–10%. O perfil continua relativamente orientado a ataque.
+- Houve alertas de farm de `confirmed_enemy_kills`, `hp_restored` e `novelty`, além de alertas históricos/stale de learner de lançamentos anteriores. Nenhum erro novo do learner v19 ou reinício de processo foi observado. O painel mostrou memória do sistema em 94% em uma amostra intermediária; acompanhar esse limite em campanhas longas.
+
+## Validação
+
+- `ruff check src tests tools`: passou.
+- `mypy src`: passou (54 arquivos).
+- `pytest` completo: 644 passed, 2 skipped, 3 warnings em 98,32 s. Os avisos são de construção de tensor do SB3 em três testes recorrentes.
+- `git diff --check`: passou; Git avisou que normalizará CRLF de `app.css` para LF ao tocar no arquivo.
+
+## Limitações e próximos passos
+
+O save da campanha continua limitado ao último banco/bench gravado. Uma falha real do jogo/Bridge que exija relançamento ainda pode retornar àquele save, mesmo com o tratamento de `stuck` preservando a sessão viva. Os dados antigos não permitem concluir por que o Bridge desconectou. A rodada 80 teve uma espera anormalmente longa; observar stale-rollout e pressão de memória nas próximas horas, sem alterar recompensa com base apenas nesses sinais.

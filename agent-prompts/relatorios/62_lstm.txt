@@ -1,0 +1,20 @@
+ETAPA 62 — POLÍTICA RECORRENTE COM MÁSCARA
+Data: 2026-10-19
+Workspace: C:\VoidGym
+Estado: VERDE
+
+Implementação
+- MaskableRecurrentPPO sobre RecurrentPPO: extrator MultiInput atual → LSTM configurável (256×1 padrão) → policy/value; máscara aplicada na coleta e no treino.
+- Estados pi/vf e episode starts preservados em buffers por sequência; BPTT truncado configurável. Estado cruza chunks PPO; reset por descontinuidade real sinalizada pelo ambiente (morte/fim de episódio, reopen/reload/troca de save).
+- Integração treino local + learner compartilhado; rollout distribuído valida estados/máscaras. Checkpoint recorrente retomável.
+- Warm-start valida safetensors/hash/manifest/fingerprint e copia só extrator; LSTM/cabeças reiniciados. SB3 e sb3-contrib fixados em 2.9.0.
+
+Validação
+- Ruff passou; mypy src passou (52 arquivos); diff --check limpo.
+- Pytest completo: 611 passed, 2 skipped, 8 subtests em 74,66s. Avisos só em conversão tensor→tensor do buffer upstream.
+- Sinal atrasado sintético aprendeu ≥95%; máscara, estados/reset, serialização, learner compartilhado e retomada cobertos.
+- CPU, 1 thread, LSTM256, features256, 18 ações, 20 warmups + 200 passos: núcleo recorrente média 0,507ms e p95 0,698ms. CNN/observação completa não incluída.
+- Smoke seguro com executável de hk-ai-2 (não executável base, que não carrega o bridge): handshake, heartbeat, ping, captura PNG 600x338, RELEASE_ALL; fechamento cooperativo, exit 0; sessão isolada usou diretório de save de teste e transação restaurou o save pessoal. Evidência: artifacts\scripted-validation\62\smoke\capture.png.
+- Runner aprimorado para reportar stdout/stderr do worker se faltar resultado, o que tornou a falha inicial diagnosticável.
+
+Arquivos: src/hk_agent/recurrent_sb3.py, src/hk_agent/maskable_recurrent.py, src/hk_agent/shared_learner.py, src/hk_agent/first_training.py, tests/test_maskable_recurrent.py, docs/MEMORIA_RECORRENTE.md.

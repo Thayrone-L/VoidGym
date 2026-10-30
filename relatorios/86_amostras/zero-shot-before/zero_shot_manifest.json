@@ -1,0 +1,26 @@
+{
+  "checkpoint": "C:\\VoidGym\\runtime\\v2\\pretrain\\pretrain-resume-2026-10-23\\universal-000697088",
+  "trained_steps": 697088,
+  "sampled_frames": 512,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "frames_per_scene": {
+    "Tutorial_01": 512
+  },
+  "action_history_available": true,
+  "iou": {
+    "EMPTY": 0.8552422940975257,
+    "SOLID": 0.011126232935333156,
+    "PLATFORM": 0.0,
+    "HAZARD": null,
+    "ENEMY": null,
+    "PLAYER": 0.1481711525189786,
+    "BREAKABLE": null,
+    "PICKUP": null,
+    "INTERACTIVE": 0.0,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}
