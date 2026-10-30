@@ -34,8 +34,8 @@ def test_mask_and_adapter_env_contract() -> None:
             env.reset()
 
 
-def test_level_seven_advances_rooms_and_terminates_after_key_gate() -> None:
-    adapter = PlatformGymAdapter(level=7, seed=45)
+def test_level_eight_advances_rooms_and_terminates_after_key_gate() -> None:
+    adapter = PlatformGymAdapter(level=8, seed=45)
     assert 3 <= len(adapter._rooms) <= 6
     ability = next(p for p in adapter.room.pickups if p.kind == "ability_double_jump")
     adapter.player.x = ability.rect.x + ability.rect.w / 2
@@ -67,11 +67,11 @@ def test_curriculum_progress_and_save_resume(tmp_path) -> None:
     curriculum = Curriculum(seed=11)
     for _ in range(800):
         curriculum.record(True)
-    assert curriculum.level == 7
+    assert curriculum.level == 8
     path = tmp_path / "curriculum.json"
     curriculum.save(path)
     resumed = Curriculum.load(path)
-    assert resumed.level == 7 and resumed.episodes == 800
+    assert resumed.level == 8 and resumed.episodes == 800
     assert resumed.style_split(10) == "test"
 
 
@@ -97,9 +97,9 @@ def test_curriculum_load_migrates_older_current_window_to_level_history(tmp_path
 
 def test_curriculum_target_uses_last_100_episodes_per_level() -> None:
     curriculum = Curriculum(seed=2)
-    for level in range(8):
+    for level in range(9):
         curriculum.history[level].extend(
-            [True] * (70 if level < 7 else 30) + [False] * (30 if level < 7 else 70)
+            [True] * (70 if level < 8 else 30) + [False] * (30 if level < 8 else 70)
         )
     assert curriculum.training_goal_met()
     curriculum.history[3].clear()

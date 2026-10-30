@@ -81,6 +81,8 @@ class Enemy:
     patrol_right: float = 0.0
     speed: float = 1.5
     alive: bool = True
+    blocks_path: bool = False
+    reward_hit_paid: bool = False
 
     def __post_init__(self) -> None:
         if not self.kind or self.hp < 1 or self.speed < 0.0:
@@ -93,6 +95,8 @@ class Enemy:
 class Pickup:
     rect: Rect
     kind: Literal["coin", "ability_double_jump", "ability_dash", "heal"] = "coin"
+    velocity_y: float = 0.0
+    falling: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in {"coin", "ability_double_jump", "ability_dash", "heal"}:
@@ -143,12 +147,27 @@ class Room:
     spawn: tuple[float, float]
     physics: PhysicsParams
     style_seed: int
+    treasure_rocks: list[TreasureRock] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.id < 0 or self.width <= 0.0 or self.height <= 0.0:
             raise ValueError("room id and dimensions are invalid")
         if not 0.0 <= self.spawn[0] <= self.width or not 0.0 <= self.spawn[1] <= self.height:
             raise ValueError("room spawn must be inside the room bounds")
+
+
+@dataclass(slots=True)
+class TreasureRock:
+    rect: Rect
+    hp: int = 3
+    broken: bool = False
+    visual_variant: int = 0
+
+    def __post_init__(self) -> None:
+        if self.hp < 2 or self.hp > 4:
+            raise ValueError("treasure rocks must take two to four hits")
+        if self.visual_variant < 0:
+            raise ValueError("visual variant must be non-negative")
 
 
 @dataclass(slots=True)

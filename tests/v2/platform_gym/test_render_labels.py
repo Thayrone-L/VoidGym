@@ -54,3 +54,14 @@ def test_labels_prioritize_player_and_are_style_independent() -> None:
     labeled_cells = a["sem"] == int(Sem.PLAYER)
     assert labeled_cells.sum() > 0
     assert np.count_nonzero(labeled_cells & sprite_cells) > labeled_cells.sum() / 2
+
+
+def test_combat_level_labels_treasure_rocks_as_breakable_and_renders_them() -> None:
+    room = generate_room(6, 22)
+    player = Player(*room.spawn, on_ground=True)
+    camera = (player.x, player.y + 1, 192 / sample_style(room.style_seed, split="test")[0].camera_width)
+    semantic = labels(room, player, camera, split="test")["sem"]
+    assert room.treasure_rocks
+    assert int(Sem.BREAKABLE) in semantic
+    image = render_room(room, player, camera, split="test")
+    assert image.shape == (108, 192, 3)

@@ -49,6 +49,12 @@ def _is_ahead(rect: Rect, player: Player, direction: int) -> bool:
 
 def _should_jump(room: Room, player: Player) -> bool:
     direction = _direction(room, player)
+    blocking_enemy = next((enemy for enemy in room.enemies
+                           if enemy.alive and enemy.blocks_path
+                           and 0 <= direction * (enemy.rect.x + enemy.rect.w / 2 - player.x) <= 2.0),
+                          None)
+    if blocking_enemy is not None:
+        return False
     reachable_top = player.y + room.physics.jump_max_height + room.physics.player_height
     obstacles = [s.rect for s in room.solids if s.kind == "solid" and s.rect.h > .3
                  and s.rect.y <= reachable_top and _is_ahead(s.rect, player, direction)]
@@ -80,21 +86,30 @@ def _should_jump(room: Room, player: Player) -> bool:
 def _attack_target(room: Room, player: Player) -> bool:
     direction = _direction(room, player)
     targets = [b.rect for b in room.breakables if not b.broken]
+    targets.extend(e.rect for e in room.enemies if e.alive)
+    targets.extend(r.rect for r in room.treasure_rocks if not r.broken)
     return any(-.1 <= direction * (rect.x + rect.w / 2 - player.x) <= 1.25
                and abs(rect.y - player.y) < 1.5 for rect in targets)
 
 
-def _buttons(room: Room, player: Player) -> dict[str, bool]:
+def _buttons(room: Room, player: Player, *, allow_attack: bool = True) -> dict[str, bool]:
     direction = _direction(room, player)
     jump = (player.jumping and player.jump_hold_time < room.physics.jump_hold_max_seconds)
     if _should_jump(room, player):
         jump = True
-    attack = _attack_target(room, player) and player.attack_cooldown <= DT
+    attack = allow_attack and _attack_target(room, player) and player.attack_cooldown <= DT
     block = next((item for item in room.breakables if not item.broken
                   and 0 <= direction * (item.rect.x + item.rect.w / 2 - player.x) <= 2.0), None)
     if block is not None:
         jump = False
         attack = player.attack_cooldown <= DT
+        if not player.on_ground:
+            return {"left": False, "right": False, "jump": False, "attack": attack}
+    enemy = next((item for item in room.enemies if item.alive and item.blocks_path
+                  and 0 <= direction * (item.rect.x + item.rect.w / 2 - player.x) <= 2.0), None)
+    if enemy is not None:
+        jump = False
+        attack = allow_attack and _attack_target(room, player) and player.attack_cooldown <= DT
         if not player.on_ground:
             return {"left": False, "right": False, "jump": False, "attack": attack}
     locked_door = next((door for door in room.doors
@@ -122,7 +137,7 @@ def _buttons(room: Room, player: Player) -> dict[str, bool]:
 
 
 def _run_room(room: Room, *, max_steps: int, abilities: set[str],
-              must_break: bool = False) -> Player | None:
+              must_break: bool = False, allow_attack: bool = True) -> Player | None:
     if not room.exits or not room.solids:
         return None
     room = deepcopy(room)
@@ -130,7 +145,7 @@ def _run_room(room: Room, *, max_steps: int, abilities: set[str],
     player.last_safe_pos = room.spawn
     player.abilities.update(abilities)
     for _ in range(max_steps):
-        events: list[Event] = step_physics(room, player, _buttons(room, player), DT)
+        events: list[Event] = step_physics(room, player, _buttons(room, player, allow_attack=allow_attack), DT)
         if any(event.kind == "exit" for event in events):
             return None if must_break and any(not block.broken for block in room.breakables) else player
         if player.y < -2 or player.x > room.width + 2 or player.hp <= 0:
@@ -139,10 +154,12 @@ def _run_room(room: Room, *, max_steps: int, abilities: set[str],
 
 
 def solve_room(room: Room, *, max_steps: int = 20_000, abilities: set[str] | None = None,
-               require_breakables: bool = False) -> bool:
+               require_breakables: bool = False, allow_attack: bool = True) -> bool:
     """Run a deterministic greedy controller through a room using ``step_physics``."""
+    if not allow_attack and any(enemy.alive and enemy.blocks_path for enemy in room.enemies):
+        return False
     return _run_room(room, max_steps=max_steps, abilities=abilities or set(),
-                     must_break=require_breakables) is not None
+                     must_break=require_breakables, allow_attack=allow_attack) is not None
 
 
 def solve_room_set(rooms: list[Room], *, max_steps: int = 20_000) -> bool:

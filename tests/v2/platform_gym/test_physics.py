@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from voidgym.gyms.platform_gym.params import PhysicsParams
 from voidgym.gyms.platform_gym.physics import step_physics
-from voidgym.gyms.platform_gym.world import Breakable, Door, Enemy, Exit, Hazard, Rect, Room, Solid, Player
+from voidgym.gyms.platform_gym.world import (
+    Breakable, Door, Enemy, Exit, Hazard, Player, Rect, Room, Solid, TreasureRock,
+)
 
 
 def room(*, physics: PhysicsParams | None = None, solids: list[Solid] | None = None,
          hazards: list[Hazard] | None = None, breakables: list[Breakable] | None = None,
-         enemies: list[Enemy] | None = None, doors: list[Door] | None = None) -> Room:
+         enemies: list[Enemy] | None = None, doors: list[Door] | None = None,
+         treasure_rocks: list[TreasureRock] | None = None) -> Room:
     return Room(0, 24, 12, solids or [Solid(Rect(0, 0, 24, 0.5))], hazards or [],
                 breakables or [], enemies or [], [], [], [Exit(Rect(23, 0.5, 1, 3), 1)],
-                doors or [], (2, 0.5), physics or PhysicsParams(), 5)
+                doors or [], (2, 0.5), physics or PhysicsParams(), 5,
+                treasure_rocks or [])
 
 
 def advance(r: Room, p: Player, buttons: dict[str, bool], frames: int) -> list:
@@ -114,6 +118,41 @@ def test_left_facing_attack_hits_target_to_the_left() -> None:
     p = Player(4.2, 0.5, facing=-1, on_ground=True)
     step_physics(r, p, {"attack": True}, 0.02)
     assert block.hp == 2
+
+
+def test_treasure_rock_takes_hits_drops_falling_coins_and_stops_when_empty() -> None:
+    rock = TreasureRock(Rect(3, .5, 1, 1), hp=2, visual_variant=2)
+    r = room(treasure_rocks=[rock])
+    p = Player(2, .5, on_ground=True)
+    first = advance(r, p, {"attack": True}, 1)
+    assert any(event.kind == "hit_treasure_rock" for event in first)
+    assert rock.hp == 1 and len(r.pickups) == 1
+    advance(r, p, {}, 18)
+    second = advance(r, p, {"attack": True}, 1)
+    assert any(event.kind == "treasure_rock_broken" for event in second)
+    assert rock.broken and len(r.pickups) in {3, 4}
+    advance(r, p, {}, 100)
+    assert all(not pickup.falling and abs(pickup.rect.y - .5) < 1e-8 for pickup in r.pickups)
+    previous_count = len(r.pickups)
+    advance(r, p, {"attack": False}, 20)
+    assert rock.broken and len(r.pickups) == previous_count
+
+
+def test_blocking_enemy_stops_player_but_can_be_killed_from_attack_range() -> None:
+    enemy = Enemy(Rect(5, .5, .8, .8), hp=2, patrol_left=5, patrol_right=5,
+                  speed=0, blocks_path=True)
+    r = room(enemies=[enemy])
+    p = Player(3, .5, on_ground=True)
+    advance(r, p, {"right": True}, 30)
+    assert p.x + r.physics.player_width / 2 <= enemy.rect.x
+    p.facing = 1
+    first = advance(r, p, {"attack": True}, 1)
+    assert any(event.kind == "hit_enemy" for event in first)
+    assert enemy.hp == 1
+    advance(r, p, {}, 18)
+    second = advance(r, p, {"attack": True}, 1)
+    assert not enemy.alive
+    assert any(event.kind == "kill" for event in second)
 
 
 def test_enemy_turns_at_a_gap_edge() -> None:

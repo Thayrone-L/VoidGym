@@ -50,10 +50,10 @@ class PlatformGymAdapter:
 
     def __init__(self, *, level: int = 0, seed: int = 0, split: Split = "train") -> None:
         self.level, self.seed, self.split = level, seed, split
-        self._rooms = generate_room_set(seed) if level == 7 else [generate_room(level, seed)]
+        self._rooms = generate_room_set(seed) if level == 8 else [generate_room(level, seed)]
         self._room_index = 0
         self.room = self._rooms[0]
-        if level != 7:
+        if level != 8:
             self.room.id = 0
         self.player = Player(*self.room.spawn, on_ground=True)
         self._events: list[Event] = []
@@ -69,10 +69,10 @@ class PlatformGymAdapter:
         if seed is not None:
             self.seed = seed
         self._room_counter = 0
-        self._rooms = generate_room_set(self.seed) if self.level == 7 else [generate_room(self.level, self.seed + self._room_counter)]
+        self._rooms = generate_room_set(self.seed) if self.level == 8 else [generate_room(self.level, self.seed + self._room_counter)]
         self._room_index = 0
         self.room = self._rooms[0]
-        if self.level != 7:
+        if self.level != 8:
             self.room.id = 0
         self.player = Player(*self.room.spawn, on_ground=True)
         self._events.clear()
@@ -127,7 +127,7 @@ class PlatformGymAdapter:
                     self._room_index += 1
                     self.room = self._rooms[self._room_index]
                     self.player = Player(*self.room.spawn, on_ground=True, abilities=abilities)
-                elif self.level == 7:
+                elif self.level == 8:
                     self._finished = True
                 else:
                     self.room = generate_room(self.level, self.seed + self._room_counter)

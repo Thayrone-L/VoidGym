@@ -5,7 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from voidgym.gyms.platform_gym.world import Door, Enemy, Pickup, Player, Rect, Room, Solid
+from voidgym.gyms.platform_gym.world import (
+    Door,
+    Enemy,
+    Pickup,
+    Player,
+    Rect,
+    Room,
+    Solid,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +43,7 @@ def _blockers(room: Room) -> list[tuple[Rect, str, object]]:
     result: list[tuple[Rect, str, object]] = [(s.rect, s.kind, s) for s in room.solids]
     result.extend((b.rect, "solid", b) for b in room.breakables if not b.broken)
     result.extend((d.rect, "solid", d) for d in room.doors if not d.opened)
+    result.extend((e.rect, "enemy", e) for e in room.enemies if e.alive and e.blocks_path)
     return result
 
 
@@ -120,10 +129,10 @@ def _resolve_y(room: Room, player: Player, blockers: list[tuple[Rect, str, objec
     player.y, player.on_ground = target_y, False
     candidate = player_rect(room, player)
     for rect, kind, _ in blockers:
-        if kind == "platform":
+        if kind in {"platform", "enemy"}:
             crosses_from_above = start_y >= rect.top and target_y <= rect.top
             horizontal_overlap = candidate.x < rect.right and candidate.right > rect.x
-            if player.vy > 0 or not crosses_from_above or not horizontal_overlap:
+            if kind == "enemy" or player.vy > 0 or not crosses_from_above or not horizontal_overlap:
                 continue
         else:
             lands_on_top = player.vy <= 0 and start_y >= rect.top and target_y <= rect.top
@@ -165,6 +174,7 @@ def _attack(room: Room, player: Player, buttons: dict[str, bool], dt: float, eve
         hitbox = Rect(box.right, player.y + 0.2, 1.2, 0.8)
     _hit_enemies(room, player, hitbox, events)
     _hit_breakables(room, player, hitbox, events)
+    _hit_treasure_rocks(room, player, hitbox, events)
     pogo_target = any(hitbox.intersects(h.rect) for h in room.hazards) or any(
         enemy.alive and hitbox.intersects(enemy.rect) for enemy in room.enemies
     )
@@ -179,6 +189,7 @@ def _hit_enemies(room: Room, player: Player, hitbox: Rect, events: list[Event]) 
             enemy.hp -= 1
             player.attack_targets_hit.add(key)
             enemy.rect = Rect(enemy.rect.x + player.facing * 0.3, enemy.rect.y, enemy.rect.w, enemy.rect.h)
+            events.append(Event("hit_enemy", str(i)))
             if enemy.hp <= 0:
                 enemy.alive = False
                 events.append(Event("kill", str(i)))
@@ -196,6 +207,28 @@ def _hit_breakables(room: Room, player: Player, hitbox: Rect, events: list[Event
             events.append(Event("break", str(i), block.reveals))
             if block.reveals == "pickup":
                 room.pickups.append(Pickup(Rect(block.rect.x, block.rect.y, 0.5, 0.5), "coin"))
+
+
+def _hit_treasure_rocks(room: Room, player: Player, hitbox: Rect,
+                        events: list[Event]) -> None:
+    for index, rock in enumerate(room.treasure_rocks):
+        key = ("treasure_rock", index)
+        if rock.broken or key in player.attack_targets_hit or not hitbox.intersects(rock.rect):
+            continue
+        rock.hp -= 1
+        player.attack_targets_hit.add(key)
+        events.append(Event("hit_treasure_rock", str(index)))
+        drop_count = (2 + ((room.style_seed + index) % 2)) if rock.hp <= 0 else 1
+        for drop in range(drop_count):
+            offset = (drop - (drop_count - 1) / 2) * 0.18
+            room.pickups.append(Pickup(
+                Rect(rock.rect.x + rock.rect.w / 2 + offset - .12,
+                     rock.rect.top + .15, .24, .24),
+                "coin", velocity_y=1.2 + .2 * drop, falling=True,
+            ))
+        if rock.hp <= 0:
+            rock.broken = True
+            events.append(Event("treasure_rock_broken", str(index)))
 
 
 def _patrol_enemies(room: Room, player: Player, dt: float, events: list[Event]) -> None:
@@ -275,6 +308,27 @@ def _collect_and_interact(room: Room, player: Player, buttons: dict[str, bool], 
     _open_touched_doors(room, player, box, events)
 
 
+def _advance_pickups(room: Room, dt: float) -> None:
+    for pickup in room.pickups:
+        if not pickup.falling:
+            continue
+        old = pickup.rect
+        next_vy = pickup.velocity_y - room.physics.gravity * dt
+        next_y = old.y + pickup.velocity_y * dt - .5 * room.physics.gravity * dt * dt
+        landing = next((solid for solid in room.solids
+                        if old.y >= solid.rect.top - 1e-6
+                        and next_y < solid.rect.top
+                        and old.x < solid.rect.right
+                        and old.right > solid.rect.x), None)
+        if landing is not None:
+            pickup.rect = Rect(old.x, landing.rect.top, old.w, old.h)
+            pickup.velocity_y = 0.0
+            pickup.falling = False
+        else:
+            pickup.rect = Rect(old.x, next_y, old.w, old.h)
+            pickup.velocity_y = next_vy
+
+
 def _record_exit_and_safe_position(room: Room, player: Player, events: list[Event]) -> None:
     box = player_rect(room, player)
     if any(box.intersects(exit_.rect) for exit_ in room.exits):
@@ -306,6 +360,7 @@ def step_physics(room: Room, player: Player, buttons: dict[str, bool], dt: float
     _attack(room, player, pressed, dt, events)
     _patrol_enemies(room, player, dt, events)
     _hazard_damage_and_death(room, player, dt, events)
+    _advance_pickups(room, dt)
     _collect_and_interact(room, player, pressed, events)
     _record_exit_and_safe_position(room, player, events)
     return events

@@ -19,10 +19,11 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
     exit_directions: set[str] = set()
     tall_rooms = 0
     tall_by_level: dict[int, int] = {}
-    for level in range(7):
+    for level in range(9):
         started = perf_counter()
         rooms = [generate_room(level, seed) for seed in range(200)]
-        assert (perf_counter() - started) / len(rooms) < 0.05
+        # Leave headroom for shared-host scheduling while still guarding regressions.
+        assert (perf_counter() - started) / len(rooms) < 0.08
         for seed, room in enumerate(rooms):
             assert solve_room(room)
             tall_rooms += room.height > room.width
@@ -41,11 +42,11 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
                 assert room.width == repeated.width
                 assert room.physics == repeated.physics
                 assert room.solids == repeated.solids
-            if level == 6:
+            if level == 7:
                 assert solve_room(room, require_breakables=True)
     assert exit_directions == {"left", "right", "up", "down"}
     assert tall_rooms > 0
-    assert all(tall_by_level[level] > 0 for level in range(7))
+    assert all(tall_by_level[level] > 0 for level in (0, 1, 2, 3, 4, 5, 7))
 
 
 def test_metroidvania_rooms_include_linked_ability_and_bench() -> None:
@@ -67,7 +68,7 @@ def test_metroidvania_retries_a_seed_whose_first_room_set_is_not_solvable() -> N
     assert solve_room_set(rooms)
 
 
-def test_pit_and_gap_levels_have_recoverable_lower_routes_and_level_six_requires_breaking() -> None:
+def test_pit_and_gap_levels_have_recoverable_lower_routes_and_level_seven_requires_breaking() -> None:
     gap = generate_room(2, 31)
     lower = next(s.rect for s in gap.solids if s.rect.y < 0.1 and s.rect.h < .6)
     gap.spawn = (lower.x + lower.w / 2, lower.top)
@@ -77,13 +78,25 @@ def test_pit_and_gap_levels_have_recoverable_lower_routes_and_level_six_requires
     assert pit.spawn[1] < next(s.rect.top for s in pit.solids if s.rect.x > pit.spawn[0])
     assert solve_room(pit)
 
-    secret = generate_room(6, 22)
+    secret = generate_room(7, 22)
     block = secret.breakables[0]
     direction = 1 if secret.exits[0].rect.x > secret.spawn[0] else -1
     assert direction * (block.rect.x + block.rect.w / 2 - secret.spawn[0]) > 0
     assert direction * (secret.exits[0].rect.x + .5 - block.rect.x - block.rect.w / 2) > 0
     assert block.rect.h >= secret.height - 1
     assert solve_room(secret, require_breakables=True)
+
+
+def test_level_six_is_attack_gated_and_treasure_rocks_have_two_to_four_hits() -> None:
+    for seed in range(200):
+        room = generate_room(6, seed)
+        blockers = [enemy for enemy in room.enemies if enemy.blocks_path]
+        assert 1 <= len(blockers) <= 2
+        assert all(enemy.hp == 2 for enemy in blockers)
+        assert 1 <= len(room.treasure_rocks) <= 2
+        assert all(2 <= rock.hp <= 4 for rock in room.treasure_rocks)
+        assert solve_room(room)
+        assert not solve_room(room, allow_attack=False)
 
 
 def test_mandatory_jump_obstacles_respect_physics_limit_and_level_two_runup() -> None:

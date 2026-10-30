@@ -270,11 +270,13 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--c-mot", type=float, default=.1)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--hours-limit", type=float)
-    parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 8),
+    parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 9),
                         help="stop after a completed round once the curriculum reaches this level")
     parser.add_argument("--goal-window-episodes", type=int, default=100)
-    parser.add_argument("--goal-success-levels-0-6", type=float, default=.70)
-    parser.add_argument("--goal-success-level-7", type=float, default=.30)
+    parser.add_argument("--goal-success-levels-0-7", "--goal-success-levels-0-6",
+                        dest="goal_success_levels_0_7", type=float, default=.70)
+    parser.add_argument("--goal-success-level-8", "--goal-success-level-7",
+                        dest="goal_success_level_8", type=float, default=.30)
     parser.add_argument("--no-improvement-steps", type=int, default=3_000_000)
     parser.add_argument("--quick-eval-interval-steps", type=int, default=1_000_000,
                         help="run quick evaluation whenever this many new steps are crossed")
@@ -297,8 +299,8 @@ def _run_impl(args: argparse.Namespace) -> Path:
             or args.quick_eval_interval_steps < 1 or args.quick_eval_episodes_per_level < 1
             or args.microbatch_sequences < 1 or args.goal_window_episodes < 1
             or args.no_improvement_steps < 1
-            or not 0 <= args.goal_success_levels_0_6 <= 1
-            or not 0 <= args.goal_success_level_7 <= 1):
+            or not 0 <= args.goal_success_levels_0_7 <= 1
+            or not 0 <= args.goal_success_level_8 <= 1):
         raise ValueError("step counts and sequence length must be positive")
     _priority_below_normal()
     random.seed(args.seed)
@@ -422,8 +424,8 @@ def _run_impl(args: argparse.Namespace) -> Path:
     fieldnames = ["steps", "L_ppo", "L_semantic", "L_inverse_dynamics", "L_hero_motion",
                   "entropy", "kl", "explained_variance", "steps_per_second", "curriculum_level",
                   "success_rate_100", "quick_eval_success",
-                  *[f"success_rate_{args.goal_window_episodes}_level_{level}" for level in range(8)],
-                  *[f"success_rate_level_{level}" for level in range(8)]]
+                  *[f"success_rate_{args.goal_window_episodes}_level_{level}" for level in range(9)],
+                  *[f"success_rate_level_{level}" for level in range(9)]]
     if log_mode == "a":
         _ensure_csv_header(log_path, fieldnames)
     started = time.monotonic()
@@ -650,33 +652,33 @@ def _run_impl(args: argparse.Namespace) -> Path:
                                              if curriculum.current else 0.0),
                         "quick_eval_success": quick_eval})
             row.update({f"success_rate_level_{level}": curriculum.success_rate(level)
-                        for level in range(8)})
+                        for level in range(9)})
             window_rates = {level: curriculum.window_success_rate(level, args.goal_window_episodes)
-                            for level in range(8)}
+                            for level in range(9)}
             row.update({f"success_rate_{args.goal_window_episodes}_level_{level}":
                         ("" if window_rates[level] is None else window_rates[level])
-                        for level in range(8)})
+                        for level in range(9)})
             writer.writerow(row)
             stream.flush()
             _atomic_json(root / "heartbeat.json", {
                 "steps": global_step, "curriculum_level": curriculum.level,
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "success_by_level": {str(level): curriculum.success_rate(level)
-                                     for level in range(8)},
+                                     for level in range(9)},
                 "success_100_by_level": {str(level): window_rates[level]
-                                         for level in range(8)},
+                                         for level in range(9)},
                 "system_memory": memory_sample,
             })
             stalled_level = curriculum.update_progress_watch(
                 global_step, window=args.goal_window_episodes,
-                levels_0_6_target=args.goal_success_levels_0_6,
-                level_7_target=args.goal_success_level_7,
+                levels_0_7_target=args.goal_success_levels_0_7,
+                level_8_target=args.goal_success_level_8,
                 no_improvement_steps=args.no_improvement_steps,
             )
             if curriculum.training_goal_met(
                     window=args.goal_window_episodes,
-                    levels_0_6_target=args.goal_success_levels_0_6,
-                    level_7_target=args.goal_success_level_7):
+                    levels_0_7_target=args.goal_success_levels_0_7,
+                    level_8_target=args.goal_success_level_8):
                 global _ACTIVE_STOP_REASON
                 _ACTIVE_STOP_REASON = "all curriculum levels met rolling success targets"
                 print(_ACTIVE_STOP_REASON, flush=True)
@@ -803,7 +805,7 @@ def _quick_eval(policy: UniversalPolicy, seed: int, *, episodes_per_level: int =
     successes = 0
     episodes = 0
     policy.eval()
-    for level in range(min(7, max_level + 1)):
+    for level in range(min(9, max_level + 1)):
         for episode in range(episodes_per_level):
             adapter = PlatformGymAdapter(level=level, seed=seed + level * 100 + episode * 10,
                                          split="test")
@@ -823,7 +825,8 @@ def _quick_eval(policy: UniversalPolicy, seed: int, *, episodes_per_level: int =
                 action = int(logits.argmax(-1).item())
                 observation, _, terminated, truncated, info = env.step(action)
                 signals = info.get("signals", {})
-                success |= bool(signals.get("room_changed"))
+                success |= (bool(signals.get("terminated")) if level == 8 else
+                            bool(signals.get("room_changed")))
                 state = next_state
                 starts = torch.tensor([terminated or truncated], device=device)
                 if success or terminated or truncated:

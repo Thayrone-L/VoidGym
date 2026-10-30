@@ -17,6 +17,7 @@ from voidgym.gyms.platform_gym.world import (
     Rect,
     Room,
     Solid,
+    TreasureRock,
 )
 
 
@@ -44,7 +45,7 @@ def _mandatory_gap_width(rng: np.random.Generator, physics: PhysicsParams,
 def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     rng = np.random.default_rng(seed)
     physics = PhysicsParams.sample(rng)
-    vertical_rate = .005 if level in {1, 5, 6} else \
+    vertical_rate = .005 if level in {1, 5, 7} else \
         .08 if level in {0, 2, 3, 4} else 0.0
     vertical_variant = allow_vertical and vertical_rate > 0 and rng.random() < vertical_rate
     width = float(rng.uniform(14, 17) if vertical_variant else
@@ -81,13 +82,14 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
         floor_y = upper_floor
     else:
         solids = [Solid(Rect(0, 0, width, floor))]
-    hazards, breakables, enemies, pickups, interactives, doors = _make_entities(
+    hazards, breakables, enemies, pickups, interactives, doors, treasure_rocks = _make_entities(
         level, rng, physics, width, height, floor, solids,
     )
     exit_rect = _make_exit(level, rng, vertical_variant and level != 4, width, floor_y, solids)
     spawn_x = 2.2 if level == 4 else 1.5
     room = Room(level, width, height, solids, hazards, breakables, enemies, pickups,
-                interactives, [Exit(exit_rect, level + 1)], doors, (spawn_x, spawn_y), physics, seed)
+                interactives, [Exit(exit_rect, level + 1)], doors, (spawn_x, spawn_y), physics,
+                seed, treasure_rocks)
     if level != 4 and rng.random() < .25:
         room = _mirror_room(room)
     return room
@@ -96,13 +98,14 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
 def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
                    width: float, height: float, floor: float, solids: list[Solid]
                    ) -> tuple[list[Hazard], list[Breakable], list[Enemy], list[Pickup],
-                              list[Interactive], list[Door]]:
+                              list[Interactive], list[Door], list[TreasureRock]]:
     hazards: list[Hazard] = []
     breakables: list[Breakable] = []
     enemies: list[Enemy] = []
     pickups: list[Pickup] = []
     interactives: list[Interactive] = []
     doors: list[Door] = []
+    treasure_rocks: list[TreasureRock] = []
     if level == 1:
         for fraction in (.27, .48, .70):
             height_u = float(rng.uniform(.5, .6) * physics.jump_short_height)
@@ -125,18 +128,14 @@ def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
         wall_x = width * .68
         solids.append(_mandatory_jump_wall(rng, physics, .55, .82, wall_x, floor))
     if level >= 5:
-        hazards.append(Hazard(Rect(width * .4, floor, 1.4, .35), "spikes"))
-        for _ in range(int(rng.integers(1, 4))):
-            x = float(rng.uniform(width * .22, width * .78))
-            enemies.append(Enemy(Rect(x, floor, .8, .8), kind=str(rng.choice(("walker", "orb", "spiky", "eye"))),
-                                 hp=2, patrol_left=max(0, x - 1),
-                                 patrol_right=min(width, x + 2.8), speed=float(rng.uniform(.7, 1.6))))
-    if level == 6:
+        _add_hazards_and_enemies(level, rng, physics, width, floor, solids,
+                                 hazards, enemies, treasure_rocks)
+    if level == 7:
         block_x = width * .68
         breakables.append(Breakable(Rect(block_x, floor, .75, height - floor), hp=3, reveals="passage",
                                     cue=bool(rng.random() < .7)))
         pickups.append(Pickup(Rect(width * .2, floor, .4, .5), "coin"))
-    if level == 7:
+    if level == 8:
         pickups.append(Pickup(Rect(width * .2, floor, .5, .5), "ability_double_jump"))
         doors.append(Door(Rect(width * .62, floor, .8, 2.2), "ability_double_jump"))
         interactives.append(Interactive(Rect(width * .4, floor, 1.0, .8)))
@@ -148,7 +147,41 @@ def _make_entities(level: int, rng: np.random.Generator, physics: PhysicsParams,
     if rng.random() < .4:
         ceiling_x = float(rng.uniform(width * .12, width * .3))
         solids.append(Solid(Rect(ceiling_x, height - 1.0, float(rng.uniform(3.0, 5.0)), .5)))
-    return hazards, breakables, enemies, pickups, interactives, doors
+    return hazards, breakables, enemies, pickups, interactives, doors, treasure_rocks
+
+
+def _add_combat_entities(rng: np.random.Generator, physics: PhysicsParams, width: float,
+                         floor: float, solids: list[Solid], enemies: list[Enemy],
+                         rocks: list[TreasureRock]) -> None:
+    """Place a low-roof mandatory blocker and optional breakable treasure rocks."""
+    solids.append(Solid(Rect(0, floor + physics.player_height + .04, width, .28)))
+    for index in range(int(rng.integers(1, 3))):
+        x = width * (.43 + .16 * index)
+        enemies.append(Enemy(
+            Rect(x, floor, .8, .8), kind=str(rng.choice(("walker", "spiky", "eye"))),
+            hp=2, patrol_left=x, patrol_right=x, speed=0.0, blocks_path=True,
+        ))
+    for index in range(int(rng.integers(1, 3))):
+        x = width * (.25 + .10 * index)
+        rocks.append(TreasureRock(
+            Rect(x, floor, 1.05, 1.05), hp=int(rng.integers(2, 5)),
+            visual_variant=int(rng.integers(0, 4)),
+        ))
+
+
+def _add_hazards_and_enemies(level: int, rng: np.random.Generator, physics: PhysicsParams,
+                             width: float, floor: float, solids: list[Solid],
+                             hazards: list[Hazard], enemies: list[Enemy],
+                             rocks: list[TreasureRock]) -> None:
+    hazards.append(Hazard(Rect(width * .4, floor, 1.4, .35), "spikes"))
+    if level == 6:
+        _add_combat_entities(rng, physics, width, floor, solids, enemies, rocks)
+        return
+    for _ in range(int(rng.integers(1, 4))):
+        x = float(rng.uniform(width * .22, width * .78))
+        enemies.append(Enemy(Rect(x, floor, .8, .8), kind=str(rng.choice(("walker", "orb", "spiky", "eye"))),
+                             hp=2, patrol_left=max(0, x - 1),
+                             patrol_right=min(width, x + 2.8), speed=float(rng.uniform(.7, 1.6))))
 
 
 def _make_exit(level: int, rng: np.random.Generator, vertical_variant: bool, width: float,
@@ -182,6 +215,8 @@ def _mirror_room(room: Room) -> Room:
         hazard.rect = _mirror_rect(hazard.rect, width)
     for block in room.breakables:
         block.rect = _mirror_rect(block.rect, width)
+    for rock in room.treasure_rocks:
+        rock.rect = _mirror_rect(rock.rect, width)
     for enemy in room.enemies:
         old_left, old_right = enemy.patrol_left, enemy.patrol_right
         enemy.rect = _mirror_rect(enemy.rect, width)
@@ -202,11 +237,11 @@ def _mirror_room(room: Room) -> Room:
 
 def generate_room(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     """Generate a seeded level and retain it only when the physics solver completes it."""
-    if not 0 <= level <= 7:
-        raise ValueError("level must be in [0, 7]")
+    if not 0 <= level <= 8:
+        raise ValueError("level must be in [0, 8]")
     for attempt in range(20):
         room = _make(level, seed + 1000 * attempt, allow_vertical=allow_vertical)
-        if solve_room(room, require_breakables=level == 6):
+        if solve_room(room, require_breakables=level == 7):
             return room
     raise RuntimeError(f"could not solve level {level} room within 20 seed attempts")
 
@@ -217,7 +252,7 @@ def generate_room_set(seed: int) -> list[Room]:
         attempt_seed = seed + attempt * 100_003
         rng = np.random.default_rng(attempt_seed)
         count = int(rng.integers(3, 7))
-        levels = [3, *[int(rng.integers(1, 6)) for _ in range(count - 2)], 5]
+        levels = [3, *[int(rng.integers(1, 7)) for _ in range(count - 2)], 5]
         rooms = [generate_room(level, attempt_seed + i * 7919, allow_vertical=False)
                  for i, level in enumerate(levels)]
         for room_id, room in enumerate(rooms):

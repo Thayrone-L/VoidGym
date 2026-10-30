@@ -10,7 +10,7 @@ import numpy as np
 from voidgym.gyms.platform_gym.params import Split
 from voidgym.gyms.platform_gym.physics import interaction_prompt, player_rect
 from voidgym.gyms.platform_gym.styles import Palette, sample_style
-from voidgym.gyms.platform_gym.world import Player, Rect, Room
+from voidgym.gyms.platform_gym.world import Player, Rect, Room, TreasureRock
 
 WIDTH, HEIGHT = 192, 108
 _YGRID, _XGRID = np.mgrid[0:HEIGHT, 0:WIDTH]
@@ -114,6 +114,36 @@ def _paint_rect(image: np.ndarray, rect: Rect, camera: tuple[float, float, float
     tile = _texture_rgb_tile(texture, color)
     rows, cols = _tile_indices(y1 - y0, x1 - x0)
     image[y0:y1, x0:x1] = tile[rows, cols]
+
+
+def _paint_treasure_rock(image: np.ndarray, rock: TreasureRock,
+                         camera: tuple[float, float, float], palette: Palette) -> None:
+    cx, cy, scale = camera
+    rect = rock.rect
+    x0 = max(0, int((rect.x - cx) * scale + WIDTH / 2))
+    x1 = min(WIDTH, int(np.ceil((rect.right - cx) * scale + WIDTH / 2)))
+    y0 = max(0, int(HEIGHT / 2 - (rect.top - cy) * scale))
+    y1 = min(HEIGHT, int(np.ceil(HEIGHT / 2 - (rect.y - cy) * scale)))
+    if x1 <= x0 or y1 <= y0:
+        return
+    yy, xx = np.mgrid[0:y1 - y0, 0:x1 - x0]
+    nx = (xx + .5) / max(1, x1 - x0) * 2 - 1
+    ny = (yy + .5) / max(1, y1 - y0) * 2 - 1
+    variant = rock.visual_variant % 4
+    shape = np.abs(nx) ** (2.0 + .25 * variant) + np.abs(ny) ** (2.0 + .2 * (3 - variant)) <= 1
+    ground = np.asarray(palette.ground, dtype=np.float32)
+    accent = np.asarray(palette.pickup, dtype=np.float32)
+    base = np.clip(ground * .68 + accent * .32, 0, 255).astype(np.uint8)
+    highlight = np.clip(base.astype(np.float32) * 1.25 + 24, 0, 255).astype(np.uint8)
+    shadow = np.clip(base.astype(np.float32) * .58, 0, 255).astype(np.uint8)
+    crop = image[y0:y1, x0:x1]
+    crop[shape] = base
+    facet = shape & (nx < -.2 + .15 * (variant % 2)) & (ny < .35)
+    crop[facet] = highlight
+    groove = shape & (ny > .05) & (ny < .14) & (nx > -.55) & (nx < .45)
+    crop[groove] = shadow
+    edge = shape & ((np.abs(nx) > .78) | (ny > .76))
+    crop[edge] = shadow
 
 
 @lru_cache(maxsize=8)
@@ -321,6 +351,9 @@ def render_room(room: Room, player: Player, camera: tuple[float, float, float] |
         if not block.broken:
             color = cast(tuple[int, int, int], tuple(max(0, c - (18 if block.cue else 0)) for c in colors.ground))
             _paint_rect(img, block.rect, cam, color, texture="crystals" if block.cue else "smooth")
+    for rock in room.treasure_rocks:
+        if not rock.broken:
+            _paint_treasure_rock(img, rock, cam, colors)
     for hazard in room.hazards:
         _paint_hazard(img, hazard.rect, cam, colors.hazard, hazard.kind)
     for enemy in room.enemies:

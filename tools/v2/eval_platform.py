@@ -30,8 +30,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--compare-checkpoint", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "relatorios" / "85_eval")
     parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--level7-sets", type=int, default=30)
-    parser.add_argument("--perception-frames", type=int, default=5000)
+    parser.add_argument("--level8-sets", type=int, default=30)
+    parser.add_argument("--level7-sets", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--perception-frames", type=int, default=5625)
     parser.add_argument("--perception-max-steps", type=int, default=512,
                         help="maximum actions per episode for balanced perception sampling")
     parser.add_argument("--split", choices=("test", "train"), default="test")
@@ -81,10 +82,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         completed = {(row["mode"], row["level"]) for row in stats}
     for stochastic in (False, True):
         mode = "stochastic" if stochastic else "deterministic"
-        for level in range(8):
+        for level in range(9):
             if (mode, level) in completed:
                 continue
-            episodes = args.level7_sets if level == 7 else args.episodes
+            level8_sets = args.level7_sets if args.level7_sets is not None else args.level8_sets
+            episodes = level8_sets if level == 8 else args.episodes
             rows = [_episode(
                 model, level, args.seed + level * 10_000 + index * 10,
                 split=args.split, stochastic=stochastic, max_steps=args.max_steps,
@@ -108,7 +110,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(args.checkpoint),
         "trained_steps": checkpoint_manifest.get("trained_steps"),
         "episodes_per_level": args.episodes,
-        "level7_sets": args.level7_sets,
+        "level8_sets": args.level8_sets,
         "split": args.split,
         "perception_frames": perception["sampled_frames"],
         "perception_output": str(args.output / f"perception_{args.split}"),
@@ -154,7 +156,7 @@ def _episode(model: UniversalPolicy, level: int, seed: int, *, split: Split,
         deaths += sum(getattr(event, "kind", None) == "death"
                       for event in signals.get("events", ()))
         stuck |= bool(signals.get("stuck", False))
-        success |= (terminated if level == 7 else
+        success |= (terminated if level == 8 else
                     bool(signals.get("room_changed", False)))
         if capture and steps % 5 == 0:
             frames.append(Image.fromarray(adapter.frame_rgb()).resize(

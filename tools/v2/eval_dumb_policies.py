@@ -33,26 +33,33 @@ def _rollout(adapter: PlatformGymAdapter, policy: str, seed: int, max_actions: i
             action = fixed_action
         adapter.apply(action)
         signals = adapter.signals()
-        if signals.get("terminated") or (level != 7 and signals.get("room_changed")):
+        if signals.get("terminated") or (level != 8 and signals.get("room_changed")):
             return True
         if signals.get("died") or signals.get("truncated"):
             return False
     return False
 
 
-def evaluate(*, count: int = 200, seed: int = 8600) -> dict[str, Any]:
+def evaluate(*, count: int = 200, seed: int = 8600,
+             max_actions: int = 300) -> dict[str, Any]:
     if count < 1:
         raise ValueError("count must be positive")
-    report: dict[str, Any] = {"rooms_per_level": count, "policies": list(POLICIES),
-                              "levels": {}, "level7_door_without_ability": {}}
-    for level in range(2, 8):
+    if max_actions < 1:
+        raise ValueError("max_actions must be positive")
+    report: dict[str, Any] = {"rooms_per_level": count, "max_actions_per_room": max_actions,
+                              "multiroom_max_actions": max_actions * 2,
+                              "policies": list(POLICIES),
+                              "levels": {}, "level8_door_without_ability": {},
+                              "level6_never_attack_solver": {}}
+    for level in range(2, 9):
         successes = {policy: 0 for policy in POLICIES}
         solver_passes = 0
         no_ability_door_passes = 0
+        no_attack_passes = 0
         for index in range(count):
             room_seed = seed + level * 1_000_000 + index
             adapter = PlatformGymAdapter(level=level, seed=room_seed, split="test")
-            if level == 7:
+            if level == 8:
                 solver_passes += int(solve_room_set(deepcopy(adapter._rooms)))
                 without_ability = deepcopy(adapter._rooms)
                 for room in without_ability:
@@ -61,13 +68,16 @@ def evaluate(*, count: int = 200, seed: int = 8600) -> dict[str, Any]:
                 no_ability_door_passes += int(solve_room_set(without_ability))
             else:
                 solver_passes += int(solve_room(deepcopy(adapter.room),
-                                                require_breakables=level == 6))
-            max_actions = 3000 if level == 7 else 1200
+                                                require_breakables=level == 7))
+                if level == 6:
+                    no_attack_passes += int(solve_room(deepcopy(adapter.room),
+                                                       allow_attack=False))
+            policy_action_limit = max_actions * 2 if level == 8 else max_actions
             for policy_index, policy in enumerate(POLICIES):
                 episode = deepcopy(adapter)
                 successes[policy] += int(_rollout(episode, policy,
                                                    room_seed + policy_index * 10_000,
-                                                   max_actions))
+                                                   policy_action_limit))
         failures = {policy: 1.0 - successes[policy] / count for policy in POLICIES}
         report["levels"][str(level)] = {
             "solver_success_rate": solver_passes / count,
@@ -75,12 +85,20 @@ def evaluate(*, count: int = 200, seed: int = 8600) -> dict[str, Any]:
             "policy_failure_rates": failures,
             "all_baselines_fail_at_least_80_percent": all(rate >= .8 for rate in failures.values()),
         }
-        if level == 7:
-            report["level7_door_without_ability"] = {
+        if level == 8:
+            report["level8_door_without_ability"] = {
                 "solver_successes": no_ability_door_passes,
                 "sets": count,
                 "failure_rate": 1.0 - no_ability_door_passes / count,
             }
+        if level == 6:
+            report["level6_never_attack_solver"] = {
+                "successes": no_attack_passes,
+                "rooms": count,
+                "failure_rate": 1.0 - no_attack_passes / count,
+            }
+        print(f"level {level}: solver={solver_passes}/{count}; "
+              f"baseline failures={failures}", flush=True)
     return report
 
 
@@ -88,10 +106,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--seed", type=int, default=8600)
+    parser.add_argument("--max-actions", type=int, default=300)
     parser.add_argument("--output", type=Path,
-                        default=PROJECT_ROOT / "relatorios" / "86b_politicas_bobas.json")
+                        default=PROJECT_ROOT / "relatorios" / "86g_politicas_bobas.json")
     args = parser.parse_args()
-    report = evaluate(count=args.count, seed=args.seed)
+    report = evaluate(count=args.count, seed=args.seed, max_actions=args.max_actions)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
                            encoding="utf-8")
@@ -99,7 +118,8 @@ def main() -> int:
     criteria_met = (all(row["all_baselines_fail_at_least_80_percent"]
                         and row["solver_success_rate"] == 1.0
                         for row in report["levels"].values())
-                    and report["level7_door_without_ability"]["failure_rate"] == 1.0)
+                    and report["level8_door_without_ability"]["failure_rate"] == 1.0)
+    criteria_met &= report["level6_never_attack_solver"]["failure_rate"] >= .8
     return 0 if criteria_met else 1
 
 

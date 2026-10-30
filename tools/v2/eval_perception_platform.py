@@ -36,7 +36,8 @@ PALETTE = np.asarray([
 ], dtype=np.uint8)
 ROUTE = ("RIGHT", "RIGHT", "RIGHT", "RIGHT+JUMP_HOLD", "RIGHT", "RIGHT+JUMP_TAP",
          "RIGHT", "RIGHT+ATTACK", "RIGHT", "RIGHT+DASH", "RIGHT")
-REQUIRED_SUPPORT = {5: (Sem.HAZARD, Sem.ENEMY), 6: (Sem.HAZARD, Sem.ENEMY)}
+REQUIRED_SUPPORT = {5: (Sem.HAZARD, Sem.ENEMY), 6: (Sem.BREAKABLE, Sem.ENEMY),
+                    7: (Sem.HAZARD, Sem.ENEMY)}
 
 
 def _args() -> argparse.Namespace:
@@ -44,8 +45,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--compare-checkpoint", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--frames", type=int, default=5000,
-                        help="total sample size, divided evenly over levels 0–7")
+    parser.add_argument("--frames", type=int, default=5625,
+                        help="total sample size, divided evenly over levels 0–8")
     parser.add_argument("--split", choices=("train", "test"), default="test")
     parser.add_argument("--seed", type=int, default=185_000)
     parser.add_argument("--max-steps", type=int, default=512)
@@ -56,7 +57,7 @@ def _args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _frame_quotas(total: int, levels: int = 8) -> dict[int, int]:
+def _frame_quotas(total: int, levels: int = 9) -> dict[int, int]:
     if total < levels or levels < 1:
         raise ValueError("frames must provide at least one frame per level")
     base, remainder = divmod(total, levels)
@@ -285,7 +286,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         class_support = {
             str(level): {item.name: int(per_level_confusion[level, int(item)].sum())
                          for item in Sem}
-            for level in range(8)
+            for level in range(9)
         }
         report = {
             "checkpoint": str(checkpoint),
@@ -304,7 +305,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "iou": {item.name: _iou(confusion, index) for index, item in enumerate(Sem)},
             "iou_by_level": {str(level): {item.name: _iou(per_level_confusion[level], index)
                                           for index, item in enumerate(Sem)}
-                             for level in range(8)},
+                             for level in range(9)},
             "levels": level_metadata,
         }
         (output_dir / "perception_manifest.json").write_text(

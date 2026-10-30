@@ -11,7 +11,7 @@ from voidgym.gyms.platform_gym.params import Split
 from voidgym.gyms.platform_gym.physics import interaction_prompt
 from voidgym.gyms.platform_gym.render import player_pixel_mask
 from voidgym.gyms.platform_gym.styles import sample_style
-from voidgym.gyms.platform_gym.world import Player, Rect, Room
+from voidgym.gyms.platform_gym.world import Breakable, Player, Rect, Room, TreasureRock
 
 
 def _stamp_entities(room: Room, stamp: Callable[[Rect, Sem], None]) -> None:
@@ -26,14 +26,22 @@ def _stamp_entities(room: Room, stamp: Callable[[Rect, Sem], None]) -> None:
         stamp(item.rect, Sem.INTERACTIVE)
     for pickup in room.pickups:
         stamp(pickup.rect, Sem.PICKUP)
-    for block in room.breakables:
-        if not block.broken:
-            stamp(block.rect, Sem.BREAKABLE)
+    _stamp_breakables(room, stamp)
     for hazard in room.hazards:
         stamp(hazard.rect, Sem.HAZARD)
     for enemy in room.enemies:
         if enemy.alive:
             stamp(enemy.rect, Sem.ENEMY)
+
+
+def _stamp_breakables(room: Room, stamp: Callable[[Rect, Sem], None]) -> None:
+    items: tuple[Breakable | TreasureRock, ...] = (
+        *room.breakables,
+        *room.treasure_rocks,
+    )
+    for item in items:
+        if not item.broken:
+            stamp(item.rect, Sem.BREAKABLE)
 
 
 def labels(room: Room, player: Player,

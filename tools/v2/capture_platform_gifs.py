@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=85_000)
-    parser.add_argument("--levels", type=int, nargs="+", default=[2, 3, 4, 6, 7])
+    parser.add_argument("--levels", type=int, nargs="+", default=[2, 3, 4, 6, 7, 8])
     parser.add_argument("--max-steps", type=int, default=1500)
     args = parser.parse_args()
 

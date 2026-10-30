@@ -4,7 +4,11 @@ import pytest
 
 from voidgym.core.config import RewardConfig
 from voidgym.gyms.platform_gym.physics import Event
-from voidgym.gyms.platform_gym.reward import CombinedPlatformReward
+from voidgym.gyms.platform_gym.reward import (
+    CombinedPlatformReward,
+    GameReward,
+    GameRewardConfig,
+)
 
 
 def _state(x: float, *, room: int = 0) -> dict[str, object]:
@@ -33,3 +37,30 @@ def test_game_reward_values_and_damage_cost() -> None:
     after = _state(1)
     after.update(hp=2, events=(Event("exit"), Event("pickup", "coin"), Event("ability")))
     assert reward(before, after) == pytest.approx(.02 - .3 + 1.0 + .2 + 1.0 - .001)
+
+
+def test_first_enemy_and_treasure_rock_hits_pay_once_and_enemy_kill_is_increased() -> None:
+    game = GameReward()
+    before = _state(1)
+    after = _state(1)
+    after["events"] = (Event("hit_enemy", "enemy-1"), Event("kill", "enemy-1"))
+    assert game(before, after) == pytest.approx(.35)
+    after["events"] = (Event("hit_enemy", "enemy-1"),)
+    assert game(before, after) == 0
+    after["events"] = (Event("hit_treasure_rock", "rock-1"),)
+    assert game(before, after) == pytest.approx(.05)
+    assert game(before, after) == 0
+    assert game(before, {**after, "events": (Event("kill", "enemy-2"),)}) == pytest.approx(.3)
+    assert game(before, {**after, "events": (Event("kill", "enemy-3"),)}) == pytest.approx(.3)
+    assert game(before, {**after, "events": (Event("kill", "enemy-4"),)}) == 0
+
+
+def test_game_reward_values_are_configurable_and_validated() -> None:
+    game = GameReward(GameRewardConfig(first_hit=.08, enemy_kill=.4,
+                                       kill_limit_per_room=2, coin=.25))
+    before = _state(1)
+    assert game(before, {**before, "events": (Event("hit_enemy", "e1"),
+                                               Event("kill", "e1"),
+                                               Event("pickup", "coin"))}) == pytest.approx(.73)
+    with pytest.raises(ValueError):
+        GameReward(GameRewardConfig(first_hit=-.1))
