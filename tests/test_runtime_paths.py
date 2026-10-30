@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -107,6 +108,34 @@ def test_instance_saves_are_preserved_seeded_and_captured(tmp_path: Path) -> Non
     (instance / "user1.dat").write_bytes(b"later")
     assert capture_instance_saves(instance, launch) == evidence
     assert (evidence / "user1.dat").read_bytes() == b"final"
+
+
+def test_instance_saves_support_cross_volume_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = tmp_path / "runtime-e"
+    launch = runtime / "launches" / "launch-cross-volume"
+    launch.mkdir(parents=True)
+    instance = tmp_path / "local-low-c"
+    baseline = tmp_path / "saves-c"
+    instance.mkdir()
+    baseline.mkdir()
+    (instance / "user1.dat").write_bytes(b"previous-on-c")
+    (baseline / "user1.dat").write_bytes(b"seed-on-c")
+    original_rename = Path.rename
+
+    def reject_cross_volume_rename(path: Path, target: Path | str) -> Path:
+        destination = Path(target)
+        source_in_runtime = path == runtime or runtime in path.parents
+        target_in_runtime = destination == runtime or runtime in destination.parents
+        if source_in_runtime != target_in_runtime:
+            raise OSError(errno.EXDEV, "simulated cross-volume rename", str(path))
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", reject_cross_volume_rename)
+    previous, _ = prepare_instance_saves(instance, baseline, launch)
+
+    assert (previous / "user1.dat").read_bytes() == b"previous-on-c"
+    assert (instance / "user1.dat").read_bytes() == b"seed-on-c"
+    assert not list(instance.glob(".*.tmp"))
 
 
 def test_stale_fence_refuses_prepare_and_capture_writes(tmp_path: Path) -> None:

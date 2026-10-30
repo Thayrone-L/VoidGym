@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import stat
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -31,6 +33,26 @@ def _check_fence(
 ) -> None:
     if token is not None and (is_fence_current is None or not is_fence_current(token)):
         raise InterruptedError("instance save slot fence is no longer current")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _copy_save_atomically(source: Path, destination: Path) -> None:
+    """Copy across volumes safely, then atomically replace on the destination volume."""
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        if _file_sha256(source) != _file_sha256(temporary):
+            raise OSError(f"save copy failed SHA-256 verification: {source}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def prepare_instance_saves(
@@ -74,27 +96,34 @@ def prepare_instance_saves(
         instance_root.mkdir(parents=True, exist_ok=True)
         backups = staging / "replaced"
         backups.mkdir()
-        for path in _save_files(instance_root):
+        existing_saves = _save_files(instance_root)
+        for path in existing_saves:
             _check_fence(fence_token, is_fence_current)
-            path.rename(backups / path.name)
+            backup = backups / path.name
+            shutil.copy2(path, backup)
+            if _file_sha256(path) != _file_sha256(backup):
+                raise OSError(f"save backup failed SHA-256 verification: {path}")
+        for path in existing_saves:
+            _check_fence(fence_token, is_fence_current)
+            path.unlink()
         try:
             for path in _save_files(seed_stage):
                 _check_fence(fence_token, is_fence_current)
-                path.rename(instance_root / path.name)
+                _copy_save_atomically(path, instance_root / path.name)
         except BaseException:
             for path in _save_files(instance_root):
                 _check_fence(fence_token, is_fence_current)
                 path.unlink(missing_ok=True)
             for path in backups.iterdir():
                 _check_fence(fence_token, is_fence_current)
-                path.rename(instance_root / path.name)
+                _copy_save_atomically(path, instance_root / path.name)
             raise
     except BaseException:
         if previous.exists() and (fence_token is None or is_fence_current is not None and is_fence_current(fence_token)):
             for path in previous.iterdir():
                 _check_fence(fence_token, is_fence_current)
                 if not (instance_root / path.name).exists():
-                    shutil.copy2(path, instance_root / path.name)
+                    _copy_save_atomically(path, instance_root / path.name)
         raise
     finally:
         if staging.exists():
