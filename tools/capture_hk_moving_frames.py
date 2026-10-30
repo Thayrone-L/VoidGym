@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import time
 import sys
+from collections.abc import Callable
 from typing import Any, cast
 
 import numpy as np
@@ -35,6 +36,33 @@ def _request(host: str, port: int, request: dict[str, object]) -> dict[str, Any]
     if result.get("ok") is not True:
         raise RuntimeError(f"game control command failed: {result}")
     return result
+
+
+_TRANSIENT_ERRORS = (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError)
+
+
+def _capture_with_retries(
+    request: Callable[..., dict[str, Any]], *, retries: int = 3,
+    retry_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Reconnect and retry a capture without replaying the gameplay action."""
+    for attempt in range(retries + 1):
+        try:
+            result = request("capture")
+            capture = result.get("capture")
+            if not isinstance(capture, dict):
+                raise TypeError("capture response is missing its capture record")
+            return capture
+        except _TRANSIENT_ERRORS as error:
+            if retry_events is not None:
+                retry_events.append({
+                    "command": "capture", "attempt": attempt + 1,
+                    "error": f"{type(error).__name__}: {error}",
+                })
+            if attempt >= retries:
+                raise
+            time.sleep(min(0.25 * (attempt + 1), 0.75))
+    raise AssertionError("unreachable capture retry state")
 
 
 def _buttons(index: int, route: str = "walk-jump") -> list[str]:
@@ -123,12 +151,13 @@ def main() -> int:
     if not isinstance(token, str) or not isinstance(port, int):
         raise TypeError("control metadata is incomplete")
     captures: list[dict[str, Any]] = []
+    retry_events: list[dict[str, Any]] = []
     started = time.time()
     def request(command: str, **values: object) -> dict[str, Any]:
         return _request("127.0.0.1", port, {"token": token, "command": command, **values})
 
     request("release")
-    first = request("capture")["capture"]
+    first = _capture_with_retries(request, retry_events=retry_events)
     captures.append(first)
     jump_countdown = 0
     args.progress.parent.mkdir(parents=True, exist_ok=True)
@@ -146,9 +175,21 @@ def main() -> int:
             # Keep the virtual jump input held through the frame capture; a
             # 100 ms lease expires while the screenshot and labels are prepared.
             lease_ms = min(500, max(250, args.lease_ms))
-        action = request("action", buttons=buttons, lease_ms=lease_ms)
-        captures.append(action["capture"])
-        first = action["capture"]
+        try:
+            action = request("action", buttons=buttons, lease_ms=lease_ms)
+            captured = action["capture"]
+        except _TRANSIENT_ERRORS as error:
+            # The bridge may have applied the action before the follow-up
+            # capture failed. Recover the current frame instead of sending the
+            # action again and accidentally moving twice.
+            retry_events.append({
+                "command": "action", "attempt": 1,
+                "error": f"{type(error).__name__}: {error}",
+                "recovered_by_capture": True,
+            })
+            captured = _capture_with_retries(request, retry_events=retry_events)
+        captures.append(captured)
+        first = captured
         if (index + 1) % 50 == 0:
             temporary = args.progress.with_suffix(".tmp")
             temporary.write_text(json.dumps({
@@ -157,6 +198,7 @@ def main() -> int:
                 "capture_count": len(captures),
                 "latest_scene": captures[-1].get("scene_name"),
                 "latest_visible_enemies": captures[-1].get("visible_enemies", []),
+                "retry_events": retry_events,
             }, indent=2) + "\n", encoding="utf-8")
             temporary.replace(args.progress)
     request("release")
@@ -166,7 +208,8 @@ def main() -> int:
         "actions": args.frames, "start_index": args.start_index,
         "capture_count": len(captures), "session_left_open": args.keep_open,
         "started_unix": started, "finished_unix": time.time(),
-        "duration_seconds": time.time() - started, "captures": captures,
+        "duration_seconds": time.time() - started, "retry_events": retry_events,
+        "captures": captures,
     }
     temporary = args.progress.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

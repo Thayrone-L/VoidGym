@@ -25,7 +25,9 @@ internal static class SemanticLabelCapture
 {
     private static readonly Collider2D[] OverlapBuffer = new Collider2D[256];
     private static readonly HashSet<int> LoggedSemanticColliders = new HashSet<int>();
+    private static readonly HashSet<int> LoggedDumpColliders = new HashSet<int>();
     private const int SemanticDiagnosticColliderLimit = 256;
+    private const int FullDiagnosticColliderLimit = 8192;
     private const byte Empty = 0;
     private const byte Solid = 1;
     private const byte Platform = 2;
@@ -589,8 +591,11 @@ internal static class SemanticLabelCapture
 
     private static void LogSemanticCollider(Collider2D collider, Action<string>? log)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("HK_LABEL_DIAGNOSTICS"), "true",
-                StringComparison.OrdinalIgnoreCase))
+        bool fullDump = string.Equals(Environment.GetEnvironmentVariable("HK_LABEL_DUMP_ALL_COLLIDERS"),
+            "true", StringComparison.OrdinalIgnoreCase);
+        bool semanticDiagnostics = string.Equals(Environment.GetEnvironmentVariable("HK_LABEL_DIAGNOSTICS"),
+            "true", StringComparison.OrdinalIgnoreCase);
+        if (!fullDump && !semanticDiagnostics)
             return;
         HealthManager? health = collider.GetComponentInParent<HealthManager>();
         DamageHero? damageHero = collider.GetComponentInParent<DamageHero>();
@@ -599,12 +604,21 @@ internal static class SemanticLabelCapture
         bool namedHazard = collider.gameObject.name.IndexOf("spike", StringComparison.OrdinalIgnoreCase) >= 0 ||
                            collider.gameObject.name.IndexOf("acid", StringComparison.OrdinalIgnoreCase) >= 0 ||
                            collider.gameObject.name.IndexOf("hazard", StringComparison.OrdinalIgnoreCase) >= 0;
-        if ((health == null && damageHero == null && !namedHazard) ||
-            LoggedSemanticColliders.Count >= SemanticDiagnosticColliderLimit ||
-            !LoggedSemanticColliders.Add(collider.GetInstanceID()))
+        if (fullDump)
+        {
+            if (LoggedDumpColliders.Count >= FullDiagnosticColliderLimit ||
+                !LoggedDumpColliders.Add(collider.GetInstanceID()))
+                return;
+        }
+        else if ((health == null && damageHero == null && !namedHazard) ||
+                 LoggedSemanticColliders.Count >= SemanticDiagnosticColliderLimit ||
+                 !LoggedSemanticColliders.Add(collider.GetInstanceID()))
+        {
             return;
+        }
 
-        string owner = health != null ? health.gameObject.name : damageHero!.gameObject.name;
+        string owner = health != null ? health.gameObject.name :
+            damageHero != null ? damageHero.gameObject.name : collider.transform.root.name;
         string hazardType = damageHero != null ? damageHero.hazardType.ToString() : "none";
         string layer = LayerMask.LayerToName(collider.gameObject.layer);
         bool enemyBody = health != null && SemanticColliderRules.IsEnemyBodyCollider(
@@ -622,7 +636,7 @@ internal static class SemanticLabelCapture
         List<string> componentNames = new List<string>(components.Length);
         foreach (Component component in components)
             if (component != null) componentNames.Add(component.GetType().Name);
-        log?.Invoke($"HK_LABEL_COLLIDER owner={owner} hierarchy={hierarchy} " +
+        log?.Invoke($"{(fullDump ? "HK_LABEL_COLLIDER_DUMP" : "HK_LABEL_COLLIDER")} owner={owner} hierarchy={hierarchy} " +
                   $"collider={collider.gameObject.name} components={string.Join(",", componentNames)} " +
                   $"type={collider.GetType().Name} trigger={collider.isTrigger} layer={layer} " +
                   $"healthManager={(health != null)} damageHero={(damageHero != null)} " +
