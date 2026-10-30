@@ -16,6 +16,44 @@ class Curriculum:
         self.current: deque[bool] = deque(maxlen=100)
         self.history: dict[int, deque[bool]] = {i: deque(maxlen=300) for i in range(8)}
         self.episodes = 0
+        self.best_window_rate: dict[int, float] = {}
+        self.last_improvement_step: dict[int, int] = {}
+
+    def window_success_rate(self, level: int, window: int = 100) -> float | None:
+        if window < 1:
+            raise ValueError("window must be positive")
+        values = self.history[level]
+        if len(values) < window:
+            return None
+        return sum(list(values)[-window:]) / window
+
+    def training_goal_met(self, *, window: int = 100, levels_0_6_target: float = .70,
+                          level_7_target: float = .30) -> bool:
+        return all((rate := self.window_success_rate(level, window)) is not None
+                   and rate >= (level_7_target if level == 7 else levels_0_6_target)
+                   for level in range(8))
+
+    def update_progress_watch(self, steps: int, *, window: int = 100,
+                              levels_0_6_target: float = .70, level_7_target: float = .30,
+                              no_improvement_steps: int = 3_000_000) -> int | None:
+        for level in range(8):
+            rate = self.window_success_rate(level, window)
+            if rate is None:
+                continue
+            target = level_7_target if level == 7 else levels_0_6_target
+            if rate >= target:
+                self.best_window_rate.pop(level, None)
+                self.last_improvement_step.pop(level, None)
+                continue
+            best = self.best_window_rate.get(level)
+            if best is None or rate > best:
+                self.best_window_rate[level] = rate
+                self.last_improvement_step[level] = steps
+                continue
+            last_improvement = self.last_improvement_step.get(level, steps)
+            if steps - last_improvement >= no_improvement_steps:
+                return level
+        return None
 
     def record(self, success: bool, level: int | None = None) -> None:
         sampled_level = self.level if level is None else int(level)
@@ -57,7 +95,11 @@ class Curriculum:
     def to_dict(self) -> dict[str, object]:
         return {"level": self.level, "seed": self.seed, "episodes": self.episodes,
                 "current": list(self.current),
-                "history": {str(k): list(v) for k, v in self.history.items()}}
+                "history": {str(k): list(v) for k, v in self.history.items()},
+                "progress_watch": {
+                    "best_window_rate": {str(k): v for k, v in self.best_window_rate.items()},
+                    "last_improvement_step": {str(k): v for k, v in self.last_improvement_step.items()},
+                }}
 
     @classmethod
     def load(cls, path: str | Path) -> Curriculum:
@@ -72,4 +114,12 @@ class Curriculum:
                           for i in range(8)}
         if not saved_history and 0 <= result.level <= 7:
             result.history[result.level].extend(old_current)
+        progress_watch = data.get("progress_watch", {})
+        if isinstance(progress_watch, dict):
+            raw_best = progress_watch.get("best_window_rate", {})
+            raw_steps = progress_watch.get("last_improvement_step", {})
+            if isinstance(raw_best, dict):
+                result.best_window_rate = {int(key): float(value) for key, value in raw_best.items()}
+            if isinstance(raw_steps, dict):
+                result.last_improvement_step = {int(key): int(value) for key, value in raw_steps.items()}
         return result

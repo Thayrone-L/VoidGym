@@ -52,6 +52,7 @@ _ACTIVE_RUN_STARTED: str | None = None
 _ACTIVE_RUN_MONOTONIC: float | None = None
 _ACTIVE_STOP_REQUESTED = False
 _ACTIVE_RUN_INITIALIZED = False
+_ACTIVE_STOP_REASON: str | None = None
 _RUN_CLEANUPS: list[Callable[[], None]] = []
 _FAULT_HANDLE: Any = None
 
@@ -271,6 +272,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hours-limit", type=float)
     parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 8),
                         help="stop after a completed round once the curriculum reaches this level")
+    parser.add_argument("--goal-window-episodes", type=int, default=100)
+    parser.add_argument("--goal-success-levels-0-6", type=float, default=.70)
+    parser.add_argument("--goal-success-level-7", type=float, default=.30)
+    parser.add_argument("--no-improvement-steps", type=int, default=3_000_000)
     parser.add_argument("--quick-eval-interval-steps", type=int, default=1_000_000,
                         help="run quick evaluation whenever this many new steps are crossed")
     parser.add_argument("--quick-eval-episodes-per-level", type=int, default=50)
@@ -290,7 +295,10 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
 def _run_impl(args: argparse.Namespace) -> Path:
     if (args.total_steps < 1 or args.rollout_steps < 1 or args.seq_len < 1
             or args.quick_eval_interval_steps < 1 or args.quick_eval_episodes_per_level < 1
-            or args.microbatch_sequences < 1):
+            or args.microbatch_sequences < 1 or args.goal_window_episodes < 1
+            or args.no_improvement_steps < 1
+            or not 0 <= args.goal_success_levels_0_6 <= 1
+            or not 0 <= args.goal_success_level_7 <= 1):
         raise ValueError("step counts and sequence length must be positive")
     _priority_below_normal()
     random.seed(args.seed)
@@ -414,6 +422,7 @@ def _run_impl(args: argparse.Namespace) -> Path:
     fieldnames = ["steps", "L_ppo", "L_semantic", "L_inverse_dynamics", "L_hero_motion",
                   "entropy", "kl", "explained_variance", "steps_per_second", "curriculum_level",
                   "success_rate_100", "quick_eval_success",
+                  *[f"success_rate_{args.goal_window_episodes}_level_{level}" for level in range(8)],
                   *[f"success_rate_level_{level}" for level in range(8)]]
     if log_mode == "a":
         _ensure_csv_header(log_path, fieldnames)
@@ -642,6 +651,11 @@ def _run_impl(args: argparse.Namespace) -> Path:
                         "quick_eval_success": quick_eval})
             row.update({f"success_rate_level_{level}": curriculum.success_rate(level)
                         for level in range(8)})
+            window_rates = {level: curriculum.window_success_rate(level, args.goal_window_episodes)
+                            for level in range(8)}
+            row.update({f"success_rate_{args.goal_window_episodes}_level_{level}":
+                        ("" if window_rates[level] is None else window_rates[level])
+                        for level in range(8)})
             writer.writerow(row)
             stream.flush()
             _atomic_json(root / "heartbeat.json", {
@@ -649,8 +663,32 @@ def _run_impl(args: argparse.Namespace) -> Path:
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "success_by_level": {str(level): curriculum.success_rate(level)
                                      for level in range(8)},
+                "success_100_by_level": {str(level): window_rates[level]
+                                         for level in range(8)},
                 "system_memory": memory_sample,
             })
+            stalled_level = curriculum.update_progress_watch(
+                global_step, window=args.goal_window_episodes,
+                levels_0_6_target=args.goal_success_levels_0_6,
+                level_7_target=args.goal_success_level_7,
+                no_improvement_steps=args.no_improvement_steps,
+            )
+            if curriculum.training_goal_met(
+                    window=args.goal_window_episodes,
+                    levels_0_6_target=args.goal_success_levels_0_6,
+                    level_7_target=args.goal_success_level_7):
+                global _ACTIVE_STOP_REASON
+                _ACTIVE_STOP_REASON = "all curriculum levels met rolling success targets"
+                print(_ACTIVE_STOP_REASON, flush=True)
+                break
+            if stalled_level is not None:
+                _ACTIVE_STOP_REASON = (f"level {stalled_level} had no rolling-success improvement "
+                                       f"for {args.no_improvement_steps} steps")
+                print(_ACTIVE_STOP_REASON, flush=True)
+                break
+            if args.hours_limit and time.monotonic() - started >= args.hours_limit * 3600:
+                _ACTIVE_STOP_REASON = f"time limit reached ({args.hours_limit:g} hours)"
+                break
             if global_step - last_checkpoint >= 100_000:
                 _save_checkpoint(root, policy, trainer, curriculum, global_step, metrics, action_table)
                 prune_checkpoints(root)
@@ -681,7 +719,7 @@ def _run_impl(args: argparse.Namespace) -> Path:
 def run(args: argparse.Namespace) -> Path:
     """Run training with persistent heartbeat and terminal status reporting."""
     global _ACTIVE_RUN_ROOT, _ACTIVE_RUN_STARTED, _ACTIVE_RUN_MONOTONIC
-    global _ACTIVE_STOP_REQUESTED, _ACTIVE_RUN_INITIALIZED
+    global _ACTIVE_STOP_REQUESTED, _ACTIVE_RUN_INITIALIZED, _ACTIVE_STOP_REASON
     root = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
     heartbeat = root / "heartbeat.json"
     status = root / "status.json"
@@ -701,6 +739,7 @@ def run(args: argparse.Namespace) -> Path:
     _ACTIVE_RUN_STARTED = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     _ACTIVE_RUN_MONOTONIC = time.monotonic()
     _ACTIVE_STOP_REQUESTED = False
+    _ACTIVE_STOP_REASON = None
     _ACTIVE_RUN_INITIALIZED = False
     _RUN_CLEANUPS.clear()
     try:
@@ -715,7 +754,7 @@ def run(args: argparse.Namespace) -> Path:
     else:
         _write_terminal_status("STOPPED" if _ACTIVE_STOP_REQUESTED else "COMPLETED",
                                "termination signal received" if _ACTIVE_STOP_REQUESTED
-                               else "training loop finished")
+                               else (_ACTIVE_STOP_REASON or "training loop finished"))
         return result
     finally:
         for cleanup in reversed(_RUN_CLEANUPS):

@@ -93,3 +93,38 @@ def test_curriculum_load_migrates_older_current_window_to_level_history(tmp_path
     curriculum = Curriculum.load(path)
     assert list(curriculum.history[2]) == [True, False, True]
     assert curriculum.success_rate(2) == 2 / 3
+
+
+def test_curriculum_target_uses_last_100_episodes_per_level() -> None:
+    curriculum = Curriculum(seed=2)
+    for level in range(8):
+        curriculum.history[level].extend(
+            [True] * (70 if level < 7 else 30) + [False] * (30 if level < 7 else 70)
+        )
+    assert curriculum.training_goal_met()
+    curriculum.history[3].clear()
+    curriculum.history[3].extend([True] * 69 + [False] * 31)
+    assert not curriculum.training_goal_met()
+
+
+def test_curriculum_stagnation_window_stops_only_unmet_level() -> None:
+    curriculum = Curriculum(seed=3)
+    curriculum.history[2].extend([True, False, False])
+    assert curriculum.update_progress_watch(100, window=3, no_improvement_steps=5) is None
+    assert curriculum.update_progress_watch(104, window=3, no_improvement_steps=5) is None
+    assert curriculum.update_progress_watch(105, window=3, no_improvement_steps=5) == 2
+    curriculum.history[2].clear()
+    curriculum.history[2].extend([True, True, True])
+    assert curriculum.update_progress_watch(106, window=3, no_improvement_steps=5) is None
+    assert 2 not in curriculum.last_improvement_step
+
+
+def test_curriculum_progress_watch_round_trips(tmp_path) -> None:
+    curriculum = Curriculum(seed=4)
+    curriculum.history[2].extend([True, False, False])
+    curriculum.update_progress_watch(123, window=3, no_improvement_steps=5)
+    path = tmp_path / "curriculum.json"
+    curriculum.save(path)
+    resumed = Curriculum.load(path)
+    assert resumed.best_window_rate == {2: 1 / 3}
+    assert resumed.last_improvement_step == {2: 123}
