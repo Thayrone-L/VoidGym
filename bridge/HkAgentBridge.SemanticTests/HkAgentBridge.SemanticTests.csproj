@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\HkAgentBridge.Mod\SemanticRasterizer.cs" Link="SemanticRasterizer.cs" />
+    <Compile Include="..\HkAgentBridge.Mod\SemanticColliderRules.cs" Link="SemanticColliderRules.cs" />
   </ItemGroup>
 </Project>

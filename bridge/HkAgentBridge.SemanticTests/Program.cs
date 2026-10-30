@@ -35,6 +35,7 @@ TestDiagonalEdgeOnlyStampsCrossedCells();
 TestOpenFloorEdgeLeavesSolidLineAndIgnoredBacking();
 TestClosedTerrainContourFillsInterior();
 Console.WriteLine("semantic rasterizer shape and priority checks passed");
+TestSemanticColliderRules();
 
 static void TestLShapedColliderDoesNotFillItsBoundingBox()
 {
@@ -179,4 +180,24 @@ static bool Clip(float p, float q, ref float enter, ref float leave)
         if (ratio < leave) leave = ratio;
     }
     return true;
+}
+
+
+static void TestSemanticColliderRules()
+{
+    if (SemanticColliderRules.IsEnemyBodyCollider(true, true, true))
+        throw new InvalidOperationException("enemy trigger collider was labelled as its body");
+    if (!SemanticColliderRules.IsEnemyBodyCollider(false, true, false))
+        throw new InvalidOperationException("HealthManager root body collider was ignored");
+    if (!SemanticColliderRules.IsEnemyBodyCollider(false, false, true))
+        throw new InvalidOperationException("non-trigger contact-damage hitbox was ignored");
+    if (SemanticColliderRules.IsEnemyBodyCollider(false, false, false))
+        throw new InvalidOperationException("sensor or terrain-buffer child without local DamageHero was labelled ENEMY");
+
+    if (!SemanticColliderRules.IsEnvironmentalHazard(true, 1, false))
+        throw new InvalidOperationException("positive DamageHero hazardType was ignored");
+    if (SemanticColliderRules.IsEnvironmentalHazard(true, 0, false) ||
+        SemanticColliderRules.IsEnvironmentalHazard(true, 1, true) ||
+        SemanticColliderRules.IsEnvironmentalHazard(false, 1, false))
+        throw new InvalidOperationException("non-environmental DamageHero collider was labelled HAZARD");
 }

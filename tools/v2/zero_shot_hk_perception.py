@@ -37,6 +37,9 @@ def _parse_args() -> argparse.Namespace:
                         default=PROJECT_ROOT / "runtime" / "v2" / "experience")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "relatorios" / "86_amostras")
     parser.add_argument("--count", type=int, default=2000)
+    parser.add_argument("--source", choices=("actor", "evaluation", "demonstration",
+                        "self_imitation", "platform_gym", "test"))
+    parser.add_argument("--campaign-id")
     parser.add_argument("--scenes", default="Tutorial_01,Room_Town_Street",
                         help="cenas candidatas (Kings Pass e, se houver, Dirtmouth)")
     return parser.parse_args()
@@ -57,7 +60,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     history_available = True
     processed = 0
 
-    reader = ExperienceReader(args.experience_root, game_id="hollow_knight")
+    reader = ExperienceReader(args.experience_root, game_id="hollow_knight",
+                              campaign_id=args.campaign_id, source=args.source)
     with torch.inference_mode():
         for block in reader.iter_stacked():
             arrays = block["arrays"]
@@ -123,6 +127,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "trained_steps": manifest.get("trained_steps"),
         "sampled_frames": processed,
         "requested_scenes": wanted_scenes,
+        "source": args.source,
+        "campaign_id": args.campaign_id,
         "frames_per_scene": scene_counts,
         "action_history_available": history_available,
         "iou": iou,

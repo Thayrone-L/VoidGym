@@ -161,7 +161,7 @@ internal sealed class VisualCaptureBackend : IDisposable
             if (request.SemanticLabels)
             {
                 long semanticStarted = Stopwatch.GetTimestamp();
-                semanticFrame = SemanticLabelCapture.Capture();
+                semanticFrame = SemanticLabelCapture.Capture(_log);
                 semanticCaptureMs = ElapsedMilliseconds(semanticStarted);
             }
             long logStarted = Stopwatch.GetTimestamp();

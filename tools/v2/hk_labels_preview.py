@@ -27,10 +27,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--experience-root", type=Path,
                         default=PROJECT_ROOT / "runtime" / "v2" / "experience")
     parser.add_argument("--scene", default="Tutorial_01")
+    parser.add_argument("--source", choices=("actor", "test"), default="actor")
     parser.add_argument("--count", type=int, default=30)
     parser.add_argument("--output", type=Path,
                         default=PROJECT_ROOT / "relatorios" / "86_amostras" / "hk_gabarito.png")
     return parser.parse_args()
+
+
+def _largest_connected_enemy_region(rows: list[tuple[np.ndarray, np.ndarray]]) -> tuple[int, int]:
+    largest_cells = 0
+    largest_frame = -1
+    for frame_index, (_, labels) in enumerate(rows):
+        mask = labels == int(Sem.ENEMY)
+        visited = np.zeros(mask.shape, dtype=np.bool_)
+        for y, x in np.argwhere(mask):
+            if visited[y, x]:
+                continue
+            visited[y, x] = True
+            stack = [(int(y), int(x))]
+            size = 0
+            while stack:
+                current_y, current_x = stack.pop()
+                size += 1
+                for next_y, next_x in (
+                    (current_y - 1, current_x), (current_y + 1, current_x),
+                    (current_y, current_x - 1), (current_y, current_x + 1),
+                ):
+                    if (0 <= next_y < mask.shape[0] and 0 <= next_x < mask.shape[1]
+                            and mask[next_y, next_x] and not visited[next_y, next_x]):
+                        visited[next_y, next_x] = True
+                        stack.append((next_y, next_x))
+            if size > largest_cells:
+                largest_cells = size
+                largest_frame = frame_index
+    return largest_cells, largest_frame
 
 
 def _overlay(frame: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -44,9 +74,9 @@ def _overlay(frame: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return result
 
 
-def _collect(root: Path, scene: str, count: int) -> list[tuple[np.ndarray, np.ndarray]]:
+def _collect(root: Path, scene: str, count: int, source: str = "actor") -> list[tuple[np.ndarray, np.ndarray]]:
     rows: list[tuple[np.ndarray, np.ndarray]] = []
-    for block in ExperienceReader(root, game_id="hollow_knight", source="actor", scene=scene):
+    for block in ExperienceReader(root, game_id="hollow_knight", source=source, scene=scene):
         arrays: dict[str, Any] = block["arrays"]
         frames, labels = arrays.get("frame"), arrays.get("sem")
         if frames is None or labels is None:
@@ -55,15 +85,16 @@ def _collect(root: Path, scene: str, count: int) -> list[tuple[np.ndarray, np.nd
             if sem.shape != (27, 48):
                 continue
             rows.append((frame, sem))
-            if len(rows) >= count:
-                return rows
-    return rows
+    if len(rows) <= count:
+        return rows
+    indices = np.linspace(0, len(rows) - 1, count, dtype=np.int64)
+    return [rows[int(index)] for index in indices]
 
 
 def render(args: argparse.Namespace) -> dict[str, Any]:
     if args.count < 1 or args.count > 120:
         raise ValueError("count must be between 1 and 120")
-    rows = _collect(args.experience_root, args.scene, args.count)
+    rows = _collect(args.experience_root, args.scene, args.count, args.source)
     if len(rows) < args.count:
         raise RuntimeError(f"found {len(rows)}/{args.count} labeled frames in scene {args.scene}")
     class_counts = np.zeros(len(Sem), dtype=np.int64)
@@ -79,8 +110,20 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     print("Fração das classes no gabarito:")
     for name, fraction in fractions.items():
         print(f"  {name}: {fraction:.1%}")
+    largest_enemy_cells, largest_enemy_frame = _largest_connected_enemy_region(rows)
+    largest_enemy_fraction = largest_enemy_cells / (27 * 48)
+    warnings: list[str] = []
     if fractions.get("SOLID", 0.0) > 0.70:
-        print("\033[91mAVISO: SOLID excede 70% das células médias; confira o gabarito.\033[0m")
+        warnings.append("SOLID excede 70% das células médias")
+    if largest_enemy_fraction > 0.06:
+        warnings.append(
+            f"região ENEMY conectada ocupa {largest_enemy_fraction:.1%} da tela "
+            f"no quadro {largest_enemy_frame}"
+        )
+    if fractions.get("ENEMY", 0.0) > 0.10:
+        warnings.append(f"ENEMY total excede 10% da amostra ({fractions['ENEMY']:.1%})")
+    for warning in warnings:
+        print(f"\033[91mAVISO: {warning}; confira o gabarito.\033[0m")
     tile_w, tile_h, columns = 384, 448, 6
     canvas = Image.new("RGB", (columns * tile_w, ((len(rows) + columns - 1) // columns) * tile_h),
                        (12, 12, 16))
@@ -96,7 +139,10 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     canvas.save(args.output)
     return {"output": str(args.output), "scene": args.scene, "frames": len(rows),
             "classes": [item.name for item in Sem], "class_fractions": fractions,
-            "ignore_id": IGNORE}
+            "largest_enemy_region_cells": largest_enemy_cells,
+            "largest_enemy_region_screen_fraction": largest_enemy_fraction,
+            "largest_enemy_region_frame": largest_enemy_frame,
+            "warnings": warnings, "source": args.source, "ignore_id": IGNORE}
 
 
 def main() -> int:

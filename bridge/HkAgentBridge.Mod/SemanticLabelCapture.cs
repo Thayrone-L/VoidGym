@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 
 namespace HkAgentBridge;
@@ -23,6 +24,8 @@ internal sealed class SemanticLabelFrame
 internal static class SemanticLabelCapture
 {
     private static readonly Collider2D[] OverlapBuffer = new Collider2D[256];
+    private static readonly HashSet<int> LoggedSemanticColliders = new HashSet<int>();
+    private const int SemanticDiagnosticColliderLimit = 256;
     private const byte Empty = 0;
     private const byte Solid = 1;
     private const byte Platform = 2;
@@ -48,7 +51,7 @@ internal static class SemanticLabelCapture
         StringComparison.OrdinalIgnoreCase
     );
 
-    public static SemanticLabelFrame Capture()
+    public static SemanticLabelFrame Capture(Action<string>? log = null)
     {
         Camera? camera = Camera.main;
         if (camera == null)
@@ -80,19 +83,21 @@ internal static class SemanticLabelCapture
         for (int index = 0; index < visibleCount; index++)
         {
             Collider2D collider = OverlapBuffer[index];
-            if (collider != null && collider.enabled && collider.gameObject.activeInHierarchy &&
-                (collider.gameObject.scene == scene ||
-                 (hero != null && collider.GetComponentInParent<HeroController>() == hero)) &&
-                TryClassify(collider, hero, out byte label, out byte priority))
+            if (collider == null || !collider.enabled || !collider.gameObject.activeInHierarchy ||
+                (collider.gameObject.scene != scene &&
+                 (hero == null || collider.GetComponentInParent<HeroController>() != hero)))
+                continue;
+
+            LogSemanticCollider(collider, log);
+            if (!TryClassify(collider, hero, out byte label, out byte priority))
+                continue;
+            if (collider is EdgeCollider2D edge && label == Solid)
             {
-                if (collider is EdgeCollider2D edge && label == Solid)
-                {
-                    terrainEdges.Add(edge);
-                    continue;
-                }
-                if (!StampColliderShape(camera, collider, label, priority, labels, priorities))
-                    MarkCandidateCells(camera, collider.bounds, candidateCells);
+                terrainEdges.Add(edge);
+                continue;
             }
+            if (!StampColliderShape(camera, collider, label, priority, labels, priorities))
+                MarkCandidateCells(camera, collider.bounds, candidateCells);
         }
 
         bool[] terrainLineCells = new bool[SemanticRasterizer.Width * SemanticRasterizer.Height];
@@ -564,17 +569,65 @@ internal static class SemanticLabelCapture
             SetCandidate(LabelBreakables ? Breakable : SemanticRasterizer.Ignore,
                 PriorityBreakable, ref label, ref priority);
 
-        if (collider.GetComponentInParent<DamageHero>() != null)
+        DamageHero? damageHero = collider.GetComponentInParent<DamageHero>();
+        DamageHero? contactDamage = collider.GetComponent<DamageHero>();
+        HealthManager? health = collider.GetComponentInParent<HealthManager>();
+        if (SemanticColliderRules.IsEnvironmentalHazard(
+                damageHero != null, damageHero?.hazardType ?? 0, health != null))
             SetCandidate(Hazard, PriorityHazard, ref label, ref priority);
 
-        HealthManager? health = collider.GetComponentInParent<HealthManager>();
-        if (health != null && !health.isDead && health.isActiveAndEnabled)
+        if (health != null && !health.isDead && health.isActiveAndEnabled &&
+            SemanticColliderRules.IsEnemyBodyCollider(
+                collider.isTrigger, collider.gameObject == health.gameObject, contactDamage != null))
             SetCandidate(Enemy, PriorityEnemy, ref label, ref priority);
 
         if (hero != null && collider.GetComponentInParent<HeroController>() == hero)
             SetCandidate(Player, PriorityPlayer, ref label, ref priority);
 
         return priority != 0;
+    }
+
+    private static void LogSemanticCollider(Collider2D collider, Action<string>? log)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("HK_LABEL_DIAGNOSTICS"), "true",
+                StringComparison.OrdinalIgnoreCase))
+            return;
+        HealthManager? health = collider.GetComponentInParent<HealthManager>();
+        DamageHero? damageHero = collider.GetComponentInParent<DamageHero>();
+        DamageHero? contactDamage = collider.GetComponent<DamageHero>();
+        bool hazardCandidate = damageHero != null && damageHero.hazardType > 0 && health == null;
+        bool namedHazard = collider.gameObject.name.IndexOf("spike", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                           collider.gameObject.name.IndexOf("acid", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                           collider.gameObject.name.IndexOf("hazard", StringComparison.OrdinalIgnoreCase) >= 0;
+        if ((health == null && damageHero == null && !namedHazard) ||
+            LoggedSemanticColliders.Count >= SemanticDiagnosticColliderLimit ||
+            !LoggedSemanticColliders.Add(collider.GetInstanceID()))
+            return;
+
+        string owner = health != null ? health.gameObject.name : damageHero!.gameObject.name;
+        string hazardType = damageHero != null ? damageHero.hazardType.ToString() : "none";
+        string layer = LayerMask.LayerToName(collider.gameObject.layer);
+        bool enemyBody = health != null && SemanticColliderRules.IsEnemyBodyCollider(
+            collider.isTrigger, collider.gameObject == health.gameObject, contactDamage != null);
+        bool environmentalHazard = SemanticColliderRules.IsEnvironmentalHazard(
+            damageHero != null, damageHero?.hazardType ?? 0, health != null);
+        StringBuilder hierarchy = new StringBuilder();
+        Transform? current = collider.transform;
+        for (int depth = 0; current != null && depth < 8; depth++, current = current.parent)
+        {
+            if (hierarchy.Length != 0) hierarchy.Append('/');
+            hierarchy.Append(current.name);
+        }
+        Component[] components = collider.gameObject.GetComponents<Component>();
+        List<string> componentNames = new List<string>(components.Length);
+        foreach (Component component in components)
+            if (component != null) componentNames.Add(component.GetType().Name);
+        log?.Invoke($"HK_LABEL_COLLIDER owner={owner} hierarchy={hierarchy} " +
+                  $"collider={collider.gameObject.name} components={string.Join(",", componentNames)} " +
+                  $"type={collider.GetType().Name} trigger={collider.isTrigger} layer={layer} " +
+                  $"healthManager={(health != null)} damageHero={(damageHero != null)} " +
+                  $"contactDamage={(contactDamage != null)} hazardCandidate={hazardCandidate} " +
+                  $"hazardType={hazardType} enemyBody={enemyBody} hazard={environmentalHazard}");
     }
 
     private static bool IsBreakable(Collider2D collider) =>
