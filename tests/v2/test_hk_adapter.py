@@ -130,6 +130,40 @@ def test_hk_adapter_reads_and_steps_through_explore_task() -> None:
     assert adapter.signals()["terminated"] is True
 
 
+def test_v2_discovery_reward_is_opt_in_on_hk_adapter() -> None:
+    names = HollowKnightAdapter(EmptyEnv()).action_table()
+    frame = SimpleNamespace(pixels=np.zeros((8, 12, 3), dtype=np.uint8),
+                            scene_name="Room", operator_telemetry=None,
+                            combat_events=())
+
+    class Task:
+        _action_names = names
+        config = SimpleNamespace(tutorial_hint_level=0)
+        _player_knowledge = SimpleNamespace(vector=lambda *, hint_level: np.asarray([hint_level]))
+
+        def __init__(self) -> None:
+            self.environment = SimpleNamespace(_frames=[frame])
+
+        def action_masks(self):
+            return np.ones(len(names), dtype=np.bool_)
+
+        def step(self, _action):
+            self.environment._frames[-1] = SimpleNamespace(
+                pixels=frame.pixels, scene_name="Room", operator_telemetry=None,
+                combat_events=({"kind": "hit_geo_rock", "scene_name": "Room",
+                                "object_id": "rock-1", "amount": 0},),
+            )
+            return {}, 1.0, False, False, {}
+
+    default_adapter = HollowKnightAdapter(Task())
+    default_adapter.apply(0)
+    assert default_adapter.last_reward == 1.0
+
+    v2_adapter = HollowKnightAdapter(Task(), enable_discovery_reward=True)
+    v2_adapter.apply(0)
+    assert v2_adapter.last_reward == pytest.approx(1.05)
+
+
 def test_hk_adapter_exposes_opt_in_labels_only_as_training_targets() -> None:
     env = EmptyEnv()
     sem = np.zeros((27, 48), dtype=np.uint8)

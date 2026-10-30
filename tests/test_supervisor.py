@@ -206,6 +206,7 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(capture.message_type, "CAPTURE_ONCE")
                 self.assertNotIn("encoding", capture.payload)
                 self.assertNotIn("semantic_labels", capture.payload)
+                self.assertNotIn("combat_events", capture.payload)
                 frame = Envelope(
                     protocol_version=PROTOCOL_VERSION,
                     message_type="FRAME",
@@ -414,6 +415,59 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(captured.semantic_labels_u4, packed)
                 self.assertEqual(captured.hero_motion, (0.5, -0.25, True))
                 self.assertFalse(captured.interact_prompt_valid)
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                await supervisor.close()
+
+        asyncio.run(scenario())
+
+    def test_combat_events_are_requested_and_decoded_only_with_capability(self) -> None:
+        async def scenario() -> None:
+            supervisor = SupervisorServer(token="combat-events-token")
+            await supervisor.start()
+            assert supervisor.port is not None
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", supervisor.port)
+                session_id = str(uuid.uuid4())
+                await write_message(writer, Envelope(
+                    protocol_version=PROTOCOL_VERSION, message_type="HELLO",
+                    run_id=supervisor.run_id, instance_id="hk-combat-events",
+                    session_id=session_id, seq=0, trace_id=str(uuid.uuid4()),
+                    sent_monotonic_ns=time.monotonic_ns(),
+                    payload={"token": "combat-events-token", "game_profile": "development",
+                             "game_version": "bridge-harness",
+                             "capabilities": ["combat_events_v1"]},
+                ))
+                await read_message(reader)
+                bridge = await supervisor.wait_for_bridge(1.0)
+                capture_task = asyncio.create_task(supervisor.capture_once(
+                    bridge=bridge, episode_id="combat-episode", encoding="raw_rgb8",
+                    combat_events=True,
+                ))
+                capture = await read_message(reader)
+                self.assertEqual(capture.message_type, "CAPTURE_ONCE")
+                self.assertIs(capture.payload.get("combat_events"), True)
+                await write_message(writer, Envelope(
+                    protocol_version=PROTOCOL_VERSION, message_type="FRAME",
+                    run_id=supervisor.run_id, instance_id="hk-combat-events",
+                    session_id=session_id, seq=1, trace_id=capture.trace_id,
+                    sent_monotonic_ns=time.monotonic_ns(), payload={
+                        "frame_id": 1, "episode_id": "combat-episode",
+                        "capture_monotonic_ns": time.monotonic_ns(),
+                        "width": 1, "height": 1, "channels": 3,
+                        "pixel_format": "RGB8", "encoding": "raw_rgb8",
+                        "payload_bytes": 3, "data_base64": base64.b64encode(b"123").decode(),
+                        "scene_transition": False,
+                        "combat_events": [{"kind": "hit_geo_rock", "scene_name": "Room",
+                                           "object_id": "Geo Rock 1", "amount": 0}],
+                    },
+                ))
+                captured = await capture_task
+                self.assertEqual(captured.combat_events, ({
+                    "kind": "hit_geo_rock", "scene_name": "Room",
+                    "object_id": "Geo Rock 1", "amount": 0,
+                },))
                 writer.close()
                 await writer.wait_closed()
             finally:

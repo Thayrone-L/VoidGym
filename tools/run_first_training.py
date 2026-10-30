@@ -154,6 +154,8 @@ def build_task(
     args: argparse.Namespace,
     phase: str,
     request_semantic_labels: bool = False,
+    request_combat_events: bool = False,
+    request_breakable_labels: bool = False,
 ) -> tuple[Any, IsolatedEpisodeProcessOwner]:
     phase_root = output_root / phase
     checkpoint_reload_plan_provider = None
@@ -174,6 +176,7 @@ def build_task(
             instance_data_root=args.instance_data_root,
             expected_product_name=(project_config.instance_product_names[int(os.environ["HK_AGENT_SLOT_ID"])] if args.instance_data_root is not None and os.environ.get("HK_AGENT_SLOT_ID") is not None else None),
             other_instance_data_roots=tuple(root for root in project_config.instance_data_roots if root.resolve(strict=False) != args.instance_data_root.resolve(strict=False)) if args.instance_data_root else (),
+            enable_breakable_labels=request_breakable_labels,
         )
     )
     try:
@@ -195,6 +198,7 @@ def build_task(
             bridge_timeout_seconds=30.0,
             process_timeout_seconds=30.0,
             request_semantic_labels=request_semantic_labels,
+            request_combat_events=request_combat_events,
         )
         environment = HollowKnightEnv(
             backend,

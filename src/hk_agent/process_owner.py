@@ -58,6 +58,7 @@ class ProcessOwnerConfig:
     instance_data_root: Path | None = None
     expected_product_name: str | None = None
     other_instance_data_roots: tuple[Path, ...] = ()
+    enable_breakable_labels: bool = False
 
     def validate(self, *, require_files: bool = True) -> None:
         if self.personal_root.resolve(strict=False) == self.experimental_root.resolve(
@@ -90,6 +91,8 @@ class ProcessOwnerConfig:
                 raise ValueError("instance mode requires the marker product name")
             if not self.redirected_save_mode:
                 raise ValueError("instance mode requires redirected save mode")
+        if type(self.enable_breakable_labels) is not bool:
+            raise TypeError("enable_breakable_labels must be bool")
 
         for value, label in (
             (self.shutdown_timeout_seconds, "shutdown timeout"),
@@ -261,6 +264,7 @@ class IsolatedEpisodeProcessOwner:
                     if self._config.instance_data_root is not None
                     else None
                 ),
+                "enable_breakable_labels": self._config.enable_breakable_labels,
             }
             environment = clean_bridge_environment(os.environ)
             launch_nonce = os.environ.get("HK_AGENT_LAUNCH_ID") or uuid.uuid4().hex

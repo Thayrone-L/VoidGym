@@ -90,7 +90,12 @@ class CaptureFactory:
         return process
 
 
-def make_owner(tmp_path: Path, process: FakeProcess) -> tuple[IsolatedEpisodeProcessOwner, CaptureFactory]:
+def make_owner(
+    tmp_path: Path,
+    process: FakeProcess,
+    *,
+    enable_breakable_labels: bool = False,
+) -> tuple[IsolatedEpisodeProcessOwner, CaptureFactory]:
     factory = CaptureFactory(process)
     owner = IsolatedEpisodeProcessOwner(
         ProcessOwnerConfig(
@@ -102,12 +107,23 @@ def make_owner(tmp_path: Path, process: FakeProcess) -> tuple[IsolatedEpisodePro
             python_executable=tmp_path / "python.exe",
             state_root=tmp_path / "state",
             shutdown_timeout_seconds=0.1,
+            enable_breakable_labels=enable_breakable_labels,
         ),
         process_factory=factory,
         powershell=tmp_path / "powershell.exe",
         validate_files=False,
     )
     return owner, factory
+
+
+def test_owner_encodes_breakable_label_opt_in_for_isolated_worker(tmp_path: Path) -> None:
+    owner, factory = make_owner(
+        tmp_path, FakeProcess(), enable_breakable_labels=True
+    )
+    owner.start_episode(endpoint(), "episode-breakables")
+    request = decode_request(factory.calls[0][1][EPISODE_REQUEST_ENV])
+    assert request["enable_breakable_labels"] is True
+    owner.shutdown()
 
 
 def endpoint() -> SupervisorEndpoint:

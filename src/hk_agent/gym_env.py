@@ -82,6 +82,7 @@ class PixelFrame:
     operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     bestiary_events: tuple[dict[str, Any], ...] = ()
+    combat_events: tuple[dict[str, Any], ...] = ()
     decode_ms: float = 0.0
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -533,6 +534,7 @@ class HollowKnightEnv(gym.Env[dict[str, NDArray[np.generic]], int]):
             scene_name=frame.scene_name,
             operator_telemetry=dict(operator_telemetry) if operator_telemetry is not None else None,
             enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
+            combat_events=frame.combat_events,
             decode_ms=frame.decode_ms,
             bridge_timing=frame.bridge_timing,
             action_availability=frame.action_availability,

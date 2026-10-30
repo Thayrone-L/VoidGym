@@ -13,6 +13,10 @@ from hk_agent.temporal_actions import (  # V1-SHIM: portar no prompt 86
     PLAYER_INTERACTION_ACTIONS,
     TEMPORAL_COMBAT_ACTIONS,
 )
+from voidgym.adapters.hollow_knight.discovery_reward import (
+    DiscoveryReward,
+    DiscoveryRewardConfig,
+)
 from voidgym.core.actions import UNIVERSAL_ACTIONS, UniversalAction
 from voidgym.core.errors import VoidGymRuntimeError as RuntimeError
 
@@ -47,11 +51,14 @@ class HollowKnightAdapter:
 
     game_id = "hollow_knight"
 
-    def __init__(self, env: Any) -> None:
+    def __init__(self, env: Any, *, enable_discovery_reward: bool = False,
+                 discovery_reward_config: DiscoveryRewardConfig | None = None) -> None:
         self.env = env
         self._last_info: dict[str, Any] = {}
         self._last_reward = 0.0
         self._task_mode = hasattr(env, "environment") and hasattr(env, "config") and hasattr(env, "action_masks")
+        self._discovery_reward = (DiscoveryReward(discovery_reward_config)
+                                  if enable_discovery_reward else None)
         if self._task_mode and tuple(getattr(env, "_action_names", ())) != _NAMES:
             raise RuntimeError("explore_v4 action table differs from the universal HK adapter")
         if set(_HK_TO_UNIVERSAL) != set(_NAMES):
@@ -61,6 +68,8 @@ class HollowKnightAdapter:
         _observation, info = self.env.reset(seed=seed, options=options)
         self._last_info = dict(info)
         self._last_reward = 0.0
+        if self._discovery_reward is not None:
+            self._discovery_reward.reset_slice()
 
     def _game_env(self) -> Any:
         return self.env.environment if self._task_mode else self.env
@@ -88,6 +97,7 @@ class HollowKnightAdapter:
 
     def apply(self, game_action_index: int) -> None:
         template = _TEMPLATES[game_action_index]
+        before_signals = self.signals() if self._discovery_reward is not None else {}
         if self._task_mode:
             _observation, reward, terminated, truncated, info = self.env.step(
                 game_action_index
@@ -99,6 +109,8 @@ class HollowKnightAdapter:
             )
         self._last_reward = float(reward)
         self._last_info = dict(info)
+        if self._discovery_reward is not None:
+            self._last_reward += self._discovery_reward(before_signals, self.signals())
 
     def action_mask(self) -> np.ndarray:
         if self._task_mode:
@@ -134,6 +146,9 @@ class HollowKnightAdapter:
                     )
                 if "hp" in telemetry:
                     result["hp"] = telemetry["hp"]
+            combat_events = getattr(frame, "combat_events", ())
+            if combat_events:
+                result["combat_events"] = [dict(event) for event in combat_events]
             return result
         frame = game_env._frames[-1]
         signal_names = {
@@ -161,6 +176,7 @@ class HollowKnightAdapter:
             "shade_distance": frame.shade_distance,
             "enemy_events_since_last_frame": frame.enemy_events_since_last_frame,
             "bestiary_events_since_last_frame": frame.bestiary_events,
+            "combat_events": [dict(event) for event in getattr(frame, "combat_events", ())],
             "action_availability": availability_dict(frame.action_availability),
         })
         if frame.operator_telemetry is not None:

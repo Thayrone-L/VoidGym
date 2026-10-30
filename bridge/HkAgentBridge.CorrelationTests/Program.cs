@@ -47,6 +47,18 @@ Assert(EpisodeLifecycleState.CountHealthRestored(5, 7, true, false, true) == 0, 
 Assert(EpisodeLifecycleState.CountHealthRestored(5, 7, false, false, false) == 0, "out-of-episode healing must be ignored");
 lifecycle.BeginEpisode(false);
 Assert(!lifecycle.Snapshot().PlayerDead, "lifecycle must start alive");
+lifecycle.RecordCombatEvent("hit_geo_rock", "Room_Test", "Geo Rock 1[0]/_Props[1]");
+lifecycle.RecordCombatEvent("geo_rock_broken", "Room_Test", "Geo Rock 1[0]/_Props[1]");
+Assert(lifecycle.Snapshot().CombatEventsSinceLastFrame.Count == 0,
+    "unrequested combat events must stay out of the snapshot");
+EpisodeLifecycleSnapshot discovery = lifecycle.Snapshot(includeCombatEvents: true);
+Assert(discovery.CombatEventsSinceLastFrame.Count == 2,
+    "combat discovery events must be queued for the requested v2 FRAME");
+Assert(discovery.CombatEventsSinceLastFrame[0].Kind == "hit_geo_rock" &&
+       discovery.CombatEventsSinceLastFrame[0].Amount == 0,
+    "rock-hit event schema must preserve kind and object identity");
+Assert(lifecycle.Snapshot(includeCombatEvents: true).CombatEventsSinceLastFrame.Count == 0,
+    "combat event queue must drain after a frame");
 lifecycle.ObserveShadePresence(true);
 lifecycle.MarkPlayerDying();
 lifecycle.ObserveShadePresence(true);

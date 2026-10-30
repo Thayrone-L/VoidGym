@@ -35,6 +35,7 @@ class WorkerRequest:
     bridge_mode: str = "legacy"
     instance_product_name: str | None = None
     instance_data_root: Path | None = None
+    enable_breakable_labels: bool = False
 
     @classmethod
     def from_environment(cls) -> WorkerRequest:
@@ -90,6 +91,9 @@ class WorkerRequest:
             bridge_mode=bridge_mode,
             instance_product_name=instance_product_name,
             instance_data_root=instance_data_root,
+            enable_breakable_labels=_boolean(
+                value, "enable_breakable_labels", default=False
+            ),
         )
         if request.bridge_mode == "instance" and not request.redirected_save_mode:
             raise ValueError("instance bridge mode requires redirected save mode")
@@ -189,6 +193,10 @@ def _game_environment(request: WorkerRequest) -> dict[str, str]:
             game_profile=str(endpoint["game_profile"]),
             save_root=str(request.experimental_root.resolve(strict=False)),
         )
+    if request.enable_breakable_labels:
+        environment["HK_LABEL_BREAKABLES"] = "true"
+    else:
+        environment.pop("HK_LABEL_BREAKABLES", None)
     for name in tuple(environment):
         if name.startswith("HK_OWNER_") or name in {
             EPISODE_REQUEST_ENV,

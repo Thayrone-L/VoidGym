@@ -23,6 +23,22 @@ internal readonly struct EnemyKillEvent
     public string? BossVersion { get; }
 }
 
+internal readonly struct CombatLifecycleEvent
+{
+    public CombatLifecycleEvent(string kind, string sceneName, string objectId, int amount)
+    {
+        Kind = kind;
+        SceneName = sceneName;
+        ObjectId = objectId;
+        Amount = amount;
+    }
+
+    public string Kind { get; }
+    public string SceneName { get; }
+    public string ObjectId { get; }
+    public int Amount { get; }
+}
+
 internal readonly struct EpisodeLifecycleSnapshot
 {
     public EpisodeLifecycleSnapshot(
@@ -38,7 +54,8 @@ internal readonly struct EpisodeLifecycleSnapshot
         int shadeHitsSinceLastFrame,
         string? sceneName,
         float? shadeDistance,
-        IReadOnlyList<EnemyKillEvent> enemyEvents
+        IReadOnlyList<EnemyKillEvent> enemyEvents,
+        IReadOnlyList<CombatLifecycleEvent> combatEvents
     )
     {
         PlayerDead = playerDead;
@@ -54,6 +71,7 @@ internal readonly struct EpisodeLifecycleSnapshot
         SceneName = sceneName;
         ShadeDistance = shadeDistance;
         EnemyEventsSinceLastFrame = enemyEvents;
+        CombatEventsSinceLastFrame = combatEvents;
     }
 
     public bool PlayerDead { get; }
@@ -69,6 +87,7 @@ internal readonly struct EpisodeLifecycleSnapshot
     public string? SceneName { get; }
     public float? ShadeDistance { get; }
     public IReadOnlyList<EnemyKillEvent> EnemyEventsSinceLastFrame { get; }
+    public IReadOnlyList<CombatLifecycleEvent> CombatEventsSinceLastFrame { get; }
 }
 
 /// <summary>
@@ -91,11 +110,14 @@ internal sealed class EpisodeLifecycleState
     private int _shadeHitCycleTotal;
     private readonly object _enemyEventLock = new();
     private readonly List<EnemyKillEvent> _enemyEventsSinceLastFrame = new();
+    private readonly object _combatEventLock = new();
+    private readonly List<CombatLifecycleEvent> _combatEventsSinceLastFrame = new();
 
     public bool IsDeathStarted => Volatile.Read(ref _deathStarted) != 0 || Volatile.Read(ref _playerDead) != 0;
     public bool ShadePending => Volatile.Read(ref _shadePending) != 0;
 
-    public EpisodeLifecycleSnapshot Snapshot(string? sceneName = null, float? shadeDistance = null) =>
+    public EpisodeLifecycleSnapshot Snapshot(string? sceneName = null, float? shadeDistance = null,
+                                              bool includeCombatEvents = false) =>
         new(
             Volatile.Read(ref _playerDead) != 0,
             Volatile.Read(ref _shadePending) != 0,
@@ -109,7 +131,8 @@ internal sealed class EpisodeLifecycleState
             Interlocked.Exchange(ref _shadeHitsSinceLastFrame, 0),
             sceneName,
             shadeDistance,
-            DrainEnemyEvents()
+            DrainEnemyEvents(),
+            includeCombatEvents ? DrainCombatEvents() : Array.Empty<CombatLifecycleEvent>()
         );
 
     public void BeginEpisode(bool? shadePendingFromSave)
@@ -120,6 +143,7 @@ internal sealed class EpisodeLifecycleState
         Interlocked.Exchange(ref _deathStarted, 0);
         Interlocked.Exchange(ref _enemyKillsSinceLastFrame, 0);
         lock (_enemyEventLock) _enemyEventsSinceLastFrame.Clear();
+        lock (_combatEventLock) _combatEventsSinceLastFrame.Clear();
         Interlocked.Exchange(ref _healthLostSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoGainedSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoSpentSinceLastFrame, 0);
@@ -137,6 +161,21 @@ internal sealed class EpisodeLifecycleState
         if (amount > 0)
         {
             Interlocked.Add(ref _geoGainedSinceLastFrame, amount);
+        }
+    }
+
+    public void RecordCombatEvent(string kind, string sceneName, string objectId, int amount = 0)
+    {
+        if (string.IsNullOrWhiteSpace(kind) || string.IsNullOrWhiteSpace(sceneName) ||
+            string.IsNullOrWhiteSpace(objectId) || amount < 0) return;
+        lock (_combatEventLock)
+        {
+            if (_combatEventsSinceLastFrame.Count < 256)
+            {
+                _combatEventsSinceLastFrame.Add(new CombatLifecycleEvent(
+                    kind, sceneName, objectId, amount
+                ));
+            }
         }
     }
 
@@ -182,6 +221,16 @@ internal sealed class EpisodeLifecycleState
         {
             EnemyKillEvent[] events = _enemyEventsSinceLastFrame.ToArray();
             _enemyEventsSinceLastFrame.Clear();
+            return events;
+        }
+    }
+
+    private IReadOnlyList<CombatLifecycleEvent> DrainCombatEvents()
+    {
+        lock (_combatEventLock)
+        {
+            CombatLifecycleEvent[] events = _combatEventsSinceLastFrame.ToArray();
+            _combatEventsSinceLastFrame.Clear();
             return events;
         }
     }

@@ -128,6 +128,7 @@ class SupervisorEnvironmentBackend:
         reuse_game_on_reset: bool = False,
         playthrough_root: Path | None = None,
         request_semantic_labels: bool = False,
+        request_combat_events: bool = False,
     ) -> None:
         if (
             bridge_timeout_seconds <= 0
@@ -160,7 +161,10 @@ class SupervisorEnvironmentBackend:
         self._reuse_game_on_reset = reuse_game_on_reset
         if type(request_semantic_labels) is not bool:
             raise TypeError("request_semantic_labels must be bool")
+        if type(request_combat_events) is not bool:
+            raise TypeError("request_combat_events must be bool")
         self._request_semantic_labels = request_semantic_labels
+        self._request_combat_events = request_combat_events
         self._playthrough_root = playthrough_root.resolve(strict=False) if playthrough_root else None
         self._shutdown_process = shutdown_process
         self._bridge_timeout = bridge_timeout_seconds
@@ -349,6 +353,7 @@ class SupervisorEnvironmentBackend:
                         episode_id=episode_id,
                         encoding="raw_rgb8",
                         semantic_labels=self._request_semantic_labels,
+                        combat_events=self._request_combat_events,
                     ),
                     timeout=self._command_timeout + 0.5,
                 )
@@ -564,6 +569,7 @@ class SupervisorEnvironmentBackend:
                 episode_id=episode_id,
                 encoding="raw_rgb8",
                 semantic_labels=self._request_semantic_labels,
+                combat_events=self._request_combat_events,
             ),
             timeout=self._command_timeout + 0.5,
         )
@@ -738,6 +744,7 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         operator_telemetry=frame.operator_telemetry,
         enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
         bestiary_events=frame.bestiary_events,
+        combat_events=frame.combat_events,
         decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
         bridge_timing=frame.bridge_timing,
         action_availability=frame.action_availability,

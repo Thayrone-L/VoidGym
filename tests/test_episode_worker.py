@@ -109,6 +109,15 @@ def test_worker_legacy_request_ignores_inherited_instance_mode(
     } & environment.keys()
 
 
+def test_worker_enables_breakable_labels_only_when_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HK_LABEL_BREAKABLES", "stale")
+    assert "HK_LABEL_BREAKABLES" not in _game_environment(request(tmp_path))
+    enabled = replace(request(tmp_path), enable_breakable_labels=True)
+    assert _game_environment(enabled)["HK_LABEL_BREAKABLES"] == "true"
+
+
 @pytest.mark.parametrize(
     ("stop_exists", "maximum_seconds", "expected_reason"),
     [

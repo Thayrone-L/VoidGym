@@ -25,8 +25,8 @@ internal sealed class BridgeClient : IDisposable
     private readonly Action<bool> _setHumanMode;
     private readonly Func<IEnumerable<string>, int, string[]> _applyAction;
     private readonly Func<IEnumerable<string>, int, string[]> _applyMenuAction;
-    private readonly Func<string, bool, CancellationToken, Task<CapturedFrame>> _captureOnce;
-    private readonly Func<EpisodeLifecycleSnapshot> _lifecycleSnapshot;
+    private readonly Func<string, bool, bool, CancellationToken, Task<CapturedFrame>> _captureOnce;
+    private readonly Func<bool, EpisodeLifecycleSnapshot> _lifecycleSnapshot;
     private readonly Func<Dictionary<string, object?>> _operatorTelemetrySnapshot;
     private readonly Action _beginEpisodeLifecycle;
     private readonly CancellationTokenSource _cancellation = new();
@@ -46,8 +46,8 @@ internal sealed class BridgeClient : IDisposable
         Action<bool> setHumanMode,
         Func<IEnumerable<string>, int, string[]> applyAction,
         Func<IEnumerable<string>, int, string[]> applyMenuAction,
-        Func<string, bool, CancellationToken, Task<CapturedFrame>> captureOnce,
-        Func<EpisodeLifecycleSnapshot> lifecycleSnapshot,
+        Func<string, bool, bool, CancellationToken, Task<CapturedFrame>> captureOnce,
+        Func<bool, EpisodeLifecycleSnapshot> lifecycleSnapshot,
         Func<Dictionary<string, object?>> operatorTelemetrySnapshot,
         Action beginEpisodeLifecycle
     )
@@ -106,6 +106,7 @@ internal sealed class BridgeClient : IDisposable
                             "shade_run_lifecycle",
                             "action_availability_v1",
                             "semantic_labels_v1",
+                            "combat_events_v1",
                         },
                     }
                 );
@@ -404,6 +405,20 @@ internal sealed class BridgeClient : IDisposable
                             break;
                         }
                         bool requestSemanticLabels = labelsToken?.Value<bool>() ?? false;
+                        JToken? combatEventsToken = command["payload"]?["combat_events"];
+                        if (combatEventsToken != null && combatEventsToken.Type != JTokenType.Boolean)
+                        {
+                            responseType = "ERROR";
+                            payload = new
+                            {
+                                command_type = messageType,
+                                error_code = "invalid_combat_events_request",
+                                recoverable = true,
+                                detail = "combat_events must be a boolean",
+                            };
+                            break;
+                        }
+                        bool requestCombatEvents = combatEventsToken?.Value<bool>() ?? false;
                         string? requestedEpisodeId =
                             (string?)command["payload"]?["episode_id"];
                         CorrelationSnapshot correlation =
@@ -415,9 +430,10 @@ internal sealed class BridgeClient : IDisposable
                             CapturedFrame frame = await _captureOnce(
                                 requestedEncoding,
                                 requestSemanticLabels,
+                                requestCombatEvents,
                                 captureCancellation.Token
                             ).ConfigureAwait(false);
-                            EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot();
+                            EpisodeLifecycleSnapshot lifecycle = _lifecycleSnapshot(requestCombatEvents);
                             Dictionary<string, object?> operatorTelemetry = _operatorTelemetrySnapshot();
                             operatorTelemetry["geo_gained_since_last_frame"] = lifecycle.GeoGainedSinceLastFrame;
                             operatorTelemetry["geo_spent_since_last_frame"] = lifecycle.GeoSpentSinceLastFrame;
@@ -497,6 +513,17 @@ internal sealed class BridgeClient : IDisposable
                             if (frame.PngByteCount is int pngBytes)
                             {
                                 framePayload["png_bytes"] = pngBytes;
+                            }
+                            if (requestCombatEvents)
+                            {
+                                framePayload["combat_events"] = lifecycle.CombatEventsSinceLastFrame
+                                    .Select(item => new Dictionary<string, object?>
+                                    {
+                                        ["kind"] = item.Kind,
+                                        ["scene_name"] = item.SceneName,
+                                        ["object_id"] = item.ObjectId,
+                                        ["amount"] = item.Amount,
+                                    }).ToArray();
                             }
                             if (requestSemanticLabels && frame.SemanticLabels != null)
                             {

@@ -645,6 +645,7 @@ internal static class SemanticLabelCapture
     }
 
     private static bool IsBreakable(Collider2D collider) =>
+        collider.GetComponentInParent<GeoRock>() != null ||
         collider.GetComponentInParent<Breakable>() != null ||
         collider.GetComponentInParent<BreakableObject>() != null ||
         collider.GetComponentInParent<BreakableInfectedVine>() != null ||

@@ -71,11 +71,13 @@ def create_hollow_knight_env(args: Any, *, shared_root: Path, actor_id: str,
         bootstrap_plan_provider=bootstrap_sequence, output_root=task_root,
         task_config=task_config, args=task_args, phase="training",
         request_semantic_labels=request_semantic_labels,
+        request_combat_events=True,
+        request_breakable_labels=True,
     )
     from voidgym.adapters.hollow_knight.adapter import HollowKnightAdapter
     from voidgym.envs.adapter_env import AdapterEnv
 
-    adapter = HollowKnightAdapter(task)
+    adapter = HollowKnightAdapter(task, enable_discovery_reward=True)
     env = AdapterEnv(adapter, lambda _before, _after: adapter.last_reward)
     action_names = getattr(task, "_action_names", ())
     if tuple(env.actions) != tuple(action_names):

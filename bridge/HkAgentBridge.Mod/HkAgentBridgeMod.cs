@@ -2,6 +2,7 @@ using System;
 using System.Reflection;
 using System.IO;
 using System.Globalization;
+using System.Linq;
 using System.Threading;
 using Modding;
 using UnityEngine;
@@ -22,11 +23,17 @@ public sealed class HkAgentBridgeMod : Mod
     private int _episodeActive;
     private int _operatorTelemetryDiagnosticLogged;
     private int _enemyObservationDiagnosticLogged;
+    private float _nextGeoRockScan;
+    private string? _geoRockScene;
+    private readonly System.Collections.Generic.Dictionary<string, int> _geoRockHits = new(StringComparer.Ordinal);
+    private readonly System.Collections.Generic.HashSet<string> _brokenGeoRocks = new(StringComparer.Ordinal);
     private int _boundsSceneHandle = int.MinValue;
     private float[]? _cachedSceneBounds;
     private float _lastDetailedOperatorSnapshot = float.NegativeInfinity;
     private bool? _shadePending;
     private static readonly MemberInfo[] ProgressFlagMembers = ReadProgressFlagMembers();
+    private static Type? _geoRockComponentType;
+    private static bool _geoRockTypeLookupDone;
 
     public override string GetVersion() =>
         Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
@@ -95,7 +102,7 @@ public sealed class HkAgentBridgeMod : Mod
                 input.ApplyAction(buttons, leaseMilliseconds),
             (buttons, leaseMilliseconds) =>
                 input.ApplyMenuAction(buttons, leaseMilliseconds),
-            (encoding, semanticLabels, cancellationToken) =>
+            (encoding, semanticLabels, _combatEvents, cancellationToken) =>
                 capture.CaptureOnceAsync(encoding, semanticLabels, cancellationToken),
             SnapshotRewardSignals,
             SnapshotOperatorTelemetry,
@@ -171,6 +178,7 @@ public sealed class HkAgentBridgeMod : Mod
             ObserveOperatorTelemetry(playerData);
             RefreshOperatorSnapshotIfDue();
         }
+        ObserveGeoRocks();
     }
 
     private void ObserveOperatorTelemetry(PlayerData playerData)
@@ -442,7 +450,11 @@ public sealed class HkAgentBridgeMod : Mod
         if (hero != null && source != null && self != null &&
             source.transform.root == hero.transform.root &&
             self.transform.root != hero.transform.root)
+        {
             _enemyObservations.RecordHit(self.gameObject.GetInstanceID());
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            _lifecycle.RecordCombatEvent("hit_enemy", scene, StableObjectId(self.transform));
+        }
         string objectName = self!.gameObject!.name!.Replace("(Clone)", "").Trim();
         if (hero != null && source != null && objectName == "Hollow Shade" &&
             source.transform.root == hero.transform.root)
@@ -452,7 +464,7 @@ public sealed class HkAgentBridgeMod : Mod
         original(self, hitInstance);
     }
 
-    private EpisodeLifecycleSnapshot SnapshotRewardSignals()
+    private EpisodeLifecycleSnapshot SnapshotRewardSignals(bool includeCombatEvents)
     {
         string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
         float? distance = null;
@@ -471,7 +483,7 @@ public sealed class HkAgentBridgeMod : Mod
                 }
             }
         }
-        return _lifecycle.Snapshot(scene, distance);
+        return _lifecycle.Snapshot(scene, distance, includeCombatEvents);
     }
 
     private void OnGeoPickupTrigger(
@@ -484,7 +496,17 @@ public sealed class HkAgentBridgeMod : Mod
         int before = playerData?.GetInt("geo") ?? 0;
         original(self, collision);
         int after = playerData?.GetInt("geo") ?? before;
-        _lifecycle.RecordGeoGained(Math.Max(0, after - before));
+        int gained = Math.Max(0, after - before);
+        _lifecycle.RecordGeoGained(gained);
+        if (gained > 0 && collision != null)
+        {
+            _lifecycle.RecordCombatEvent(
+                "geo_collected",
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
+                StableObjectId(collision.transform),
+                gained
+            );
+        }
     }
 
     private void OnHeroTakeGeo(
@@ -520,7 +542,115 @@ public sealed class HkAgentBridgeMod : Mod
                 UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
                 healthManager == null ? 0 : _enemyObservations.Hits(healthManager.gameObject.GetInstanceID())
             );
+            if (healthManager != null)
+            {
+                _lifecycle.RecordCombatEvent(
+                    "kill_enemy",
+                    UnityEngine.SceneManagement.SceneManager.GetActiveScene().name,
+                    StableObjectId(healthManager.transform)
+                );
+            }
         }
+    }
+
+    private void ObserveGeoRocks()
+    {
+        if (Time.realtimeSinceStartup < _nextGeoRockScan) return;
+        _nextGeoRockScan = Time.realtimeSinceStartup + 0.1f;
+        string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+        if (!string.Equals(scene, _geoRockScene, StringComparison.Ordinal))
+        {
+            _geoRockScene = scene;
+            _geoRockHits.Clear();
+            _brokenGeoRocks.Clear();
+        }
+        if (!_geoRockTypeLookupDone)
+        {
+            _geoRockComponentType = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(assembly => assembly.GetType("GeoRock", false))
+                .FirstOrDefault(candidate => candidate != null);
+            _geoRockTypeLookupDone = true;
+        }
+        Type? geoRockType = _geoRockComponentType;
+        if (geoRockType == null) return;
+        var seen = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            foreach (UnityEngine.Object item in UnityEngine.Object.FindObjectsOfType(geoRockType))
+            {
+                if (!(item is Component component) || component == null ||
+                    !component.gameObject.activeInHierarchy) continue;
+                string objectId = StableObjectId(component.transform);
+                int? hits = ReadGeoRockHits(component);
+                if (!hits.HasValue) continue;
+                seen.Add(objectId);
+                if (_geoRockHits.TryGetValue(objectId, out int previous) && hits.Value < previous)
+                {
+                    int damage = previous - hits.Value;
+                    for (int index = 0; index < damage; index++)
+                        _lifecycle.RecordCombatEvent("hit_geo_rock", scene, objectId);
+                }
+                _geoRockHits[objectId] = hits.Value;
+                if (hits.Value == 0 && _brokenGeoRocks.Add(objectId))
+                    _lifecycle.RecordCombatEvent("geo_rock_broken", scene, objectId);
+            }
+            foreach (var old in _geoRockHits.ToArray())
+            {
+                if (seen.Contains(old.Key) || old.Value <= 0 || !_brokenGeoRocks.Add(old.Key)) continue;
+                _lifecycle.RecordCombatEvent("hit_geo_rock", scene, old.Key);
+                _lifecycle.RecordCombatEvent("geo_rock_broken", scene, old.Key);
+            }
+            foreach (string objectId in _brokenGeoRocks)
+                _geoRockHits.Remove(objectId);
+        }
+        catch (Exception) { }
+    }
+
+    private static int? ReadGeoRockHits(object component)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        try
+        {
+            Type type = component.GetType();
+            foreach (FieldInfo field in type.GetFields(flags))
+            {
+                object? value = field.GetValue(component);
+                if (value == null) continue;
+                if (field.Name.Equals("hitsLeft", StringComparison.OrdinalIgnoreCase) && value is int direct)
+                    return Math.Max(0, direct);
+                if (field.FieldType.Name == "GeoRockData")
+                {
+                    FieldInfo? hitsField = field.FieldType.GetField("hitsLeft", flags);
+                    if (hitsField?.GetValue(value) is int hits) return Math.Max(0, hits);
+                }
+            }
+            foreach (PropertyInfo property in type.GetProperties(flags))
+            {
+                if (property.GetIndexParameters().Length != 0 || property.GetMethod == null) continue;
+                object? value = property.GetValue(component, null);
+                if (property.Name.Equals("hitsLeft", StringComparison.OrdinalIgnoreCase) && value is int direct)
+                    return Math.Max(0, direct);
+                if (value != null && property.PropertyType.Name == "GeoRockData")
+                {
+                    FieldInfo? hitsField = property.PropertyType.GetField("hitsLeft", flags);
+                    if (hitsField?.GetValue(value) is int hits) return Math.Max(0, hits);
+                }
+            }
+        }
+        catch (Exception) { }
+        return null;
+    }
+
+    private static string StableObjectId(Transform transform)
+    {
+        var names = new System.Collections.Generic.List<string>();
+        for (Transform? node = transform; node != null; node = node.parent)
+        {
+            string name = EpisodeLifecycleState.NormalizeEnemyType(node.name);
+            names.Add(name + "[" + node.GetSiblingIndex().ToString(CultureInfo.InvariantCulture) + "]");
+        }
+        names.Reverse();
+        return string.Join("/", names);
     }
 
     private int OnAfterTakeDamage(int hazardType, int damageAmount)

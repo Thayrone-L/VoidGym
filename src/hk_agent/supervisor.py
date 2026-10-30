@@ -69,6 +69,7 @@ class CapturedFrame:
     operator_telemetry: dict[str, Any] | None = None
     enemy_events_since_last_frame: tuple[tuple[str, str], ...] = ()
     bestiary_events: tuple[dict[str, Any], ...] = ()
+    combat_events: tuple[dict[str, Any], ...] = ()
     # Optional diagnostics from the bridge (name, value); never used as observation.
     bridge_timing: tuple[tuple[str, float], ...] = ()
     action_availability: ActionAvailability | None = None
@@ -278,13 +279,18 @@ class SupervisorServer:
         episode_id: str | None = None,
         encoding: str = "png",
         semantic_labels: bool = False,
+        combat_events: bool = False,
     ) -> CapturedFrame:
         if type(semantic_labels) is not bool:
             raise TypeError("semantic_labels must be bool")
+        if type(combat_events) is not bool:
+            raise TypeError("combat_events must be bool")
         if encoding not in {"png", "raw_rgb8"}:
             raise ValueError("encoding must be png or raw_rgb8")
         if semantic_labels and (bridge is None or "semantic_labels_v1" not in bridge.capabilities):
             raise ProtocolError("bridge does not advertise semantic_labels_v1")
+        if combat_events and (bridge is None or "combat_events_v1" not in bridge.capabilities):
+            raise ProtocolError("bridge does not advertise combat_events_v1")
         effective_encoding = encoding
         if effective_encoding == "raw_rgb8" and (
             bridge is None or "frame_raw_rgb8" not in bridge.capabilities
@@ -295,6 +301,8 @@ class SupervisorServer:
             payload["episode_id"] = episode_id
         if semantic_labels:
             payload["semantic_labels"] = True
+        if combat_events:
+            payload["combat_events"] = True
         if effective_encoding == "raw_rgb8":
             payload["encoding"] = effective_encoding
         response = await self.send_command(
@@ -310,6 +318,31 @@ class SupervisorServer:
             raise ProtocolError("FRAME omitted requested semantic_labels_v1 data")
         if not semantic_labels and payload.get("semantic_labels") is not None:
             raise ProtocolError("FRAME returned semantic labels that were not requested")
+        raw_combat_events = payload.get("combat_events")
+        if combat_events:
+            if not isinstance(raw_combat_events, list) or len(raw_combat_events) > 256:
+                raise ProtocolError("FRAME omitted or invalid combat_events_v1 data")
+            valid_kinds = {"hit_enemy", "kill_enemy", "hit_geo_rock", "geo_rock_broken",
+                           "geo_collected"}
+            checked_combat_events: list[dict[str, Any]] = []
+            for event in raw_combat_events:
+                if not isinstance(event, dict):
+                    raise ProtocolError("Invalid FRAME combat event")
+                kind, scene, object_id = (event.get("kind"), event.get("scene_name"),
+                                          event.get("object_id"))
+                amount = event.get("amount", 0)
+                if (not isinstance(kind, str) or kind not in valid_kinds
+                        or not isinstance(scene, str) or not scene
+                        or len(scene) > 256 or not isinstance(object_id, str) or not object_id
+                        or len(object_id) > 256 or isinstance(amount, bool)
+                        or not isinstance(amount, int) or not 0 <= amount <= 999_999):
+                    raise ProtocolError("Invalid FRAME combat event fields")
+                checked_combat_events.append({"kind": kind, "scene_name": scene,
+                                              "object_id": object_id, "amount": amount})
+        else:
+            if raw_combat_events is not None:
+                raise ProtocolError("FRAME returned combat events that were not requested")
+            checked_combat_events = []
         frame_id = payload.get("frame_id")
         capture_monotonic_ns = payload.get("capture_monotonic_ns")
         width = payload.get("width")
@@ -572,6 +605,7 @@ class SupervisorServer:
             operator_telemetry=operator_telemetry,
             enemy_events_since_last_frame=tuple(enemy_events),
             bestiary_events=tuple(bestiary_events),
+            combat_events=tuple(checked_combat_events),
             bridge_timing=parse_bridge_timing(payload),
             action_availability=parse_action_availability(payload.get("action_availability")),
             human_buttons=human_buttons,
