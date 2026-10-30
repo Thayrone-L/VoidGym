@@ -255,7 +255,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             if path == "/api/operator/start":
                 require_keys(
                     payload,
-                    ("instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes"),
+                    ("instances", "duration_kind", "duration_value", "campaign_name", "help_stuck_count", "help_stuck_minutes", "engine"),
                 )
                 if set(payload) not in (
                     {"instances", "duration_kind", "duration_value"},

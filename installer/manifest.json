@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "voidgym_version": "2.0.0.dev0",
+  "python": {
+    "version": "3.12.10",
+    "source": "python.org Windows x64 installer; Python 3.12.10 is the last 3.12 release with a Windows installer",
+    "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
+    "sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb"
+  },
+  "repo": {
+    "url": "https://github.com/Thayrone-L/VoidGym",
+    "ref": "v2.0.0-dev",
+    "archive_sha256": null
+  },
+  "bridge_dll": {
+    "available": false,
+    "url": null,
+    "sha256": null,
+    "pending_reason": "Release do bridge ainda não publicada; não distribuir DLL sem artefato e hash verificados."
+  },
+  "modding_api": {
+    "version": "77",
+    "game_version": "1.5.78.11833",
+    "url": "https://github.com/hk-modding/api/releases/download/1.5.78.11833-77/moddingapi.v77.windows.zip",
+    "sha256": "bc9f0db3d0916b05cd5a2420bb602fb1b239ce3ff6c289fd84bffb682fb8f1d6"
+  },
+  "supported_games": [
+    {
+      "store": "gog",
+      "version": "1.5.78.11833",
+      "exe_sha256": "4d3d0f55afbb249170241d0dc6faf9a5dcf3e1ed427a282ae990bb6e4e3a6913",
+      "globalgamemanagers_sha256": "57ebbd860f452878d82000ed7caa9d40f22436ffcc1e56088eec28683c486efa"
+    }
+  ],
+  "map_art": {
+    "url": "https://www.mediafire.com/file/mo42xgq0f4dw8nx/",
+    "sha256": null,
+    "credit": "Mapa: The Embraced One — hallownest.net · Hollow Knight © Team Cherry",
+    "requires_consent": true,
+    "distribution_approved": false
+  }
+}

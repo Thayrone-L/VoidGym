@@ -372,7 +372,8 @@ def test_server_binds_loopback_and_rejects_panel_weights(tmp_path: Path) -> None
 
         connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
         body = json.dumps({"instances": 1, "duration_kind": "until_stopped", "duration_value": None,
-                           "campaign_name": "smoke", "help_stuck_count": 9, "help_stuck_minutes": 180})
+                           "campaign_name": "smoke", "help_stuck_count": 9, "help_stuck_minutes": 180,
+                           "engine": "v2"})
         connection.request("POST", "/api/operator/start", body=body,
                            headers={"Content-Type": "application/json", "X-Control-Token": plane.csrf_token})
         response = connection.getresponse()
