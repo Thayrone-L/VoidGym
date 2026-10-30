@@ -2,6 +2,8 @@
 
 ## Estado
 
+A árvore foi organizada conforme o prompt 86f: o instalador 90 e o rascunho do 87 foram para a branch `v2/instalador`; o PR #8 recebeu em commit separado a correção v1 `7f10902` para promover saves entre volumes por cópia, SHA-256 e `os.replace`. Essa correção foi motivada pela campanha `jogada-1-repeat-1c3b`, que falhou em 21/10/2026 com `OSError: [Errno 28]` quando C: encheu enquanto o runtime já estava em E:.
+
 A avaliação completa do checkpoint `universal-009235520` foi concluída (9.235.520 passos). A Etapa 2 não encontrou defeito no gerador do nível 2; por isso não houve mudança no gerador. A classificação ENEMY foi restringida e a DLL corrigida foi compilada e implantada somente em `hk-ai-1`. A amostra longa de HK ainda não atende aos requisitos de HAZARD e EXIT: a captura chegou a 1.500 quadros, mas ficou em `Tutorial_01`, sem transição e sem HAZARD no gabarito. Uma nova tentativa com a regra corrigida perdeu o canal de captura após 61 quadros. A transferência nessa amostra curta é exploratória, não a medição oficial pedida.
 
 A Etapa 4 de treino **não foi iniciada**. O prompt 86e exige autorização do operador no momento da retomada; o critério foi implementado no código, mas ainda precisa desse “sim”.
@@ -23,22 +25,29 @@ Os números de 85 vêm do relatório existente `relatorios/85_eval/tabela.md`; a
 
 O checkpoint 86e melhora muito os níveis 0, 1, 3, 4, 5 e 7 no modo estocástico. No modo determinístico, L2 recua 8 pontos contra o 85 e L6 recua de 18% para 5%; no estocástico L6 sobe a 94%. Essa discrepância aponta para sensibilidade à seleção de ação em L6, não para ausência total de comportamento útil. As políticas bobas falham em pelo menos 80% das salas de L2–7, como requerido.
 
-### Percepção semântica no ginásio
+### Percepção semântica balanceada (reavaliação 86f)
 
-| Classe | IoU 85 | IoU 86e | Suporte 86e |
-|---|---:|---:|---:|
-| EMPTY | 0,893 | 0,953 | 6.125.568 |
-| SOLID | 0,377 | 0,182 | 244.347 |
-| PLATFORM | 0,168 | 0,090 | 18.725 |
-| HAZARD | 0 | 0 | 0 |
-| ENEMY | 0 | 0 | 0 |
-| PLAYER | 0,297 | 0,684 | 30.042 |
-| BREAKABLE | 0 | 0 | 0 |
-| PICKUP | 0 | n/d | 0 |
-| INTERACTIVE | n/d | n/d | 0 |
-| EXIT | 0,066 | 0,090 | 61.318 |
+A tabela anterior do 86e foi removida porque acumulava os primeiros 5.000 quadros, quase todos do nível 0; seus suportes zero em HAZARD/ENEMY e a comparação com o 85 não eram válidos. A avaliação nova usa 5.000 quadros por split, 625 em cada nível 0–7, coletados com rota fixa independente do checkpoint e espalhados por 100 episódios. Os hashes de amostra coincidem entre 85 e 86e dentro de cada split. Os níveis 5 e 6 têm suporte positivo para ambas as classes obrigatórias.
 
-A matriz completa está em `relatorios/86e_eval_009235520/confusion.csv`; avaliação e GIFs estão em `relatorios/86e_eval_009235520/`.
+IoU agregado nos oito níveis:
+
+| Split | Checkpoint | SOLID | HAZARD | ENEMY | BREAKABLE | PLAYER | EXIT |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Teste | 85 `000697088` | 0,3763 | 0 | 0 | 0 | 0,3786 | 0,1836 |
+| Teste | 86e `009235520` | 0,3088 | 0,0045 | 0,0642 | 0,0878 | 0,5132 | 0,1128 |
+| Treino | 85 `000697088` | 0,3733 | 0 | 0 | 0 | 0,4706 | 0,1771 |
+| Treino | 86e `009235520` | 0,3075 | 0,0051 | 0,0683 | 0,0949 | 0,5988 | 0,1080 |
+
+IoU e suporte nas classes avaliadas com obrigação de cobertura:
+
+| Split | Nível | Suporte HAZARD | IoU HAZARD (85 → 86e) | Suporte ENEMY | IoU ENEMY (85 → 86e) |
+|---|---:|---:|---:|---:|---:|
+| Teste | 5 | 2.291 | 0 → 0,0102 | 8.414 | 0 → 0,1409 |
+| Teste | 6 | 1.546 | 0 → 0,0031 | 9.806 | 0 → 0,1070 |
+| Treino | 5 | 2.116 | 0 → 0,0128 | 8.186 | 0 → 0,1750 |
+| Treino | 6 | 2.005 | 0 → 0,0033 | 10.770 | 0 → 0,0964 |
+
+O 86e saiu de IoU zero para ENEMY e HAZARD nos dois splits, mas HAZARD continua quase não reconhecido. ENEMY é parecido entre treino e teste, sem sinal forte de decorar apenas o estilo do treino. SOLID e EXIT caíram contra o 85; a correção da amostragem torna essa queda observável, mas não a explica. Os manifests, matrizes e hashes estão em `relatorios/86f_perception/shared_{train,test}/`.
 
 ### Inspeção visual dos GIFs
 
