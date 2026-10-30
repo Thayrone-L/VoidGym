@@ -59,10 +59,12 @@ O checkpoint depois do treino depende de autorização específica para treino l
 
 ## Validação
 
-- Testes v2: 134 passaram e 2 foram ignorados. Teste da opção v2 que ativa rótulos de quebráveis no processo isolado: passou.
-- Ruff (`src`, `tools`, `tests`): passou. Mypy (`src` e os avaliadores modificados): passou.
-- A tentativa de suíte Python completa teve de excluir um teste de integração que compila C#: o sandbox bloqueou a escrita em `C:\VoidGym\obj\Release\net8.0`. Build Release e testes C# da bridge já haviam passado antes da restrição. A suíte restante completa não foi concluída nesta rodada.
+- Suíte Python completa: **864 passaram, 4 foram ignorados**, sem falhas; 3 avisos do SB3 sobre cópia de tensor.
+- Teste da opção v2 que ativa rótulos de quebráveis no processo isolado: passou dentro da suíte.
+- Ruff (`src`, `tools`, `tests`): passou. Mypy em `src` e mypy nos quatro avaliadores alterados: passou.
+- `git diff HEAD~2 --check`: passou. Build Release de `HkAgentBridge.Mod` contra o Managed isolado `hk-ai-1`: 0 avisos/erros. Harneses C# de correlação/lifecycle e rasterização/classificação semântica: passaram.
 - Ruff: passou nas alterações Python.
 - C# `HkAgentBridge.Mod` Release: compilou com zero avisos/erros contra a cópia isolada `hk-ai-1`; nenhuma DLL foi instalada.
 - Testes C# de correlação/lifecycle e rasterização semântica: passaram.
-- `git diff --check`, commits e push no PR #8: pendentes; o processo Git não conseguiu acessar a raiz `C:\VoidGym` neste sandbox. Operação HK e treino longo continuam pendentes da janela/autorização apropriadas.
+- Commits e push no PR #8 concluídos: `35318c2` (ginásio/avaliadores) e `ff5d711` (bridge e recompensa v2).
+- Etapa 3 ainda aguarda a janela de 3–5 min que o operador disse que informará para a captura manual em `hk-ai-1`, incluindo hash e restauração do save isolado. Não implantei DLL nem abri o jogo. Treino longo e avaliação antes/depois no checkpoint novo aguardam autorização específica na hora; nenhuma campanha foi iniciada.
