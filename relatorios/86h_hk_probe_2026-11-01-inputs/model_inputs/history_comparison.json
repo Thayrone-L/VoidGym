@@ -1,0 +1,176 @@
+[
+  {
+    "step": 0,
+    "action_history": [
+      0,
+      0,
+      0
+    ],
+    "frame_sha256": [
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92"
+    ],
+    "distinct_input_frames": 1,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "ATTACK",
+    "null_history_top_action": "ATTACK",
+    "top_action_changed": false,
+    "total_variation_distance": 1.862645149230957e-09,
+    "real_history_attack_probability": 0.6394399404525757,
+    "null_history_attack_probability": 0.6394399404525757
+  },
+  {
+    "step": 1,
+    "action_history": [
+      0,
+      0,
+      17
+    ],
+    "frame_sha256": [
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "804e3adc6d324502b6d06782f5f1635383311fae3633962819bd37c671ef74a6"
+    ],
+    "distinct_input_frames": 2,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "LEFT+JUMP_MAX",
+    "null_history_top_action": "LEFT+JUMP_MAX",
+    "top_action_changed": false,
+    "total_variation_distance": 0.20494131743907928,
+    "real_history_attack_probability": 0.4557098150253296,
+    "null_history_attack_probability": 0.3481379747390747
+  },
+  {
+    "step": 2,
+    "action_history": [
+      0,
+      17,
+      10
+    ],
+    "frame_sha256": [
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "804e3adc6d324502b6d06782f5f1635383311fae3633962819bd37c671ef74a6",
+      "ee15600b899dc8ae2d665132723d8393747e755bfb8cb83866db7b038cc75783"
+    ],
+    "distinct_input_frames": 3,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "RIGHT+JUMP_HOLD",
+    "null_history_top_action": "RIGHT+JUMP_HOLD",
+    "top_action_changed": false,
+    "total_variation_distance": 0.2056172490119934,
+    "real_history_attack_probability": 0.2496665120124817,
+    "null_history_attack_probability": 0.11162915080785751
+  },
+  {
+    "step": 3,
+    "action_history": [
+      17,
+      10,
+      8
+    ],
+    "frame_sha256": [
+      "e3907cc25af976aa031ad4de941fef928f69df0801857a742aba96a19db89c92",
+      "804e3adc6d324502b6d06782f5f1635383311fae3633962819bd37c671ef74a6",
+      "ee15600b899dc8ae2d665132723d8393747e755bfb8cb83866db7b038cc75783",
+      "e3eb1e390e8f1ed7d1ea9c9bf7d574c062621156b056ee1588d4f361f142149b"
+    ],
+    "distinct_input_frames": 4,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "RIGHT+JUMP_HOLD",
+    "null_history_top_action": "RIGHT+JUMP_HOLD",
+    "top_action_changed": false,
+    "total_variation_distance": 0.1697079837322235,
+    "real_history_attack_probability": 0.2777847647666931,
+    "null_history_attack_probability": 0.18348084390163422
+  },
+  {
+    "step": 4,
+    "action_history": [
+      10,
+      8,
+      8
+    ],
+    "frame_sha256": [
+      "804e3adc6d324502b6d06782f5f1635383311fae3633962819bd37c671ef74a6",
+      "ee15600b899dc8ae2d665132723d8393747e755bfb8cb83866db7b038cc75783",
+      "e3eb1e390e8f1ed7d1ea9c9bf7d574c062621156b056ee1588d4f361f142149b",
+      "a706ddd5b9824df42094e282a9eaddf2e16fe8bf7f82a24dfb5232f2e15c0c95"
+    ],
+    "distinct_input_frames": 4,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "RIGHT+JUMP_HOLD",
+    "null_history_top_action": "RIGHT+JUMP_HOLD",
+    "top_action_changed": false,
+    "total_variation_distance": 0.13593199849128723,
+    "real_history_attack_probability": 0.38848555088043213,
+    "null_history_attack_probability": 0.30415448546409607
+  },
+  {
+    "step": 20,
+    "action_history": [
+      10,
+      5,
+      12
+    ],
+    "frame_sha256": [
+      "299bd39188fcf4b249bf252b456909a11e343613e2122825b80e0e9588a0cca1",
+      "c00ba107a86a541340e675a0b1952dc65506bff44c95672714c51299222e7466",
+      "e92635aa394b8fab0712a00c6c6eb2dc441a4c9c4d520bcf0a3be93df7cacf89",
+      "9d687282d04d9fd226e6b5433091abc2a4dd54d6ce14dc535039ab9b756acd23"
+    ],
+    "distinct_input_frames": 4,
+    "pixel_shape_chw": [
+      12,
+      108,
+      192
+    ],
+    "pixel_dtype": "uint8",
+    "pixel_min": 0,
+    "pixel_max": 255,
+    "real_history_top_action": "UP+ATTACK",
+    "null_history_top_action": "ATTACK",
+    "top_action_changed": true,
+    "total_variation_distance": 0.23679888248443604,
+    "real_history_attack_probability": 0.6625231504440308,
+    "null_history_attack_probability": 0.5522140264511108
+  }
+]
