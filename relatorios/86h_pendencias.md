@@ -20,7 +20,7 @@ Probe somente inferência, CUDA, checkpoint `universal-009235520`, 300 s após a
 
 - 8 combinações de ataque ficaram liberadas em 1.044/1.044 decisões; nail arts ficaram indisponíveis, como esperado sem carga.
 - Ataques escolhidos: 411/1.044 (39,37%); probabilidade softmax agregada média das ações de ataque: 37,10%.
-- Com ATTACK enviado: 411; botões aplicados coincidiram com o pedido em 1.044/1.044 linhas. Tabela nome por nome do checkpoint e adaptador: idêntica (43 ações). Nenhum evento `hit_enemy` ocorreu; a cena observada não continha um inimigo-alvo registrado. Logo, a política não está deixando de atacar nessa rodada; a observação anterior não se reproduziu. Máscara, tradução e tabela não explicam a observação antiga.
+- Com ATTACK enviado: 411; botões aplicados coincidiram com o pedido em 1.044/1.044 linhas. Tabela nome por nome do checkpoint e adaptador: idêntica (43 ações). Nenhum evento `hit_enemy` ocorreu; esta rodada comprova que a política escolheu e enviou ataques, mas não confirma contato/impacto em alvo. Portanto, máscara, tradução, tabela e ausência de ataques escolhidos não explicam a observação antiga; a causa de ausência de impacto continua inconclusiva.
 - No ginásio, nível 2: 2.411/8.000 ações escolhidas eram ataques (30,14%). Esse arquivo contém frequência de ações escolhidas, não probabilidades softmax, então a comparação é de frequência, não de probabilidade.
 - GIF de 30 s: `relatorios/86h_hk_probe_2026-11-01-r2/policy-30s.gif`. Registro por decisão e resumo em `...-r2/decisions.jsonl` e `summary.json`.
 - Integridade: os hashes de `user1.dat`, backups e JSON da instância `hk-ai-1` coincidiram antes/depois. O jogo foi fechado ao fim; o save pessoal não foi usado.
