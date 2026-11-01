@@ -130,6 +130,8 @@ class RecurrentPPOTrainer:
         sem_targets = sem.reshape(-1, *sem.shape[-2:])
         sem_logits = semantic_logits.flatten(0, 1)
         sem_loss = semantic_loss(sem_logits, sem_targets, self.semantic_weights)
+        focal_sem_loss = semantic_loss(sem_logits, sem_targets, self.semantic_weights,
+                                       loss_type="focal", focal_gamma=2.0)
         inverse_loss = self._inverse_loss(features, batch)
         motion_loss = self.policy.hero_motion.loss(motion, ground, batch.hero_motion,
                                                    batch.has_labels)
@@ -140,6 +142,7 @@ class RecurrentPPOTrainer:
         explained = 1 - (batch.returns - values.detach()).var(unbiased=False) / variance.clamp_min(1e-8)
         metrics = {"loss": float(loss.detach()), "L_ppo": float(policy_loss.detach()),
                    "L_semantic": float(sem_loss.detach()),
+                   "L_semantic_focal": float(focal_sem_loss.detach()),
                    "L_inverse_dynamics": float(inverse_loss.detach()),
                    "L_hero_motion": float(motion_loss.detach()),
                    "entropy": float(entropy.detach()), "kl": float(approximate_kl.detach()),

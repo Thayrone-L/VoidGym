@@ -421,7 +421,8 @@ def _run_impl(args: argparse.Namespace) -> Path:
     _register_cleanup(experience_writer.close)
     log_path = root / "log.csv"
     log_mode = "a" if log_path.exists() and global_step else "w"
-    fieldnames = ["steps", "L_ppo", "L_semantic", "L_inverse_dynamics", "L_hero_motion",
+    fieldnames = ["steps", "L_ppo", "L_semantic", "L_semantic_focal",
+                  "L_inverse_dynamics", "L_hero_motion",
                   "entropy", "kl", "explained_variance", "steps_per_second", "curriculum_level",
                   "success_rate_100", "quick_eval_success",
                   *[f"success_rate_{args.goal_window_episodes}_level_{level}" for level in range(9)],
@@ -644,7 +645,7 @@ def _run_impl(args: argparse.Namespace) -> Path:
             })
             profile_stream.flush()
             elapsed = max(.001, time.monotonic() - started)
-            row: dict[str, Any] = {key: metrics.get(key, 0.0) for key in fieldnames[1:8]}
+            row: dict[str, Any] = {key: metrics.get(key, 0.0) for key in fieldnames[1:9]}
             row.update({"steps": global_step,
                         "steps_per_second": (global_step - started_step) / elapsed,
                         "curriculum_level": curriculum.level,

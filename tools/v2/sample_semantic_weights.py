@@ -1,4 +1,4 @@
-"""Estimate semantic class weights from exactly 50,000 generated gym frames."""
+"""Estimate semantic class weights from all nine levels over 50,000 gym frames."""
 
 from __future__ import annotations
 
@@ -25,7 +25,8 @@ def main() -> int:
     room_count = 500
     per_room = samples // room_count
     for index in range(room_count):
-        room = generate_room(index % 7, 50_000 + index)
+        level = index % 9
+        room = generate_room(level, 50_000 + index)
         player = Player(*room.spawn, on_ground=True)
         for frame in range(per_room):
             player.x = float(rng.uniform(.5, max(.51, room.width - .5)))
@@ -34,6 +35,7 @@ def main() -> int:
             counts += np.bincount(np.asarray(label).reshape(-1), minlength=len(Sem))
     result = {
         "frames": samples, "grid": list(SEM_GRID), "classes": [item.name for item in Sem],
+        "levels": list(range(9)), "level_sampling": "round_robin",
         "cell_counts": counts.tolist(),
         "weights": inverse_frequency_weights(counts.tolist()).tolist(),
     }

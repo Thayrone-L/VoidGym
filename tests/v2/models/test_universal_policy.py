@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import torch
+from pathlib import Path
+
 
 from voidgym.core.actions import UNIVERSAL_ACTIONS
 from voidgym.core.observation import FRAME_STACK, UNIVERSAL_ACTION_HISTORY_KEY, UNIVERSAL_IMAGE_KEY
 from voidgym.core.semantics import IGNORE, SEM_GRID, Sem
 from voidgym.models.encoder import ImpalaEncoder
-from voidgym.models.perception import SemanticHead, semantic_loss
+from voidgym.models.perception import SemanticHead, inverse_frequency_weights, semantic_loss
 from voidgym.models.policy import UniversalPolicy
+from voidgym.training.checkpoints import load_universal, save_universal
+from voidgym.training.recurrent_ppo import RecurrentPPOTrainer
 
 
 def _obs(batch: int = 2) -> dict[str, torch.Tensor]:
@@ -29,6 +33,62 @@ def test_encoder_and_semantic_head_shapes_and_ignore_loss() -> None:
     assert torch.isfinite(loss) and loss.item() == 0
     targets[:, 4, 5] = int(Sem.PLAYER)
     assert torch.isfinite(semantic_loss(logits, targets))
+
+
+def test_high_resolution_skip_preserves_legacy_logits_and_trains_decoder():
+    encoder = ImpalaEncoder()
+    features, _, high_resolution = encoder.forward_with_high_resolution_skip(
+        _obs()[UNIVERSAL_IMAGE_KEY]
+    )
+    head = SemanticHead()
+    legacy_logits = head(features)
+    skip_logits = head(features)
+    torch.testing.assert_close(skip_logits, legacy_logits)
+    assert high_resolution.shape == (2, 16, 54, 96)
+
+    policy = UniversalPolicy()
+    policy.semantic_skip(high_resolution.detach()).sum().backward()
+    assert policy.semantic_skip[-1].weight.grad is not None
+    assert torch.count_nonzero(policy.semantic_skip[-1].weight.grad).item() > 0
+
+
+def test_focal_loss_is_finite_weighted_and_ignores_unlabeled_cells():
+    logits = torch.randn(2, len(Sem), *SEM_GRID, requires_grad=True)
+    targets = torch.full((2, *SEM_GRID), IGNORE, dtype=torch.long)
+    targets[:, 3:8, 4:10] = int(Sem.HAZARD)
+    weights = inverse_frequency_weights([1000, 100, 100, 5, 5, 5, 5, 5, 5, 5])
+
+    cross_entropy = semantic_loss(logits, targets, weights)
+    focal = semantic_loss(logits, targets, weights, loss_type="focal", focal_gamma=2.0)
+    assert torch.isfinite(focal) and focal > 0
+    assert not torch.isclose(focal, cross_entropy)
+    focal.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_old_universal_checkpoint_loads_with_zero_initialized_skip_branch(tmp_path: Path):
+    source = UniversalPolicy()
+    action_table = tuple(item.name for item in UNIVERSAL_ACTIONS)
+    source_trainer = RecurrentPPOTrainer(source, augment=False)
+    checkpoint = tmp_path / "legacy-checkpoint"
+    save_universal(checkpoint, source, action_table, steps=123,
+                   optimizer=source_trainer.optimizer)
+    (checkpoint / "semantic_skip.pt").unlink()
+
+    target = UniversalPolicy()
+    target_trainer = RecurrentPPOTrainer(target, augment=False)
+    loaded = load_universal(checkpoint, target, action_table,
+                            optimizer=target_trainer.optimizer)
+    assert loaded["trained_steps"] == 123
+    images = _obs(1)[UNIVERSAL_IMAGE_KEY]
+    target.eval()
+    source.eval()
+    with torch.no_grad():
+        expected = source({UNIVERSAL_IMAGE_KEY: images,
+                           UNIVERSAL_ACTION_HISTORY_KEY: torch.zeros((1, 3), dtype=torch.long)})
+        actual = target({UNIVERSAL_IMAGE_KEY: images,
+                         UNIVERSAL_ACTION_HISTORY_KEY: torch.zeros((1, 3), dtype=torch.long)})
+    torch.testing.assert_close(actual["semantic_logits"], expected["semantic_logits"])
 
 
 def test_inverse_and_motion_auxiliary_losses_backpropagate_to_features_only() -> None:

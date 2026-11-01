@@ -13,7 +13,7 @@ from voidgym.core.semantics import IGNORE, SEM_GRID, Sem
 
 
 class SemanticHead(nn.Module):
-    """Predict semantic logits on the 27×48 training-label grid."""
+    """Semantic decoder with an optional first-block 54×96 spatial skip."""
 
     def __init__(self, in_channels: int = 32) -> None:
         super().__init__()
@@ -53,10 +53,25 @@ def load_class_weights(path: str | Path) -> Tensor:
     return weights
 
 
-def semantic_loss(logits: Tensor, targets: Tensor, weights: Tensor | None = None) -> Tensor:
-    """Cross-entropy over valid cells, safely returning zero for all-ignored labels."""
+def semantic_loss(logits: Tensor, targets: Tensor, weights: Tensor | None = None, *,
+                  loss_type: str = "cross_entropy", focal_gamma: float = 2.0) -> Tensor:
+    """Class-weighted cross-entropy or focal loss over valid semantic cells."""
     if logits.ndim != 4 or targets.ndim != 3 or logits.shape[0] != targets.shape[0]:
         raise ValueError("expected logits (B,C,H,W) and targets (B,H,W)")
+    if loss_type not in {"cross_entropy", "focal"}:
+        raise ValueError("loss_type must be 'cross_entropy' or 'focal'")
+    if focal_gamma < 0:
+        raise ValueError("focal_gamma must be nonnegative")
     if not targets.ne(IGNORE).any():
         return logits.sum() * 0.0
-    return F.cross_entropy(logits, targets.long(), weight=weights, ignore_index=IGNORE)
+    if loss_type == "cross_entropy":
+        return F.cross_entropy(logits, targets.long(), weight=weights, ignore_index=IGNORE)
+    valid = targets.ne(IGNORE)
+    raw = F.cross_entropy(logits, targets.long(), ignore_index=IGNORE, reduction="none")
+    focal = raw * (1.0 - torch.exp(-raw)).pow(focal_gamma)
+    if weights is None:
+        return focal[valid].mean()
+    safe_targets = targets.long().clamp(min=0, max=len(Sem) - 1)
+    class_weights = weights.to(device=targets.device, dtype=logits.dtype)[safe_targets]
+    weighted = focal * class_weights
+    return weighted[valid].sum() / class_weights[valid].sum().clamp_min(torch.finfo(logits.dtype).eps)

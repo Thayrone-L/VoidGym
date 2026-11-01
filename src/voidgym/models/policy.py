@@ -40,6 +40,14 @@ class UniversalPolicy(nn.Module):
         self.actor = nn.ModuleDict({"explore": nn.Linear(hidden_size, action_count)})
         self.privileged_projection = nn.Linear(privileged_dim, 64)
         self.critic = nn.Sequential(nn.Linear(hidden_size + 64, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.semantic_skip = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, len(Sem), kernel_size=1),
+        )
+        skip_out = cast(nn.Conv2d, self.semantic_skip[-1])
+        nn.init.zeros_(skip_out.weight)
+        assert skip_out.bias is not None
+        nn.init.zeros_(skip_out.bias)
 
     def add_game_extras(self, game_id: str, input_dim: int) -> None:
         """Register a zero-output adapter so new game inputs preserve the policy initially."""
@@ -66,7 +74,7 @@ class UniversalPolicy(nn.Module):
         image, sequence = _sequence(obs[UNIVERSAL_IMAGE_KEY], 4)
         history, _ = _sequence(obs[UNIVERSAL_ACTION_HISTORY_KEY], 2)
         batch, steps = image.shape[:2]
-        feature_map, vector = self._encode_sequence(image)
+        feature_map, high_resolution_skip, vector = self._encode_sequence(image)
         history_vector = self.history_projection(
             self.history_embedding(history.long().clamp(0, 255)).flatten(start_dim=-2))
         extra_vector = vector.new_zeros((batch, steps, 256))
@@ -105,6 +113,10 @@ class UniversalPolicy(nn.Module):
         values = self.critic(torch.cat((latent, privileged_vector), dim=-1)).squeeze(-1)
         semantic = self.perception(feature_map.flatten(0, 1)).reshape(
             batch, steps, len(Sem), *SEM_GRID)
+        skip_logits = self.semantic_skip(high_resolution_skip.flatten(0, 1))
+        skip_logits = F.interpolate(skip_logits, size=SEM_GRID,
+                                    mode="bilinear", align_corners=False)
+        semantic = semantic + skip_logits.reshape(batch, steps, len(Sem), *SEM_GRID)
         motion, on_ground = self.hero_motion(vector)
         output: dict[str, Tensor | tuple[Tensor, Tensor]] = {
             "logits": logits, "values": values, "state": (h, c),
@@ -121,10 +133,12 @@ class UniversalPolicy(nn.Module):
         shape = (self.layers, batch, self.hidden_size)
         return torch.zeros(shape, device=device, dtype=dtype), torch.zeros(shape, device=device, dtype=dtype)
 
-    def _encode_sequence(self, image: Tensor) -> tuple[Tensor, Tensor]:
+    def _encode_sequence(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         batch, steps = image.shape[:2]
-        feature_map, vector = self.encoder(image.flatten(0, 1))
+        feature_map, vector, high_resolution_skip = self.encoder.forward_with_high_resolution_skip(
+            image.flatten(0, 1))
         return (feature_map.reshape(batch, steps, *feature_map.shape[1:]),
+                high_resolution_skip.reshape(batch, steps, *high_resolution_skip.shape[1:]),
                 vector.reshape(batch, steps, -1))
 
 

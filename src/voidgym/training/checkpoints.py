@@ -25,6 +25,7 @@ def save_universal(path: Path, model: UniversalPolicy, action_table: tuple[str, 
     try:
         _save_state(temporary / "encoder.pt", model.encoder)
         _save_state(temporary / "perception.pt", model.perception)
+        _save_state(temporary / "semantic_skip.pt", model.semantic_skip)
         _save_state(temporary / "aux_heads.pt", {
             "inverse_dynamics": model.inverse_dynamics.state_dict(),
             "hero_motion": model.hero_motion.state_dict(),
@@ -54,6 +55,7 @@ def save_universal(path: Path, model: UniversalPolicy, action_table: tuple[str, 
             "contract_version": MODEL_CONTRACT_VERSION, "action_table": list(action_table),
             "semantic_grid": list(SEM_GRID), "frame_stack": FRAME_STACK,
             "image_hw": list(UNIVERSAL_IMAGE_HW), "feature_map": [32, 14, 24],
+            "semantic_skip": [16, 54, 96],
             "feature_vector": 256, "trained_steps": steps, "metrics": metrics or {},
             "experts": list(model.actor.keys()), "game_ids": list(model.game_extras.keys()),
         }
@@ -83,7 +85,11 @@ def load_universal(path: Path, model: UniversalPolicy,
     if manifest.get("experts") != list(model.actor.keys()):
         raise ValueError("checkpoint actor experts differ from the initialized policy")
     _load_state(path / "encoder.pt", model.encoder)
-    _load_state(path / "perception.pt", model.perception)
+    perception_state = _load_state(path / "perception.pt")
+    _load_compatible_perception_state(model, perception_state)
+    skip_path = path / "semantic_skip.pt"
+    if skip_path.is_file():
+        _load_state(skip_path, model.semantic_skip)
     aux = _load_state(path / "aux_heads.pt")
     model.inverse_dynamics.load_state_dict(aux["inverse_dynamics"])
     model.hero_motion.load_state_dict(aux["hero_motion"])
@@ -109,13 +115,26 @@ def load_universal(path: Path, model: UniversalPolicy,
     return cast(dict[str, Any], manifest)
 
 
+def _load_compatible_perception_state(model: UniversalPolicy,
+                                      saved_state: dict[str, Any]) -> None:
+    """Keep the legacy semantic head's checkpoint keys and shapes unchanged."""
+    model.perception.load_state_dict(saved_state, strict=True)
+
+
 def _compatible_optimizer_state(optimizer: torch.optim.Optimizer,
                                 saved_state: dict[str, Any]) -> dict[str, Any]:
     """Split an older single optimizer group while retaining Adam moments."""
     current_groups = optimizer.state_dict()["param_groups"]
     saved_groups = saved_state["param_groups"]
     if len(saved_groups) == len(current_groups):
-        return saved_state
+        expanded_groups = []
+        for current, saved in zip(current_groups, saved_groups, strict=True):
+            current_ids = current["params"]
+            saved_ids = saved["params"]
+            if len(saved_ids) > len(current_ids) or current_ids[:len(saved_ids)] != saved_ids:
+                return saved_state
+            expanded_groups.append({**saved, "params": current_ids})
+        return {**saved_state, "param_groups": expanded_groups}
     current_total = sum(len(group["params"]) for group in current_groups)
     saved_total = sum(len(group["params"]) for group in saved_groups)
     if len(saved_groups) != 1 or saved_total != current_total:
