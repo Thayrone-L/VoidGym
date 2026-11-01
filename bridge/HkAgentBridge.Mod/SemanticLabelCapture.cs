@@ -559,11 +559,11 @@ internal static class SemanticLabelCapture
             return false;
 
         float screenAreaFraction = ScreenAreaFraction(Camera.main!, collider.bounds);
-        if ((collider.GetComponentInParent<RestBench>() != null ||
-            collider.GetComponentInParent<BridgeLever>() != null ||
-            collider.GetComponentInParent<BossStatueLever>() != null ||
-            collider.GetComponentInParent<StagTravel>() != null) &&
-            SemanticColliderRules.IsInteractiveCollider(collider.isTrigger, screenAreaFraction))
+        if ((collider.GetComponent<RestBench>() != null ||
+            collider.GetComponent<BridgeLever>() != null ||
+            collider.GetComponent<BossStatueLever>() != null ||
+            collider.GetComponent<StagTravel>() != null) &&
+            SemanticColliderRules.IsInteractiveCollider(screenAreaFraction))
             SetCandidate(Interactive, PriorityInteractive, ref label, ref priority);
 
         if (collider.GetComponentInParent<GeoControl>() != null)
@@ -577,7 +577,7 @@ internal static class SemanticLabelCapture
         DamageHero? contactDamage = collider.GetComponent<DamageHero>();
         HealthManager? health = collider.GetComponentInParent<HealthManager>();
         if (SemanticColliderRules.IsEnvironmentalHazard(
-                damageHero != null, damageHero?.hazardType ?? 0, health != null,
+                contactDamage != null, contactDamage?.hazardType ?? 0, health != null,
                 collider.isTrigger, screenAreaFraction, HasHazardVisual(collider)))
             SetCandidate(Hazard, PriorityHazard, ref label, ref priority);
 
@@ -670,7 +670,7 @@ internal static class SemanticLabelCapture
         bool enemyBody = health != null && SemanticColliderRules.IsEnemyBodyCollider(
             collider.isTrigger, collider.gameObject == health.gameObject, contactDamage != null);
         bool environmentalHazard = SemanticColliderRules.IsEnvironmentalHazard(
-            damageHero != null, damageHero?.hazardType ?? 0, health != null,
+            contactDamage != null, contactDamage?.hazardType ?? 0, health != null,
             collider.isTrigger, screenAreaFraction, HasHazardVisual(collider));
         StringBuilder hierarchy = new StringBuilder();
         Transform? current = collider.transform;
