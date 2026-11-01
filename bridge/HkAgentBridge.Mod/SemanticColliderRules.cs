@@ -7,6 +7,10 @@ internal static class SemanticColliderRules
         !isTrigger && (isHealthManagerObject || hasContactDamage);
 
     public static bool IsEnvironmentalHazard(bool hasDamageHero, int hazardType,
-        bool hasHealthManager) =>
-        hasDamageHero && hazardType > 0 && !hasHealthManager;
+        bool hasHealthManager, bool isTrigger, float screenAreaFraction, bool hasHazardVisual) =>
+        hasDamageHero && hazardType > 0 && !hasHealthManager &&
+        (!isTrigger || screenAreaFraction <= 0.08f || hasHazardVisual);
+
+    public static bool IsInteractiveCollider(bool isTrigger, float screenAreaFraction) =>
+        !isTrigger && screenAreaFraction <= 0.08f;
 }

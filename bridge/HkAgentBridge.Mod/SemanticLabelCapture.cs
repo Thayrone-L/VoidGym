@@ -558,10 +558,12 @@ internal static class SemanticLabelCapture
             (hero == null || collider.GetComponentInParent<HeroController>() != hero))
             return false;
 
-        if (collider.GetComponentInParent<RestBench>() != null ||
+        float screenAreaFraction = ScreenAreaFraction(Camera.main!, collider.bounds);
+        if ((collider.GetComponentInParent<RestBench>() != null ||
             collider.GetComponentInParent<BridgeLever>() != null ||
             collider.GetComponentInParent<BossStatueLever>() != null ||
-            collider.GetComponentInParent<StagTravel>() != null)
+            collider.GetComponentInParent<StagTravel>() != null) &&
+            SemanticColliderRules.IsInteractiveCollider(collider.isTrigger, screenAreaFraction))
             SetCandidate(Interactive, PriorityInteractive, ref label, ref priority);
 
         if (collider.GetComponentInParent<GeoControl>() != null)
@@ -575,7 +577,8 @@ internal static class SemanticLabelCapture
         DamageHero? contactDamage = collider.GetComponent<DamageHero>();
         HealthManager? health = collider.GetComponentInParent<HealthManager>();
         if (SemanticColliderRules.IsEnvironmentalHazard(
-                damageHero != null, damageHero?.hazardType ?? 0, health != null))
+                damageHero != null, damageHero?.hazardType ?? 0, health != null,
+                collider.isTrigger, screenAreaFraction, HasHazardVisual(collider)))
             SetCandidate(Hazard, PriorityHazard, ref label, ref priority);
 
         if (health != null && !health.isDead && health.isActiveAndEnabled &&
@@ -588,6 +591,48 @@ internal static class SemanticLabelCapture
 
         return priority != 0;
     }
+
+    private static float ScreenAreaFraction(Camera camera, Bounds bounds)
+    {
+        float minX = float.PositiveInfinity;
+        float minY = float.PositiveInfinity;
+        float maxX = float.NegativeInfinity;
+        float maxY = float.NegativeInfinity;
+        for (int x = 0; x < 2; x++)
+        for (int y = 0; y < 2; y++)
+        {
+            Vector3 corner = new(x == 0 ? bounds.min.x : bounds.max.x,
+                y == 0 ? bounds.min.y : bounds.max.y, bounds.center.z);
+            Vector3 viewport = camera.WorldToViewportPoint(corner);
+            if (viewport.z <= 0f) continue;
+            minX = Mathf.Min(minX, viewport.x);
+            minY = Mathf.Min(minY, viewport.y);
+            maxX = Mathf.Max(maxX, viewport.x);
+            maxY = Mathf.Max(maxY, viewport.y);
+        }
+        if (float.IsInfinity(minX) || float.IsInfinity(minY) ||
+            float.IsInfinity(maxX) || float.IsInfinity(maxY)) return 0f;
+        float width = Mathf.Clamp01(maxX) - Mathf.Clamp01(minX);
+        float height = Mathf.Clamp01(maxY) - Mathf.Clamp01(minY);
+        return Mathf.Max(0f, width) * Mathf.Max(0f, height);
+    }
+
+    private static bool HasHazardVisual(Collider2D collider)
+    {
+        for (Transform? current = collider.transform; current != null; current = current.parent)
+        {
+            if (ContainsHazardName(current.name)) return true;
+            SpriteRenderer? renderer = current.GetComponent<SpriteRenderer>();
+            if (renderer != null && renderer.sprite != null && ContainsHazardName(renderer.sprite.name))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool ContainsHazardName(string name) =>
+        name.IndexOf("spike", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        name.IndexOf("thorn", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        name.IndexOf("acid", StringComparison.OrdinalIgnoreCase) >= 0;
 
     private static void LogSemanticCollider(Collider2D collider, Action<string>? log)
     {
@@ -620,11 +665,13 @@ internal static class SemanticLabelCapture
         string owner = health != null ? health.gameObject.name :
             damageHero != null ? damageHero.gameObject.name : collider.transform.root.name;
         string hazardType = damageHero != null ? damageHero.hazardType.ToString() : "none";
+        float screenAreaFraction = ScreenAreaFraction(Camera.main!, collider.bounds);
         string layer = LayerMask.LayerToName(collider.gameObject.layer);
         bool enemyBody = health != null && SemanticColliderRules.IsEnemyBodyCollider(
             collider.isTrigger, collider.gameObject == health.gameObject, contactDamage != null);
         bool environmentalHazard = SemanticColliderRules.IsEnvironmentalHazard(
-            damageHero != null, damageHero?.hazardType ?? 0, health != null);
+            damageHero != null, damageHero?.hazardType ?? 0, health != null,
+            collider.isTrigger, screenAreaFraction, HasHazardVisual(collider));
         StringBuilder hierarchy = new StringBuilder();
         Transform? current = collider.transform;
         for (int depth = 0; current != null && depth < 8; depth++, current = current.parent)
@@ -641,7 +688,9 @@ internal static class SemanticLabelCapture
                   $"type={collider.GetType().Name} trigger={collider.isTrigger} layer={layer} " +
                   $"healthManager={(health != null)} damageHero={(damageHero != null)} " +
                   $"contactDamage={(contactDamage != null)} hazardCandidate={hazardCandidate} " +
-                  $"hazardType={hazardType} enemyBody={enemyBody} hazard={environmentalHazard}");
+                  $"hazardType={hazardType} bounds={collider.bounds} " +
+                  $"worldSize={collider.bounds.size} screenArea={screenAreaFraction:P2} " +
+                  $"enemyBody={enemyBody} hazard={environmentalHazard}");
     }
 
     private static bool IsBreakable(Collider2D collider) =>

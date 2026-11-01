@@ -194,10 +194,16 @@ static void TestSemanticColliderRules()
     if (SemanticColliderRules.IsEnemyBodyCollider(false, false, false))
         throw new InvalidOperationException("sensor or terrain-buffer child without local DamageHero was labelled ENEMY");
 
-    if (!SemanticColliderRules.IsEnvironmentalHazard(true, 1, false))
+    if (!SemanticColliderRules.IsEnvironmentalHazard(true, 1, false, true, .01f, false))
         throw new InvalidOperationException("positive DamageHero hazardType was ignored");
-    if (SemanticColliderRules.IsEnvironmentalHazard(true, 0, false) ||
-        SemanticColliderRules.IsEnvironmentalHazard(true, 1, true) ||
-        SemanticColliderRules.IsEnvironmentalHazard(false, 1, false))
+    if (SemanticColliderRules.IsEnvironmentalHazard(true, 1, false, true, .09f, false) ||
+        !SemanticColliderRules.IsEnvironmentalHazard(true, 1, false, true, .30f, true) ||
+        SemanticColliderRules.IsEnvironmentalHazard(true, 0, false, false, .01f, false) ||
+        SemanticColliderRules.IsEnvironmentalHazard(true, 1, true, false, .01f, false) ||
+        SemanticColliderRules.IsEnvironmentalHazard(false, 1, false, false, .01f, false))
         throw new InvalidOperationException("non-environmental DamageHero collider was labelled HAZARD");
+    if (SemanticColliderRules.IsInteractiveCollider(true, .01f) ||
+        SemanticColliderRules.IsInteractiveCollider(false, .09f) ||
+        !SemanticColliderRules.IsInteractiveCollider(false, .01f))
+        throw new InvalidOperationException("INTERACTIVE accepted a trigger or oversized collider");
 }

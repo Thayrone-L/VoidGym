@@ -34,11 +34,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _largest_connected_enemy_region(rows: list[tuple[np.ndarray, np.ndarray]]) -> tuple[int, int]:
+def _largest_connected_region(rows: list[tuple[np.ndarray, np.ndarray]],
+                             semantic: Sem) -> tuple[int, int]:
     largest_cells = 0
     largest_frame = -1
     for frame_index, (_, labels) in enumerate(rows):
-        mask = labels == int(Sem.ENEMY)
+        mask = labels == int(semantic)
         visited = np.zeros(mask.shape, dtype=np.bool_)
         for y, x in np.argwhere(mask):
             if visited[y, x]:
@@ -63,6 +64,14 @@ def _largest_connected_enemy_region(rows: list[tuple[np.ndarray, np.ndarray]]) -
     return largest_cells, largest_frame
 
 
+def _is_transition_frame(frame: np.ndarray) -> bool:
+    """Discard fully faded/black frames while preserving dark gameplay scenes."""
+    if frame.ndim != 3 or frame.shape[-1] < 3:
+        return True
+    dark = np.all(frame[..., :3] <= 10, axis=-1)
+    return float(dark.mean()) >= 0.98
+
+
 def _overlay(frame: np.ndarray, labels: np.ndarray) -> np.ndarray:
     scaled = Image.fromarray(labels).resize((frame.shape[1], frame.shape[0]), Image.Resampling.NEAREST)
     ids = np.asarray(scaled)
@@ -74,7 +83,7 @@ def _overlay(frame: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return result
 
 
-def _collect(root: Path, scene: str, count: int, source: str = "actor") -> list[tuple[np.ndarray, np.ndarray]]:
+def _collect(root: Path, scene: str, source: str = "actor") -> list[tuple[np.ndarray, np.ndarray]]:
     rows: list[tuple[np.ndarray, np.ndarray]] = []
     for block in ExperienceReader(root, game_id="hollow_knight", source=source, scene=scene):
         arrays: dict[str, Any] = block["arrays"]
@@ -85,18 +94,21 @@ def _collect(root: Path, scene: str, count: int, source: str = "actor") -> list[
             if sem.shape != (27, 48):
                 continue
             rows.append((frame, sem))
-    if len(rows) <= count:
-        return rows
-    indices = np.linspace(0, len(rows) - 1, count, dtype=np.int64)
-    return [rows[int(index)] for index in indices]
+    return rows
 
 
 def render(args: argparse.Namespace) -> dict[str, Any]:
     if args.count < 1 or args.count > 120:
         raise ValueError("count must be between 1 and 120")
-    rows = _collect(args.experience_root, args.scene, args.count, args.source)
+    captured_rows = _collect(args.experience_root, args.scene, args.source)
+    rows = [row for row in captured_rows if not _is_transition_frame(row[0])]
+    discarded_transition_frames = len(captured_rows) - len(rows)
+    if len(rows) > args.count:
+        indices = np.linspace(0, len(rows) - 1, args.count, dtype=np.int64)
+        rows = [rows[int(index)] for index in indices]
     if len(rows) < args.count:
-        raise RuntimeError(f"found {len(rows)}/{args.count} labeled frames in scene {args.scene}")
+        raise RuntimeError(f"found {len(rows)}/{args.count} in-game labeled frames in scene "
+                           f"{args.scene}; discarded {discarded_transition_frames} transition frames")
     class_counts = np.zeros(len(Sem), dtype=np.int64)
     ignored = 0
     for _, labels in rows:
@@ -110,7 +122,11 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     print("Fração das classes no gabarito:")
     for name, fraction in fractions.items():
         print(f"  {name}: {fraction:.1%}")
-    largest_enemy_cells, largest_enemy_frame = _largest_connected_enemy_region(rows)
+    largest_regions = {
+        item: _largest_connected_region(rows, item)
+        for item in (Sem.HAZARD, Sem.ENEMY, Sem.INTERACTIVE)
+    }
+    largest_enemy_cells, largest_enemy_frame = largest_regions[Sem.ENEMY]
     largest_enemy_fraction = largest_enemy_cells / (27 * 48)
     warnings: list[str] = []
     if fractions.get("SOLID", 0.0) > 0.70:
@@ -122,6 +138,12 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
         )
     if fractions.get("ENEMY", 0.0) > 0.10:
         warnings.append(f"ENEMY total excede 10% da amostra ({fractions['ENEMY']:.1%})")
+    for semantic in (Sem.HAZARD, Sem.INTERACTIVE):
+        cells, frame_index = largest_regions[semantic]
+        fraction = cells / (27 * 48)
+        if fraction > 0.08:
+            warnings.append(f"região {semantic.name} conectada ocupa {fraction:.1%} da tela "
+                            f"no quadro {frame_index}; revise o colisor/gabarito")
     for warning in warnings:
         print(f"\033[91mAVISO: {warning}; confira o gabarito.\033[0m")
     tile_w, tile_h, columns = 384, 448, 6
@@ -138,10 +160,15 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(args.output)
     return {"output": str(args.output), "scene": args.scene, "frames": len(rows),
+            "captured_frames_before_transition_filter": len(captured_rows),
+            "discarded_transition_frames": discarded_transition_frames,
             "classes": [item.name for item in Sem], "class_fractions": fractions,
             "largest_enemy_region_cells": largest_enemy_cells,
             "largest_enemy_region_screen_fraction": largest_enemy_fraction,
             "largest_enemy_region_frame": largest_enemy_frame,
+            "largest_regions": {item.name: {"cells": cells, "frame": frame,
+                                             "screen_fraction": cells / (27 * 48)}
+                                for item, (cells, frame) in largest_regions.items()},
             "warnings": warnings, "source": args.source, "ignore_id": IGNORE}
 
 
