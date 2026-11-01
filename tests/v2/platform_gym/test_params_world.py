@@ -13,6 +13,7 @@ from voidgym.gyms.platform_gym.params import (
     StyleParams,
     split_for_seed,
 )
+from voidgym.gyms.platform_gym.styles import sample_style
 from voidgym.gyms.platform_gym.world import Rect, Solid
 
 
@@ -40,6 +41,12 @@ def test_seed_split_and_held_out_style_families() -> None:
     assert test.character_family in TEST_CHARACTER_FAMILIES
     assert set(TRAIN_TEXTURE_FAMILIES).isdisjoint(TEST_TEXTURE_FAMILIES)
     assert set(TRAIN_CHARACTER_FAMILIES).isdisjoint(TEST_CHARACTER_FAMILIES)
+
+
+def test_silhouette_style_is_deterministic_and_near_one_fifth() -> None:
+    flags = [sample_style(seed, split="train")[0].silhouette for seed in range(1000)]
+    assert 0.15 <= sum(flags) / len(flags) <= 0.25
+    assert flags == [sample_style(seed, split="train")[0].silhouette for seed in range(1000)]
 
 
 def test_world_rect_and_solid_contract() -> None:

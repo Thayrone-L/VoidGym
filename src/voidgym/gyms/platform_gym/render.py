@@ -340,6 +340,8 @@ def render_room(room: Room, player: Player, camera: tuple[float, float, float] |
     offsets = tuple(int(cam[0] * scale * (.05 + layer * .04))
                     for layer in range(style.background_layers))
     img = _background_frame(seed, split, colors.background, offsets).copy()
+    if style.silhouette:
+        _paint_dark_silhouettes(img, seed)
     _, _, light, noise, scanline = _static_effects(seed, split)
     for solid in room.solids:
         _paint_rect(img, solid.rect, cam, colors.platform if solid.kind == "platform" else colors.ground, texture=texture_id)
@@ -382,3 +384,25 @@ def render_room(room: Room, player: Player, camera: tuple[float, float, float] |
     if scanline:
         img[::3] = (img[::3].astype(np.float32) * .92).astype(np.uint8)
     return cast(np.ndarray, img)
+
+
+def _paint_dark_silhouettes(image: np.ndarray, seed: int) -> None:
+    """Paint decorative, non-collidable black forms in the distant background."""
+    rng = np.random.default_rng(seed ^ 0x86_86_86)
+    for _ in range(int(rng.integers(3, 7))):
+        x0 = int(rng.integers(0, WIDTH - 8))
+        width = int(rng.integers(5, 22))
+        top = int(rng.integers(30, HEIGHT - 8))
+        x1 = min(WIDTH, x0 + width)
+        kind = int(rng.integers(0, 3))
+        if kind == 0:
+            image[top:, x0:x1] = (5, 6, 9)
+        elif kind == 1:
+            center = (x0 + x1) // 2
+            for row in range(top, HEIGHT):
+                half = max(1, (row - top) // 4)
+                image[row, max(x0, center - half):min(x1, center + half + 1)] = (5, 6, 9)
+        else:
+            image[top:min(HEIGHT, top + 3), x0:x1] = (5, 6, 9)
+            image[top:, x0:min(x1, x0 + 2)] = (5, 6, 9)
+            image[top:, max(x0, x1 - 2):x1] = (5, 6, 9)

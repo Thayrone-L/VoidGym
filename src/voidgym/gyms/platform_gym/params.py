@@ -105,6 +105,7 @@ class StyleParams:
     light_strength: float
     camera_width: float
     hud_icons: int
+    silhouette: bool = False
 
     def __post_init__(self) -> None:
         if self.texture_family not in TEXTURE_FAMILIES:
@@ -125,7 +126,8 @@ class StyleParams:
             raise ValueError("hud_icons must be in [0, 5]")
 
     @classmethod
-    def sample(cls, rng: np.random.Generator, *, split: Split) -> StyleParams:
+    def sample(cls, rng: np.random.Generator, *, split: Split,
+               silhouette: bool = False) -> StyleParams:
         """Sample style values while keeping test-only families out of training."""
         if split not in {"train", "test"}:
             raise ValueError("split must be train or test")
@@ -142,4 +144,5 @@ class StyleParams:
             light_strength=float(rng.uniform(0.0, 1.0)),
             camera_width=float(rng.uniform(18.0, 32.0)),
             hud_icons=int(rng.integers(0, 6)),
+            silhouette=silhouette,
         )

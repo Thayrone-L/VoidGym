@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import sys
 import math
 from typing import cast, Literal
@@ -40,7 +41,10 @@ def overlay(frame: np.ndarray, sem: np.ndarray) -> Image.Image:
 
 
 def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=OUT)
+    out = parser.parse_args().output
+    out.mkdir(parents=True, exist_ok=True)
     frames: list[Image.Image] = []
     labels_frames: list[Image.Image] = []
     levels = [0, 1, 2, 3, 4, 5, 6, 7, 8] * 3
@@ -55,7 +59,7 @@ def main() -> None:
         sheet = Image.new("RGB", (384 * 4, 216 * math.ceil(len(source) / 4)), (10, 10, 14))
         for i, image in enumerate(source):
             sheet.paste(image, ((i % 4) * 384, (i // 4) * 216))
-        sheet.save(OUT / name)
+        sheet.save(out / name)
     for level in (3, 4, 6, 7, 8):
         rooms = generate_room_set(8400 + level) if level == 8 else [generate_room(level, 8400 + level)]
         images = []
@@ -73,7 +77,7 @@ def main() -> None:
                     break
             else:
                 raise RuntimeError(f"solver preview did not exit level {level} room {room.id}")
-        images[0].save(OUT / f"solver_nivel_{level}.gif", save_all=True, append_images=images[1:], duration=40, loop=0)
+        images[0].save(out / f"solver_nivel_{level}.gif", save_all=True, append_images=images[1:], duration=40, loop=0)
     comparison = []
     for split, start in (("train", 8500), ("test", 8501)):
         for i in range(9):
@@ -88,7 +92,7 @@ def main() -> None:
     for i, (_, image) in enumerate(comparison):
         row = i // 4
         sheet.paste(image, ((i % 4) * 384, 28 + row * 216))
-    sheet.save(OUT / "teste_vs_treino.png")
+    sheet.save(out / "teste_vs_treino.png")
 
 
 if __name__ == "__main__":

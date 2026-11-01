@@ -32,7 +32,8 @@ def _hsv(rng: np.random.Generator, low: float = .25, high: float = .9) -> tuple[
 @lru_cache(maxsize=256)
 def sample_style(seed: int, *, split: Split = "train") -> tuple[StyleParams, Palette]:
     rng = np.random.default_rng(seed)
-    style = StyleParams.sample(rng, split=split)
+    style_bucket = (seed * 2_654_435_761) & 0xFFFFFFFF
+    style = StyleParams.sample(rng, split=split, silhouette=style_bucket < 858_993_460)
     background = _hsv(rng, .12, .52)
     foreground = _hsv(rng, .55, .98)
     if style.contrast >= .15:
@@ -40,5 +41,12 @@ def sample_style(seed: int, *, split: Split = "train") -> tuple[StyleParams, Pal
         bg_luma = sum(c * w for c, w in zip(background, (.2126, .7152, .0722), strict=False))
         if abs(bg_luma - sum(c * w for c, w in zip(foreground, (.2126, .7152, .0722), strict=False))) < 38:
             foreground = (245, 220, 70) if bg_luma < 120 else (30, 35, 65)
-    palette = Palette(background, _hsv(rng), _hsv(rng), (220, 65, 90), _hsv(rng), _hsv(rng), (245, 210, 55), foreground)
+    if style.silhouette:
+        background = (78, 86, 96)
+        foreground = (195, 205, 215)
+        ground = (9, 11, 15)
+        platform = (17, 20, 25)
+    else:
+        ground, platform = _hsv(rng), _hsv(rng)
+    palette = Palette(background, ground, platform, (220, 65, 90), _hsv(rng), _hsv(rng), (245, 210, 55), foreground)
     return style, palette
