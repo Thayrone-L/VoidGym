@@ -91,23 +91,28 @@ ENEMY exige collider não-trigger no próprio objeto do `HealthManager` ou colli
 
 A suíte semântica passou, o build Release passou e a DLL foi instalada e validada apenas em `hk-ai-1` (`sha256 cffcb879…`). Não houve mudança em `src/hk_agent/` v1.
 
-### Amostras, HAZARD, EXIT e transferência a seco
+### Amostras, HAZARD, EXIT e transferencia a seco
 
-A captura longa anterior produziu 1.500 quadros únicos da cena `Tutorial_01`, mas nenhuma transição de cena. O gabarito anterior tinha 0% HAZARD e EXIT, portanto não satisfaz a Etapa 3. A amostra corrigida da nova captura contém 61 quadros antes de o canal retornar `capture_failed`; não mostra HAZARD nem EXIT. Nenhum collider de espinho/ácido com `DamageHero` e `hazardType` foi identificado nas hierarquias observadas. Não afirmo que os espinhos foram classificados corretamente até observar esses componentes em jogo.
+As tentativas antigas ficam registradas como historico: a captura longa automatizada ficou em Tutorial_01, e a tentativa adaptativa encerrou em 61 quadros apos `capture_failed`. A captura manual posterior, feita com o operador na instancia isolada `hk-ai-1`, completou a travessia da Passagem do Rei ate Town/Dirtmouth em duas sessoes. O conjunto possui **1.572 quadros unicos**, todos com imagem e rotulo semantico `u4-v1`; **1.532 quadros de jogo** (1.204 em Tutorial_01 e 328 em Town) foram usados na transferencia. Os 40 quadros de menu foram excluidos da inferencia.
 
-A prévia de oito quadros corrigida (`relatorios/86e_hk_capture_combat/hk_gabarito.png`) cobre a amostra parcial: EMPTY 43,8%, SOLID 55,2%, ENEMY 0,5%, PLAYER 0,5%; maior região ENEMY = 12 células (0,93% da tela), sem aviso. HAZARD e EXIT continuam em 0 nesta amostra.
+| Classe | Quadros com suporte | Celulas rotuladas | Fracao de celulas validas |
+|---|---:|---:|---:|
+| HAZARD | 271 | 21.196 | 1,04% |
+| ENEMY | 163 | 1.180 | 0,06% |
+| EXIT | 109 | 3.452 | 0,17% |
 
-Os três checkpoints foram comparados nos mesmos 61 quadros corrigidos, sem `action_history` (limitação explícita do dry transfer):
+A captura manual alcancou a cena Town e inclui as classes exigidas. O gabarito de oito quadros esta em `relatorios/86f_hk_capture_manual/hk_gabarito.png`; os quadros e labels estao no runtime E: e o manifesto combinado e `E:\VoidGymRuntime\86f-manual-capture\final-capture-manifest.json`.
 
-| Checkpoint | IoU EMPTY | SOLID | ENEMY | PLAYER | HAZARD/EXIT |
-|---|---:|---:|---:|---:|---|
-| `universal-000697088` (85) | 0,291 | 0,078 | 0 | 0,041 | Sem pixels alvo |
-| `universal-005060096` (86c) | 0,305 | 0,081 | 0 | 0,073 | Sem pixels alvo |
-| `universal-009235520` (86e) | 0,304 | 0,015 | 0,010 | 0,042 | Sem pixels alvo |
+Transferencia a seco feita com o avaliador oficial nos mesmos 1.532 quadros para `universal-000697088` (85) e `universal-009235520` (86e):
 
-Como faltam HAZARD/EXIT e há somente 61 quadros, esses números são exploratórios e **não** substituem a transferência seca oficial em ≥1.500 quadros com as três classes. Os resultados detalhados estão em `relatorios/86e_hk_capture_combat/zero_shot_{85,86c,86e}/`.
+| Checkpoint | IoU EMPTY | SOLID | HAZARD | ENEMY | PLAYER | EXIT |
+|---|---:|---:|---:|---:|---:|---:|
+| 85 `000697088` | 0,4395 | 0,0635 | 0 | 0 | 0,0486 | 0,0015 |
+| 86e `009235520` | 0,4766 | 0,0134 | 0 | 0,0012 | 0,0347 | 0,0001 |
 
-Depois das duas sessões, o jogo foi fechado, a transação de save foi concluída e os hashes de `user1.dat`, `user1_1.5.78.11833.dat` e `user1.dat.bak1` da instância `hk-ai-1` foram restaurados ao snapshot pré-captura. O inventário dos 100 arquivos do save pessoal coincidiu com o snapshot da transação; ele não foi alterado.
+O importador existente nao grava `action_history`; o avaliador informa `action_history_available=false` e usa historico nulo. Assim, estes resultados medem transferencia visual sem sequencia de botoes. HAZARD continua com IoU zero nos dois checkpoints; ENEMY e EXIT tambem permanecem muito baixos. A amostra satisfaz o requisito de cobertura, mas os modelos ainda nao demonstram percepcao util dessas classes.
+
+Os saves foram restaurados por SHA-256: o save pessoal coincide com o backup transacional e o save de `hk-ai-1` coincide com o snapshot anterior a captura. A sessao terminou normalmente; nao houve treino.
 
 ## Etapa 4 e currículo
 
@@ -132,6 +137,6 @@ A retomada da Etapa 4 aguarda a autorização explícita exigida no próprio pro
 - Curva de sucesso por nível: `relatorios/86e_avaliacao_curriculo.png`
 - Captura de 1.500 quadros sem transição: `relatorios/86e_hk_capture_longjump/`
 
-## Conclusão
+## Conclusao
 
-A avaliação e a investigação do nível 2 estão completas; as regras ENEMY foram corrigidas e testadas. Não alterei o gerador porque a geometria passa no solver e respeita os limites definidos. Para fechar o 86e ainda faltam uma captura controlada que alcance HAZARD e EXIT, a transferência oficial com ≥1.500 quadros contendo as três classes e a autorização fresca para iniciar a Etapa 4. Nenhum treino foi iniciado nesta retomada.
+A avaliacao de comportamento, o diagnostico do nivel 2, a captura manual de 1.572 quadros e a transferencia a seco para os checkpoints 85 e 86e estao registrados. A amostra contem HAZARD, ENEMY e EXIT, mas a IoU mostra que a percepcao transferida ainda e muito baixa. A Etapa 4 de treino final nao foi iniciada; o prompt 86e requer autorizacao explicita para essa etapa. Nenhuma campanha foi iniciada nesta verificacao.
