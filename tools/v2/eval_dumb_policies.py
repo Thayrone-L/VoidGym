@@ -57,7 +57,9 @@ def evaluate(*, count: int = 200, seed: int = 8600,
         no_ability_door_passes = 0
         no_attack_passes = 0
         for index in range(count):
-            room_seed = seed + level * 1_000_000 + index
+            # Keep this fixed seed schedule aligned with eval_platform.py and
+            # the 86i action-solver set so per-room outcomes can be joined.
+            room_seed = seed + level * 10_000 + index * 10
             adapter = PlatformGymAdapter(level=level, seed=room_seed, split="test")
             if level == 8:
                 solver_passes += int(solve_room_set(deepcopy(adapter._rooms)))

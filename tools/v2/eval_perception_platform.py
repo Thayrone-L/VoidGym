@@ -27,6 +27,7 @@ from voidgym.core.semantics import IGNORE, SEM_GRID, Sem
 from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
 from voidgym.gyms.platform_gym.params import Split
+from voidgym.gyms.platform_gym.styles import sample_style
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.checkpoints import load_universal
 
@@ -54,6 +55,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-episodes-per-level", type=int, default=500)
     parser.add_argument("--stride", type=int, default=8,
                         help="sample candidate observations at this step interval")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     return parser.parse_args()
 
 
@@ -121,7 +123,8 @@ def _collect_level(level: int, split: Split, args: argparse.Namespace,
         remaining = max(0, needed - len(samples))
         quota = (base_quotas[episode] if episode < len(base_quotas)
                  else min(max(base_quotas, default=1), remaining))
-        episode_seed = args.seed + level * 10_000 + episode * 10
+        split_seed_offset = 0 if split == "train" else 1_000_000
+        episode_seed = args.seed + split_seed_offset + level * 10_000 + episode * 10
         adapter = PlatformGymAdapter(level=level, seed=episode_seed, split=split)
         env = AdapterEnv(adapter, lambda _before, _after: 0.0)
         observation, info = env.reset(seed=episode_seed)
@@ -136,6 +139,8 @@ def _collect_level(level: int, split: Split, args: argparse.Namespace,
                 candidates_seen += 1
                 sample = _new_sample(observation, mask, target, adapter.frame_rgb(),
                                      episode, step, episode_seed)
+                style, _ = sample_style(adapter.room.style_seed, split=split)
+                sample["style_group"] = "silhouette" if style.silhouette else "other"
                 for semantic in REQUIRED_SUPPORT.get(level, ()):
                     if semantic not in support_candidates and np.any(target == int(semantic)):
                         support_candidates[semantic] = sample
@@ -238,7 +243,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.frames < 8 or args.stride < 1 or args.episodes_per_level < 1:
         raise ValueError("frames, stride and episodes-per-level must be positive")
     torch.set_num_threads(3)
-    device = torch.device("cpu")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
     action_table = tuple(PlatformGymAdapter(level=0, split=args.split).action_table())
     models: list[tuple[str, Path, UniversalPolicy, dict[str, Any]]] = []
     for checkpoint in [args.checkpoint, *args.compare_checkpoint]:
@@ -249,7 +256,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     args.output.mkdir(parents=True, exist_ok=True)
     quotas = _frame_quotas(args.frames)
     per_model_confusion = {
-        label: np.zeros((8, len(Sem), len(Sem)), dtype=np.int64)
+        label: np.zeros((9, len(Sem), len(Sem)), dtype=np.int64)
+        for label, _, _, _ in models
+    }
+    per_model_style_confusion = {
+        label: {group: np.zeros((9, len(Sem), len(Sem)), dtype=np.int64)
+                for group in ("silhouette", "other")}
         for label, _, _, _ in models
     }
     previews: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
@@ -266,6 +278,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for model_index, (label, _, model, _) in enumerate(models):
                 predicted = _infer_sample(model, sample, device)
                 _accumulate(per_model_confusion[label][level], sample["target"], predicted)
+                _accumulate(per_model_style_confusion[label][sample["style_group"]][level],
+                            sample["target"], predicted)
                 if model_index == 0 and index in {0, len(samples) - 1}:
                     previews.append((sample["frame"], predicted, sample["target"], level))
         sample_hashes[str(level)] = digest.hexdigest()
@@ -281,6 +295,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_confusion(output_dir / "confusion.csv", confusion)
         _write_by_level(output_dir / "confusion_by_level.csv", per_level_confusion)
+        style_confusion_paths: dict[str, str] = {}
+        for group in ("silhouette", "other"):
+            path = output_dir / f"confusion_by_level_{group}.csv"
+            _write_by_level(path, per_model_style_confusion[label][group])
+            style_confusion_paths[group] = str(path)
         if label == models[0][0]:
             _write_previews(output_dir / "percepcao.png", previews)
         class_support = {
@@ -298,6 +317,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "split": args.split,
             "sample_policy": {"action_route": list(ROUTE), "stride": args.stride,
                               "seed": args.seed, "max_steps": args.max_steps,
+                              "split_seed_offset": (0 if args.split == "train" else 1_000_000),
                               "episodes_per_level": args.episodes_per_level,
                               "stateless_per_frame": True},
             "sample_id_sha256_by_level": sample_hashes,
@@ -306,6 +326,36 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "iou_by_level": {str(level): {item.name: _iou(per_level_confusion[level], index)
                                           for index, item in enumerate(Sem)}
                              for level in range(9)},
+            "style_groups": {
+                group: {
+                    "frames_by_level": {
+                        str(level): sum(sample["style_group"] == group
+                                        for sample in samples)
+                        for level in range(9)
+                    },
+                    "iou_by_level": {
+                        str(level): {
+                            item.name: _iou(per_model_style_confusion[label][group][level], index)
+                            for index, item in enumerate(Sem)
+                        }
+                        for level in range(9)
+                    },
+                    "class_support_by_level": {
+                        str(level): {
+                            item.name: int(per_model_style_confusion[label][group][level,
+                                                                                  int(item)].sum())
+                            for item in Sem
+                        }
+                        for level in range(9)
+                    },
+                    "confusion_by_level_csv": style_confusion_paths[group],
+                    "iou": {
+                        item.name: _iou(per_model_style_confusion[label][group].sum(axis=0), index)
+                        for index, item in enumerate(Sem)
+                    },
+                }
+                for group in ("silhouette", "other")
+            },
             "levels": level_metadata,
         }
         (output_dir / "perception_manifest.json").write_text(

@@ -135,7 +135,7 @@ def main() -> int:
     original_step = backend.step
     applied_rows: list[dict[str, Any]] = []
 
-    def traced_step(*, action_id: int, buttons: tuple[str, ...], lease_ms: int):
+    def traced_step(*, action_id: int, buttons: tuple[str, ...], lease_ms: int) -> Any:
         result = original_step(action_id=action_id, buttons=buttons, lease_ms=lease_ms)
         applied = result.applied_action
         applied_rows.append({
@@ -149,11 +149,17 @@ def main() -> int:
 
     backend.step = traced_step
     records_path = output / "decisions.jsonl"
-    counts = Counter()
-    mask_counts = Counter()
+    counts: Counter[str] = Counter()
+    mask_counts: Counter[str] = Counter()
     decisions_with_attack_available = 0
     attack_action_slots_available = 0
     attack_probability_sum = 0.0
+    rightward_advance = 0.0
+    hit_enemy_events = 0
+    position_records = 0
+    movement_directions: Counter[str] = Counter()
+    previous_position: tuple[str | None, float] | None = None
+    positions_by_scene: dict[str, list[float]] = {}
     total_steps = 0
     episode_resets = 0
     sampled_gif_frames: list[Image.Image] = []
@@ -188,7 +194,7 @@ def main() -> int:
                     if not isinstance(logits, torch.Tensor) or not isinstance(next_state, tuple):
                         raise TypeError("policy output does not contain logits and recurrent state")
                     probabilities = Categorical(logits=logits).probs[0]
-                    action_tensor = Categorical(logits=logits).sample()
+                    action_tensor = Categorical(logits=logits).sample()  # type: ignore[no-untyped-call]
                     if total_steps in {0, 1, 2, 3, 4, 20}:
                         stack = np.asarray(observation["pixels"], dtype=np.uint8)
                         channels = np.moveaxis(stack, 0, -1).reshape(108, 192, 4, 3)
@@ -265,6 +271,38 @@ def main() -> int:
                 applied = applied_rows[-1]
                 signals = next_info.get("signals", {})
                 combat_events = signals.get("combat_events", applied["combat_events"])
+                telemetry = signals.get("operator_telemetry", {})
+                telemetry = telemetry if isinstance(telemetry, dict) else {}
+                x = signals.get("x", telemetry.get("x"))
+                y = signals.get("y", telemetry.get("y"))
+                scene_name = signals.get("scene_name")
+                position_x = float(x) if isinstance(x, (int, float)) else None
+                position_y = float(y) if isinstance(y, (int, float)) else None
+                delta_x = None
+                if position_x is not None and position_y is not None:
+                    position_records += 1
+                    scene_key = str(scene_name or "unknown")
+                    if scene_key not in positions_by_scene:
+                        positions_by_scene[scene_key] = [position_x, position_x]
+                    else:
+                        positions_by_scene[scene_key][1] = position_x
+                    if previous_position is not None and previous_position[0] == scene_name:
+                        delta_x = position_x - previous_position[1]
+                        rightward_advance += max(0.0, delta_x)
+                    previous_position = (scene_name if isinstance(scene_name, str) else None,
+                                         position_x)
+                labels = env.adapter.training_labels() or {}
+                velocity = labels.get("hero_velocity")
+                vx = (float(velocity[0]) if isinstance(velocity, (tuple, list, np.ndarray))
+                      and len(velocity) >= 1 else None)
+                movement_direction = ("right" if vx is not None and vx > .05 else
+                                      "left" if vx is not None and vx < -.05 else "stationary")
+                movement_directions[movement_direction] += 1
+                if isinstance(combat_events, (tuple, list)):
+                    hit_enemy_events += sum(
+                        isinstance(event, dict) and event.get("kind") == "hit_enemy"
+                        for event in combat_events
+                    )
                 frame_rgb = env.adapter.frame_rgb().copy()
                 if total_steps % 5 == 0:
                     universal = fit_to_universal(frame_rgb)
@@ -296,7 +334,14 @@ def main() -> int:
                     "applied_buttons": applied["applied_buttons"],
                     "requested_buttons": applied["requested_buttons"],
                     "combat_events": combat_events,
-                    "scene_name": signals.get("scene_name"),
+                    "position_x": position_x,
+                    "position_y": position_y,
+                    "delta_x_since_previous_decision": delta_x,
+                    "hero_velocity_x": vx,
+                    "hero_movement_direction": movement_direction,
+                    "applied_direction": ("right" if "RIGHT" in applied["applied_buttons"] else
+                                          "left" if "LEFT" in applied["applied_buttons"] else None),
+                    "scene_name": scene_name,
                     "reward": float(reward),
                     "terminated": bool(terminated),
                     "truncated": bool(truncated),
@@ -332,12 +377,17 @@ def main() -> int:
         )
     finally:
         backend.step = original_step
-        env.close()
-        owner.close()
-    restoration = _restore_save_files(save_root, save_snapshot, before_save_hashes)
-    (output / "save-restoration.json").write_text(
-        json.dumps(restoration, indent=2) + "\n", encoding="utf-8"
-    )
+        try:
+            env.close()
+        finally:
+            try:
+                owner.close()
+            finally:
+                restoration = _restore_save_files(save_root, save_snapshot,
+                                                 before_save_hashes)
+                (output / "save-restoration.json").write_text(
+                    json.dumps(restoration, indent=2) + "\n", encoding="utf-8"
+                )
 
     summary = {
         "status": "COMPLETED",
@@ -357,6 +407,21 @@ def main() -> int:
         "attack_mask_allowed_action_slots": attack_action_slots_available,
         "attack_mask_allowed_per_action": {name: mask_counts[name] for name in (action_names[i] for i in attack_indices)},
         "attack_probability_mean": attack_probability_sum / max(1, total_steps),
+        "position_records": position_records,
+        "position_coverage": position_records / max(1, total_steps),
+        "rightward_advance_world_units": sum(
+            max(0.0, last - first) for first, last in positions_by_scene.values()
+        ),
+        "cumulative_positive_x_motion_world_units": rightward_advance,
+        "net_x_change_by_scene": {
+            scene: last - first for scene, (first, last) in positions_by_scene.items()
+        },
+        "hit_enemy_events": hit_enemy_events,
+        "hero_movement_directions": dict(movement_directions),
+        "direction_measurement": (
+            "movement direction inferred from semantic hero_velocity.vx; "
+            "applied button direction is recorded separately"
+        ),
         "records": str(records_path),
         "gif": str(output / "policy-30s.gif"),
         "save_restoration": restoration,
