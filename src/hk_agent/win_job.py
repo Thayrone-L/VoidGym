@@ -128,6 +128,19 @@ def resume_process(pid: int) -> None:
         kernel32.CloseHandle(process)
 
 
+def _process_parent_pid(pid: int) -> int | None:
+    """Return a parent PID when psutil can still observe the process."""
+    try:
+        import psutil  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    try:
+        return int(psutil.Process(pid).ppid())
+    except (psutil.Error, OSError, ValueError):
+        # The process may exit after its OS handle was inspected; parent is optional.
+        return None
+
+
 def process_identity(pid: int) -> dict[str, object]:
     """Return stable process identity fields used to validate a persisted launch."""
     if os.name == "nt":
@@ -152,12 +165,9 @@ def process_identity(pid: int) -> dict[str, object]:
                 raise ctypes.WinError()
             ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
             result: dict[str, object] = {"pid": pid, "creation_time": ticks, "executable": image.value}
-            try:
-                import psutil  # type: ignore[import-untyped]
-
-                result["parent_pid"] = psutil.Process(pid).ppid()
-            except (ImportError, OSError, ValueError):
-                pass
+            parent_pid = _process_parent_pid(pid)
+            if parent_pid is not None:
+                result["parent_pid"] = parent_pid
             return result
         finally:
             kernel32.CloseHandle(handle)
@@ -165,6 +175,12 @@ def process_identity(pid: int) -> dict[str, object]:
         import psutil
 
         process = psutil.Process(pid)
-        return {"pid": pid, "creation_time": process.create_time(), "executable": process.exe(), "parent_pid": process.ppid()}
-    except (ImportError, OSError, ValueError) as error:
+        result = {"pid": pid, "creation_time": process.create_time(), "executable": process.exe()}
+    except ImportError as error:
         raise OSError(f"cannot inspect process {pid}: {error}") from error
+    except (psutil.Error, OSError, ValueError) as error:
+        raise OSError(f"cannot inspect process {pid}: {error}") from error
+    parent_pid = _process_parent_pid(pid)
+    if parent_pid is not None:
+        result["parent_pid"] = parent_pid
+    return result

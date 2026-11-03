@@ -12,7 +12,6 @@ import itertools
 from copy import deepcopy
 from dataclasses import dataclass
 from math import ceil
-from typing import cast
 
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
 from voidgym.gyms.platform_gym.solver import _buttons
@@ -91,7 +90,7 @@ def _heuristic(adapter: PlatformGymAdapter) -> float:
     distance = abs(exit_.rect.x + exit_.rect.w / 2 - adapter.player.x)
     rooms_left = max(0, len(adapter._rooms) - adapter._room_index - 1)
     estimate = distance / room.physics.run_speed + rooms_left * 1.5
-    return cast(float, estimate)
+    return estimate
 
 
 def solve_with_actions(adapter: PlatformGymAdapter, *, max_expansions: int = 30_000,

@@ -49,10 +49,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["e2e: teste integrado do fluxo VoidGym sem jogo real"]
+norecursedirs = [".test-tmp"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = [".test-tmp"]
 
 [tool.ruff.lint]
 extend-select = ["B", "C901", "I", "N"]
@@ -68,3 +70,4 @@ max-complexity = 12
 [tool.mypy]
 python_version = "3.12"
 strict = true
+exclude = ['\\.test-tmp/']

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from hk_agent import worker_cycle as worker_cycle_module
 from hk_agent.control_plane import CampaignSpec, ControlPlane
 from hk_agent.control_plane_server import ControlPlaneHTTPServer
 from hk_agent.runtime_paths import prepare_instance_saves
+from hk_agent.win_job import _process_parent_pid
 
 
 def _project(tmp_path: Path) -> Path:
@@ -33,6 +35,20 @@ def _project(tmp_path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("print('dry run')\n", encoding="utf-8")
     return tmp_path
+
+
+def test_process_parent_pid_handles_process_exiting_during_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoSuchProcess(Exception):
+        pass
+
+    def process(_pid: int) -> Any:
+        raise NoSuchProcess("fake process exited")
+
+    fake_psutil = SimpleNamespace(Error=NoSuchProcess, Process=process)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    assert _process_parent_pid(424_242) is None
 
 
 def _payload(campaign_type: str = "scene_change_probe") -> dict[str, object]:
