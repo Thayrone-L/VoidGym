@@ -30,7 +30,7 @@ As políticas de controle simples falharam em pelo menos 80% das salas dos níve
 
 ### Evidência de comportamento no vão
 
-No teste completo de 200 episódios por modo/nível, nível 2 teve 101/200 sucessos determinísticos (50,5%) e 121/200 estocásticos (60,5%). A política determinística escolheu `LEFT+ATTACK` 58.038 vezes e `ATTACK` 41.202 vezes no nível 2; a estocástica escolheu `ATTACK` 39.839, `LEFT+ATTACK` 24.407, `JUMP_TAP` 17.461 e `LEFT+JUMP_TAP` 14.852 vezes. Na amostra de trace perto do vão (60 episódios determinísticos), predominaram DOWN+ATTACK (341), LEFT+ATTACK (197), LEFT+JUMP_TAP (138), JUMP+ATTACK (130), RIGHT+ATTACK (97) e RIGHT+JUMP_MAX (75). A primeira falha inspecionada (`seed=28600`) oscila de avanço para reversão junto ao vão. O contato de dez GIFs e os arquivos individuais estão em [`behavior_l2_trace`](86i_nivel2_e_avaliacao/behavior_l2_trace/).
+No teste completo de 200 episódios por modo/nível, nível 2 teve 101/200 sucessos determinísticos (50,5%) e 121/200 estocásticos (60,5%). A política determinística escolheu `LEFT+ATTACK` 58.038 vezes e `ATTACK` 41.202 vezes no nível 2; a estocástica escolheu `ATTACK` 39.839, `LEFT+ATTACK` 24.407, `JUMP_TAP` 17.461 e `LEFT+JUMP_TAP` 14.852 vezes. Na amostra de trace perto do vão (60 episódios determinísticos), predominaram DOWN+ATTACK (341), LEFT+ATTACK (197), LEFT+JUMP_TAP (138), JUMP+ATTACK (130), RIGHT+ATTACK (97) e RIGHT+JUMP_MAX (75). A primeira falha inspecionada (`seed=28600`) oscila de avanço para reversão junto ao vão. O contato visual dos dez episódios está em [`l2_failure_contact.png`](86i_nivel2_e_avaliacao/behavior_l2_trace/l2_failure_contact.png); os traces brutos permanecem nos resultados locais.
 
 Não aplicamos mudança de recompensa, peso de currículo nem término de episódio: a evidência mostra erro de política, mas esta avaliação não isolou qual intervenção corrige a causa. Qualquer alteração e novo treino exigem decisão/autorização futura. O limite de busca de 20.000 expansões foi iniciado como retry opcional, mas não concluiu nenhum dos 103 casos antes de ser interrompido para evitar pressão de memória; o arquivo de progresso não representa uma rodada concluída.
 
@@ -101,7 +101,7 @@ Resultados e evidências reproduzíveis:
 - [`dumb_policies.json`](86i_nivel2_e_avaliacao/dumb_policies.json)
 - [`behavior_test/tabela.md`](86i_nivel2_e_avaliacao/behavior_test/tabela.md)
 - Manifestos e matrizes em `perception_train_disjoint`, `perception_test_disjoint` e `hk_recapture`.
-- Contact sheet e GIFs do trace em `behavior_l2_trace`.
+- Contact sheet dos traces em [`l2_failure_contact.png`](86i_nivel2_e_avaliacao/behavior_l2_trace/l2_failure_contact.png).
 
 Validação executada em 03/11/2026:
 
