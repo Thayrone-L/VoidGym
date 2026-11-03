@@ -58,7 +58,10 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     spawn_y = floor
     solids: list[Solid]
     if level == 2:
-        gap_width = _mandatory_gap_width(rng, physics, .35, .70)
+        # Long level-2 gaps are the dominant failure source for the pretrained
+        # policy. Keep useful variation while leaving a wider control margin
+        # than the previous 70%-of-theoretical-reach ceiling.
+        gap_width = _mandatory_gap_width(rng, physics, .35, .50)
         gap_left = width * .42
         pit_width = gap_width * .62
         solids = [Solid(Rect(0, floor - .6, gap_left, .6)),

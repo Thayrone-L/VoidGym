@@ -1,3 +1,5 @@
+from collections import Counter
+
 import numpy as np
 from gymnasium.utils.env_checker import check_env
 
@@ -84,6 +86,23 @@ def test_curriculum_samples_next_level_with_sixty_percent_current_level_success(
     assert curriculum.level == 2
     assert 3 in sampled
     assert curriculum.success_rate(2) == .6
+
+
+def test_curriculum_reweights_unlocked_levels_below_seventy_percent() -> None:
+    curriculum = Curriculum(seed=11)
+    curriculum.level = 4
+    for level in (0, 2, 3):
+        curriculum.history[level].extend([True] * 80 + [False] * 20)
+    curriculum.history[1].extend([True] * 69 + [False] * 31)
+
+    lower_samples: list[int] = []
+    for seed in range(20_000):
+        if .6 <= np.random.default_rng(seed).random() < .9:
+            lower_samples.append(curriculum.sample_level(seed))
+    counts = Counter(lower_samples)
+
+    assert counts[1] / len(lower_samples) > .45
+    assert counts[1] > 2 * max(counts[level] for level in (0, 2, 3))
 
 
 def test_curriculum_load_migrates_older_current_window_to_level_history(tmp_path) -> None:

@@ -79,7 +79,13 @@ class Curriculum:
         if choice < .6:
             return self.level
         if choice < .9:
-            return int(rng.integers(0, self.level))
+            lower_levels = list(range(self.level))
+            weights = np.ones(len(lower_levels), dtype=np.float64)
+            for index, level in enumerate(lower_levels):
+                rate = self.window_success_rate(level, window=100)
+                if rate is not None and rate < .70:
+                    weights[index] = 3.0
+            return int(rng.choice(lower_levels, p=weights / weights.sum()))
         return self.level if self.level == 8 else self.level + 1
 
     def success_rate(self, level: int) -> float:

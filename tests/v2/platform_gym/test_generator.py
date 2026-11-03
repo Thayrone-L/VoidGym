@@ -129,7 +129,7 @@ def test_mandatory_jump_obstacles_respect_physics_limit_and_level_two_runup() ->
                            if solid.rect.y == 0)
                 gap = pit.w / .62
                 wall = max(challenge, key=lambda solid: solid.rect.x)
-                assert .35 * reach <= gap <= .70 * reach
+                assert .35 * reach <= gap <= .50 * reach
                 runup = (wall.rect.x - (pit.x + gap) if wall.rect.x > pit.x else
                          pit.x - (gap - pit.w) - (wall.rect.x + wall.rect.w))
                 assert runup >= 3.0 - 1e-8
