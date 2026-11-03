@@ -22,6 +22,20 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 
+def _worker_pythonpath(current: str | None = None) -> str:
+    """Ensure the spawned episode worker can import the checkout from any cwd."""
+    value = os.environ.get("PYTHONPATH", "") if current is None else current
+    entries = [item for item in value.split(os.pathsep) if item]
+    normalized = {os.path.normcase(os.path.abspath(item)) for item in entries}
+    for path in (ROOT / "src", ROOT):
+        resolved = str(path.resolve(strict=True))
+        key = os.path.normcase(os.path.abspath(resolved))
+        if key not in normalized:
+            entries.insert(0, resolved)
+            normalized.add(key)
+    return os.pathsep.join(entries)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -76,6 +90,9 @@ def main() -> int:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
 
+    # The owner launches ``python -m hk_agent.episode_worker`` in a child
+    # process. The parent-only sys.path inserts above are not inherited there.
+    os.environ["PYTHONPATH"] = _worker_pythonpath()
     os.environ["HK_AGENT_SLOT_ID"] = "0"
     os.environ["HK_LABEL_DIAGNOSTICS"] = "true"
     output = args.output.resolve()
@@ -118,7 +135,7 @@ def main() -> int:
         "--horizon", "3000",
     ])
     env, owner = create_hollow_knight_env(
-        hk_args, shared_root=shared, actor_id="probe-86h", slot_id=0,
+        hk_args, shared_root=shared, actor_id="probe-86j", slot_id=0,
         request_semantic_labels=True,
     )
     device = torch.device(args.device)
