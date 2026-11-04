@@ -7,6 +7,7 @@ import numpy as np
 from tests.test_gym_env import FakeBackend, make_env
 from voidgym.adapters.hollow_knight.adapter import HollowKnightAdapter
 from voidgym.core.observation import split_observation
+from voidgym.core.semantics import Sem
 
 
 class EmptyEnv:
@@ -208,3 +209,29 @@ def test_latest_campaign_checkpoint_contract(tmp_path) -> None:
         assert model.action_space == current_env.action_space
     finally:
         current_env.close()
+
+
+def test_tutorial_01_interact_is_masked_away_and_allowed_near_bench() -> None:
+    names = HollowKnightAdapter(EmptyEnv()).action_table()
+    interact = names.index("INTERACT")
+    env = EmptyEnv()
+    labels = np.zeros((27, 48), dtype=np.uint8)
+    labels[10, 10] = Sem.PLAYER
+    labels[10, 13] = Sem.INTERACTIVE
+    env._frames = [SimpleNamespace(scene_name="Tutorial_01", semantic_labels=labels,
+                                   interact_prompt=False, interact_prompt_valid=False)]
+    adapter = HollowKnightAdapter(env)
+    assert not adapter.action_mask()[interact]
+
+    labels[10, 12] = Sem.INTERACTIVE
+    assert adapter.action_mask()[interact]
+
+    labels[10, 12] = Sem.EMPTY
+    env._frames[-1] = SimpleNamespace(scene_name="Tutorial_01", semantic_labels=labels,
+                                      interact_prompt=True,
+                                      interact_prompt_valid=True)
+    assert adapter.action_mask()[interact]
+
+    env._frames[-1] = SimpleNamespace(scene_name="Tutorial_01", semantic_labels=labels,
+                                      interact_prompt=True, interact_prompt_valid=False)
+    assert not adapter.action_mask()[interact]

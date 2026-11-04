@@ -19,6 +19,7 @@ from voidgym.adapters.hollow_knight.discovery_reward import (
 )
 from voidgym.core.actions import UNIVERSAL_ACTIONS, UniversalAction
 from voidgym.core.errors import VoidGymRuntimeError as RuntimeError
+from voidgym.core.semantics import Sem
 
 _TEMPLATES = TEMPORAL_COMBAT_ACTIONS + PLAYER_INTERACTION_ACTIONS
 _NAMES = tuple(template.name for template in _TEMPLATES)
@@ -44,6 +45,26 @@ _HK_TO_UNIVERSAL = {
     "MENU_SUBMIT": "MENU_SUBMIT", "MENU_CANCEL": "MENU_CANCEL", "OPEN_CHARMS": "OPEN_MENU",
 }
 _UNIVERSAL = {action.name: action for action in UNIVERSAL_ACTIONS}
+
+
+def _has_visible_interaction_reason(game_env: Any) -> bool:
+    """Require a validated prompt or an INTERACTIVE gabarito within 2 cells."""
+    frames = getattr(game_env, "_frames", ())
+    if not frames:
+        return False
+    frame = frames[-1]
+    if (bool(getattr(frame, "interact_prompt_valid", False))
+            and bool(getattr(frame, "interact_prompt", False))):
+        return True
+    labels = getattr(frame, "semantic_labels", None)
+    if not isinstance(labels, np.ndarray) or labels.shape != (27, 48):
+        return False
+    players = np.argwhere(labels == int(Sem.PLAYER))
+    targets = np.argwhere(labels == int(Sem.INTERACTIVE))
+    if not len(players) or not len(targets):
+        return False
+    distance = np.abs(players[:, None, :] - targets[None, :, :]).max(axis=-1)
+    return bool(np.any(distance <= 2))
 
 
 class HollowKnightAdapter:
@@ -114,9 +135,15 @@ class HollowKnightAdapter:
 
     def action_mask(self) -> np.ndarray:
         if self._task_mode:
-            return np.asarray(self.env.action_masks(), dtype=np.bool_)
-        availability = self.env.latest_action_availability
-        return build_action_mask(_NAMES, availability)
+            mask = np.asarray(self.env.action_masks(), dtype=np.bool_).copy()
+        else:
+            availability = self.env.latest_action_availability
+            mask = build_action_mask(_NAMES, availability)
+        # INTERACT was always available in the v1 HK adapter, unlike in the
+        # platform gym. In v2 it is legal only with a visible nearby gabarito
+        # target or a validated game prompt.
+        mask[_NAMES.index("INTERACT")] = _has_visible_interaction_reason(self._game_env())
+        return mask
 
     def signals(self) -> dict[str, Any]:
         game_env = self._game_env()
@@ -127,6 +154,7 @@ class HollowKnightAdapter:
             result = {"scene_name": frame.scene_name,
                       "terminated": bool(self._last_info.get("terminated", False)),
                       "truncated": bool(self._last_info.get("truncated", False)),
+                      "termination_reason": self._last_info.get("termination_reason"),
                       "room_changed": bool(self._last_info.get("scene_change_event", False)),
                       "died": self._last_info.get("termination_reason") == "player_dead",
                       "progress": max((float(value) for value in self._last_info.get("max_progress_by_scene", {}).values()), default=0.0)
