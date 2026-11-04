@@ -127,6 +127,8 @@ def main() -> int:
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--wait-timeout", type=float, default=3600.0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--diagnostic-breakable-labels", action="store_true",
+                        help="opt in to full breakable labels for diagnostics")
     v2_args, remaining = parser.parse_known_args()
     if v2_args.mode == "hollow_knight":
         required = (v2_args.shared_root, v2_args.experience_root,
@@ -148,7 +150,8 @@ def main() -> int:
         shared = v2_args.shared_root.resolve()
         env, owner = create_hollow_knight_env(
             hk_args, shared_root=shared, actor_id=actor_id,
-            slot_id=slot_id, request_semantic_labels=True
+            slot_id=slot_id, request_semantic_labels=True,
+            diagnostic_breakable_labels=v2_args.diagnostic_breakable_labels,
         )
         try:
             extras_dim = int(PlayerKnowledge.space().shape[0])

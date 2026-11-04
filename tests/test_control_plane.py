@@ -108,7 +108,58 @@ def test_v2_engine_uses_production_actor_command_and_v1_stays_default(tmp_path: 
         plane.close()
     assert Path(command[1]) == actor_tool
     assert "--mode" in command and "hollow_knight" in command
+    assert "--diagnostic-breakable-labels" not in command
     assert Path(command[command.index("--universal-checkpoint") + 1]) == checkpoint
+
+
+def test_v2_shared_learner_launch_uses_crash_resume_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _project(tmp_path)
+    runtime = tmp_path / "runtime"
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    checkpoint = runtime / "v2" / "pretrain" / "seed" / "universal-012438528"
+    checkpoint.mkdir(parents=True)
+    payload = _payload("exploration_training")
+    payload.update({"weights": {}, "engine": "v2", "reward_version": "explore_v4",
+                    "shared_learner": True, "save_source": "new_game",
+                    "universal_checkpoint": str(checkpoint),
+                    "duration_mode": "continuous", "augment_random_shift": True})
+    spec = CampaignSpec.from_payload(payload)
+    control = ControlPlane(root, runtime_root=runtime)
+    (checkpoint / "manifest.json").write_text(json.dumps({
+        "trained_steps": 12_438_528, "action_table": ["NOOP"],
+    }), "utf-8")
+    process = _FakeProcess([])
+    process._return_code = 0
+    process._done.set()
+
+    class ImmediateThread:
+        def __init__(self, *, target: Any, args: tuple[Any, ...], daemon: bool) -> None:
+            self.target, self.args, self.daemon = target, args, daemon
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(control_plane_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(control_plane_module, "process_identity", lambda _pid: {"pid": process.pid})
+    monkeypatch.setattr(control_plane_module.threading, "Thread", ImmediateThread)
+    record = control._launch_shared_learner(
+        spec, version=1, group_id="group-v2", shared_root=shared,
+        actor_ids=("actor-slot-0", "actor-slot-1"),
+    )
+    command = json.loads((shared / "learner-command.json").read_text("utf-8"))["argv"]
+    assert "run_learner.py" in " ".join(command)
+    assert "-X" in command and "faulthandler" in command
+    assert "--continuous" in command
+    campaign_config = json.loads((shared / "campaign-config.json").read_text("utf-8"))
+    assert campaign_config["aux"]["augment_random_shift"] is True
+    assert "supervise_hk_learner.py" in " ".join(record["command"])
+    assert "--continuous" not in record["command"]
+    assert "--augment-random-shift" not in record["command"]
+    assert str(checkpoint.resolve()) in record["command"]
+    assert record["status"] == "RUNNING"
 
 
 def test_prompt_82_campaign_flags_have_documented_safe_defaults_and_validation() -> None:
@@ -280,7 +331,7 @@ def test_operator_snapshot_surfaces_persisted_actor_restart(
             "shared_group": "campaign-v0001",
             "old_launch_id": "actor-old",
             "new_launch_id": "actor-new",
-            "restart_number_in_hour": 1,
+            "restart_number_in_24h": 1,
         }) + "\n",
         "utf-8",
     )
@@ -1825,6 +1876,68 @@ def test_http_api_is_local_and_requires_token_for_mutations(tmp_path: Path) -> N
         thread.join(timeout=2)
 
 
+def test_http_campaign_api_accepts_v2_universal_checkpoint_configuration(
+    tmp_path: Path,
+) -> None:
+    root = _project(tmp_path)
+    static_root = Path(__file__).resolve().parents[1] / "src" / "hk_agent" / "control_plane_web"
+    server = ControlPlaneHTTPServer(("127.0.0.1", 0), ControlPlane(root), static_root)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/api/session")
+        response = connection.getresponse()
+        token = json.loads(response.read())["csrf_token"]
+        assert response.status == 200
+
+        payload = _payload("exploration_training")
+        payload.update({
+            "campaign_id": "v2-hk-smoke",
+            "engine": "v2",
+            "reward_version": "explore_v4",
+            "shared_learner": True,
+            "actors": 2,
+            "rollout_steps": 512,
+            "batch_size": 256,
+            "checkpoint_interval": 1024,
+            "timesteps": 10_000_000,
+            "duration_mode": "continuous",
+            "duration_limit_seconds": 600,
+            "save_source": "existing_save",
+            "universal_checkpoint": str(tmp_path / "universal-000012438528"),
+            "weights": {},
+            "challenge_practice_enabled": True,
+            "help_requests_enabled": True,
+            "help_stuck_count": 10,
+            "help_stuck_minutes": 60,
+            "augment_random_shift": True,
+        })
+        connection.request(
+            "POST",
+            "/api/campaigns",
+            json.dumps(payload),
+            {
+                "Content-Type": "application/json",
+                "X-Control-Token": token,
+                "Origin": f"http://127.0.0.1:{server.server_port}",
+            },
+        )
+        created = connection.getresponse()
+        result = json.loads(created.read())
+        assert created.status == 201
+        assert result["engine"] == "v2"
+        assert result["universal_checkpoint"] == payload["universal_checkpoint"]
+        assert result["augment_random_shift"] is True
+        assert result["help_requests_enabled"] is True
+        assert result["help_stuck_count"] == 10
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_panel_adopts_game_identity_sidecar_only_for_its_own_launch(tmp_path: Path) -> None:
     control = ControlPlane(_project(tmp_path))
     launch_root = control.control_root / "launches" / "L1"
@@ -2304,11 +2417,11 @@ def test_shared_actor_restart_is_bounded_and_recorded(tmp_path: Path) -> None:
     control._launch_single = launch
     for _ in range(3):
         control.restart_shared_actor("actor-old", reason="soak test")
-    with pytest.raises(RuntimeError, match="3 per hour"):
+    with pytest.raises(RuntimeError, match="3 per 24 hours"):
         control.restart_shared_actor("actor-old", reason="limit test")
     rows = (tmp_path / "shared" / "actor-restarts.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 3
-    assert json.loads(rows[-1])["restart_number_in_hour"] == 3
+    assert json.loads(rows[-1])["restart_number_in_24h"] == 3
 
 
 def test_map_detail_cache_keys_include_path_mtime_and_size(tmp_path: Path) -> None:

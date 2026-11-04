@@ -82,6 +82,8 @@ internal static class SemanticLabelCapture
             OverlapBuffer);
         bool[] candidateCells = new bool[SemanticRasterizer.Width * SemanticRasterizer.Height];
         List<EdgeCollider2D> terrainEdges = new List<EdgeCollider2D>();
+        List<Collider2D> ignoredBreakables = new List<Collider2D>();
+        HashSet<int> ignoredBreakableIds = new HashSet<int>();
         for (int index = 0; index < visibleCount; index++)
         {
             Collider2D collider = OverlapBuffer[index];
@@ -91,6 +93,12 @@ internal static class SemanticLabelCapture
                 continue;
 
             LogSemanticCollider(collider, log);
+            if (!LabelBreakables && IsOtherBreakable(collider))
+            {
+                if (ignoredBreakableIds.Add(collider.GetInstanceID()))
+                    ignoredBreakables.Add(collider);
+                continue;
+            }
             if (!TryClassify(collider, hero, out byte label, out byte priority))
                 continue;
             if (collider is EdgeCollider2D edge && label == Solid)
@@ -135,11 +143,16 @@ internal static class SemanticLabelCapture
                     (collider.gameObject.scene != scene &&
                      (hero == null || collider.GetComponentInParent<HeroController>() != hero)))
                     continue;
+                if (!LabelBreakables && IsOtherBreakable(collider))
+                    continue;
                 if (!TryClassify(collider, hero, out byte label, out byte priority))
                     continue;
                 SemanticRasterizer.StampCell(labels, priorities, x, y, label, priority);
             }
         }
+
+        foreach (Collider2D collider in ignoredBreakables)
+            StampIgnoredBreakable(camera, collider, gameplayPlaneDepth, labels, priorities);
 
         float vx = 0f;
         float vy = 0f;
@@ -569,9 +582,10 @@ internal static class SemanticLabelCapture
         if (collider.GetComponentInParent<GeoControl>() != null)
             SetCandidate(Pickup, PriorityPickup, ref label, ref priority);
 
-        if (IsBreakable(collider))
-            SetCandidate(LabelBreakables ? Breakable : SemanticRasterizer.Ignore,
-                PriorityBreakable, ref label, ref priority);
+        byte? breakableLabel = SemanticColliderRules.BreakableLabel(
+            IsGeoRock(collider), IsOtherBreakable(collider), LabelBreakables);
+        if (breakableLabel.HasValue && breakableLabel.Value != SemanticRasterizer.Ignore)
+            SetCandidate(breakableLabel.Value, PriorityBreakable, ref label, ref priority);
 
         DamageHero? damageHero = collider.GetComponentInParent<DamageHero>();
         DamageHero? contactDamage = collider.GetComponent<DamageHero>();
@@ -693,15 +707,35 @@ internal static class SemanticLabelCapture
                   $"enemyBody={enemyBody} hazard={environmentalHazard}");
     }
 
-    private static bool IsBreakable(Collider2D collider) =>
-        collider.GetComponentInParent<GeoRock>() != null ||
-        collider.GetComponentInParent<Breakable>() != null ||
+    private static bool IsGeoRock(Collider2D collider) =>
+        collider.GetComponentInParent<GeoRock>() != null;
+
+    private static bool IsOtherBreakable(Collider2D collider) =>
+        !IsGeoRock(collider) && (collider.GetComponentInParent<Breakable>() != null ||
         collider.GetComponentInParent<BreakableObject>() != null ||
         collider.GetComponentInParent<BreakableInfectedVine>() != null ||
         collider.GetComponentInParent<BreakablePole>() != null ||
         collider.GetComponentInParent<BreakablePoleSimple>() != null ||
         collider.GetComponentInParent<BreakablePoleTopLand>() != null ||
-        collider.GetComponentInParent<DestructibleProp>() != null;
+        collider.GetComponentInParent<DestructibleProp>() != null);
+
+    private static void StampIgnoredBreakable(Camera camera, Collider2D collider,
+        float gameplayPlaneDepth, byte[] labels, byte[] priorities)
+    {
+        bool[] candidates = new bool[SemanticRasterizer.Width * SemanticRasterizer.Height];
+        MarkCandidateCells(camera, collider.bounds, candidates);
+        for (int y = 0; y < SemanticRasterizer.Height; y++)
+        for (int x = 0; x < SemanticRasterizer.Width; x++)
+        {
+            if (!candidates[y * SemanticRasterizer.Width + x]) continue;
+            Vector3 world = camera.ViewportToWorldPoint(new Vector3(
+                (x + 0.5f) / SemanticRasterizer.Width,
+                1f - (y + 0.5f) / SemanticRasterizer.Height,
+                gameplayPlaneDepth));
+            if (collider.OverlapPoint(new Vector2(world.x, world.y)))
+                SemanticRasterizer.StampIgnoreCell(labels, priorities, x, y, PrioritySolid);
+        }
+    }
 
     private static bool IsGrassOrCuttable(Collider2D collider) =>
         collider.GetComponentInParent<GrassBehaviour>() != null ||

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +18,7 @@ from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.buffers import RecurrentRolloutBuffer, _privileged
 from voidgym.training.checkpoints import load_universal
+from voidgym.training.runtime_monitor import publish_role_state, resource_snapshot
 from voidgym.training.shared_rollouts import publish_rollout
 
 
@@ -96,6 +98,7 @@ def _collect_steps(
     state: tuple[torch.Tensor, torch.Tensor], episode_start: bool,
     total_steps: int, episode_return: float, round_returns: list[float],
     device: torch.device, seed: int, stop_file: Path | None,
+    telemetry_callback: Any = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], tuple[torch.Tensor, torch.Tensor],
            bool, int, float, bool]:
     for _ in range(buffer.steps):
@@ -128,6 +131,8 @@ def _collect_steps(
         writer.append(_experience_row(env, observation, action, reward, terminated,
                                       truncated, next_info, masks, actor_id, policy_round))
         total_steps += 1
+        if telemetry_callback is not None:
+            telemetry_callback(total_steps, policy_round + 1)
         episode_return += reward
         if done:
             round_returns.append(episode_return)
@@ -169,13 +174,14 @@ def _publish_round(
     return rollout_file, latest
 
 
-def run_actor(
+def _run_actor_impl(
               env: AdapterEnv, policy: UniversalPolicy, *, shared_root: Path,
               actor_id: str, action_table: tuple[str, ...], universal_checkpoint: Path,
               experience_root: Path, campaign_id: str, rollout_steps: int = 512,
               sequence_length: int = 32, gamma: float = .995, gae_lambda: float = .95,
               device: str = "cpu", seed: int = 7, wait_timeout: float = 3600.0,
-              stop_file: Path | None = None, semantic_labels: bool = True) -> dict[str, Any]:
+              stop_file: Path | None = None, semantic_labels: bool = True,
+              telemetry_callback: Any = None) -> dict[str, Any]:
     if rollout_steps < 1 or sequence_length < 1 or rollout_steps % sequence_length:
         raise ValueError("rollout_steps must be a positive multiple of sequence_length")
     if tuple(env.actions) != action_table:
@@ -212,7 +218,7 @@ def run_actor(
                 observation=observation, info=info, state=state, episode_start=episode_start,
                 total_steps=total_steps, episode_return=episode_return,
                 round_returns=round_returns, device=selected_device, seed=seed,
-                stop_file=stop_file,
+                stop_file=stop_file, telemetry_callback=telemetry_callback,
             )
             if stopped:
                 break
@@ -238,3 +244,74 @@ def run_actor(
             "actor_id": actor_id, "completed_steps": total_steps,
             "last_policy_round": policy_round, "last_rollout": str(rollout_file) if "rollout_file" in locals() else None,
             "recent_episode_returns": round_returns}
+
+
+def run_actor(
+    env: AdapterEnv, policy: UniversalPolicy, *, shared_root: Path,
+    actor_id: str, action_table: tuple[str, ...], universal_checkpoint: Path,
+    experience_root: Path, campaign_id: str, rollout_steps: int = 512,
+    sequence_length: int = 32, gamma: float = .995, gae_lambda: float = .95,
+    device: str = "cpu", seed: int = 7, wait_timeout: float = 3600.0,
+    stop_file: Path | None = None, semantic_labels: bool = True,
+) -> dict[str, Any]:
+    """Run an actor with independent telemetry and a per-process faulthandler file."""
+    import faulthandler
+    import threading
+
+    telemetry_path = shared_root / "telemetry" / f"actor-{actor_id}.json"
+    fault_path = shared_root / "telemetry" / f"faulthandler-actor-{actor_id}.log"
+    fault_path.parent.mkdir(parents=True, exist_ok=True)
+    fault_file = fault_path.open("a", encoding="utf-8")
+    faulthandler.enable(file=fault_file, all_threads=True)
+    state: dict[str, int | str] = {"status": "RUNNING", "completed_steps": 0, "round": 0}
+    state_lock = threading.Lock()
+    heartbeat_stop = threading.Event()
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.is_set():
+            with state_lock:
+                snapshot = dict(state)
+            publish_role_state(telemetry_path, {
+                **resource_snapshot(device), **snapshot, "role": "actor",
+                "actor_id": actor_id, "pid": os.getpid(),
+            })
+            heartbeat_stop.wait(5.0)
+
+    def update_progress(steps: int, round_id: int) -> None:
+        with state_lock:
+            state["completed_steps"] = steps
+            state["round"] = round_id
+
+    thread = threading.Thread(target=heartbeat_loop, name=f"actor-heartbeat-{actor_id}",
+                              daemon=True)
+    thread.start()
+    try:
+        result = _run_actor_impl(
+            env, policy, shared_root=shared_root, actor_id=actor_id,
+            action_table=action_table, universal_checkpoint=universal_checkpoint,
+            experience_root=experience_root, campaign_id=campaign_id,
+            rollout_steps=rollout_steps, sequence_length=sequence_length,
+            gamma=gamma, gae_lambda=gae_lambda, device=device, seed=seed,
+            wait_timeout=wait_timeout, stop_file=stop_file,
+            semantic_labels=semantic_labels, telemetry_callback=update_progress,
+        )
+        with state_lock:
+            state.update({"status": str(result.get("status", "COMPLETED")),
+                          "completed_steps": int(result.get("completed_steps", 0)),
+                          "round": int(result.get("last_policy_round", 0))})
+        return result
+    except BaseException as error:
+        with state_lock:
+            state.update({"status": "FAILED", "error": f"{type(error).__name__}: {error}"[:2000]})
+        raise
+    finally:
+        heartbeat_stop.set()
+        thread.join(timeout=6.0)
+        with state_lock:
+            final_state = dict(state)
+        publish_role_state(telemetry_path, {
+            **resource_snapshot(device), **final_state, "role": "actor",
+            "actor_id": actor_id, "pid": os.getpid(), "finished_unix_ns": time.time_ns(),
+        })
+        faulthandler.disable()
+        fault_file.close()

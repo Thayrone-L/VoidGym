@@ -32,15 +32,41 @@ def _iou(matrix: np.ndarray, class_index: int) -> float | None:
     return float(matrix[class_index, class_index] / union) if union else None
 
 
+def _capture_paths(
+    capture_dir: Path, capture_manifest: Path | None,
+) -> tuple[list[Path], int, int]:
+    if capture_manifest is None:
+        paths = sorted(capture_dir.glob("*-capture.png"))
+        return paths, len(paths), 0
+    data = json.loads(capture_manifest.read_text(encoding="utf-8"))
+    rows = data.get("captures") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise TypeError("capture manifest must contain a captures list")
+    paths: list[Path] = []
+    menu_frames = 0
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise TypeError("capture manifest has an invalid frame row")
+        if row.get("scene_name") == "Menu_Title":
+            menu_frames += 1
+            continue
+        path = Path(row["path"]).resolve(strict=True)
+        if path.suffix.lower() != ".png" or not path.is_file():
+            raise ValueError("capture manifest frame must reference an existing PNG")
+        paths.append(path)
+    return paths, len(rows), menu_frames
+
+
 def evaluate(checkpoint: Path, capture_dir: Path, output: Path, *, device_name: str,
-             skip_menu_frames: int, black_mean_below: float) -> dict[str, Any]:
+             skip_menu_frames: int, black_mean_below: float,
+             capture_manifest: Path | None = None) -> dict[str, Any]:
     device = torch.device(device_name)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     action_table = tuple(item.name for item in TEMPORAL_COMBAT_ACTIONS + PLAYER_INTERACTION_ACTIONS)
     model = UniversalPolicy().to(device).eval()
     checkpoint_manifest = load_universal(checkpoint, model, action_table)
-    paths = sorted(capture_dir.glob("*-capture.png"))
+    paths, manifest_frames, menu_scene_frames = _capture_paths(capture_dir, capture_manifest)
     if not paths:
         raise FileNotFoundError(f"no capture frames under {capture_dir}")
     confusion = np.zeros((len(Sem), len(Sem)), dtype=np.int64)
@@ -115,8 +141,11 @@ def evaluate(checkpoint: Path, capture_dir: Path, output: Path, *, device_name: 
         "checkpoint": str(checkpoint),
         "trained_steps": checkpoint_manifest.get("trained_steps"),
         "capture_dir": str(capture_dir),
+        "capture_manifest": str(capture_manifest) if capture_manifest is not None else None,
         "device": str(device),
         "capture_frames_available": len(paths),
+        "capture_frames_in_manifest": manifest_frames,
+        "menu_scene_frames_excluded": menu_scene_frames,
         "menu_frames_excluded_by_order": skipped_menu,
         "almost_black_frames_excluded": skipped_black,
         "frames_evaluated": rows,
@@ -138,6 +167,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--capture-dir", type=Path, required=True)
+    parser.add_argument("--capture-manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--skip-menu-frames", type=int, default=21)
@@ -145,7 +175,8 @@ def main() -> int:
     args = parser.parse_args()
     result = evaluate(args.checkpoint, args.capture_dir, args.output,
                       device_name=args.device, skip_menu_frames=args.skip_menu_frames,
-                      black_mean_below=args.black_mean_below)
+                      black_mean_below=args.black_mean_below,
+                      capture_manifest=args.capture_manifest)
     print(json.dumps(result, indent=2))
     return 0
 

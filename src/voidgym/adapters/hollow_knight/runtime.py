@@ -19,7 +19,8 @@ from tools.run_first_training import build_task
 
 def create_hollow_knight_env(args: Any, *, shared_root: Path, actor_id: str,
                              slot_id: int,
-                             request_semantic_labels: bool = True) -> tuple[Any, Any]:
+                             request_semantic_labels: bool = True,
+                             diagnostic_breakable_labels: bool = False) -> tuple[Any, Any]:
     """Create AdapterEnv + owner using the managed slot and explore_v4 task shim."""
     config_path = Path(args.config).resolve(strict=True)
     project_config = load_config(config_path, allow_training=True)
@@ -72,7 +73,7 @@ def create_hollow_knight_env(args: Any, *, shared_root: Path, actor_id: str,
         task_config=task_config, args=task_args, phase="training",
         request_semantic_labels=request_semantic_labels,
         request_combat_events=True,
-        request_breakable_labels=True,
+        request_breakable_labels=diagnostic_breakable_labels,
     )
     from voidgym.adapters.hollow_knight.adapter import HollowKnightAdapter
     from voidgym.envs.adapter_env import AdapterEnv

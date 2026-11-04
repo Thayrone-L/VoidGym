@@ -48,7 +48,17 @@ def test_universal_learner_updates_checkpoint_and_two_actors_import_it(tmp_path:
     assert learner_result["status"] == "COMPLETED"
     assert learner_result["completed_timesteps"] == 4
     assert json.loads((shared / "learner.json").read_text(encoding="utf-8"))["status"] == "COMPLETED"
+    assert json.loads((shared / "status.json").read_text(encoding="utf-8"))["status"] == "COMPLETED"
+    heartbeat = json.loads((shared / "heartbeat.json").read_text(encoding="utf-8"))
+    assert heartbeat["ram_available_bytes"] is not None
+    assert "commit_available_bytes" in heartbeat
     assert all(result["completed_steps"] >= 2 for result in actor_results)
+    for result in actor_results:
+        actor_telemetry = json.loads(
+            (shared / "telemetry" / f"actor-{result['actor_id']}.json").read_text("utf-8")
+        )
+        assert actor_telemetry["status"] == "CANCELLED"
+        assert "vram_free_bytes" in actor_telemetry
     latest = shared / "latest.json"
     assert latest.is_file()
     latest_data = json.loads(latest.read_text(encoding="utf-8"))

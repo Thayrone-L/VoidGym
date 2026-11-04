@@ -36,6 +36,19 @@ TestOpenFloorEdgeLeavesSolidLineAndIgnoredBacking();
 TestClosedTerrainContourFillsInterior();
 Console.WriteLine("semantic rasterizer shape and priority checks passed");
 TestSemanticColliderRules();
+TestBreakableLabelPolicy();
+
+static void TestBreakableLabelPolicy()
+{
+    if (SemanticColliderRules.BreakableLabel(true, true, false) != 6)
+        throw new InvalidOperationException("visible GeoRock must remain labeled in training");
+    if (SemanticColliderRules.BreakableLabel(false, true, false) != SemanticRasterizer.Ignore)
+        throw new InvalidOperationException("non-GeoRock breakables must be ignored in training");
+    if (SemanticColliderRules.BreakableLabel(false, true, true) != 6)
+        throw new InvalidOperationException("diagnostic mode must expose other breakable labels");
+    if (SemanticColliderRules.BreakableLabel(false, false, true) is not null)
+        throw new InvalidOperationException("ordinary colliders must not receive breakable labels");
+}
 
 static void TestLShapedColliderDoesNotFillItsBoundingBox()
 {

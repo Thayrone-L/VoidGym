@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,17 @@ import torch
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.checkpoints import load_universal, prune_checkpoints, save_universal
 from voidgym.training.recurrent_ppo import RecurrentPPOTrainer
+from voidgym.training.runtime_monitor import resource_snapshot
 from voidgym.training.shared_rollouts import load_rollout, publish_json, rollout_path
+
+_MIN_COMMIT_BYTES = 3 * 1024**3
+
+
+def _assert_commit_guard() -> None:
+    stats = resource_snapshot()
+    available = stats.get("commit_available_bytes")
+    if isinstance(available, int) and available < _MIN_COMMIT_BYTES:
+        raise MemoryError(f"learner commit guard: {available} bytes available; 3 GiB required")
 
 
 def _publish_monitor_state(
@@ -25,6 +37,7 @@ def _publish_monitor_state(
         "completed_timesteps": completed_steps,
         "updated_unix_ns": time.time_ns(),
     }
+    state.update(resource_snapshot())
     if metrics is not None:
         state["metrics"] = metrics
     if failure is not None:
@@ -196,18 +209,12 @@ def _train_shared_round(
     return next_round, completed_steps, metrics, row
 
 
-def run_shared_learner(  # noqa: C901 - validates the shared learner contract before launch
-        *, shared_root: Path, universal_checkpoint: Path,
-                       action_table: tuple[str, ...], actors: tuple[str, ...],
-                       total_timesteps: int, rollout_steps: int, sequence_length: int,
-                       game_id: str | None = None, game_extras_dim: int = 0,
-                       learning_rate: float, lr_encoder_scale: float,
-                       gamma: float, gae_lambda: float, clip_range: float,
-                       entropy_coef: float, epochs: int, batch_size: int,
-                       c_sem: float, c_inv: float, c_mot: float,
-                       device_name: str = "cpu", seed: int = 7,
-                       continuous: bool = False, freeze_encoder_rounds: int = 0,
-                       wait_timeout: float = 3600.0, stop_file: Path | None = None) -> dict[str, Any]:
+def _validate_learner_contract(
+    actors: tuple[str, ...], rollout_steps: int, sequence_length: int,
+    total_timesteps: int, continuous: bool, batch_size: int,
+    freeze_encoder_rounds: int, game_extras_dim: int, game_id: str | None,
+    device_name: str,
+) -> torch.device:
     if not actors or len(set(actors)) != len(actors):
         raise ValueError("actor ids must be unique and nonempty")
     if any(not actor or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in actor) for actor in actors):
@@ -224,46 +231,138 @@ def run_shared_learner(  # noqa: C901 - validates the shared learner contract be
         raise ValueError("game_extras_dim requires a game_id and cannot be negative")
     if device_name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for the v2 learner but is unavailable")
-    device = torch.device(device_name)
+    return torch.device(device_name)
+
+
+def _start_learner_heartbeat(
+    root: Path, round_id: int, completed_steps: int, device: torch.device,
+) -> tuple[threading.Event, threading.Thread, dict[str, int], threading.Lock]:
+    stopped = threading.Event()
+    lock = threading.Lock()
+    progress = {"round": round_id, "steps": completed_steps}
+
+    def run() -> None:
+        while not stopped.wait(5.0):
+            with lock:
+                current_round, current_steps = progress["round"], progress["steps"]
+            payload = {"learner_pid": float(os.getpid()), **resource_snapshot(device.type)}
+            _publish_monitor_state(root, "RUNNING", current_round, current_steps,
+                                   metrics=payload)
+
+    thread = threading.Thread(target=run, name="hk-learner-heartbeat", daemon=True)
+    thread.start()
+    return stopped, thread, progress, lock
+
+
+def _train_rounds(
+    root: Path, model: UniversalPolicy, trainer: RecurrentPPOTrainer,
+    policy_root: Path, device: torch.device, *, round_id: int, completed_steps: int,
+    actors: tuple[str, ...], action_table: tuple[str, ...], continuous: bool,
+    total_timesteps: int, rollout_steps: int, sequence_length: int, batch_size: int,
+    epochs: int, freeze_encoder_rounds: int, game_id: str | None,
+    wait_timeout: float, stop_file: Path | None, progress: dict[str, int],
+    progress_lock: threading.Lock,
+) -> tuple[str, int, int, list[dict[str, Any]]]:
+    rounds: list[dict[str, Any]] = []
+    status = "RUNNING"
+    while continuous or completed_steps < total_timesteps:
+        _assert_commit_guard()
+        update = _train_shared_round(
+            root, policy_root, model, trainer, round_id=round_id,
+            completed_steps=completed_steps, actors=actors, actions=action_table,
+            device=device, timeout=wait_timeout, stop_file=stop_file,
+            freeze_encoder=True, freeze_rounds=freeze_encoder_rounds,
+            rollout_steps=rollout_steps, sequence_length=sequence_length,
+            batch_size=batch_size, epochs=epochs, game_id=game_id,
+        )
+        if update is None:
+            status = "CANCELLED"
+            break
+        round_id, completed_steps, _metrics, row = update
+        rounds.append(row)
+        with progress_lock:
+            progress["round"], progress["steps"] = round_id, completed_steps
+    if status == "RUNNING":
+        status = "COMPLETED"
+    return status, round_id, completed_steps, rounds
+
+
+def run_shared_learner(
+    *, shared_root: Path, universal_checkpoint: Path,
+    action_table: tuple[str, ...], actors: tuple[str, ...],
+    total_timesteps: int, rollout_steps: int, sequence_length: int,
+    game_id: str | None = None, game_extras_dim: int = 0,
+    learning_rate: float, lr_encoder_scale: float,
+    gamma: float, gae_lambda: float, clip_range: float,
+    entropy_coef: float, epochs: int, batch_size: int,
+    c_sem: float, c_inv: float, c_mot: float,
+    device_name: str = "cpu", seed: int = 7,
+    continuous: bool = False, freeze_encoder_rounds: int = 0,
+    wait_timeout: float = 3600.0, stop_file: Path | None = None,
+) -> dict[str, Any]:
+    device = _validate_learner_contract(
+        actors, rollout_steps, sequence_length, total_timesteps, continuous,
+        batch_size, freeze_encoder_rounds, game_extras_dim, game_id, device_name,
+    )
     torch.set_num_threads(3)
     torch.manual_seed(seed)
     shared_root.mkdir(parents=True, exist_ok=True)
-    model, trainer, policy_root, completed_steps, round_id = _setup_learner(
-        shared_root, universal_checkpoint, action_table, game_id, game_extras_dim,
-        device, learning_rate=learning_rate, clip_range=clip_range,
-        entropy_coef=entropy_coef, c_sem=c_sem, c_inv=c_inv, c_mot=c_mot,
-        encoder_scale=lr_encoder_scale,
-    )
-    _publish_monitor_state(shared_root, "RUNNING", round_id, completed_steps)
+    fault_handle = (shared_root / "faulthandler-learner.log").open("a", encoding="utf-8")
+    import faulthandler
+
+    faulthandler.enable(file=fault_handle, all_threads=True)
+    round_id, completed_steps = 0, 0
     rounds: list[dict[str, Any]] = []
-    status = "RUNNING"
+    status, failure_message = "FAILED", None
+    heartbeat_stop: threading.Event | None = None
+    heartbeat_thread: threading.Thread | None = None
     try:
-        while continuous or completed_steps < total_timesteps:
-            update = _train_shared_round(
-                shared_root, policy_root, model, trainer, round_id=round_id,
-                completed_steps=completed_steps, actors=actors, actions=action_table,
-                device=device, timeout=wait_timeout, stop_file=stop_file,
-                freeze_encoder=True, freeze_rounds=freeze_encoder_rounds,
-                rollout_steps=rollout_steps, sequence_length=sequence_length,
-                batch_size=batch_size, epochs=epochs, game_id=game_id,
-            )
-            if update is None:
-                status = "CANCELLED"
-                break
-            round_id, completed_steps, _metrics, row = update
-            rounds.append(row)
-        if status == "RUNNING":
-            status = "COMPLETED"
+        _assert_commit_guard()
+        model, trainer, policy_root, completed_steps, round_id = _setup_learner(
+            shared_root, universal_checkpoint, action_table, game_id, game_extras_dim,
+            device, learning_rate=learning_rate, clip_range=clip_range,
+            entropy_coef=entropy_coef, c_sem=c_sem, c_inv=c_inv, c_mot=c_mot,
+            encoder_scale=lr_encoder_scale,
+        )
+        _publish_monitor_state(shared_root, "RUNNING", round_id, completed_steps)
+        heartbeat_stop, heartbeat_thread, progress, progress_lock = _start_learner_heartbeat(
+            shared_root, round_id, completed_steps, device,
+        )
+        status, round_id, completed_steps, rounds = _train_rounds(
+            shared_root, model, trainer, policy_root, device,
+            round_id=round_id, completed_steps=completed_steps, actors=actors,
+            action_table=action_table, continuous=continuous,
+            total_timesteps=total_timesteps, rollout_steps=rollout_steps,
+            sequence_length=sequence_length, batch_size=batch_size, epochs=epochs,
+            freeze_encoder_rounds=freeze_encoder_rounds, game_id=game_id,
+            wait_timeout=wait_timeout, stop_file=stop_file, progress=progress,
+            progress_lock=progress_lock,
+        )
     except BaseException as error:
         status = "FAILED"
+        failure_message = f"{type(error).__name__}: {error}"
         _publish_monitor_state(shared_root, status, round_id, completed_steps,
-                               failure=str(error))
+                               failure=failure_message)
         raise
     finally:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=6.0)
         manifest = {"schema_version": 1, "algorithm": "RecurrentPPOUniversal",
                     "status": status, "round": round_id,
                     "completed_timesteps": completed_steps, "actors": list(actors),
                     "rounds": rounds, "finished_unix_ns": time.time_ns()}
         publish_json(shared_root / "manifest.json", manifest)
-        _publish_monitor_state(shared_root, status, round_id, completed_steps)
+        _publish_monitor_state(shared_root, status, round_id, completed_steps,
+                               failure=failure_message)
+        terminal: dict[str, Any] = {
+            "status": status, "round": round_id, "completed_timesteps": completed_steps,
+            "finished_unix_ns": time.time_ns(), "metrics": rounds[-1] if rounds else {},
+        }
+        if failure_message is not None:
+            terminal["error"] = failure_message[:2000]
+        publish_json(shared_root / "status.json", terminal)
+        faulthandler.disable()
+        fault_handle.close()
     return manifest

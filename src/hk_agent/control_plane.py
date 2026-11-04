@@ -185,6 +185,7 @@ class CampaignSpec:
     reward_version: str = "explore_v3"
     warm_start_checkpoint: str | None = None
     warm_start_source_campaign: str | None = None
+    universal_checkpoint: str | None = None
     stuck_seconds: float = 120.0
     evaluation_interval: int = 20
     tutorial_hint_level: int = 0
@@ -256,6 +257,13 @@ class CampaignSpec:
             raise ValueError("warm_start_checkpoint must be a bounded path")
         if warm_start_source_campaign is not None and (not isinstance(warm_start_source_campaign, str) or len(warm_start_source_campaign) > 128):
             raise ValueError("warm_start_source_campaign must be a bounded campaign id")
+        universal_checkpoint = payload.get("universal_checkpoint")
+        if universal_checkpoint is not None and (
+            not isinstance(universal_checkpoint, str) or len(universal_checkpoint) > 2048
+        ):
+            raise ValueError("universal_checkpoint must be a bounded path")
+        if universal_checkpoint is not None and engine != "v2":
+            raise ValueError("universal_checkpoint is supported only by the v2 engine")
         if campaign_type != "exploration_training":
             reward_version = "explore_v1"
         name = str(payload.get("name", "")).strip()
@@ -434,6 +442,7 @@ class CampaignSpec:
             reward_version=str(reward_version),
             warm_start_checkpoint=warm_start_checkpoint,
             warm_start_source_campaign=warm_start_source_campaign,
+            universal_checkpoint=universal_checkpoint,
             stuck_seconds=_bounded_float(payload.get("stuck_seconds", 120.0), "stuck_seconds", 1.0, 3600.0) if campaign_type == "exploration_training" else 120.0,
             evaluation_interval=_bounded_int(payload.get("evaluation_interval", 20), "evaluation_interval", 1, 10_000) if campaign_type == "exploration_training" else 20,
             tutorial_hint_level=_bounded_int(payload.get("tutorial_hint_level", 0), "tutorial_hint_level", 0, 1) if campaign_type == "exploration_training" else 0,
@@ -2852,7 +2861,7 @@ class ControlPlane:
         if stop_file is not None:
             command += ["--stop-file", str(stop_file)]
         if spec.engine == "v2":
-            checkpoint = self._v2_pretrain_checkpoint()
+            checkpoint = self._campaign_v2_checkpoint(spec)
             shared_root = self.runtime_root / "shared" / spec.campaign_id
             actor_id = f"actor-slot-{slot_id if slot_id is not None else 0}"
             command += [
@@ -2892,6 +2901,26 @@ class ControlPlane:
         if not any(checkpoint.is_relative_to(root) for root in roots):
             raise RuntimeError("universal pretrain checkpoint escaped its configured runtime")
         return checkpoint
+
+    def _campaign_v2_checkpoint(self, spec: CampaignSpec) -> Path:
+        if spec.universal_checkpoint is None:
+            return self._v2_pretrain_checkpoint()
+        selected = Path(spec.universal_checkpoint).resolve(strict=True)
+        roots = (
+            (self.project_root / "runtime" / "v2" / "pretrain").resolve(strict=False),
+            (self.runtime_root / "v2" / "pretrain").resolve(strict=False),
+        )
+        if not any(selected.is_relative_to(root) for root in roots):
+            raise ValueError("v2 universal checkpoint must be inside the configured pretrain runtime")
+        try:
+            manifest = json.loads((selected / "manifest.json").read_text("utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("selected v2 universal checkpoint has no readable manifest") from error
+        if (not selected.is_dir() or type(manifest.get("trained_steps")) is not int
+                or not isinstance(manifest.get("action_table"), list)
+                or not manifest["action_table"]):
+            raise ValueError("selected v2 universal checkpoint is incomplete")
+        return selected
 
     @staticmethod
     def _effective_seed(spec: CampaignSpec, slot_id: int | None) -> int:
@@ -3012,7 +3041,8 @@ class ControlPlane:
         log_path = launch_root / "process.log"
         if spec.engine == "v2":
             tool_path = self.project_root / "tools" / "v2" / "run_learner.py"
-            checkpoint = self._v2_pretrain_checkpoint()
+            supervisor_path = self.project_root / "tools" / "v2" / "supervise_hk_learner.py"
+            checkpoint = self._campaign_v2_checkpoint(spec)
             campaign_config = shared_root / "campaign-config.json"
             atomic_json(campaign_config, {
                 "schema_version": 1, "campaign_id": spec.campaign_id,
@@ -3051,6 +3081,15 @@ class ControlPlane:
             ]
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
+            learner_command = [command[0], "-X", "faulthandler", "-u", *command[1:]]
+            command_file = shared_root / "learner-command.json"
+            atomic_json(command_file, {"argv": learner_command})
+            command = [
+                _project_training_python_executable(self.project_root), "-X", "faulthandler", "-u",
+                str(supervisor_path), "--shared-root", str(shared_root),
+                "--stop-file", str(stop_file), "--fallback-checkpoint", str(checkpoint),
+                "--command-json", str(command_file),
+            ]
         else:
             tool_path = self.project_root / "tools" / "run_shared_learner.py"
             command = [
@@ -3063,9 +3102,9 @@ class ControlPlane:
             "--torch-interop-threads", str(self.torch_interop_threads),
             "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
             ]
-        if spec.augment_random_shift:
+        if spec.augment_random_shift and spec.engine != "v2":
             command.append("--augment-random-shift")
-        if spec.warm_start_checkpoint:
+        if spec.warm_start_checkpoint and spec.engine != "v2":
             warm_path = Path(spec.warm_start_checkpoint).resolve(strict=True)
             allowed_warm_root = (self.runtime_root / "shared").resolve(strict=False)
             try:
@@ -3076,7 +3115,7 @@ class ControlPlane:
                 raise ValueError("warm-start checkpoint must be an existing PPO ZIP")
             command += ["--warm-start-checkpoint", str(warm_path),
                         "--warm-start-source-campaign", spec.warm_start_source_campaign or "explore_v3"]
-        if spec.duration_mode == "continuous":
+        if spec.duration_mode == "continuous" and spec.engine != "v2":
             command.append("--continuous")
         record: dict[str, object] = {
             "schema_version": 1, "launch_id": launch_id, "campaign_id": spec.campaign_id,
@@ -3604,15 +3643,15 @@ class ControlPlane:
                         continue
                     stamp = item.get("time_unix_ns") if isinstance(item, Mapping) else None
                     if (isinstance(item, Mapping) and item.get("shared_group") == group
-                            and isinstance(stamp, int) and stamp >= now_ns - 3_600_000_000_000):
+                            and isinstance(stamp, int) and stamp >= now_ns - 86_400_000_000_000):
                         persisted.append(stamp)
             except OSError:
                 pass
             recent = [now - max(0.0, (now_ns - stamp) / 1_000_000_000) for stamp in persisted]
             if not persisted:
-                recent = [value for value in self._shared_actor_restarts.get(group, []) if now - value < 3600]
+                recent = [value for value in self._shared_actor_restarts.get(group, []) if now - value < 86_400]
             if len(recent) >= 3:
-                raise RuntimeError("shared actor restart limit reached (3 per hour)")
+                raise RuntimeError("shared actor restart limit reached (3 per 24 hours)")
             recent.append(now)
             self._shared_actor_restarts[group] = recent
             campaign_id = str(record["campaign_id"])
@@ -3656,7 +3695,7 @@ class ControlPlane:
         restart_record = {
             "time_unix_ns": time.time_ns(), "shared_group": group,
             "old_launch_id": launch_id, "new_launch_id": replacement["launch_id"],
-            "reason": reason, "restart_number_in_hour": len(recent),
+            "reason": reason, "restart_number_in_24h": len(recent),
         }
         restart_log = shared_root / "actor-restarts.jsonl"
         restart_log.parent.mkdir(parents=True, exist_ok=True)
@@ -3665,7 +3704,7 @@ class ControlPlane:
             stream.flush()
             os.fsync(stream.fileno())
         replacement.update({"restart_of": launch_id, "restart_reason": reason,
-                            "restart_number_in_hour": len(recent)})
+                            "restart_number_in_24h": len(recent)})
         launch_path = self.control_root / "launches" / str(replacement["launch_id"]) / "launch.json"
         atomic_json(launch_path, replacement)
         return replacement
