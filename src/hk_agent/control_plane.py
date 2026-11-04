@@ -3092,6 +3092,7 @@ class ControlPlane:
                 "--gamma", str(spec.gamma or 0.995), "--gae-lambda", str(spec.gae_lambda or 0.95),
                 "--clip-range", str(spec.clip_range or 0.2),
                 "--entropy-coef", str(spec.ent_coef or 0.01), "--epochs", str(spec.n_epochs or 4),
+                "--straggler-timeout-seconds", str(spec.straggler_timeout_seconds),
                 "--seed", str(spec.seed), "--device", "auto",
                 "--stop-file", str(stop_file),
             ]
@@ -4437,7 +4438,7 @@ class ControlPlane:
                         or not isinstance(shared_root, str) or group in self._shared_failed_learners):
                     continue
                 learner_status = self._read_json(Path(shared_root) / "learner.json")
-                beat = learner_status.get("heartbeat_unix_ns")
+                beat = learner_heartbeat_timestamp(learner_status)
                 wait_ms = learner_status.get("last_wait_rollouts_ms", 0.0)
                 train_ms = learner_status.get("last_train_ms", 0.0)
                 straggler_ms = learner_status.get("last_straggler_wait_ms", 0.0)
@@ -4475,8 +4476,17 @@ class ControlPlane:
                 stale = beat_stale or (startup_expired and not beat_belongs_to_launch)
                 if not failed and learner.get("status") in {"RUNNING", "STARTING"} and stale:
                     failure = f"learner heartbeat expirou após {stale_after:.0f}s"
-                    learner_status.update({"status": "FAILED", "failure": failure})
-                    atomic_json(Path(shared_root) / "learner.json", learner_status)
+                    atomic_json(Path(shared_root) / "control-plane-status.json", {
+                        "status": "FAILED", "failure": failure,
+                        "launch_id": learner_id, "updated_unix_ns": now_ns,
+                    })
+                    stop_value = learner.get("stop_file")
+                    if isinstance(stop_value, str) and stop_value:
+                        stop_path = self.project_root / stop_value
+                        atomic_json(stop_path, {
+                            "requested_unix_ns": now_ns,
+                            "reason": "control plane detected stale learner heartbeat",
+                        })
                     learner.update({"status": "FAILED", "failure": failure,
                                     "finished_unix_ns": time.time_ns()})
                     atomic_json(self.control_root / "launches" / learner_id / "launch.json", learner)

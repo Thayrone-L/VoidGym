@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -122,12 +124,19 @@ def load_rollout(path: Path, *, expected_round: int, expected_actor: str,
 
 def publish_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(value, sort_keys=True, allow_nan=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(100):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 99:
+                    raise
+                time.sleep(0.02)
     finally:
         temporary.unlink(missing_ok=True)

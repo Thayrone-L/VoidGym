@@ -82,8 +82,8 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
               fallback_checkpoint: Path, max_restarts: int = 3,
               window_hours: float = 24.0,
               popen_factory: Any = subprocess.Popen) -> int:
-    if max_restarts != 3 or window_hours != 24.0:
-        raise ValueError("HK learner recovery is fixed at 3 restarts per rolling 24 hours")
+    if not 0 <= max_restarts <= 3 or window_hours != 24.0:
+        raise ValueError("HK learner recovery allows 0–3 restarts in a rolling 24 hours")
     shared_root.mkdir(parents=True, exist_ok=True)
     history_path = shared_root / "learner-restarts.jsonl"
     history: list[str] = []
@@ -124,7 +124,10 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                     return_code = int(process.wait())
                 state = {}
                 try:
-                    loaded = json.loads((shared_root / "status.json").read_text("utf-8"))
+                    state_path = shared_root / "learner.json"
+                    if not state_path.is_file():  # compatibility with older learner commands
+                        state_path = shared_root / "status.json"
+                    loaded = json.loads(state_path.read_text("utf-8"))
                     state = loaded if isinstance(loaded, dict) else {}
                 except (OSError, json.JSONDecodeError):
                     pass
@@ -136,6 +139,11 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                     })
                     return 0
                 if stop_file.is_file() and terminal in {"CANCELLED", "STOPPED"}:
+                    publish_role_state(shared_root / "supervisor.json", {
+                        "status": terminal, "attempt": attempt,
+                        "restart_count": restart_count,
+                        "finished_at": datetime.now().astimezone().isoformat(),
+                    })
                     return 0
                 now_dt = datetime.now(UTC)
                 history = [item for item in history if _timestamp(item) >= now_dt - timedelta(hours=24)]
@@ -152,14 +160,21 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                         "last_learner_status": terminal,
                     })
                     return 0
-                if len(history) > 3:
+                if len(history) > max_restarts:
                     failure = {
-                        "status": "FAILED", "reason": "learner restart limit reached (3 per 24 hours)",
+                        "status": "FAILED",
+                        "reason": f"learner restart limit reached ({max_restarts} per 24 hours)",
                         "exit_code": return_code, "restart_count_24h": len(history),
                         "finished_at": datetime.now().astimezone().isoformat(),
                     }
-                    publish_role_state(shared_root / "status.json", failure)
-                    publish_role_state(shared_root / "learner.json", failure)
+                    status_path = shared_root / "status.json"
+                    current_status = {}
+                    try:
+                        current = json.loads(status_path.read_text("utf-8"))
+                        current_status = current if isinstance(current, dict) else {}
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                    publish_role_state(status_path, {**current_status, **failure})
                     publish_role_state(shared_root / "supervisor.json", failure)
                     return return_code or 1
                 resume = latest_checkpoint(shared_root, fallback_checkpoint)
@@ -179,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("--fallback-checkpoint", type=Path, required=True)
     parser.add_argument("--command-json", type=Path, required=True)
+    parser.add_argument("--max-restarts", type=int, default=3, choices=range(4))
     args = parser.parse_args(argv)
     command_data = json.loads(args.command_json.read_text("utf-8"))
     command = command_data.get("argv") if isinstance(command_data, dict) else None
@@ -186,7 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("command-json must contain a nonempty argv string list")
     return supervise(command, shared_root=args.shared_root.resolve(),
                      stop_file=args.stop_file.resolve(),
-                     fallback_checkpoint=args.fallback_checkpoint.resolve(strict=True))
+                     fallback_checkpoint=args.fallback_checkpoint.resolve(strict=True),
+                     max_restarts=args.max_restarts)
 
 
 if __name__ == "__main__":

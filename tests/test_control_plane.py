@@ -331,6 +331,40 @@ def test_shared_learner_startup_without_heartbeat_expires_after_grace(
 
     assert control._launches["learner-new"]["status"] == "FAILED"
     assert "heartbeat expirou" in str(control._launches["learner-new"]["failure"])
+    assert json.loads((shared / "learner.json").read_text(encoding="utf-8"))["status"] == "TRAINING"
+    assert json.loads((shared / "control-plane-status.json").read_text(encoding="utf-8"))["status"] == "FAILED"
+
+
+def test_shared_learner_contract_handles_31_minute_legacy_and_current_heartbeats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000_000_000_000
+    monkeypatch.setattr("hk_agent.control_plane.time.time_ns", lambda: now)
+    control = ControlPlane(_project(tmp_path), runtime_root=tmp_path / "runtime")
+    stopped: list[str] = []
+    monkeypatch.setattr(control, "_refresh_locked", lambda: None)
+    monkeypatch.setattr(control, "stop", lambda launch_id, **kwargs: stopped.append(launch_id))
+
+    for campaign, heartbeat in (("legacy", {"updated_unix_ns": now - 31 * 60 * 1_000_000_000}),
+                                ("canonical", {"heartbeat_unix_ns": now,
+                                               "updated_unix_ns": now - 31 * 60 * 1_000_000_000})):
+        shared = tmp_path / "runtime" / "shared" / campaign
+        shared.mkdir(parents=True)
+        (shared / "learner.json").write_text(json.dumps({
+            "status": "RUNNING", **heartbeat,
+            "last_wait_rollouts_ms": 1000,
+        }), encoding="utf-8")
+        learner_id = f"learner-{campaign}"
+        control._launches = {
+            learner_id: {"role": "learner", "campaign_id": campaign,
+                         "shared_group": f"{campaign}-v0001", "shared_root": str(shared),
+                         "started_unix_ns": now - 32 * 60 * 1_000_000_000,
+                         "status": "RUNNING"},
+        }
+        control._supervise_failed_shared_learners()
+        expected = "FAILED" if campaign == "legacy" else "RUNNING"
+        assert control._launches[learner_id]["status"] == expected
+        assert json.loads((shared / "learner.json").read_text(encoding="utf-8"))["status"] == "RUNNING"
 
 
 def test_map_matching_prefers_capture_with_scene_bounds() -> None:

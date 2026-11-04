@@ -63,7 +63,7 @@ def test_supervisor_stops_after_three_restarts_in_rolling_24_hours(tmp_path: Pat
     shared.mkdir()
     fallback = tmp_path / "base"
     _checkpoint(fallback, steps=10)
-    script = tmp_path / "fake_crash.py"
+    script = shared / "fake_crash.py"
     script.write_text(
         "import json, pathlib; pathlib.Path(__file__).parent.joinpath('status.json').write_text(json.dumps({'status':'FAILED'})); raise SystemExit(3)\n",
         encoding="utf-8",
@@ -80,7 +80,26 @@ def test_supervisor_stops_after_three_restarts_in_rolling_24_hours(tmp_path: Pat
 def test_supervisor_recovery_window_is_fixed(tmp_path: Path) -> None:
     fallback = tmp_path / "base"
     _checkpoint(fallback, steps=10)
-    with pytest.raises(ValueError, match="fixed at 3 restarts per rolling 24 hours"):
+    with pytest.raises(ValueError, match="allows 0–3 restarts in a rolling 24 hours"):
         supervise([sys.executable, "-c", "pass"], shared_root=tmp_path / "shared",
                   stop_file=tmp_path / "STOP", fallback_checkpoint=fallback,
-                  max_restarts=2)
+                  max_restarts=4)
+
+
+def test_campaign_owner_mode_exits_after_one_learner_failure(tmp_path: Path) -> None:
+    shared = tmp_path / "shared-owner"
+    shared.mkdir()
+    fallback = tmp_path / "base-owner"
+    _checkpoint(fallback, steps=10)
+    script = tmp_path / "owner_failure.py"
+    script.write_text(
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1], 'learner.json').write_text(json.dumps({'status':'FAILED'})); raise SystemExit(3)\n",
+        encoding="utf-8",
+    )
+    result = supervise([sys.executable, str(script), str(shared)], shared_root=shared,
+                       stop_file=tmp_path / "STOP-owner", fallback_checkpoint=fallback,
+                       max_restarts=0)
+    assert result == 3
+    assert json.loads((shared / "status.json").read_text(encoding="utf-8"))["status"] == "FAILED"
+    assert json.loads((shared / "supervisor.json").read_text(encoding="utf-8"))["status"] == "FAILED"
+    assert json.loads((shared / "learner.json").read_text(encoding="utf-8"))["status"] == "FAILED"
