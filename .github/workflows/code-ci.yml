@@ -29,8 +29,10 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: |
+          python -m pip install --disable-pip-version-check -r requirements-training.lock
+          python -m pip install --disable-pip-version-check -r requirements-map.lock
           python -m pip install --disable-pip-version-check -r requirements-dev.lock
-          python -m pip install --disable-pip-version-check --no-deps -e .
+          python -m pip install --disable-pip-version-check -e ".[environment,development]"
       - name: Lint
         run: python -m ruff check src tests tools
       # Full project typing runs in the Windows v2 job, where PyTorch and Win32 APIs
