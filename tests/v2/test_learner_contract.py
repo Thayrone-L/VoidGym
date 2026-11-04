@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from voidgym.training.learner_contract import learner_heartbeat_timestamp, learner_monitor_state
+from voidgym_shared.learner_contract import learner_heartbeat_timestamp, learner_monitor_state
 
 
 def test_monitor_contract_publishes_both_equal_heartbeat_names_and_durations(monkeypatch) -> None:
-    monkeypatch.setattr("voidgym.training.learner_contract.time.time_ns", lambda: 123456789)
+    monkeypatch.setattr("voidgym_shared.learner_contract.time.time_ns", lambda: 123456789)
     state = learner_monitor_state(
         status="RUNNING", round_id=7, completed_steps=4096,
         resources={"ram_available_bytes": 123},

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from hk_agent.bridge_environment import clean_bridge_environment
-from voidgym.training.learner_contract import learner_heartbeat_timestamp
+from voidgym_shared.learner_contract import learner_heartbeat_timestamp
 from hk_agent.playthrough import (
     backup_playthrough,
     initialize_playthrough,

@@ -14,12 +14,12 @@ from typing import Any
 
 import torch
 
-from voidgym.training.learner_contract import learner_monitor_state
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.checkpoints import load_universal, prune_checkpoints, save_universal
 from voidgym.training.recurrent_ppo import RecurrentPPOTrainer
 from voidgym.training.runtime_monitor import resource_snapshot
 from voidgym.training.shared_rollouts import load_rollout, publish_json, rollout_path
+from voidgym_shared.learner_contract import learner_monitor_state
 
 _MIN_COMMIT_BYTES = 3 * 1024**3
 _MIN_ACTUAL_COMMIT_BYTES = 3 * 1024**3 // 2
