@@ -7,6 +7,8 @@ import math
 import os
 import threading
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +21,34 @@ from voidgym.training.runtime_monitor import resource_snapshot
 from voidgym.training.shared_rollouts import load_rollout, publish_json, rollout_path
 
 _MIN_COMMIT_BYTES = 3 * 1024**3
+_MIN_ACTUAL_COMMIT_BYTES = 3 * 1024**3 // 2
 
 
-def _assert_commit_guard() -> None:
-    stats = resource_snapshot()
-    available = stats.get("commit_available_bytes")
-    if isinstance(available, int) and available < _MIN_COMMIT_BYTES:
-        raise MemoryError(f"learner commit guard: {available} bytes available; 3 GiB required")
+def _commit_guard_failure(stats: Mapping[str, Any]) -> str | None:
+    current = stats.get("commit_available_bytes")
+    potential = stats.get("potential_commit_available_bytes")
+    if not isinstance(current, int):
+        return None
+    effective = potential if isinstance(potential, int) else current
+    if current >= _MIN_ACTUAL_COMMIT_BYTES and effective >= _MIN_COMMIT_BYTES:
+        return None
+    return (f"learner commit guard: {current} bytes current and {effective} bytes potential; "
+            "requires 1.5 GiB current and 3 GiB potential")
+
+
+@dataclass(frozen=True)
+class _RolloutWait:
+    sequences: list[Any]
+    missing_actors: tuple[str, ...]
+    wait_ms: float
+    straggler_wait_ms: float
+
+
+def _assert_commit_guard(shared_root: Path | None = None) -> None:
+    stats = resource_snapshot(shared_root=shared_root)
+    failure = _commit_guard_failure(stats)
+    if failure is not None:
+        raise MemoryError(failure)
 
 
 def _publish_monitor_state(

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from voidgym.core.config import config_from_dict, config_from_toml, config_hash, migrate
-from voidgym.core.hardware import HardwareProfile, plan_resources
+from voidgym.core.hardware import HardwareProfile, pagefile_growth_bytes, plan_resources
 
 
 def test_config_round_trip_and_stable_hash() -> None:
@@ -91,3 +91,17 @@ def test_pretrain_plan_reserves_learner_and_worker_growth() -> None:
             8, 16, 16, 8, "RTX", 12, 10, "8.6", 100, "Windows",
             commit_available_gb=8.39, worker_private_gb=.1,
         ), "pretrain_platform")
+
+
+@pytest.mark.parametrize(
+    "current,maximum,free,expected",
+    [
+        (16 * 2**30, 32 * 2**30, 170 * 2**30, 16 * 2**30),
+        (16 * 2**30, 32 * 2**30, 4 * 2**30, 4 * 2**30),
+        (32 * 2**30, 32 * 2**30, 170 * 2**30, 0),
+    ],
+)
+def test_pagefile_growth_is_bounded_by_configured_maximum_and_free_disk(
+    current: int, maximum: int, free: int, expected: int,
+) -> None:
+    assert pagefile_growth_bytes(current, maximum, free) == expected

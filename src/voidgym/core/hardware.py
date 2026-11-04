@@ -115,12 +115,62 @@ def _memory_commit() -> tuple[float | None, float | None, float | None, float | 
 def memory_commit_stats() -> dict[str, int | None]:
     """Return Windows commit and pagefile counters as bytes for live telemetry."""
     used, limit, available, pagefile = _memory_commit()
+    current_pagefile = int(pagefile * 2**30) if pagefile is not None else None
+    pagefile_max, disk_growth = _pagefile_growth_capacity(current_pagefile)
+    growth = (pagefile_growth_bytes(current_pagefile, pagefile_max, disk_growth)
+              if pagefile_max is not None and current_pagefile is not None
+              and disk_growth is not None else None)
+    potential_limit = int(limit * 2**30) + growth if limit is not None and growth is not None else None
+    potential_available = int(available * 2**30) + growth if available is not None and growth is not None else None
     return {
         "commit_used_bytes": int(used * 2**30) if used is not None else None,
         "commit_limit_bytes": int(limit * 2**30) if limit is not None else None,
         "commit_available_bytes": int(available * 2**30) if available is not None else None,
-        "paging_file_total_bytes": int(pagefile * 2**30) if pagefile is not None else None,
+        "paging_file_total_bytes": current_pagefile,
+        "paging_file_max_bytes": pagefile_max,
+        "paging_file_growth_capacity_bytes": growth,
+        "potential_commit_limit_bytes": potential_limit,
+        "potential_commit_available_bytes": potential_available,
     }
+
+
+def _pagefile_growth_capacity(current_pagefile_bytes: int | None) -> tuple[int | None, int | None]:
+    """Read configured pagefile maxima and free volume capacity without changing settings."""
+    if os.name != "nt" or current_pagefile_bytes is None:
+        return None, None
+    try:
+        import winreg
+
+        key_path = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            entries, _kind = winreg.QueryValueEx(key, "PagingFiles")
+        if not isinstance(entries, (list, tuple)) or not entries:
+            return None, None
+        maximum_bytes = 0
+        volumes: set[str] = set()
+        for entry in entries:
+            parts = str(entry).split()
+            if len(parts) < 3:
+                return None, None
+            maximum_mb = int(parts[2])
+            if maximum_mb <= 0:
+                return None, None
+            maximum_bytes += maximum_mb * 1024**2
+            drive, _tail = os.path.splitdrive(parts[0])
+            if not drive:
+                return None, None
+            volumes.add(drive + os.sep)
+        disk_free = sum(shutil.disk_usage(volume).free for volume in volumes)
+        return maximum_bytes, disk_free
+    except (ImportError, OSError, ValueError, TypeError):
+        return None, None
+
+
+def pagefile_growth_bytes(current_bytes: int, maximum_bytes: int, disk_free_bytes: int) -> int:
+    """Bound possible pagefile growth by both configured maximum and free disk space."""
+    if min(current_bytes, maximum_bytes, disk_free_bytes) < 0:
+        raise ValueError("pagefile sizes and free disk space must be non-negative")
+    return max(0, min(maximum_bytes - current_bytes, disk_free_bytes))
 
 
 def detect_hardware(runtime_root: Path = Path("runtime")) -> HardwareProfile:

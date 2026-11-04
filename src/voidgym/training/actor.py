@@ -272,7 +272,7 @@ def run_actor(
             with state_lock:
                 snapshot = dict(state)
             publish_role_state(telemetry_path, {
-                **resource_snapshot(device), **snapshot, "role": "actor",
+                **resource_snapshot(device, shared_root), **snapshot, "role": "actor",
                 "actor_id": actor_id, "pid": os.getpid(),
             })
             heartbeat_stop.wait(5.0)
@@ -310,7 +310,7 @@ def run_actor(
         with state_lock:
             final_state = dict(state)
         publish_role_state(telemetry_path, {
-            **resource_snapshot(device), **final_state, "role": "actor",
+            **resource_snapshot(device, shared_root), **final_state, "role": "actor",
             "actor_id": actor_id, "pid": os.getpid(), "finished_unix_ns": time.time_ns(),
         })
         faulthandler.disable()

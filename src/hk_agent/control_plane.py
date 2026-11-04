@@ -144,6 +144,19 @@ def _project_python_executable(project_root: Path) -> str:
     return sys.executable
 
 
+def _project_actor_python_executable(project_root: Path) -> str:
+    candidates = (
+        project_root / ".venv-cpu" / "Scripts" / "python.exe",
+        project_root / ".venv-cpu" / "bin" / "python",
+        project_root / ".venv" / "Scripts" / "python.exe",
+        project_root / ".venv" / "bin" / "python",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
 def _project_training_python_executable(project_root: Path) -> str:
     cuda = project_root / ".venv-cuda" / "Scripts" / "python.exe"
     return str(cuda) if cuda.is_file() else _project_python_executable(project_root)
@@ -2738,8 +2751,10 @@ class ControlPlane:
         allowed_tool_dir = self.project_root / "tools" / ("v2" if spec.engine == "v2" else "")
         if tool_path.parent != allowed_tool_dir.resolve():
             raise RuntimeError("tool escaped the allowlisted directory")
+        actor_python = (_project_actor_python_executable(self.project_root)
+                        if spec.engine == "v2" else _project_python_executable(self.project_root))
         command = [
-            _project_python_executable(self.project_root),
+            actor_python,
             str(tool_path),
             "--seed",
             str(spec.seed if seed_override is None else seed_override),

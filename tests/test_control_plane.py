@@ -84,11 +84,39 @@ def test_launch_commands_use_project_virtual_environment(tmp_path: Path) -> None
     assert command[0] == str(python)
 
 
+def test_v2_actor_command_uses_cpu_project_environment_when_present(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    python = root / ".venv-cpu" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"cpu torch executable marker")
+    actor_tool = root / "tools" / "v2" / "run_actor.py"
+    actor_tool.parent.mkdir(parents=True)
+    actor_tool.write_text("# test command target\n", encoding="utf-8")
+    checkpoint = tmp_path / "runtime" / "v2" / "pretrain" / "seed" / "universal-000001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "manifest.json").write_text(
+        json.dumps({"trained_steps": 1, "action_table": ["NOOP"]}), encoding="utf-8"
+    )
+    payload = _payload("exploration_training")
+    payload.update({"weights": {}, "engine": "v2", "reward_version": "explore_v4",
+                    "shared_learner": True})
+    spec = CampaignSpec.from_payload(payload)
+    plane = ControlPlane(root, runtime_root=tmp_path / "runtime")
+    try:
+        command = plane.build_command(spec, execute=False)
+    finally:
+        plane.close()
+    assert command[0] == str(python)
+
+
 def test_v2_engine_uses_production_actor_command_and_v1_stays_default(tmp_path: Path) -> None:
     default_payload = _payload("exploration_training")
     default_payload["weights"] = {}
     assert CampaignSpec.from_payload(default_payload).engine == "v1"
     root = _project(tmp_path)
+    cpu_python = root / ".venv-cpu" / "Scripts" / "python.exe"
+    cpu_python.parent.mkdir(parents=True)
+    cpu_python.write_bytes(b"cpu torch executable marker")
     actor_tool = root / "tools" / "v2" / "run_actor.py"
     actor_tool.parent.mkdir(parents=True)
     actor_tool.write_text("# test command target\n", encoding="utf-8")
@@ -107,6 +135,7 @@ def test_v2_engine_uses_production_actor_command_and_v1_stays_default(tmp_path: 
     finally:
         plane.close()
     assert Path(command[1]) == actor_tool
+    assert command[0] == str(cpu_python)
     assert "--mode" in command and "hollow_knight" in command
     assert "--diagnostic-breakable-labels" not in command
     assert Path(command[command.index("--universal-checkpoint") + 1]) == checkpoint

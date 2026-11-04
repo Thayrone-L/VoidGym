@@ -1,6 +1,7 @@
 # Python
 .venv/
 .venv-cuda/
+.venv-cpu/
 __pycache__/
 *.py[cod]
 *.egg-info/
