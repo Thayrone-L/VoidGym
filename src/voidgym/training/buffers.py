@@ -41,6 +41,8 @@ class RecurrentRolloutBuffer:
         self.actions: list[Tensor] = []
         self.rewards: list[Tensor] = []
         self.dones: list[Tensor] = []
+        self.truncated: list[Tensor] = []
+        self.bootstrap_values: list[Tensor] = []
         self.values: list[Tensor] = []
         self.log_probs: list[Tensor] = []
         self.masks: list[Tensor] = []
@@ -64,6 +66,14 @@ class RecurrentRolloutBuffer:
         self.actions.append(actions.detach().cpu().long().reshape(self.envs))
         self.rewards.append(rewards.detach().cpu().float().reshape(self.envs))
         self.dones.append(dones.detach().cpu().bool().reshape(self.envs))
+        truncations, bootstraps = [], []
+        for info in infos:
+            signals = info.get("signals", {})
+            truncations.append(bool(signals.get("truncated", False)))
+            bootstrap = info.get("ppo_bootstrap_value", 0.0)
+            bootstraps.append(float(torch.as_tensor(bootstrap).detach().cpu().item()))
+        self.truncated.append(torch.tensor(truncations, dtype=torch.bool))
+        self.bootstrap_values.append(torch.tensor(bootstraps, dtype=torch.float32))
         self.values.append(values.detach().cpu().float().reshape(self.envs))
         self.log_probs.append(log_probs.detach().cpu().float().reshape(self.envs))
         self.masks.append(action_masks.detach().cpu().bool())
@@ -100,13 +110,19 @@ class RecurrentRolloutBuffer:
         if count != self.steps:
             raise RuntimeError("rollout buffer is not full")
         rewards, dones = torch.stack(self.rewards), torch.stack(self.dones)
+        truncated = torch.stack(self.truncated)
+        bootstrap_values = torch.stack(self.bootstrap_values)
         values = torch.stack(self.values)
         advantages = torch.zeros_like(rewards)
         next_advantage = torch.zeros(self.envs)
         next_value = last_values.detach().cpu().reshape(self.envs)
         for index in reversed(range(count)):
-            not_done = (~dones[index]).float()
-            delta = rewards[index] + gamma * next_value * not_done - values[index]
+            done = dones[index]
+            boundary_value = torch.where(truncated[index], bootstrap_values[index],
+                                         torch.zeros(self.envs))
+            transition_next_value = torch.where(done, boundary_value, next_value)
+            delta = rewards[index] + gamma * transition_next_value - values[index]
+            not_done = (~done).float()
             next_advantage = delta + gamma * gae_lambda * not_done * next_advantage
             advantages[index] = next_advantage
             next_value = values[index]

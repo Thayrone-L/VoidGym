@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
+from voidgym.core.config import process_environment
 from voidgym.core.experience_store import ExperienceWriter
 from voidgym.core.observation import fit_to_universal
 from voidgym.envs.adapter_env import AdapterEnv
@@ -44,6 +45,15 @@ def _latest_policy(root: Path, *, minimum_round: int, timeout: float,
     raise TimeoutError(f"timed out waiting for policy round {minimum_round}")
 
 
+def _actor_torch_threads() -> int:
+    raw = process_environment().get("HK_AGENT_ACTOR_TORCH_THREADS", "2")
+    try:
+        requested = int(raw)
+    except ValueError:
+        requested = 2
+    return min(4, max(1, requested))
+
+
 def _to_tensors(observation: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
     return {key: torch.as_tensor(value[None], device=device) for key, value in observation.items()}
 
@@ -56,6 +66,7 @@ def _forward(policy: UniversalPolicy, observation: dict[str, torch.Tensor],
     return cast(dict[str, Any], policy(
         observation, state, starts, mask, privileged=privileged,
         game_id=game_id if extras is not None else None, game_extras=extras,
+        compute_auxiliary=False,
     ))
 
 
@@ -109,6 +120,7 @@ def _collect_steps(
         mask_t = torch.as_tensor(masks[None], device=device)
         critic_context = _privileged(info)[None].to(device)
         starts = torch.tensor([episode_start], dtype=torch.bool, device=device)
+        inference_started = time.perf_counter()
         with torch.no_grad():
             output = _forward(policy, obs_t, state, starts, mask_t,
                               critic_context, env.adapter.game_id)
@@ -120,9 +132,26 @@ def _collect_steps(
             action_t = distribution.sample()  # type: ignore[no-untyped-call]
             log_prob = distribution.log_prob(action_t)  # type: ignore[no-untyped-call]
         action = int(action_t.item())
+        inference_ms = (time.perf_counter() - inference_started) * 1000.0
         old_state = (state[0].detach().clone(), state[1].detach().clone())
         next_observation, reward, terminated, truncated, next_info = env.step(action)
+        next_signals = next_info.get("signals", {})
+        if isinstance(next_signals, dict):
+            next_info = {**next_info, "signals": {
+                **next_signals, "terminated": bool(terminated), "truncated": bool(truncated),
+            }}
         done = terminated or truncated
+        if truncated:
+            next_mask = torch.as_tensor(env.action_masks()[None], device=device)
+            with torch.no_grad():
+                bootstrap = _forward(
+                    policy, _to_tensors(next_observation, device), next_state,
+                    torch.zeros(1, dtype=torch.bool, device=device), next_mask,
+                    _privileged(next_info)[None].to(device), env.adapter.game_id,
+                )["values"]
+            if not isinstance(bootstrap, torch.Tensor):
+                raise TypeError("universal policy returned invalid truncation bootstrap")
+            next_info = {**next_info, "ppo_bootstrap_value": bootstrap.detach().cpu().reshape(-1)[0]}
         buffer.add(
             obs_t, action_t, torch.tensor([reward], dtype=torch.float32, device=device),
             torch.tensor([done], dtype=torch.bool, device=device), values.reshape(1),
@@ -132,13 +161,20 @@ def _collect_steps(
                                       truncated, next_info, masks, actor_id, policy_round))
         total_steps += 1
         if telemetry_callback is not None:
-            telemetry_callback(total_steps, policy_round + 1)
+            telemetry_callback(total_steps, policy_round + 1, inference_ms)
         episode_return += reward
+        signals = next_info.get("signals", {})
+        slice_truncation = bool(truncated and signals.get("termination_reason") == "stuck")
         if done:
             round_returns.append(episode_return)
             episode_return = 0.0
-            observation, info = env.reset(seed=seed + total_steps)
-            state, episode_start = policy.initial_state(1, device), True
+            if slice_truncation:
+                # End the PPO slice, but keep the live HK process and position.
+                observation, info = next_observation, next_info
+                state, episode_start = policy.initial_state(1, device), True
+            else:
+                observation, info = env.reset(seed=seed + total_steps)
+                state, episode_start = policy.initial_state(1, device), True
         else:
             observation, info, state, episode_start = next_observation, next_info, next_state, False
     return observation, info, state, episode_start, total_steps, episode_return, False
@@ -187,7 +223,8 @@ def _run_actor_impl(
     if tuple(env.actions) != action_table:
         raise ValueError("actor action table differs from the campaign contract")
     selected_device = torch.device(device)
-    torch.set_num_threads(1)
+    actor_threads = _actor_torch_threads()
+    torch.set_num_threads(actor_threads)
     torch.manual_seed(seed)
     np.random.seed(seed)
     policy.to(selected_device).eval()
@@ -263,7 +300,9 @@ def run_actor(
     fault_path.parent.mkdir(parents=True, exist_ok=True)
     fault_file = fault_path.open("a", encoding="utf-8")
     faulthandler.enable(file=fault_file, all_threads=True)
-    state: dict[str, int | str] = {"status": "RUNNING", "completed_steps": 0, "round": 0}
+    state: dict[str, Any] = {"status": "RUNNING", "completed_steps": 0, "round": 0,
+                             "torch_threads": _actor_torch_threads()}
+    inference_samples: list[float] = []
     state_lock = threading.Lock()
     heartbeat_stop = threading.Event()
 
@@ -277,10 +316,16 @@ def run_actor(
             })
             heartbeat_stop.wait(5.0)
 
-    def update_progress(steps: int, round_id: int) -> None:
+    def update_progress(steps: int, round_id: int, inference_ms: float) -> None:
+        inference_samples.append(float(inference_ms))
+        if len(inference_samples) > 256:
+            del inference_samples[:-256]
         with state_lock:
             state["completed_steps"] = steps
             state["round"] = round_id
+            state["actor_inference_ms_last"] = float(inference_ms)
+            state["actor_inference_ms_mean_256"] = float(np.mean(inference_samples))
+            state["actor_inference_ms_p95_256"] = float(np.percentile(inference_samples, 95))
 
     thread = threading.Thread(target=heartbeat_loop, name=f"actor-heartbeat-{actor_id}",
                               daemon=True)

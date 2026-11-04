@@ -439,6 +439,34 @@ def test_v3_stuck_truncates_after_threshold_but_progress_resets_timer(tmp_path: 
     assert task._reload_checkpoint_next_reset is False
 
 
+def test_two_stuck_slices_keep_same_live_environment_without_reset(tmp_path: Path) -> None:
+    env = _Environment()
+    reset_calls = 0
+    original_reset = env.reset
+
+    def count_reset(*args, **kwargs):
+        nonlocal reset_calls
+        reset_calls += 1
+        return original_reset(*args, **kwargs)
+
+    env.reset = count_reset  # type: ignore[method-assign]
+    task = ExplorationTask(
+        env, config=_v3_config(stuck_seconds=0.12, horizon_steps=30),
+        lifelong_memory_root=tmp_path / "memory",
+    )
+    task.reset()
+    assert reset_calls == 1
+    for _slice in range(2):
+        for _ in range(2):
+            _, _, terminated, truncated, info = task.step(0)
+        assert not terminated and truncated
+        assert info["termination_reason"] == "stuck"
+        assert not task._done
+        assert task._progress_elapsed_seconds == 0.0
+        assert reset_calls == 1
+    task.close()
+
+
 def test_journey_episode_ids_continue_after_actor_process_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

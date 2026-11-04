@@ -69,7 +69,8 @@ class UniversalPolicy(nn.Module):
     def forward(self, obs: Mapping[str, Tensor], state: tuple[Tensor, Tensor] | None = None,
                 episode_starts: Tensor | None = None, action_mask: Tensor | None = None,
                 *, expert: str = "explore", game_id: str | None = None,
-                game_extras: Tensor | None = None, privileged: Tensor | None = None
+                game_extras: Tensor | None = None, privileged: Tensor | None = None,
+                compute_auxiliary: bool = True
                 ) -> dict[str, Tensor | tuple[Tensor, Tensor]]:
         image, sequence = _sequence(obs[UNIVERSAL_IMAGE_KEY], 4)
         history, _ = _sequence(obs[UNIVERSAL_ACTION_HISTORY_KEY], 2)
@@ -111,6 +112,21 @@ class UniversalPolicy(nn.Module):
                 privileged = privileged.unsqueeze(1)
             privileged_vector = F.relu(self.privileged_projection(privileged.to(latent.dtype)))
         values = self.critic(torch.cat((latent, privileged_vector), dim=-1)).squeeze(-1)
+        output: dict[str, Tensor | tuple[Tensor, Tensor]] = {
+            "logits": logits, "values": values, "state": (h, c), "features": vector,
+        }
+        output.update(self._auxiliary_outputs(feature_map, high_resolution_skip,
+                                              vector, batch, steps, compute_auxiliary))
+        if not sequence:
+            output = {key: (value[:, 0] if isinstance(value, Tensor) and value.ndim > 1 else value)
+                      for key, value in output.items()}
+        return output
+
+    def _auxiliary_outputs(self, feature_map: Tensor, high_resolution_skip: Tensor,
+                           vector: Tensor, batch: int, steps: int,
+                           enabled: bool) -> dict[str, Tensor]:
+        if not enabled:
+            return {}
         semantic = self.perception(feature_map.flatten(0, 1)).reshape(
             batch, steps, len(Sem), *SEM_GRID)
         skip_logits = self.semantic_skip(high_resolution_skip.flatten(0, 1))
@@ -118,15 +134,8 @@ class UniversalPolicy(nn.Module):
                                     mode="bilinear", align_corners=False)
         semantic = semantic + skip_logits.reshape(batch, steps, len(Sem), *SEM_GRID)
         motion, on_ground = self.hero_motion(vector)
-        output: dict[str, Tensor | tuple[Tensor, Tensor]] = {
-            "logits": logits, "values": values, "state": (h, c),
-            "semantic_logits": semantic, "features": vector,
-            "motion": motion, "on_ground_logits": on_ground,
-        }
-        if not sequence:
-            output = {key: (value[:, 0] if isinstance(value, Tensor) and value.ndim > 1 else value)
-                      for key, value in output.items()}
-        return output
+        return {"semantic_logits": semantic, "motion": motion,
+                "on_ground_logits": on_ground}
 
     def initial_state(self, batch: int, device: torch.device,
                       dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -106,6 +108,32 @@ def test_component_checkpoint_roundtrip_and_action_table_guard(tmp_path) -> None
         load_universal(checkpoint, restored, ["B", "A"])
 
 
+def test_truncation_bootstraps_value_without_crossing_gae_boundary() -> None:
+    buffer = RecurrentRolloutBuffer(steps=1, envs=1, sequence_length=1)
+    state = (torch.zeros((1, 1, 2)), torch.zeros((1, 1, 2)))
+    buffer.add(
+        _observation(), torch.tensor([0]), torch.tensor([1.0]), torch.tensor([True]),
+        torch.tensor([2.0]), torch.tensor([0.0]),
+        torch.ones((1, len(UNIVERSAL_ACTIONS)), dtype=torch.bool),
+        torch.tensor([False]), state,
+        [{"signals": {"truncated": True}, "ppo_bootstrap_value": torch.tensor(7.0)}],
+    )
+    buffer.compute_returns(torch.tensor([99.0]), gamma=0.9, gae_lambda=0.95)
+    torch.testing.assert_close(buffer.returns, torch.tensor([[7.3]]))
+    torch.testing.assert_close(buffer.advantages, torch.tensor([[5.3]]))
+
+
+def test_actor_policy_path_can_skip_auxiliary_heads() -> None:
+    model = UniversalPolicy().eval()
+    model.perception.forward = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("semantic head called"))
+    model.semantic_skip.forward = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("semantic skip called"))
+    model.hero_motion.forward = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("motion head called"))
+    with torch.no_grad():
+        output = model(_observation(), compute_auxiliary=False)
+    assert {"logits", "values", "state"} <= set(output)
+    assert "semantic_logits" not in output and "motion" not in output
+
+
 def test_missing_oracle_marks_all_auxiliary_targets_invalid() -> None:
     model = UniversalPolicy()
     buffer = RecurrentRolloutBuffer(steps=1, envs=1, sequence_length=1)
@@ -117,3 +145,75 @@ def test_missing_oracle_marks_all_auxiliary_targets_invalid() -> None:
     sample = buffer.sems[0]
     assert sample.unique().tolist() == [255]
     assert not buffer.has_labels[0].any()
+
+
+def test_actor_keeps_live_environment_across_stuck_slices(monkeypatch) -> None:
+    from voidgym.training import actor as actor_module
+
+    class FakePolicy:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _obs, state, *_args, **kwargs):
+            assert kwargs["compute_auxiliary"] is False
+            self.calls += 1
+            value = 2.0 if self.calls % 2 else 7.0
+            return {"logits": torch.zeros((1, 1)), "values": torch.tensor([value]),
+                    "state": state}
+
+        @staticmethod
+        def initial_state(batch, device):
+            return (torch.zeros((1, batch, 2), device=device),
+                    torch.zeros((1, batch, 2), device=device))
+
+    class FakeEnv:
+        def __init__(self):
+            self.actions = ("NOOP",)
+            self.adapter = SimpleNamespace(game_id="hollow_knight",
+                                           frame_rgb=lambda: np.zeros((108, 192, 3), np.uint8))
+            self.steps = 0
+            self.reset_calls = 0
+
+        def action_masks(self):
+            return np.ones(1, dtype=np.bool_)
+
+        def step(self, _action):
+            self.steps += 1
+            return _observation_numpy(), 0.0, False, True, {
+                "signals": {"truncated": True, "termination_reason": "stuck"},
+                "training_labels": None,
+            }
+
+        def reset(self, *, seed=None):
+            self.reset_calls += 1
+            return _observation_numpy(), {"signals": {}, "training_labels": None}
+
+    class Writer:
+        def __init__(self):
+            self.rows = []
+
+        def append(self, row):
+            self.rows.append(row)
+
+    monkeypatch.setattr(
+        actor_module, "_forward",
+        lambda policy, *args, **kwargs: policy(*args, compute_auxiliary=False, **kwargs),
+    )
+    env, policy, writer = FakeEnv(), FakePolicy(), Writer()
+    buffer = RecurrentRolloutBuffer(steps=2, envs=1, sequence_length=1)
+    state = policy.initial_state(1, torch.device("cpu"))
+    actor_module._collect_steps(
+        env, policy, buffer, writer, actor_id="test", policy_round=0,
+        observation=_observation_numpy(), info={"signals": {}, "training_labels": None},
+        state=state, episode_start=True, total_steps=0, episode_return=0.0,
+        round_returns=[], device=torch.device("cpu"), seed=1, stop_file=None,
+    )
+    assert env.steps == 2
+    assert env.reset_calls == 0
+    assert [float(value.item()) for value in buffer.bootstrap_values] == [7.0, 7.0]
+    assert writer.rows[0]["truncated"] and not writer.rows[0]["done"]
+
+
+def _observation_numpy() -> dict[str, np.ndarray]:
+    return {"pixels": np.zeros((12, 108, 192), np.uint8),
+            "action_history": np.zeros(3, np.int64)}

@@ -1533,7 +1533,10 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
                 (row for row in self._help_request_ledger.stuck_locations() if row.get("place") == place),
                 None,
             )
-        self._done = task_terminated or task_truncated
+        # A stuck threshold is a PPO slice boundary, not an environment reset.
+        # The actor bootstraps this truncation and continues at the same frame.
+        stuck_slice = bool(stuck and task_truncated and not task_terminated)
+        self._done = task_terminated or (task_truncated and not stuck_slice)
         if self._done and self._diary is not None and self._journey_root is not None:
             self._diary.finish(
                 termination_reason,
@@ -1548,7 +1551,7 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
             self.environment.backend.release_all()
         farm_alerts = self._record_farm_window(components, current_scene, template.name)
         episode_progress: dict[str, Any] | None = None
-        if self._done and self.config.reward_version in {"explore_v3", "explore_v4"}:
+        if (self._done or stuck_slice) and self.config.reward_version in {"explore_v3", "explore_v4"}:
             episode_progress = {
                 "episode": self._episode_number,
                 "steps": self._steps,
@@ -1637,6 +1640,9 @@ class ExplorationTask(gym.Env[dict[str, NDArray[np.generic]], int]):
         observation = self._apply_player_knowledge(observation)
         step_profile["knowledge_observation_ms"] = (time.perf_counter() - started) * 1000
         info["actor_step_profile_ms"] = step_profile
+        if stuck_slice:
+            # Start a new no-progress window without discarding the live game.
+            self._progress_elapsed_seconds = 0.0
         self._last_policy_observation = {key: np.asarray(value).copy() for key, value in observation.items()}
         return observation, reward, task_terminated, task_truncated, info
 
