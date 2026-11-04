@@ -16,7 +16,7 @@ concurrency:
 jobs:
   python:
     name: Python
-    runs-on: ubuntu-24.04
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -39,8 +39,8 @@ jobs:
       # are available. This Linux job keeps the portable lint and test coverage.
       - name: Create local-only readiness fixture
         run: |
-          mkdir -p artifacts/interactive/kings-pass-1/bootstrap
-          touch artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png
+          New-Item -ItemType Directory -Force -Path artifacts/interactive/kings-pass-1/bootstrap | Out-Null
+          New-Item -ItemType File -Force -Path artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png | Out-Null
       - name: Test
         run: python -m pytest -q
 

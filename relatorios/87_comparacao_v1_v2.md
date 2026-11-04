@@ -94,7 +94,7 @@ Validação local concluída:
 - `git diff --check` passou.
 - As fumaças continuam reprovadas pelo guard de commit; portanto não aprovam a campanha.
 
-O CI remoto do commit anterior apontou falha no job Python e nos dois jobs v2. A causa dos jobs v2 era a resolução ambígua do pacote `tests` no runner Windows. Foram adicionados `tests/__init__.py` e `tests/v2/__init__.py` para fixar os imports locais. O workflow Python foi ajustado para executar a tipagem no job Windows v2, onde estão disponíveis as dependências e APIs Win32. O estado dos novos checks remotos será registrado depois do push desta revisão.
+O CI remoto apontou falha inicial de imports e dependências ausentes. Os pacotes locais `tests` e `tests.v2` agora têm `__init__.py`; os locks de treino, mapa e desenvolvimento são instalados nos jobs que precisam deles. O mypy completo roda no job Windows v2, e a suíte Python completa também foi movida para Windows porque seus testes de instalação e diretórios dependem de caminhos e variáveis desse sistema. O check separado de fronteira portátil continua em Linux. Os checks do segundo push passaram em bridge, política portátil e nos dois jobs v2; o job Python da primeira tentativa encontrou sete incompatibilidades Linux. A versão final do CI será registrada quando os checks do commit atual terminarem.
 
 ## Próxima ação necessária
 
