@@ -93,11 +93,13 @@ def main() -> int:
     parser.add_argument("--c-sem", type=float, default=0.5)
     parser.add_argument("--c-inv", type=float, default=0.1)
     parser.add_argument("--c-mot", type=float, default=0.1)
+    parser.add_argument("--aux-losses", action="store_true")
     parser.add_argument("--freeze-encoder-rounds", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--continuous", action="store_true")
     parser.add_argument("--stop-file", type=Path)
+    parser.add_argument("--straggler-timeout-seconds", type=float, default=300.0)
     v2_args, remaining = parser.parse_known_args()
     if v2_args.mode == "universal":
         if (v2_args.shared_root is None or v2_args.universal_checkpoint is None
@@ -138,11 +140,15 @@ def main() -> int:
             learning_rate=campaign.ppo.learning_rate, lr_encoder_scale=v2_args.lr_encoder_scale,
             gamma=campaign.ppo.gamma, gae_lambda=campaign.ppo.gae_lambda, clip_range=campaign.ppo.clip_range,
             entropy_coef=campaign.ppo.entropy_coef, epochs=campaign.ppo.epochs,
-            batch_size=campaign.ppo.batch_size, c_sem=campaign.aux.c_sem, c_inv=campaign.aux.c_inv,
-            c_mot=campaign.aux.c_mot, device_name=device, seed=v2_args.seed,
+            batch_size=campaign.ppo.batch_size,
+            c_sem=campaign.aux.c_sem if v2_args.aux_losses else 0.0,
+            c_inv=campaign.aux.c_inv if v2_args.aux_losses else 0.0,
+            c_mot=campaign.aux.c_mot if v2_args.aux_losses else 0.0,
+            device_name=device, seed=v2_args.seed,
             continuous=v2_args.continuous,
             freeze_encoder_rounds=v2_args.freeze_encoder_rounds,
             stop_file=v2_args.stop_file,
+            straggler_timeout=v2_args.straggler_timeout_seconds,
         )
         print(json.dumps(result, sort_keys=True))
         return 0

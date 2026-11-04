@@ -154,7 +154,8 @@ def test_v2_shared_learner_launch_uses_crash_resume_supervisor(
     payload.update({"weights": {}, "engine": "v2", "reward_version": "explore_v4",
                     "shared_learner": True, "save_source": "new_game",
                     "universal_checkpoint": str(checkpoint),
-                    "duration_mode": "continuous", "augment_random_shift": True})
+                    "duration_mode": "continuous", "augment_random_shift": True,
+                    "aux_losses": True})
     spec = CampaignSpec.from_payload(payload)
     control = ControlPlane(root, runtime_root=runtime)
     (checkpoint / "manifest.json").write_text(json.dumps({
@@ -182,8 +183,10 @@ def test_v2_shared_learner_launch_uses_crash_resume_supervisor(
     assert "run_learner.py" in " ".join(command)
     assert "-X" in command and "faulthandler" in command
     assert "--continuous" in command
+    assert "--aux-losses" in command
     campaign_config = json.loads((shared / "campaign-config.json").read_text("utf-8"))
     assert campaign_config["aux"]["augment_random_shift"] is True
+    assert campaign_config["aux"]["c_sem"] > 0
     assert "supervise_hk_learner.py" in " ".join(record["command"])
     assert "--continuous" not in record["command"]
     assert "--augment-random-shift" not in record["command"]
@@ -205,9 +208,10 @@ def test_prompt_82_campaign_flags_have_documented_safe_defaults_and_validation()
     configured = CampaignSpec.from_payload(payload)
     assert configured.game_speed == 1.0
     assert configured.augment_random_shift
+    configured_aux = CampaignSpec.from_payload(dict(payload, aux_losses=True))
+    assert configured_aux.aux_losses
     for option, value in (
         ("game_speed", 1.5),
-        ("aux_losses", True),
         ("asymmetric_critic", True),
         ("mask_interact_without_prompt", True),
     ):

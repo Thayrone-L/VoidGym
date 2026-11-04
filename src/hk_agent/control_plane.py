@@ -249,7 +249,7 @@ class CampaignSpec:
         unsupported_82 = []
         if game_speed != 1.0:
             unsupported_82.append("game_speed != 1.0")
-        unsupported_82.extend(key for key in ("aux_losses", "asymmetric_critic", "mask_interact_without_prompt") if feature_toggles[key])
+        unsupported_82.extend(key for key in ("asymmetric_critic", "mask_interact_without_prompt") if feature_toggles[key])
         if unsupported_82:
             raise ValueError(
                 "prompt 82 options are not implemented end-to-end yet: "
@@ -3096,6 +3096,8 @@ class ControlPlane:
                 "--seed", str(spec.seed), "--device", "auto",
                 "--stop-file", str(stop_file),
             ]
+            if spec.aux_losses:
+                command.append("--aux-losses")
             if spec.duration_mode == "continuous":
                 command.append("--continuous")
             learner_command = [command[0], "-X", "faulthandler", "-u", *command[1:]]
