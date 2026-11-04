@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from hk_agent.bridge_environment import clean_bridge_environment
+from voidgym.training.learner_contract import learner_heartbeat_timestamp
 from hk_agent.playthrough import (
     backup_playthrough,
     initialize_playthrough,
@@ -3103,7 +3104,7 @@ class ControlPlane:
                 _project_training_python_executable(self.project_root), "-X", "faulthandler", "-u",
                 str(supervisor_path), "--shared-root", str(shared_root),
                 "--stop-file", str(stop_file), "--fallback-checkpoint", str(checkpoint),
-                "--command-json", str(command_file),
+                "--command-json", str(command_file), "--max-restarts", "0",
             ]
         else:
             tool_path = self.project_root / "tools" / "run_shared_learner.py"
