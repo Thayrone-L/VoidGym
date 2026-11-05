@@ -11,9 +11,9 @@ As correções de 87s/87t e 87u foram separadas por assunto, commitadas e enviad
 - `49d51fc` Move learner contract to shared package
 - Commits anteriores de 87s/87t no mesmo branch: `b27de4a`, `a86e823`, `ed41f59`, `6028028`, `16e25c2`.
 
-O contrato foi movido para `src/voidgym_shared/learner_contract.py` e o import de v1 foi ajustado. Os cinco checks remotos do HEAD `49d51fc` estavam verdes.
+O contrato foi movido para `src/voidgym_shared/learner_contract.py` e o import de v1 foi ajustado. Os cinco checks remotos do HEAD `49d51fc` estavam verdes. No HEAD `e557b35`, os workflows remotos `Code CI` e `VoidGym v2` também concluíram com sucesso.
 
-A primeira execução da suíte identificou o gargalo no solver físico (cerca de 1,46 milhão de passos físicos para 1.800 salas). Otimizei `src/voidgym/gyms/platform_gym/solver.py` sem alterar certificados nem a asserção: os intervalos estáticos de piso são ordenados uma vez por sala, e direção/saída são calculadas uma vez por passo e reutilizadas pelo controlador. O teste de desempenho passou isoladamente em 70,75 s. Em seguida, a suíte completa passou: 902 aprovados, 4 ignorados, 3 avisos e 8 subtestes aprovados em 302,30 s. Ruff passou; `mypy src` passou sem erros em 113 arquivos; `git diff --check` passou. Os cinco checks remotos registrados anteriormente estavam verdes no HEAD `49d51fc`; os checks do novo commit de solver serão confirmados após o push.
+A primeira execução da suíte identificou o gargalo no solver físico (cerca de 1,46 milhão de passos físicos para 1.800 salas). Otimizei `src/voidgym/gyms/platform_gym/solver.py` sem alterar certificados nem a asserção: os intervalos estáticos de piso são ordenados uma vez por sala, e direção/saída são calculadas uma vez por passo e reutilizadas pelo controlador. O teste de desempenho passou isoladamente em 70,75 s. Em seguida, a suíte completa passou: 902 aprovados, 4 ignorados, 3 avisos e 8 subtestes aprovados em 302,30 s. Ruff passou; `mypy src` passou sem erros em 113 arquivos; `git diff --check` passou. Os workflows `Code CI` e `VoidGym v2` do HEAD `e557b35` concluíram com sucesso.
 
 ## Auditoria das máscaras de ação
 
