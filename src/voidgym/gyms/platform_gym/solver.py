@@ -16,9 +16,15 @@ def _direction(room: Room, player: Player) -> int:
     return 1 if exit_.rect.x + exit_.rect.w / 2 >= player.x else -1
 
 
-def _floor_ahead(room: Room, player: Player, direction: int) -> tuple[float, float, float] | None:
-    floor_sides = sorted(((s.rect.x, s.rect.right, s.rect.top) for s in room.solids
-                         if s.rect.h <= 0.7), key=lambda span: span[0])
+def _floor_ahead(
+    room: Room,
+    player: Player,
+    direction: int,
+    floor_sides: tuple[tuple[float, float, float], ...] | None = None,
+) -> tuple[float, float, float] | None:
+    if floor_sides is None:
+        floor_sides = tuple(sorted(((s.rect.x, s.rect.right, s.rect.top) for s in room.solids
+                                    if s.rect.h <= 0.7), key=lambda span: span[0]))
     current = next((span for span in floor_sides
                     if span[0] - room.physics.player_width <= player.x <= span[1] + room.physics.player_width
                     and abs(span[2] - player.y) <= .25), None)
@@ -47,8 +53,15 @@ def _is_ahead(rect: Rect, player: Player, direction: int) -> bool:
     return direction * (rect.x + rect.w / 2 - player.x) >= -rect.w / 2
 
 
-def _should_jump(room: Room, player: Player) -> bool:
-    direction = _direction(room, player)
+def _should_jump(
+    room: Room,
+    player: Player,
+    *,
+    direction: int | None = None,
+    floor_sides: tuple[tuple[float, float, float], ...] | None = None,
+) -> bool:
+    if direction is None:
+        direction = _direction(room, player)
     blocking_enemy = next((enemy for enemy in room.enemies
                            if enemy.alive and enemy.blocks_path
                            and 0 <= direction * (enemy.rect.x + enemy.rect.w / 2 - player.x) <= 2.0),
@@ -68,7 +81,7 @@ def _should_jump(room: Room, player: Player) -> bool:
             return True
         if player.vy < 0 and player.y <= target.y + .8 and player.jump_buffer_timer <= 0:
             return True
-    next_floor = _floor_ahead(room, player, direction)
+    next_floor = _floor_ahead(room, player, direction, floor_sides)
     gap_distance = room.physics.run_speed * (room.physics.jump_hold_max_seconds +
                                                2 * room.physics.jump_v0 / room.physics.gravity)
     if next_floor is not None:
@@ -83,8 +96,9 @@ def _should_jump(room: Room, player: Player) -> bool:
                 _jump_trigger_distance(room, player, min(r.top - player.y for r in raised)))
 
 
-def _attack_target(room: Room, player: Player) -> bool:
-    direction = _direction(room, player)
+def _attack_target(room: Room, player: Player, direction: int | None = None) -> bool:
+    if direction is None:
+        direction = _direction(room, player)
     targets = [b.rect for b in room.breakables if not b.broken]
     targets.extend(e.rect for e in room.enemies if e.alive)
     targets.extend(r.rect for r in room.treasure_rocks if not r.broken)
@@ -92,12 +106,19 @@ def _attack_target(room: Room, player: Player) -> bool:
                and abs(rect.y - player.y) < 1.5 for rect in targets)
 
 
-def _buttons(room: Room, player: Player, *, allow_attack: bool = True) -> dict[str, bool]:
-    direction = _direction(room, player)
+def _buttons(
+    room: Room,
+    player: Player,
+    *,
+    allow_attack: bool = True,
+    floor_sides: tuple[tuple[float, float, float], ...] | None = None,
+) -> dict[str, bool]:
+    exit_ = min(room.exits, key=lambda item: abs(item.rect.x + item.rect.w / 2 - player.x))
+    direction = 1 if exit_.rect.x + exit_.rect.w / 2 >= player.x else -1
     jump = (player.jumping and player.jump_hold_time < room.physics.jump_hold_max_seconds)
-    if _should_jump(room, player):
+    if _should_jump(room, player, direction=direction, floor_sides=floor_sides):
         jump = True
-    attack = allow_attack and _attack_target(room, player) and player.attack_cooldown <= DT
+    attack = allow_attack and _attack_target(room, player, direction) and player.attack_cooldown <= DT
     block = next((item for item in room.breakables if not item.broken
                   and 0 <= direction * (item.rect.x + item.rect.w / 2 - player.x) <= 2.0), None)
     if block is not None:
@@ -109,7 +130,7 @@ def _buttons(room: Room, player: Player, *, allow_attack: bool = True) -> dict[s
                   and 0 <= direction * (item.rect.x + item.rect.w / 2 - player.x) <= 2.0), None)
     if enemy is not None:
         jump = False
-        attack = allow_attack and _attack_target(room, player) and player.attack_cooldown <= DT
+        attack = allow_attack and _attack_target(room, player, direction) and player.attack_cooldown <= DT
         if not player.on_ground:
             return {"left": False, "right": False, "jump": False, "attack": attack}
     locked_door = next((door for door in room.doors
@@ -125,7 +146,6 @@ def _buttons(room: Room, player: Player, *, allow_attack: bool = True) -> dict[s
     waiting_for_land = not player.on_ground and player.jump_buffer_timer > 0 and not player.jumping
     left = direction < 0 and not waiting_for_land
     right = direction > 0 and not waiting_for_land
-    exit_ = min(room.exits, key=lambda item: abs(item.rect.x + item.rect.w / 2 - player.x))
     exit_distance = direction * (exit_.rect.x + exit_.rect.w / 2 - player.x)
     box_top = player.y + room.physics.player_height
     vertically_aligned = box_top > exit_.rect.y and player.y < exit_.rect.top
@@ -144,8 +164,13 @@ def _run_room(room: Room, *, max_steps: int, abilities: set[str],
     player = Player(*room.spawn, on_ground=True)
     player.last_safe_pos = room.spawn
     player.abilities.update(abilities)
+    floor_sides = tuple(sorted(((s.rect.x, s.rect.right, s.rect.top) for s in room.solids
+                                if s.rect.h <= 0.7), key=lambda span: span[0]))
     for _ in range(max_steps):
-        events: list[Event] = step_physics(room, player, _buttons(room, player, allow_attack=allow_attack), DT)
+        events: list[Event] = step_physics(
+            room, player, _buttons(room, player, allow_attack=allow_attack,
+                                   floor_sides=floor_sides), DT,
+        )
         if any(event.kind == "exit" for event in events):
             return None if must_break and any(not block.broken for block in room.breakables) else player
         if player.y < -2 or player.x > room.width + 2 or player.hp <= 0:
