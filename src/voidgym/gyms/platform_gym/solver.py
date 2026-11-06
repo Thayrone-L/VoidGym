@@ -112,9 +112,12 @@ def _buttons(
     *,
     allow_attack: bool = True,
     floor_sides: tuple[tuple[float, float, float], ...] | None = None,
+    direction_override: int | None = None,
 ) -> dict[str, bool]:
     exit_ = min(room.exits, key=lambda item: abs(item.rect.x + item.rect.w / 2 - player.x))
-    direction = 1 if exit_.rect.x + exit_.rect.w / 2 >= player.x else -1
+    direction = direction_override
+    if direction is None:
+        direction = 1 if exit_.rect.x + exit_.rect.w / 2 >= player.x else -1
     jump = (player.jumping and player.jump_hold_time < room.physics.jump_hold_max_seconds)
     if _should_jump(room, player, direction=direction, floor_sides=floor_sides):
         jump = True
@@ -161,7 +164,7 @@ def _run_room(room: Room, *, max_steps: int, abilities: set[str],
     if not room.exits or not room.solids:
         return None
     room = deepcopy(room)
-    player = Player(*room.spawn, on_ground=True)
+    player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing)
     player.last_safe_pos = room.spawn
     player.abilities.update(abilities)
     floor_sides = tuple(sorted(((s.rect.x, s.rect.right, s.rect.top) for s in room.solids
@@ -178,11 +181,66 @@ def _run_room(room: Room, *, max_steps: int, abilities: set[str],
     return None
 
 
+def _run_dead_end(room: Room, *, max_steps: int, allow_attack: bool) -> Player | None:
+    """Certify the required retreat, climb, then cross-over route in a dead-end room."""
+    if not room.exits or not room.solids or room.solver_backtrack_waypoint is None:
+        return None
+    room = deepcopy(room)
+    player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing)
+    player.last_safe_pos = room.spawn
+    stairs = sorted((solid.rect for solid in room.solids
+                     if solid.kind == "platform" and solid.rect.w < 3.0),
+                    key=lambda rect: abs(rect.x + rect.w / 2 - room.spawn[0]))
+    if not stairs:
+        return None
+
+    target_index = 0
+    jump_hold_frames = 0
+    frames_per_jump_hold = max(1, round(room.physics.jump_hold_max_seconds * .8 / DT))
+    for _ in range(max_steps):
+        if target_index < len(stairs):
+            target = stairs[target_index]
+            target_x = target.x + target.w / 2
+            standing_on_target = (player.on_ground
+                                  and abs(player.y - target.top) <= .12
+                                  and target.x - room.physics.player_width / 2 <= player.x
+                                  <= target.right + room.physics.player_width / 2)
+            if standing_on_target:
+                target_index += 1
+                jump_hold_frames = 0
+                continue
+
+            horizontal_delta = target_x - player.x
+            direction = (0 if abs(horizontal_delta) <= .35
+                         else 1 if horizontal_delta > 0 else -1)
+            if jump_hold_frames:
+                jump = True
+                jump_hold_frames -= 1
+            elif player.on_ground and target.top > player.y + .1:
+                jump = True
+                jump_hold_frames = frames_per_jump_hold - 1
+            else:
+                jump = False
+            buttons = {"left": direction < 0, "right": direction > 0,
+                       "jump": jump, "attack": allow_attack and _attack_target(room, player, direction)}
+        else:
+            buttons = _buttons(room, player, allow_attack=allow_attack,
+                               direction_override=room.spawn_facing)
+        events = step_physics(room, player, buttons, DT)
+        if any(event.kind == "exit" for event in events):
+            return player
+        if player.y < -2 or player.x < -2 or player.x > room.width + 2 or player.hp <= 0:
+            return None
+    return None
+
+
 def solve_room(room: Room, *, max_steps: int = 20_000, abilities: set[str] | None = None,
                require_breakables: bool = False, allow_attack: bool = True) -> bool:
     """Run a deterministic greedy controller through a room using ``step_physics``."""
     if not allow_attack and any(enemy.alive and enemy.blocks_path for enemy in room.enemies):
         return False
+    if room.solver_backtrack_waypoint is not None:
+        return _run_dead_end(room, max_steps=max_steps, allow_attack=allow_attack) is not None
     return _run_room(room, max_steps=max_steps, abilities=abilities or set(),
                      must_break=require_breakables, allow_attack=allow_attack) is not None
 
