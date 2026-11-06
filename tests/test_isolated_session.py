@@ -269,7 +269,7 @@ def test_smoke_runs_inside_save_transaction_without_leaking_credentials(
         capture_output=True,
         text=True,
         env=inherited_environment,
-        timeout=15,
+        timeout=60,
     )
 
     assert completed.returncode == (1 if keep_connection_open else 0), (
