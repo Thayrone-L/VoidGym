@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from voidgym.core.semantics import Sem
 from voidgym.gyms.platform_gym.generator import generate_room, generate_room_set
+from voidgym.gyms.platform_gym.levels import LEVEL_COUNT, MULTI_ROOM_LEVEL
 from voidgym.gyms.platform_gym.labels import labels
 from voidgym.gyms.platform_gym.physics import step_physics
 from voidgym.gyms.platform_gym.render import render_room
@@ -47,10 +48,11 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     frames: list[Image.Image] = []
     labels_frames: list[Image.Image] = []
-    levels = [0, 1, 2, 3, 4, 5, 6, 7, 8] * 3
+    levels = list(range(LEVEL_COUNT)) * 3
     for i, level in enumerate(levels):
-        room = generate_room_set(8400 + i)[0] if level == 8 else generate_room(level, 8400 + i)
-        player = Player(*room.spawn, on_ground=True)
+        room = (generate_room_set(8400 + i)[0] if level == MULTI_ROOM_LEVEL
+                else generate_room(level, 8400 + i))
+        player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing)
         frame = render_room(room, player)
         frames.append(Image.fromarray(frame).resize((384, 216), Image.Resampling.NEAREST))
         sem = cast(np.ndarray, labels(room, player)["sem"])
@@ -61,11 +63,13 @@ def main() -> None:
             sheet.paste(image, ((i % 4) * 384, (i // 4) * 216))
         sheet.save(out / name)
     for level in (3, 4, 6, 7, 8):
-        rooms = generate_room_set(8400 + level) if level == 8 else [generate_room(level, 8400 + level)]
+        rooms = (generate_room_set(8400 + level) if level == MULTI_ROOM_LEVEL
+                 else [generate_room(level, 8400 + level)])
         images = []
         abilities: set[str] = set()
         for room in rooms:
-            player = Player(*room.spawn, on_ground=True, abilities=abilities)
+            player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing,
+                            abilities=abilities)
             player.last_safe_pos = room.spawn
             for tick in range(2000):
                 events = step_physics(room, player, _buttons(room, player), .02)
@@ -80,9 +84,9 @@ def main() -> None:
         images[0].save(out / f"solver_nivel_{level}.gif", save_all=True, append_images=images[1:], duration=40, loop=0)
     comparison = []
     for split, start in (("train", 8500), ("test", 8501)):
-        for i in range(9):
-            room = generate_room(i % 9, start + i)
-            player = Player(*room.spawn, on_ground=True)
+        for i in range(LEVEL_COUNT):
+            room = generate_room(i % LEVEL_COUNT, start + i)
+            player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing)
             image = Image.fromarray(render_room(room, player, split=cast(Literal["train", "test"], split))).resize((384, 216), Image.Resampling.NEAREST)
             comparison.append((split, image))
     sheet = Image.new("RGB", (384 * 4, 216 * math.ceil(len(comparison) / 4) + 28), (10, 10, 14))

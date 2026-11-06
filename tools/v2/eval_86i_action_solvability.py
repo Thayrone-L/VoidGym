@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.gyms.platform_gym.action_solver import ActionSolveResult, solve_with_actions
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
+from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, LEVEL_COUNT, MULTI_ROOM_LEVEL
 from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
 
 
@@ -75,14 +76,14 @@ def _solve_one(task: tuple[int, int, int, int, float, float]) -> dict[str, Any]:
     level, index, seed_base, max_expansions, max_game_seconds, heuristic_weight = task
     seed = seed_base + level * 10_000 + index * 10
     adapter = PlatformGymAdapter(level=level, seed=seed, split="test")
-    if level == 8:
+    if level == MULTI_ROOM_LEVEL:
         free_ok = solve_room_set(adapter._rooms)
     else:
         free_ok = solve_room(adapter.room, require_breakables=level == 7)
     result = (_solve_level8_by_room(adapter, max_expansions=max_expansions,
                                     max_game_seconds=max_game_seconds,
                                     heuristic_weight=heuristic_weight)
-              if level == 8 else
+              if level == MULTI_ROOM_LEVEL else
               solve_with_actions(adapter, max_expansions=max_expansions,
                                  max_game_seconds=max_game_seconds,
                                  heuristic_weight=heuristic_weight))
@@ -114,9 +115,10 @@ def evaluate(*, count: int, seed: int, output: Path, workers: int,
     if progress_path.exists():
         rows = {f"{item['level']}:{item['episode']}": item
                 for item in json.loads(progress_path.read_text(encoding="utf-8"))["results"]}
-    levels_to_run = range(9) if only_level is None else (only_level,)
+    levels_to_run = range(LEVEL_COUNT) if only_level is None else (only_level,)
     tasks = [(level, episode, seed, max_expansions,
-              max_game_seconds * (2 if level == 8 else 1), heuristic_weight)
+              max_game_seconds * (2 if level in {MULTI_ROOM_LEVEL, DEAD_END_LEVEL} else 1),
+              heuristic_weight)
              for level in levels_to_run for episode in range(count)
              if f"{level}:{episode}" not in rows or
              (retry_failed and rows[f"{level}:{episode}"].get("action_solver_reason") == "node_limit")]
@@ -140,12 +142,12 @@ def evaluate(*, count: int, seed: int, output: Path, workers: int,
                 temporary = progress_path.with_suffix(".tmp")
                 temporary.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
                 temporary.replace(progress_path)
-                print(f"action solver: {len(rows)}/{count * 9} salas; "
+                print(f"action solver: {len(rows)}/{count * LEVEL_COUNT} salas; "
                       f"buscas desta rodada={task_runs_done}/{len(tasks)}", flush=True)
 
     result_rows = sorted(rows.values(), key=lambda item: (item["level"], item["episode"]))
     levels: dict[str, Any] = {}
-    for level in range(9):
+    for level in range(LEVEL_COUNT):
         selected = [row for row in result_rows if row["level"] == level]
         levels[str(level)] = {
             "rooms": len(selected),
@@ -183,7 +185,7 @@ def main() -> int:
     parser.add_argument("--heuristic-weight", type=float, default=2.5)
     parser.add_argument("--retry-failed", action="store_true",
                         help="retry previous rooms whose search hit its node limit")
-    parser.add_argument("--only-level", type=int, choices=range(9),
+    parser.add_argument("--only-level", type=int, choices=range(LEVEL_COUNT),
                         help="limit a retry to one level while preserving other saved rows")
     parser.add_argument("--output", type=Path,
                         default=PROJECT_ROOT / "relatorios" / "86i_action_solver")

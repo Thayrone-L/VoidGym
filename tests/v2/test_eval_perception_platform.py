@@ -9,15 +9,15 @@ from tools.v2.eval_perception_platform import (
 )
 
 
-def test_default_perception_sample_is_balanced_over_nine_levels() -> None:
+def test_default_perception_sample_is_balanced_over_ten_levels() -> None:
     quotas = _frame_quotas(5625)
-    assert quotas == dict.fromkeys(range(9), 625)
+    assert quotas == {level: 563 if level < 5 else 562 for level in range(10)}
     assert sum(quotas.values()) == 5625
 
 
 def test_remainder_is_distributed_by_at_most_one_frame() -> None:
     quotas = _frame_quotas(5003)
-    assert list(quotas.values()) == [556, 556, 556, 556, 556, 556, 556, 556, 555]
+    assert list(quotas.values()) == [501, 501, 501, 500, 500, 500, 500, 500, 500, 500]
 
 
 def test_per_episode_quota_spreads_samples_over_episodes() -> None:

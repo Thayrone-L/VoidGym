@@ -1,4 +1,4 @@
-"""Estimate semantic class weights from all nine levels over 50,000 gym frames."""
+"""Estimate semantic class weights from all ten levels over 50,000 gym frames."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.core.semantics import SEM_GRID, Sem
 from voidgym.gyms.platform_gym.generator import generate_room
+from voidgym.gyms.platform_gym.levels import LEVEL_COUNT
 from voidgym.gyms.platform_gym.labels import labels
 from voidgym.gyms.platform_gym.world import Player
 from voidgym.models.perception import inverse_frequency_weights
@@ -25,9 +26,9 @@ def main() -> int:
     room_count = 500
     per_room = samples // room_count
     for index in range(room_count):
-        level = index % 9
+        level = index % LEVEL_COUNT
         room = generate_room(level, 50_000 + index)
-        player = Player(*room.spawn, on_ground=True)
+        player = Player(*room.spawn, on_ground=True, facing=room.spawn_facing)
         for frame in range(per_room):
             player.x = float(rng.uniform(.5, max(.51, room.width - .5)))
             player.y = room.spawn[1] + float(rng.uniform(0, min(2.0, room.height - room.spawn[1] - 1)))
@@ -35,7 +36,7 @@ def main() -> int:
             counts += np.bincount(np.asarray(label).reshape(-1), minlength=len(Sem))
     result = {
         "frames": samples, "grid": list(SEM_GRID), "classes": [item.name for item in Sem],
-        "levels": list(range(9)), "level_sampling": "round_robin",
+        "levels": list(range(LEVEL_COUNT)), "level_sampling": "round_robin",
         "cell_counts": counts.tolist(),
         "weights": inverse_frequency_weights(counts.tolist()).tolist(),
     }

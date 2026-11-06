@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
+from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, LEVEL_COUNT, MULTI_ROOM_LEVEL
 from voidgym.gyms.platform_gym.params import Split
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.checkpoints import load_universal
@@ -41,7 +42,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=85_000)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--only-level", type=int, choices=range(9),
+    parser.add_argument("--only-level", type=int, choices=range(LEVEL_COUNT),
                         help="evaluate only one level, for targeted failure tracing")
     parser.add_argument("--only-mode", choices=("deterministic", "stochastic"),
                         help="evaluate only one sampling mode")
@@ -99,14 +100,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         completed = {(row["mode"], row["level"]) for row in stats}
     modes = ((False, True) if args.only_mode is None else
              (args.only_mode == "stochastic",))
-    levels = range(9) if args.only_level is None else (args.only_level,)
+    levels = range(LEVEL_COUNT) if args.only_level is None else (args.only_level,)
     for stochastic in modes:
         mode = "stochastic" if stochastic else "deterministic"
         for level in levels:
             if (mode, level) in completed:
                 continue
             level8_sets = args.level7_sets if args.level7_sets is not None else args.level8_sets
-            episodes = level8_sets if level == 8 else args.episodes
+            episodes = level8_sets if level == MULTI_ROOM_LEVEL else args.episodes
             rows = [_episode(
                 model, level, args.seed + level * 10_000 + index * 10,
                 split=args.split, stochastic=stochastic, max_steps=args.max_steps,
@@ -224,7 +225,7 @@ def _episode(model: UniversalPolicy, level: int, seed: int, *, split: Split,
         deaths += sum(getattr(event, "kind", None) == "death"
                       for event in signals.get("events", ()))
         stuck |= bool(signals.get("stuck", False))
-        success |= (terminated if level == 8 else
+        success |= (terminated if level in {MULTI_ROOM_LEVEL, DEAD_END_LEVEL} else
                     bool(signals.get("room_changed", False)))
         if capture and steps % 5 == 0:
             frames.append(Image.fromarray(adapter.frame_rgb()).resize(

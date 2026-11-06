@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
+from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, LEVEL_COUNT, MULTI_ROOM_LEVEL
 from voidgym.models.policy import UniversalPolicy
 from voidgym.training.checkpoints import load_universal
 
@@ -102,7 +103,8 @@ def evaluate(checkpoint: Path, *, levels: Iterable[int], episodes: int, seed: in
                     observations[index] = observation
                     if terminated or truncated:
                         signals = info.get("signals", {})
-                        success = (bool(signals.get("terminated")) if level == 8 else
+                        success = (bool(signals.get("terminated"))
+                                   if level in {MULTI_ROOM_LEVEL, DEAD_END_LEVEL} else
                                    bool(signals.get("room_changed")))
                         successes += int(success)
                         completed += 1
@@ -133,15 +135,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--levels", type=int, nargs="+", default=list(range(9)))
+    parser.add_argument("--levels", type=int, nargs="+", default=list(range(LEVEL_COUNT)))
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--seed", type=int, default=85_000)
     parser.add_argument("--max-steps", type=int, default=40,
                         help="bounded action-frequency sample per room")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     args = parser.parse_args()
-    if args.episodes < 1 or args.max_steps < 1 or any(not 0 <= level <= 8 for level in args.levels):
-        parser.error("episodes/max-steps must be positive and levels must be in [0, 8]")
+    if args.episodes < 1 or args.max_steps < 1 or any(not 0 <= level < LEVEL_COUNT for level in args.levels):
+        parser.error(f"episodes/max-steps must be positive and levels must be in [0, {LEVEL_COUNT - 1}]")
     result = evaluate(args.checkpoint, levels=args.levels, episodes=args.episodes,
                       seed=args.seed, max_steps=args.max_steps, device_name=args.device,
                       progress_path=args.output)

@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from voidgym.core.semantics import IGNORE, SEM_GRID, Sem
 from voidgym.envs.adapter_env import AdapterEnv
 from voidgym.gyms.platform_gym.adapter import PlatformGymAdapter
+from voidgym.gyms.platform_gym.levels import LEVEL_COUNT
 from voidgym.gyms.platform_gym.params import Split
 from voidgym.gyms.platform_gym.styles import sample_style
 from voidgym.models.policy import UniversalPolicy
@@ -47,7 +48,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--compare-checkpoint", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=5625,
-                        help="total sample size, divided evenly over levels 0–8")
+                        help="total sample size, divided evenly over levels 0–9")
     parser.add_argument("--split", choices=("train", "test"), default="test")
     parser.add_argument("--seed", type=int, default=185_000)
     parser.add_argument("--max-steps", type=int, default=512)
@@ -59,7 +60,7 @@ def _args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _frame_quotas(total: int, levels: int = 9) -> dict[int, int]:
+def _frame_quotas(total: int, levels: int = LEVEL_COUNT) -> dict[int, int]:
     if total < levels or levels < 1:
         raise ValueError("frames must provide at least one frame per level")
     base, remainder = divmod(total, levels)
@@ -254,13 +255,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         label = checkpoint.name.removeprefix("universal-")
         models.append((label, checkpoint, model, manifest))
     args.output.mkdir(parents=True, exist_ok=True)
-    quotas = _frame_quotas(args.frames)
+    quotas = _frame_quotas(args.frames, LEVEL_COUNT)
     per_model_confusion = {
-        label: np.zeros((9, len(Sem), len(Sem)), dtype=np.int64)
+        label: np.zeros((LEVEL_COUNT, len(Sem), len(Sem)), dtype=np.int64)
         for label, _, _, _ in models
     }
     per_model_style_confusion = {
-        label: {group: np.zeros((9, len(Sem), len(Sem)), dtype=np.int64)
+        label: {group: np.zeros((LEVEL_COUNT, len(Sem), len(Sem)), dtype=np.int64)
                 for group in ("silhouette", "other")}
         for label, _, _, _ in models
     }
@@ -305,7 +306,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         class_support = {
             str(level): {item.name: int(per_level_confusion[level, int(item)].sum())
                          for item in Sem}
-            for level in range(9)
+            for level in range(LEVEL_COUNT)
         }
         report = {
             "checkpoint": str(checkpoint),
@@ -325,20 +326,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "iou": {item.name: _iou(confusion, index) for index, item in enumerate(Sem)},
             "iou_by_level": {str(level): {item.name: _iou(per_level_confusion[level], index)
                                           for index, item in enumerate(Sem)}
-                             for level in range(9)},
+                             for level in range(LEVEL_COUNT)},
             "style_groups": {
                 group: {
                     "frames_by_level": {
                         str(level): sum(sample["style_group"] == group
                                         for sample in samples)
-                        for level in range(9)
+                        for level in range(LEVEL_COUNT)
                     },
                     "iou_by_level": {
                         str(level): {
                             item.name: _iou(per_model_style_confusion[label][group][level], index)
                             for index, item in enumerate(Sem)
                         }
-                        for level in range(9)
+                        for level in range(LEVEL_COUNT)
                     },
                     "class_support_by_level": {
                         str(level): {
@@ -346,7 +347,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                                                                                   int(item)].sum())
                             for item in Sem
                         }
-                        for level in range(9)
+                        for level in range(LEVEL_COUNT)
                     },
                     "confusion_by_level_csv": style_confusion_paths[group],
                     "iou": {
