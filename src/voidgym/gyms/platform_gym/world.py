@@ -148,12 +148,20 @@ class Room:
     physics: PhysicsParams
     style_seed: int
     treasure_rocks: list[TreasureRock] = field(default_factory=list)
+    spawn_facing: int = 1
+    solver_backtrack_waypoint: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if self.id < 0 or self.width <= 0.0 or self.height <= 0.0:
             raise ValueError("room id and dimensions are invalid")
         if not 0.0 <= self.spawn[0] <= self.width or not 0.0 <= self.spawn[1] <= self.height:
             raise ValueError("room spawn must be inside the room bounds")
+        if self.spawn_facing not in {-1, 1}:
+            raise ValueError("room spawn_facing must be -1 or 1")
+        if (self.solver_backtrack_waypoint is not None
+                and not (0.0 <= self.solver_backtrack_waypoint[0] <= self.width
+                         and 0.0 <= self.solver_backtrack_waypoint[1] <= self.height)):
+            raise ValueError("solver backtrack waypoint must be inside the room")
 
 
 @dataclass(slots=True)

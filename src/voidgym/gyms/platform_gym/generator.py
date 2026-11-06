@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, MAX_LEVEL
 from voidgym.gyms.platform_gym.params import PhysicsParams
 from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
 from voidgym.gyms.platform_gym.world import (
@@ -95,6 +96,45 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
                 seed, treasure_rocks)
     if level != 4 and rng.random() < .25:
         room = _mirror_room(room)
+    return room
+
+
+def _make_dead_end(seed: int, variant: int) -> Room:
+    """Build a certified lesson where the wall-facing route is a dead end."""
+    rng = np.random.default_rng(seed)
+    physics = PhysicsParams.sample(rng)
+    floor = .6
+    width = 30.0
+    wall_width = 2.5
+    facing = -1 if variant == 2 else 1
+    wall_x = width * .67 if facing > 0 else width * .33 - wall_width
+    wall_height = physics.jump_max_height * 1.65
+    spawn_distance = 3.2 if variant != 1 else 8.0
+    spawn_x = wall_x - spawn_distance if facing > 0 else wall_x + wall_width + spawn_distance
+    back = -facing
+    step_count = 4
+    rise = physics.jump_max_height * .5
+    solids = [Solid(Rect(0.0, 0.0, width, floor)),
+              Solid(Rect(wall_x, floor, wall_width, wall_height))]
+    centers: list[float] = []
+    for index in range(step_count):
+        center = spawn_x + back * (2.7 + index * 2.6)
+        centers.append(center)
+        solids.append(Solid(Rect(center - 1.2, floor + (index + 1) * rise, 2.4, .22),
+                            kind="platform"))
+    exit_y = floor + step_count * rise
+    room_height = exit_y + 2.5
+    exit_x = width - 2.4 if facing > 0 else .6
+    bridge_left = min(exit_x, centers[-1] - 1.2)
+    bridge_right = max(exit_x + 1.8, centers[-1] + 1.2)
+    solids.append(Solid(Rect(bridge_left, exit_y, bridge_right - bridge_left, .22),
+                        kind="platform"))
+    room = Room(
+        DEAD_END_LEVEL, width, room_height, solids, [], [], [], [], [],
+        [Exit(Rect(exit_x, exit_y, 1.8, 1.4), DEAD_END_LEVEL + 1)], [],
+        (spawn_x, floor), physics, seed, spawn_facing=facing,
+        solver_backtrack_waypoint=(centers[-1], exit_y + .22),
+    )
     return room
 
 
@@ -235,13 +275,24 @@ def _mirror_room(room: Room) -> Room:
     for door in room.doors:
         door.rect = _mirror_rect(door.rect, width)
     room.spawn = (width - room.spawn[0], room.spawn[1])
+    if room.solver_backtrack_waypoint is not None:
+        waypoint_x, waypoint_y = room.solver_backtrack_waypoint
+        room.solver_backtrack_waypoint = (width - waypoint_x, waypoint_y)
+    room.spawn_facing *= -1
     return room
 
 
 def generate_room(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     """Generate a seeded level and retain it only when the physics solver completes it."""
-    if not 0 <= level <= 8:
-        raise ValueError("level must be in [0, 8]")
+    if not 0 <= level <= MAX_LEVEL:
+        raise ValueError(f"level must be in [0, {MAX_LEVEL}]")
+    if level == DEAD_END_LEVEL:
+        variant = seed % 3
+        for attempt in range(20):
+            room = _make_dead_end(seed + 1000 * attempt, variant)
+            if solve_room(room):
+                return room
+        raise RuntimeError("could not solve dead-end room within 20 seed attempts")
     for attempt in range(20):
         room = _make(level, seed + 1000 * attempt, allow_vertical=allow_vertical)
         if solve_room(room, require_breakables=level == 7):

@@ -13,13 +13,14 @@ from voidgym.gyms.platform_gym.generator import (
     generate_room_set,
 )
 from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
+from voidgym.gyms.platform_gym.levels import LEVEL_COUNT
 
 
 def test_generated_rooms_certified_deterministic_and_fast() -> None:
     exit_directions: set[str] = set()
     tall_rooms = 0
     tall_by_level: dict[int, int] = {}
-    for level in range(9):
+    for level in range(LEVEL_COUNT):
         started = perf_counter()
         rooms = [generate_room(level, seed) for seed in range(200)]
         # Leave headroom for shared-host scheduling while still guarding regressions.
@@ -47,6 +48,31 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
     assert exit_directions == {"left", "right", "up", "down"}
     assert tall_rooms > 0
     assert all(tall_by_level[level] > 0 for level in (0, 1, 2, 3, 4, 5, 7))
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_dead_end_variants_have_a_solver_certified_backward_exit(seed: int) -> None:
+    room = generate_room(9, seed)
+    wall = next(solid.rect for solid in room.solids
+                if solid.rect.w >= 2.0 and solid.rect.h >= 1.5 * room.physics.jump_max_height)
+    exit_center = room.exits[0].rect.x + room.exits[0].rect.w / 2
+    wall_center = wall.x + wall.w / 2
+    bridge = next(solid.rect for solid in room.solids
+                  if solid.kind == "platform" and solid.rect.w > wall.w + 4.0)
+    platforms = sorted((solid.rect for solid in room.solids
+                        if solid.kind == "platform" and solid.rect.w <= wall.w + 4.0),
+                       key=lambda rect: room.spawn_facing * rect.x, reverse=True)
+
+    assert wall.w >= 2.0
+    assert wall.h >= 1.5 * room.physics.jump_max_height
+    assert not room.breakables
+    assert room.spawn_facing * (wall.x + wall.w / 2 - room.spawn[0]) > 0
+    assert room.spawn_facing * (exit_center - wall_center) > 0
+    assert len(platforms) >= 3
+    assert [rect.y for rect in platforms] == sorted(rect.y for rect in platforms)
+    assert bridge.x < wall.x and bridge.right > wall.right
+    assert bridge.y > wall.top
+    assert solve_room(room)
 
 
 def test_metroidvania_rooms_include_linked_ability_and_bench() -> None:

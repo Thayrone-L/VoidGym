@@ -11,6 +11,7 @@ import numpy as np
 from voidgym.core.actions import UNIVERSAL_ACTIONS, UniversalAction
 from voidgym.gyms.platform_gym.generator import generate_room, generate_room_set
 from voidgym.gyms.platform_gym.labels import labels
+from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, MULTI_ROOM_LEVEL
 from voidgym.gyms.platform_gym.params import PHYSICS_DT_SECONDS, Split
 from voidgym.gyms.platform_gym.physics import Event, interaction_prompt, step_physics
 from voidgym.gyms.platform_gym.render import render_room
@@ -50,12 +51,13 @@ class PlatformGymAdapter:
 
     def __init__(self, *, level: int = 0, seed: int = 0, split: Split = "train") -> None:
         self.level, self.seed, self.split = level, seed, split
-        self._rooms = generate_room_set(seed) if level == 8 else [generate_room(level, seed)]
+        self._rooms = (generate_room_set(seed) if level == MULTI_ROOM_LEVEL
+                       else [generate_room(level, seed)])
         self._room_index = 0
         self.room = self._rooms[0]
-        if level != 8:
+        if level != MULTI_ROOM_LEVEL:
             self.room.id = 0
-        self.player = Player(*self.room.spawn, on_ground=True)
+        self.player = Player(*self.room.spawn, on_ground=True, facing=self.room.spawn_facing)
         self._events: list[Event] = []
         self._episode_steps = 0
         self._room_counter = 0
@@ -69,12 +71,13 @@ class PlatformGymAdapter:
         if seed is not None:
             self.seed = seed
         self._room_counter = 0
-        self._rooms = generate_room_set(self.seed) if self.level == 8 else [generate_room(self.level, self.seed + self._room_counter)]
+        self._rooms = (generate_room_set(self.seed) if self.level == MULTI_ROOM_LEVEL
+                       else [generate_room(self.level, self.seed + self._room_counter)])
         self._room_index = 0
         self.room = self._rooms[0]
-        if self.level != 8:
+        if self.level != MULTI_ROOM_LEVEL:
             self.room.id = 0
-        self.player = Player(*self.room.spawn, on_ground=True)
+        self.player = Player(*self.room.spawn, on_ground=True, facing=self.room.spawn_facing)
         self._events.clear()
         self._episode_steps = 0
         self._last_step_game_ms = 80
@@ -126,13 +129,15 @@ class PlatformGymAdapter:
                     abilities = set(self.player.abilities)
                     self._room_index += 1
                     self.room = self._rooms[self._room_index]
-                    self.player = Player(*self.room.spawn, on_ground=True, abilities=abilities)
-                elif self.level == 8:
+                    self.player = Player(*self.room.spawn, on_ground=True,
+                                         facing=self.room.spawn_facing, abilities=abilities)
+                elif self.level in {MULTI_ROOM_LEVEL, DEAD_END_LEVEL}:
                     self._finished = True
                 else:
                     self.room = generate_room(self.level, self.seed + self._room_counter)
                     self.room.id = self._room_counter
-                    self.player = Player(*self.room.spawn, on_ground=True)
+                    self.player = Player(*self.room.spawn, on_ground=True,
+                                         facing=self.room.spawn_facing)
                 break
         self._episode_steps += 1
         cell = (self.room.id, int(self.player.x / 2), int(self.player.y / 2))
