@@ -170,8 +170,10 @@ def _collect_steps(
             episode_return = 0.0
             if slice_truncation:
                 # End the PPO slice, but keep the live HK process and position.
+                # A stuck boundary truncates returns, not the environment episode;
+                # carry the recurrent context into the next slice as well.
                 observation, info = next_observation, next_info
-                state, episode_start = policy.initial_state(1, device), True
+                state, episode_start = next_state, False
             else:
                 observation, info = env.reset(seed=seed + total_steps)
                 state, episode_start = policy.initial_state(1, device), True

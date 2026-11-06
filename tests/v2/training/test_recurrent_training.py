@@ -154,12 +154,12 @@ def test_actor_keeps_live_environment_across_stuck_slices(monkeypatch) -> None:
         def __init__(self):
             self.calls = 0
 
-        def __call__(self, _obs, state, *_args, **kwargs):
+        def __call__(self, _obs, state, starts, *_args, **kwargs):
             assert kwargs["compute_auxiliary"] is False
             self.calls += 1
             value = 2.0 if self.calls % 2 else 7.0
             return {"logits": torch.zeros((1, 1)), "values": torch.tensor([value]),
-                    "state": state}
+                    "state": (state[0] + 1, state[1] + 1)}
 
         @staticmethod
         def initial_state(batch, device):
@@ -212,6 +212,13 @@ def test_actor_keeps_live_environment_across_stuck_slices(monkeypatch) -> None:
     assert env.reset_calls == 0
     assert [float(value.item()) for value in buffer.bootstrap_values] == [7.0, 7.0]
     assert writer.rows[0]["truncated"] and not writer.rows[0]["done"]
+    assert [float(value[0].flatten()[0].item()) for value in buffer.states] == [0.0, 1.0]
+    assert [bool(value.item()) for value in buffer.starts] == [True, False]
+    buffer.compute_returns(torch.zeros(1), gamma=.995, gae_lambda=.95)
+    sequences = buffer.sequences(torch.device("cpu"))
+    assert [float(sequence.initial_state[0].flatten()[0].item())
+            for sequence in sequences] == [0.0, 1.0]
+    assert [sequence.episode_starts.item() for sequence in sequences] == [True, False]
 
 
 def _observation_numpy() -> dict[str, np.ndarray]:
