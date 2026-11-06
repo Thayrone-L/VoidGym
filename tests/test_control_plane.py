@@ -188,6 +188,7 @@ def test_v2_shared_learner_launch_uses_crash_resume_supervisor(
     assert campaign_config["aux"]["augment_random_shift"] is True
     assert campaign_config["aux"]["c_sem"] > 0
     assert "supervise_hk_learner.py" in " ".join(record["command"])
+    assert record["command"][record["command"].index("--max-restarts") + 1] == "3"
     assert "--continuous" not in record["command"]
     assert "--augment-random-shift" not in record["command"]
     assert str(checkpoint.resolve()) in record["command"]

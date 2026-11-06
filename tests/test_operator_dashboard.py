@@ -240,6 +240,12 @@ def test_operator_snapshot_explains_failed_group_and_cancelled_actor(tmp_path: P
     (shared_root / "actors").mkdir(parents=True)
     (shared_root / "actors" / "slot-0.json").write_text(
         json.dumps({"slot": 0, "status": "CANCELLED"}), encoding="utf-8")
+    help_root = shared_root / "help-requests"
+    help_root.mkdir()
+    (help_root / "slot-0.json").write_text(json.dumps({"requests": [{
+        "request_id": "help-pending", "slot": 0, "status": "pending",
+        "created_unix": 1.0,
+    }]}), encoding="utf-8")
     learner_log = plane.control_root / "launches" / "learner-a" / "process.log"
     learner_log.parent.mkdir(parents=True)
     learner_log.write_text("Traceback (most recent call last):\nValueError: warm-start campaigns must use a new shared checkpoint directory\n", encoding="utf-8")

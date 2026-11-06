@@ -18,7 +18,7 @@ def learner_heartbeat_timestamp(payload: dict[str, Any]) -> int | None:
 def learner_monitor_state(
     *, status: str, round_id: int, completed_steps: int,
     resources: dict[str, Any], metrics: dict[str, float] | None = None,
-    failure: str | None = None,
+    failure: str | None = None, waiting_memory: bool = False,
     last_wait_rollouts_ms: float = 0.0, last_train_ms: float = 0.0,
     last_straggler_wait_ms: float = 0.0,
 ) -> dict[str, Any]:
@@ -33,6 +33,7 @@ def learner_monitor_state(
         "last_wait_rollouts_ms": float(last_wait_rollouts_ms),
         "last_train_ms": float(last_train_ms),
         "last_straggler_wait_ms": float(last_straggler_wait_ms),
+        "waiting_memory": bool(waiting_memory),
         **resources,
     }
     if metrics:

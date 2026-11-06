@@ -28,6 +28,9 @@ _MIN_ACTUAL_COMMIT_BYTES = 3 * 1024**3 // 2
 def _commit_guard_failure(stats: Mapping[str, Any]) -> str | None:
     current = stats.get("commit_available_bytes")
     potential = stats.get("potential_commit_available_bytes")
+    if isinstance(potential, int) and potential < _MIN_COMMIT_BYTES:
+        return (f"learner commit guard: {current} bytes current and {potential} bytes potential; "
+                "requires 1.5 GiB current and 3 GiB potential")
     if not isinstance(current, int):
         return None
     effective = potential if isinstance(potential, int) else current
@@ -45,22 +48,62 @@ class _RolloutWait:
     straggler_wait_ms: float
 
 
-def _assert_commit_guard(shared_root: Path | None = None) -> None:
-    stats = resource_snapshot(shared_root=shared_root)
-    failure = _commit_guard_failure(stats)
-    if failure is not None:
-        raise MemoryError(failure)
+def _wait_for_commit_guard(
+    root: Path, round_id: int, completed_steps: int, *,
+    progress: dict[str, Any] | None = None, progress_lock: threading.Lock | None = None,
+    stop_file: Path | None = None, timeout_seconds: float = 30 * 60,
+    poll_seconds: float = 5.0, snapshot_fn: Any = resource_snapshot,
+    monotonic_fn: Any = time.monotonic, sleep_fn: Any = time.sleep,
+) -> bool:
+    """Wait for current commit recovery, publishing RUNNING heartbeats meanwhile."""
+    below_since: float | None = None
+    while True:
+        if stop_file is not None and stop_file.is_file():
+            if progress is not None and progress_lock is not None:
+                with progress_lock:
+                    progress["waiting_memory"] = False
+            return False
+        stats = snapshot_fn(shared_root=root)
+        potential = stats.get("potential_commit_available_bytes")
+        current = stats.get("commit_available_bytes")
+        failure = _commit_guard_failure(stats)
+        if isinstance(potential, int) and potential < _MIN_COMMIT_BYTES:
+            raise MemoryError(failure or "learner potential commit below 3 GiB")
+        if not isinstance(current, int) or failure is None:
+            if progress is not None and progress_lock is not None:
+                with progress_lock:
+                    progress["waiting_memory"] = False
+            if below_since is not None:
+                _publish_monitor_state(root, "RUNNING", round_id, completed_steps,
+                                       metrics={"waiting_memory": 0.0}, waiting_memory=False)
+            return True
+        now = monotonic_fn()
+        if below_since is None:
+            below_since = now
+        if now - below_since >= timeout_seconds:
+            raise MemoryError(f"{failure}; remained below the current-commit guard for "
+                              f"{timeout_seconds:.0f} seconds")
+        if progress is not None and progress_lock is not None:
+            with progress_lock:
+                progress["waiting_memory"] = True
+                progress["phase"] = "waiting_memory"
+                progress["phase_started_monotonic"] = now
+        _publish_monitor_state(root, "RUNNING", round_id, completed_steps,
+                               metrics={"waiting_memory": 1.0}, waiting_memory=True)
+        sleep_fn(min(poll_seconds, max(0.0, timeout_seconds - (now - below_since))))
 
 
 def _publish_monitor_state(
     root: Path, status: str, round_id: int, completed_steps: int,
     *, metrics: dict[str, float] | None = None, failure: str | None = None,
+    waiting_memory: bool = False,
     last_wait_rollouts_ms: float = 0.0, last_train_ms: float = 0.0,
     last_straggler_wait_ms: float = 0.0,
 ) -> None:
     state = learner_monitor_state(
         status=status, round_id=round_id, completed_steps=completed_steps,
         resources=resource_snapshot(shared_root=root), metrics=metrics, failure=failure,
+        waiting_memory=waiting_memory,
         last_wait_rollouts_ms=last_wait_rollouts_ms,
         last_train_ms=last_train_ms,
         last_straggler_wait_ms=last_straggler_wait_ms,
@@ -331,6 +374,7 @@ def _start_learner_heartbeat(
         "phase": "starting", "phase_started_monotonic": time.monotonic(),
         "last_wait_rollouts_ms": 0.0, "last_train_ms": 0.0,
         "last_straggler_wait_ms": 0.0,
+        "waiting_memory": False,
     }
 
     def run() -> None:
@@ -342,6 +386,7 @@ def _start_learner_heartbeat(
                 straggler_ms = float(progress["last_straggler_wait_ms"])
                 phase = progress["phase"]
                 phase_started = progress["phase_started_monotonic"]
+                waiting_memory = bool(progress.get("waiting_memory", False))
                 if phase == "waiting_rollouts":
                     wait_ms = max(wait_ms, (time.monotonic() - phase_started) * 1000.0)
                 elif phase == "training":
@@ -352,7 +397,8 @@ def _start_learner_heartbeat(
                                    metrics=payload,
                                    last_wait_rollouts_ms=wait_ms,
                                    last_train_ms=train_ms,
-                                   last_straggler_wait_ms=straggler_ms)
+                                   last_straggler_wait_ms=straggler_ms,
+                                   waiting_memory=waiting_memory)
 
     thread = threading.Thread(target=run, name="hk-learner-heartbeat", daemon=True)
     thread.start()
@@ -372,7 +418,12 @@ def _train_rounds(
     rounds: list[dict[str, Any]] = []
     status = "RUNNING"
     while continuous or completed_steps < total_timesteps:
-        _assert_commit_guard(root)
+        if not _wait_for_commit_guard(
+            root, round_id, completed_steps, progress=progress,
+            progress_lock=progress_lock, stop_file=stop_file,
+        ):
+            status = "CANCELLED"
+            break
         update = _train_shared_round(
             root, policy_root, model, trainer, round_id=round_id,
             completed_steps=completed_steps, actors=actors, actions=action_table,
@@ -451,28 +502,31 @@ def run_shared_learner(
     heartbeat_stop: threading.Event | None = None
     heartbeat_thread: threading.Thread | None = None
     try:
-        _assert_commit_guard(shared_root)
-        model, trainer, policy_root, completed_steps, round_id = _setup_learner(
-            shared_root, universal_checkpoint, action_table, game_id, game_extras_dim,
-            device, learning_rate=learning_rate, clip_range=clip_range,
-            entropy_coef=entropy_coef, c_sem=c_sem, c_inv=c_inv, c_mot=c_mot,
-            encoder_scale=lr_encoder_scale,
-        )
-        _publish_monitor_state(shared_root, "RUNNING", round_id, completed_steps)
-        heartbeat_stop, heartbeat_thread, progress, progress_lock = _start_learner_heartbeat(
-            shared_root, round_id, completed_steps, device,
-        )
-        status, round_id, completed_steps, rounds = _train_rounds(
-            shared_root, model, trainer, policy_root, device,
-            round_id=round_id, completed_steps=completed_steps, actors=actors,
-            action_table=action_table, continuous=continuous,
-            total_timesteps=total_timesteps, rollout_steps=rollout_steps,
-            sequence_length=sequence_length, batch_size=batch_size, epochs=epochs,
-            freeze_encoder_rounds=freeze_encoder_rounds, game_id=game_id,
-            wait_timeout=wait_timeout, straggler_timeout=straggler_timeout,
-            stop_file=stop_file, progress=progress,
-            progress_lock=progress_lock,
-        )
+        if not _wait_for_commit_guard(shared_root, round_id, completed_steps,
+                                      stop_file=stop_file):
+            status = "CANCELLED"
+        else:
+            model, trainer, policy_root, completed_steps, round_id = _setup_learner(
+                shared_root, universal_checkpoint, action_table, game_id, game_extras_dim,
+                device, learning_rate=learning_rate, clip_range=clip_range,
+                entropy_coef=entropy_coef, c_sem=c_sem, c_inv=c_inv, c_mot=c_mot,
+                encoder_scale=lr_encoder_scale,
+            )
+            _publish_monitor_state(shared_root, "RUNNING", round_id, completed_steps)
+            heartbeat_stop, heartbeat_thread, progress, progress_lock = _start_learner_heartbeat(
+                shared_root, round_id, completed_steps, device,
+            )
+            status, round_id, completed_steps, rounds = _train_rounds(
+                shared_root, model, trainer, policy_root, device,
+                round_id=round_id, completed_steps=completed_steps, actors=actors,
+                action_table=action_table, continuous=continuous,
+                total_timesteps=total_timesteps, rollout_steps=rollout_steps,
+                sequence_length=sequence_length, batch_size=batch_size, epochs=epochs,
+                freeze_encoder_rounds=freeze_encoder_rounds, game_id=game_id,
+                wait_timeout=wait_timeout, straggler_timeout=straggler_timeout,
+                stop_file=stop_file, progress=progress,
+                progress_lock=progress_lock,
+            )
     except BaseException as error:
         status = "FAILED"
         failure_message = f"{type(error).__name__}: {error}"

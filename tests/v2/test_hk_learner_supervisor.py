@@ -63,6 +63,17 @@ def test_supervisor_stops_after_three_restarts_in_rolling_24_hours(tmp_path: Pat
     shared.mkdir()
     fallback = tmp_path / "base"
     _checkpoint(fallback, steps=10)
+    checkpoint = shared / "policies" / "universal-000020"
+    _checkpoint(checkpoint, steps=20)
+    checkpoint_manifest = json.loads((checkpoint / "manifest.json").read_text("utf-8"))
+    checkpoint_manifest["metrics"]["shared_round"] = 4
+    (checkpoint / "manifest.json").write_text(json.dumps(checkpoint_manifest), "utf-8")
+    (shared / "latest.json").write_text(json.dumps({
+        "round": 4, "policy": "policies/universal-000020", "trained_steps": 20,
+    }), "utf-8")
+    (shared / "learner.json").write_text(json.dumps({
+        "status": "FAILED", "completed_timesteps": 10, "round": 1,
+    }), "utf-8")
     script = shared / "fake_crash.py"
     script.write_text(
         "import json, pathlib; pathlib.Path(__file__).parent.joinpath('status.json').write_text(json.dumps({'status':'FAILED'})); raise SystemExit(3)\n",
@@ -75,6 +86,9 @@ def test_supervisor_stops_after_three_restarts_in_rolling_24_hours(tmp_path: Pat
     assert status["status"] == "FAILED"
     assert status["restart_count_24h"] == 4
     assert "3 per 24 hours" in status["reason"]
+    assert status["completed_timesteps"] == 20
+    assert status["round"] == 4
+    assert status["policy"] == "policies/universal-000020"
 
 
 def test_supervisor_recovery_window_is_fixed(tmp_path: Path) -> None:

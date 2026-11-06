@@ -1598,6 +1598,16 @@ class ControlPlane:
                 "message": marker_warning,
                 "technical_detail": str(marker_error) if marker_error is not None else None,
             }
+        # Keep a terminal failure visible when optional help/stuck alerts coexist.
+        if not active_records and failed_record is not None:
+            raw_reason = failed_record.get("failure") or failed_record.get("stop_reason")
+            detail = self._launch_error_detail(failed_record)
+            reason = self._operator_reason(f'{raw_reason or ""} {detail or ""}')
+            if reason == "O treino foi encerrado por um erro.":
+                evidence = detail or str(raw_reason or "erro sem detalhe")
+                reason = f"Falha: {evidence[:180]}"
+            status_banner = {"kind": "error", "message": f"O treino parou: {reason}",
+                             "technical_detail": detail}
         recent_events = []
         for row in sorted(launch_records, key=lambda item: int(item.get("finished_unix_ns", 0) or 0), reverse=True):
             if row.get("status") not in {"FAILED", "CANCELLED", "COMPLETED"}:
@@ -3107,7 +3117,7 @@ class ControlPlane:
                 _project_training_python_executable(self.project_root), "-X", "faulthandler", "-u",
                 str(supervisor_path), "--shared-root", str(shared_root),
                 "--stop-file", str(stop_file), "--fallback-checkpoint", str(checkpoint),
-                "--command-json", str(command_file), "--max-restarts", "0",
+                "--command-json", str(command_file), "--max-restarts", "3",
             ]
         else:
             tool_path = self.project_root / "tools" / "run_shared_learner.py"

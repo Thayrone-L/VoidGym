@@ -78,6 +78,73 @@ def latest_checkpoint(root: Path, fallback: Path) -> Path:
     raise RuntimeError("no complete universal checkpoint is available for learner resume")
 
 
+def _latest_progress(root: Path) -> dict[str, Any]:
+    """Read the freshest learner/checkpoint progress without changing runtime files."""
+    candidates: list[dict[str, Any]] = []
+    for filename in ("learner.json", "latest.json"):
+        try:
+            payload = json.loads((root / filename).read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        steps = payload.get("completed_timesteps", payload.get("trained_steps"))
+        if type(steps) is not int or steps < 0:
+            continue
+        row: dict[str, Any] = {"completed_timesteps": steps}
+        round_id = payload.get("round", payload.get("metrics", {}).get("shared_round", 0)
+                              if isinstance(payload.get("metrics"), dict) else 0)
+        if type(round_id) is int and round_id >= 0:
+            row["round"] = round_id
+        relative = payload.get("policy")
+        if isinstance(relative, str):
+            try:
+                checkpoint = (root / relative).resolve(strict=True)
+                checkpoint.relative_to(root.resolve(strict=True))
+                if _checkpoint_files_ok(checkpoint):
+                    row["policy"] = checkpoint.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                pass
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            row["metrics"] = metrics
+        candidates.append(row)
+    policies = root / "policies"
+    for path in policies.glob("universal-*") if policies.is_dir() else ():
+        if not _checkpoint_files_ok(path):
+            continue
+        try:
+            manifest = json.loads((path / "manifest.json").read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        metrics = manifest.get("metrics") if isinstance(manifest, dict) else None
+        row = {
+            "completed_timesteps": int(manifest["trained_steps"]),
+            "policy": path.relative_to(root).as_posix(),
+            "metrics": metrics if isinstance(metrics, dict) else {},
+        }
+        round_id = metrics.get("shared_round", 0) if isinstance(metrics, dict) else 0
+        if type(round_id) is int and round_id >= 0:
+            row["round"] = round_id
+        candidates.append(row)
+    if not candidates:
+        return {}
+    best = max(candidates, key=lambda row: (row["completed_timesteps"], row.get("round", 0)))
+    # If the learner heartbeat is ahead of the last checkpoint, preserve its real
+    # step/round while still reporting the newest complete policy available.
+    latest_policy = max((row for row in candidates if "policy" in row),
+                        key=lambda row: (row["completed_timesteps"], row.get("round", 0)),
+                        default=None)
+    result = dict(best)
+    if latest_policy is not None:
+        result["policy"] = latest_policy["policy"]
+        if best["completed_timesteps"] == latest_policy["completed_timesteps"]:
+            result["metrics"] = latest_policy.get("metrics", result.get("metrics", {}))
+    result.setdefault("round", 0)
+    result.setdefault("metrics", {})
+    return result
+
+
 def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
               fallback_checkpoint: Path, max_restarts: int = 3,
               window_hours: float = 24.0,
@@ -133,12 +200,20 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                     pass
                 terminal = state.get("status")
                 if return_code == 0 and terminal in {"COMPLETED", "CANCELLED", "STOPPED"}:
+                    final = {**state, **_latest_progress(shared_root),
+                             "status": terminal, "exit_code": return_code,
+                             "finished_at": datetime.now().astimezone().isoformat()}
+                    publish_role_state(shared_root / "status.json", final)
                     publish_role_state(shared_root / "supervisor.json", {
                         "status": terminal, "attempt": attempt,
                         "restart_count": restart_count, "finished_at": datetime.now().astimezone().isoformat(),
                     })
                     return 0
                 if stop_file.is_file() and terminal in {"CANCELLED", "STOPPED"}:
+                    final = {**state, **_latest_progress(shared_root),
+                             "status": terminal, "exit_code": return_code,
+                             "finished_at": datetime.now().astimezone().isoformat()}
+                    publish_role_state(shared_root / "status.json", final)
                     publish_role_state(shared_root / "supervisor.json", {
                         "status": terminal, "attempt": attempt,
                         "restart_count": restart_count,
@@ -156,6 +231,7 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                     os.fsync(stream.fileno())
                 if stop_file.is_file():
                     publish_role_state(shared_root / "status.json", {
+                        **state, **_latest_progress(shared_root),
                         "status": "CANCELLED", "finished_at": datetime.now().astimezone().isoformat(),
                         "last_learner_status": terminal,
                     })
@@ -174,7 +250,9 @@ def supervise(command: Sequence[str], *, shared_root: Path, stop_file: Path,
                         current_status = current if isinstance(current, dict) else {}
                     except (OSError, json.JSONDecodeError):
                         pass
-                    publish_role_state(status_path, {**current_status, **failure})
+                    publish_role_state(status_path, {
+                        **current_status, **_latest_progress(shared_root), **failure,
+                    })
                     publish_role_state(shared_root / "supervisor.json", failure)
                     return return_code or 1
                 resume = latest_checkpoint(shared_root, fallback_checkpoint)

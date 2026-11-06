@@ -90,6 +90,60 @@ def test_commit_guard_accepts_dynamic_pagefile_capacity_but_keeps_actual_floor()
     })
 
 
+def test_commit_guard_wait_recovers_and_publishes_waiting_state(tmp_path: Path, monkeypatch) -> None:
+    gib = 1024**3
+    snapshots = iter([
+        {"commit_available_bytes": gib, "potential_commit_available_bytes": 8 * gib},
+        {"commit_available_bytes": gib, "potential_commit_available_bytes": 8 * gib},
+        {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 8 * gib},
+    ])
+    now = [0.0]
+    published = []
+    monkeypatch.setattr(shared, "_publish_monitor_state",
+                        lambda *_args, **kwargs: published.append(kwargs["waiting_memory"]))
+    progress: dict[str, object] = {}
+    result = shared._wait_for_commit_guard(
+        tmp_path, 4, 123, progress=progress, progress_lock=threading.Lock(),
+        snapshot_fn=lambda **_kwargs: next(snapshots),
+        monotonic_fn=lambda: now[0],
+        sleep_fn=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        poll_seconds=5,
+    )
+    assert result is True
+    assert published == [True, True, False]
+    assert progress["waiting_memory"] is False
+
+
+def test_commit_guard_fails_after_thirty_continuous_minutes(tmp_path: Path, monkeypatch) -> None:
+    gib = 1024**3
+    now = [0.0]
+    monkeypatch.setattr(shared, "_publish_monitor_state", lambda *_args, **_kwargs: None)
+    with pytest.raises(MemoryError, match="remained below the current-commit guard"):
+        shared._wait_for_commit_guard(
+            tmp_path, 0, 0,
+            snapshot_fn=lambda **_kwargs: {
+                "commit_available_bytes": gib,
+                "potential_commit_available_bytes": 8 * gib,
+            },
+            monotonic_fn=lambda: now[0],
+            sleep_fn=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            timeout_seconds=30 * 60,
+        )
+    assert now[0] == 30 * 60
+
+
+def test_commit_guard_fails_immediately_when_potential_capacity_is_below_floor(tmp_path: Path) -> None:
+    gib = 1024**3
+    with pytest.raises(MemoryError, match="3 GiB potential"):
+        shared._wait_for_commit_guard(
+            tmp_path, 0, 0,
+            snapshot_fn=lambda **_kwargs: {
+                "commit_available_bytes": 8 * gib,
+                "potential_commit_available_bytes": 2 * gib,
+            },
+        )
+
+
 def test_publish_json_retries_transient_replace_permission_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
