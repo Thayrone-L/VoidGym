@@ -45,7 +45,7 @@ Essa é uma leitura atual; não descreve os processos em 05/11 às 11:48.
 
 ## 4. Testes, validações e commits
 
-Os testes focados de guard, supervisor, comando do painel, banner, currículo e ferramentas passaram. A suíte completa executada em 06/11 passou: **912 passed, 4 skipped, 3 warnings, 8 subtests**, em 274,93 s. `ruff check .` passou; `mypy src` passou nos 114 arquivos; `git diff --check` e CI remoto ainda serão conferidos antes do push. O código 87v deve ser separado em commits por memória, beco, solver, currículo e ferramentas; as correções 87w e o relatório 87u ficam em commits próprios. Push previsto para o PR #8.
+Os testes focados e a suíte completa passaram: **912 passed, 4 skipped, 3 warnings, 8 subtests**, em 276,97 s na execução final. `ruff check .`, `mypy src` (114 arquivos) e `git diff --check` passaram. O primeiro CI após o push passou nos checks Bridge contracts, Portable policy boundary e nos dois jobs v2; o job Python falhou apenas no teste `test_wait_rollouts_rejects_rollout_from_retired_actor_launch`, cujo timeout de 10 ms expirou antes da gravação do log no runner Windows. Aumentei esse timeout para 1 s; o teste isolado e a suíte completa passaram localmente. O CI será repetido com essa correção antes de considerar a revisão concluída. Os commits locais separados são: 87w `f5c324b`; memória recorrente `26ad0ad`; solver `86519ec`; geometria `6769333`; currículo `c2f2074`; ferramentas e relatório 87v `9b0f085`; relatório 87u `7235b85`. A integração do commit remoto de 87u e as correções locais foi enviada ao PR #8; a correção do teste seguirá em novo commit.
 
 ## 5. Retomada
 

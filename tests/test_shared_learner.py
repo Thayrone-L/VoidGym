@@ -368,7 +368,7 @@ def test_wait_rollouts_rejects_rollout_from_retired_actor_launch(tmp_path):
     with pytest.raises(TimeoutError, match="no valid actor rollouts"):
         store.wait_rollouts(
             round_number=1, actors=1, fingerprint=FINGERPRINT, n_steps=2,
-            observation_space=observation_space, action_count=action_count, timeout=0.01,
+            observation_space=observation_space, action_count=action_count, timeout=1.0,
         )
 
     rejected = (tmp_path / "rejected.jsonl").read_text("utf-8")
@@ -388,7 +388,7 @@ def test_one_actor_satisfies_quorum_after_timeout(tmp_path):
     observation_space, action_count = _spaces()
     rollouts, slots, metrics = store.wait_rollouts(
         round_number=1, actors=2, fingerprint=FINGERPRINT, n_steps=2,
-        observation_space=observation_space, action_count=action_count, timeout=0.01,
+        observation_space=observation_space, action_count=action_count, timeout=1.0,
     )
     assert slots == [0]
     assert len(rollouts) == 1
