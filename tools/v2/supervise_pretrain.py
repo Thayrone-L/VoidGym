@@ -124,7 +124,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--microbatch-sequences", type=int, default=16)
     parser.add_argument("--quick-eval-interval-steps", type=int, default=1_000_000)
     parser.add_argument("--quick-eval-episodes-per-level", type=int, default=50)
-    parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 8))
+    parser.add_argument("--stop-at-curriculum-level", type=int, choices=range(1, 10))
     parser.add_argument("--max-restarts", type=int, default=3)
     parser.add_argument("--window-hours", type=float, default=24.0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")

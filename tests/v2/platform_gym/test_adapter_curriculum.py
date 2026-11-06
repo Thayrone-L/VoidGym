@@ -116,14 +116,42 @@ def test_curriculum_load_migrates_older_current_window_to_level_history(tmp_path
 
 def test_curriculum_target_uses_last_100_episodes_per_level() -> None:
     curriculum = Curriculum(seed=2)
-    for level in range(9):
+    for level in range(10):
         curriculum.history[level].extend(
-            [True] * (70 if level < 8 else 30) + [False] * (30 if level < 8 else 70)
+            [True] * (30 if level == 8 else 70) + [False] * (70 if level == 8 else 30)
         )
-    assert curriculum.training_goal_met()
+    assert curriculum.training_goal_met(level_8_target=.30)
     curriculum.history[3].clear()
     curriculum.history[3].extend([True] * 69 + [False] * 31)
-    assert not curriculum.training_goal_met()
+    assert not curriculum.training_goal_met(level_8_target=.30)
+
+
+def test_dead_end_curriculum_goal_requires_all_levels_to_hold_seventy_percent() -> None:
+    curriculum = Curriculum(seed=5)
+    for level in range(10):
+        curriculum.history[level].extend([True] * 70 + [False] * 30)
+    assert curriculum.training_goal_met(level_8_target=.70, level_9_target=.70)
+    curriculum.history[8].clear()
+    curriculum.history[8].extend([True] * 69 + [False] * 31)
+    assert not curriculum.training_goal_met(level_8_target=.70, level_9_target=.70)
+
+
+def test_curriculum_advances_at_exact_seventy_percent() -> None:
+    curriculum = Curriculum(seed=7)
+    for success in [True] * 70 + [False] * 30:
+        curriculum.record(success)
+    assert curriculum.level == 1
+
+
+def test_curriculum_schema_three_resumes_dead_end_history(tmp_path) -> None:
+    curriculum = Curriculum(seed=6)
+    curriculum.level = 9
+    curriculum.history[9].extend([True] * 70 + [False] * 30)
+    path = tmp_path / "dead-end-curriculum.json"
+    curriculum.save(path)
+    resumed = Curriculum.load(path)
+    assert resumed.level == 9
+    assert resumed.window_success_rate(9) == .7
 
 
 def test_curriculum_stagnation_window_stops_only_unmet_level() -> None:

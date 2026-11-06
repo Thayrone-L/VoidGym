@@ -6,6 +6,7 @@ import json
 from collections import deque
 from pathlib import Path
 
+from voidgym.gyms.platform_gym.levels import LEVEL_COUNT, MAX_LEVEL
 from voidgym.gyms.platform_gym.params import split_for_seed
 
 
@@ -14,7 +15,7 @@ class Curriculum:
         self.level = 0
         self.seed = seed
         self.current: deque[bool] = deque(maxlen=100)
-        self.history: dict[int, deque[bool]] = {i: deque(maxlen=300) for i in range(9)}
+        self.history: dict[int, deque[bool]] = {i: deque(maxlen=300) for i in range(LEVEL_COUNT)}
         self.episodes = 0
         self.best_window_rate: dict[int, float] = {}
         self.last_improvement_step: dict[int, int] = {}
@@ -28,19 +29,22 @@ class Curriculum:
         return sum(list(values)[-window:]) / window
 
     def training_goal_met(self, *, window: int = 100, levels_0_7_target: float = .70,
-                          level_8_target: float = .30) -> bool:
+                          level_8_target: float = .70, level_9_target: float = .70) -> bool:
         return all((rate := self.window_success_rate(level, window)) is not None
-                   and rate >= (level_8_target if level == 8 else levels_0_7_target)
-                   for level in range(9))
+                   and rate >= (level_9_target if level == 9 else
+                                level_8_target if level == 8 else levels_0_7_target)
+                   for level in range(LEVEL_COUNT))
 
     def update_progress_watch(self, steps: int, *, window: int = 100,
-                              levels_0_7_target: float = .70, level_8_target: float = .30,
+                              levels_0_7_target: float = .70, level_8_target: float = .70,
+                              level_9_target: float = .70,
                               no_improvement_steps: int = 3_000_000) -> int | None:
-        for level in range(9):
+        for level in range(LEVEL_COUNT):
             rate = self.window_success_rate(level, window)
             if rate is None:
                 continue
-            target = level_8_target if level == 8 else levels_0_7_target
+            target = (level_9_target if level == 9 else
+                      level_8_target if level == 8 else levels_0_7_target)
             if rate >= target:
                 self.best_window_rate.pop(level, None)
                 self.last_improvement_step.pop(level, None)
@@ -57,13 +61,13 @@ class Curriculum:
 
     def record(self, success: bool, level: int | None = None) -> None:
         sampled_level = self.level if level is None else int(level)
-        if not 0 <= sampled_level <= 8:
-            raise ValueError("level must be in [0, 8]")
+        if not 0 <= sampled_level <= MAX_LEVEL:
+            raise ValueError(f"level must be in [0, {MAX_LEVEL}]")
         self.history[sampled_level].append(bool(success))
         if sampled_level == self.level:
             self.current.append(bool(success))
         self.episodes += 1
-        if len(self.current) == 100 and sum(self.current) / 100 > 0.7 and self.level < 8:
+        if len(self.current) == 100 and sum(self.current) / 100 >= 0.7 and self.level < MAX_LEVEL:
             self.level += 1
             self.current.clear()
         elif len(self.history[self.level]) == 300 and sum(self.history[self.level]) / 300 < 0.2 and self.level > 0:
@@ -86,7 +90,7 @@ class Curriculum:
                 if rate is not None and rate < .70:
                     weights[index] = 3.0
             return int(rng.choice(lower_levels, p=weights / weights.sum()))
-        return self.level if self.level == 8 else self.level + 1
+        return self.level if self.level == MAX_LEVEL else self.level + 1
 
     def success_rate(self, level: int) -> float:
         values = self.history[level]
@@ -99,7 +103,7 @@ class Curriculum:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def to_dict(self) -> dict[str, object]:
-        return {"schema_version": 2, "level": self.level, "seed": self.seed,
+        return {"schema_version": 3, "level": self.level, "seed": self.seed,
                 "episodes": self.episodes,
                 "current": list(self.current),
                 "history": {str(k): list(v) for k, v in self.history.items()},
@@ -113,15 +117,19 @@ class Curriculum:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         result = cls(seed=int(data["seed"]))
         result.level = int(data["level"])
-        legacy = int(data.get("schema_version", 1)) < 2
+        schema_version = int(data.get("schema_version", 1))
+        legacy = schema_version < 2
         result.episodes = int(data["episodes"])
+        if not 0 <= result.level <= MAX_LEVEL:
+            raise ValueError(f"curriculum level must be in [0, {MAX_LEVEL}]")
         old_current = [bool(x) for x in data.get("current", [])]
         result.current.extend(old_current)
         saved_history = data.get("history", {})
         # Pre-86g stored level 6 as the mandatory-break room and level 7 as
         # the multi-room challenge. Shift those to 7 and 8; level 6 is new.
-        result.history = {i: deque(maxlen=300) for i in range(9)}
-        for old_level in range(9 if not legacy else 8):
+        result.history = {i: deque(maxlen=300) for i in range(LEVEL_COUNT)}
+        saved_level_count = LEVEL_COUNT if schema_version >= 3 else 9 if not legacy else 8
+        for old_level in range(saved_level_count):
             new_level = old_level if not legacy or old_level < 6 else old_level + 1
             result.history[new_level].extend(
                 bool(x) for x in saved_history.get(str(old_level), [])
