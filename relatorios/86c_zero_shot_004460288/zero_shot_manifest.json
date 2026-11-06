@@ -1,0 +1,26 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86b-gpu-2026-10-27\\universal-004460288",
+  "trained_steps": 4460288,
+  "sampled_frames": 1500,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "frames_per_scene": {
+    "Tutorial_01": 1500
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.21078601659979113,
+    "SOLID": 0.015850755445124477,
+    "PLATFORM": 0.0,
+    "HAZARD": null,
+    "ENEMY": 0.0,
+    "PLAYER": 0.057222974279636435,
+    "BREAKABLE": null,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

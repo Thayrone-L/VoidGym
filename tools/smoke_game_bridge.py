@@ -13,7 +13,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from hk_agent.supervisor import SupervisorServer
+from hk_agent.supervisor import CapturedFrame, SupervisorServer, require_png_frame
 
 
 def _sha256(path: Path) -> str:
@@ -32,6 +32,12 @@ def _save_hashes(save_root: Path) -> dict[str, str]:
         for path in sorted(save_root.glob("user*.dat*"))
         if path.is_file()
     }
+
+
+def _write_png_capture(output: Path, frame: CapturedFrame) -> None:
+    require_png_frame(frame)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(frame.data)
 
 
 def _request_close(process_id: int) -> int:
@@ -125,8 +131,7 @@ async def run(args: argparse.Namespace) -> int:
         captured_bytes = len(frame.data)
         if args.capture_output is not None:
             output = args.capture_output.resolve(strict=False)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(frame.data)
+            _write_png_capture(output, frame)
         released = await supervisor.send_command("RELEASE_ALL", {}, bridge=accepted)
         release_all_ok = released.message_type == "ACK"
         await asyncio.sleep(args.settle_seconds)

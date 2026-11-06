@@ -1,0 +1,48 @@
+Fra��o das classes no gabarito:
+  EMPTY: 43.8%
+  SOLID: 55.2%
+  PLATFORM: 0.0%
+  HAZARD: 0.0%
+  ENEMY: 0.5%
+  PLAYER: 0.5%
+  BREAKABLE: 0.0%
+  PICKUP: 0.0%
+  INTERACTIVE: 0.0%
+  EXIT: 0.0%
+  IGNORE: 0.0%
+{
+  "output": "relatorios\\86e_hk_capture_combat\\hk_gabarito.png",
+  "scene": "Tutorial_01",
+  "frames": 8,
+  "classes": [
+    "EMPTY",
+    "SOLID",
+    "PLATFORM",
+    "HAZARD",
+    "ENEMY",
+    "PLAYER",
+    "BREAKABLE",
+    "PICKUP",
+    "INTERACTIVE",
+    "EXIT"
+  ],
+  "class_fractions": {
+    "EMPTY": 0.4384645061728395,
+    "SOLID": 0.5517939814814815,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.0,
+    "ENEMY": 0.005111882716049383,
+    "PLAYER": 0.004629629629629629,
+    "BREAKABLE": 0.0,
+    "PICKUP": 0.0,
+    "INTERACTIVE": 0.0,
+    "EXIT": 0.0,
+    "IGNORE": 0.0
+  },
+  "largest_enemy_region_cells": 12,
+  "largest_enemy_region_screen_fraction": 0.009259259259259259,
+  "largest_enemy_region_frame": 3,
+  "warnings": [],
+  "source": "test",
+  "ignore_id": 255
+}

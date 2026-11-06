@@ -1,0 +1,26 @@
+{
+  "checkpoint": "runtime\\v2\\pretrain\\pretrain-resume-2026-10-23\\universal-000697088",
+  "trained_steps": 697088,
+  "sampled_frames": 2000,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "frames_per_scene": {
+    "Tutorial_01": 2000
+  },
+  "action_history_available": true,
+  "iou": {
+    "EMPTY": 0.011448204921468313,
+    "SOLID": 0.013169063927745916,
+    "PLATFORM": 0.0,
+    "HAZARD": null,
+    "ENEMY": null,
+    "PLAYER": 0.0,
+    "BREAKABLE": null,
+    "PICKUP": null,
+    "INTERACTIVE": 0.0,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

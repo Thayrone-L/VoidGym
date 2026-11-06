@@ -1,0 +1,30 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86e-final-resume4-2026-11-03-cuda\\universal-012438528",
+  "trained_steps": 12438528,
+  "capture_dir": "E:\\VoidGymRuntime\\86f-manual-capture\\session-20261031-141148\\frames",
+  "device": "cuda",
+  "capture_frames_available": 723,
+  "menu_frames_excluded_by_order": 0,
+  "almost_black_frames_excluded": 12,
+  "frames_evaluated": 711,
+  "action_history_available": false,
+  "action_history_used": "zero-filled (the manual recapture stores no decisions)",
+  "sample_sha256": "21f8a3a490e21f3dfc308edd3295b6ddbb8d36cb80b889150ad749918605ec91",
+  "iou": {
+    "EMPTY": 0.46602714996194755,
+    "SOLID": 0.08776465083635512,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.009171195652173914,
+    "ENEMY": 0.001996637242538882,
+    "PLAYER": 0.04991337348403597,
+    "BREAKABLE": 0.0,
+    "PICKUP": null,
+    "INTERACTIVE": 0.03510632031572127,
+    "EXIT": 0.001055880441845354
+  },
+  "solid_support_cells": 390910,
+  "solid_predicted_empty_cells": 328889,
+  "solid_predicted_empty_fraction": 0.8413419968790771,
+  "confusion_csv": "C:\\VoidGym\\relatorios\\87_perception_initial\\traversal-b\\confusion.csv",
+  "solid_row_csv": "C:\\VoidGym\\relatorios\\87_perception_initial\\traversal-b\\solid_row.csv"
+}

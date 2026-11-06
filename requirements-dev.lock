@@ -3,6 +3,7 @@
 cloudpickle==3.1.2
 colorama==0.4.6
 Farama-Notifications==0.0.6
+fsspec==2026.9.0
 gymnasium==1.4.0
 iniconfig==2.3.1
 librt==0.16.0
@@ -18,3 +19,15 @@ pytest==9.1.1
 ruff==0.17.0
 safetensors==0.8.0
 typing_extensions==4.16.0
+UnityPy==1.25.4
+astc-encoder-py==0.1.12
+archspec==0.2.6
+attrs==26.1.0
+brotli==1.2.0
+etcpak==0.9.15
+fmod_toolkit==0.1.3
+lz4==4.4.5
+Pillow==12.3.0
+pyfmodex==0.7.2
+texture2ddecoder==1.0.6
+tpk_ar==0.2.4

@@ -1,0 +1,50 @@
+Relatório 67 — Desempenho do ator e farm
+Data: 2026-10-20
+
+Resumo
+- Instrumentação do laço do ator, redução de gravações síncronas e otimização incremental das janelas de farm implementadas nos commits abaixo.
+- Painel atualizado com passos/s por instância e detalhamento do perfil por etapa. Alerta novo de farm inclui `farm_component:<componente>` quando um componente ultrapassa o limiar.
+- Campanha `jogada-1`, versão 15, retomada do checkpoint 58. O painel ficou em http://127.0.0.1:8766/ e a campanha permaneceu ativa na última verificação.
+- O soak durou mais de 15 minutos (22:01:43–22:20:19, horário local). Resultado operacional: PARCIAL. Houve uma desconexão do bridge e reinicialização automática do ator 0; a rodada 60 terminou com apenas o ator 1. O ator 0 substituto voltou a coletar, sem ainda completar um novo par de rollouts antes deste registro.
+
+Medição por ator
+Amostras dos rollouts de 512 passos capturados com o build atualizado, no início da execução v15:
+
+| Ator | Rodadas amostradas | Coleta por lote | Velocidade | `env_step_ms` | Forward da política | Recompensa/log |
+|---|---|---:|---:|---:|---:|---:|
+| slot 0 | 58–59 | 71,6–72,8 s | 7,03–7,15 passos/s | 131,7–133,8 ms | 6,67–6,92 ms | 16,2–16,7 ms |
+| slot 1 | 58–61 | 74,3–76,2 s | 6,72–6,89 passos/s | 137,1–140,4 ms | 6,68–6,89 ms | 16,5–17,2 ms |
+
+Outros timings médios observados por etapa: máscara de ação ~0,08–0,09 ms; conversão da observação ~0,05 ms; transferência da ação ~0,02 ms; callback ~0,85–0,99 ms; buffer ~0,29–0,32 ms. `task_journey_and_observation_ms` ficou em ~0,72–0,87 ms. Gravações de conhecimento do jogador ficaram entre ~3,0 e 6,5 ms; diário entre ~4,1 e 6,6 ms. A coleta ponta a ponta estimada pelo lote foi ~140–152 ms/passo: abaixo dos ~220–390 ms/passo relatados antes, porém ainda acima da meta de ~130 ms.
+
+Soak e incidências
+- v15 iniciou às 22:01:43 local usando `round-00000058.zip`; ambos os slots coletaram as rodadas 58 e 59 sem rollouts obsoletos nesses lotes.
+- Na rodada 60, o processo original do slot 0 falhou durante uma reinicialização de ambiente: `ConnectionError: Bridge disconnected` no menu bootstrap; a transação terminou com código 1. O supervisor iniciou o substituto `launch-20261020T011204-48ff66` às 22:13:29. O novo processo estava `COLLECTING` na rodada 60 na última checagem.
+- O learner avançou a rodada 60 com `actors_received=[1]`, 512 transições e `wait_rollouts_ms=600031`; a rodada 61 estava em 49.664 passos treinados. Não houve rollouts obsoletos registrados nessa rodada. O total de 4 rejeições e 5 rollouts obsoletos no manifesto é histórico da campanha, não uma contagem nova do soak.
+- O único alerta presente no manifesto é o legado `component_over_60_percent`, herdado de rodadas anteriores. Nenhum novo alerta de farm ocorreu durante o soak; por isso não há componente novo a detalhar. O caminho atualizado grava `farm_component:<nome>` quando o limiar dispara.
+- Saves da tentativa v14 iniciada pelo painel antigo foram restaurados pela parada segura. v15 retomou do checkpoint 58 e manteve saves isolados por instância.
+- A última leitura confirmou três processos ativos (learner + dois slots), dashboard acessível, última checkpoint `round-00000060.zip`. A campanha ficou rodando após o soak.
+
+Validação de código (antes do soak, após as alterações de código)
+- `ruff check src tests tools`: passou.
+- `mypy src`: passou, sem problemas em 54 arquivos.
+- `pytest` completo: 636 passaram, 2 ignorados, 3 warnings e 8 subtests.
+- `git diff --check`: passou.
+
+Commits no PR #8
+- `ccf68b3 Speed up actor loop and fix per-slice reward caps in continuous play`
+- `17a55f4 Make rolling farm telemetry incremental`
+- Este relatório será adicionado em commit próprio e enviado ao mesmo PR.
+
+Conclusão
+O profiling confirmou a melhora substancial no laço do ator e identificou `env_step`/bridge como o maior custo remanescente. A janela móvel de farm e o decaimento vitalício permanecem no código validado. O soak atingiu a duração solicitada, mas fica registrado como parcial devido à desconexão do bridge, à reinicialização automática e à rodada 60 sem o par completo. A campanha permanece ativa para que o slot substituto possa retomar a contribuição compartilhada.
+
+Atualização de encerramento — 2026-10-20 (sessão da noite)
+- A retomada v17 a partir de `round-00000073.zip` expôs uma exceção em `_commit_continuous_budget`: havia um bloco duplicado após o laço que dependia de `name`/`amount` mesmo com a fila vazia. Foi removido e coberto por testes de lote vazio e de commit único.
+- A memória vitalícia de abates agora avança em todo abate confirmado, mesmo quando o orçamento do trecho ou da janela já acabou, e grava o arquivo em lotes de 32 passos ou ao fechar/resetar o ator. Isso impede que um tipo na mesma cena volte a ganhar recompensa por não ter sido contado durante uma janela saturada. A curva contínua segue `1/(1+visitas)^2`; o orçamento continua limitado pelo trecho desde descanso/recarga e pela janela móvel de 236 buckets × 64 passos (15.104 passos).
+- A instrumentação inclui os tempos do backend no info do ambiente e os repassa pela tarefa; o painel lista aplicar/capturar/decode, além de política, conhecimento, diário, recompensa/log e buffer. O forward dos atores usa uma thread PyTorch; configuração do learner: 3 threads intra-op e 1 inter-op.
+- A coleta v18 publicou uma rodada completa com os dois slots: 1.024 transições, total de 61.440 → 62.464 passos, rodada 73 → 74. Medidas por ator nessa coleta: slot 0, 72,9 s/lote, 7,02 passos/s, política 7,21 ms, `env_step` 133,77 ms; slot 1, 75,2 s/lote, 6,80 passos/s, política 6,92 ms, `env_step` 138,60 ms. Diário ~4,2–4,5 ms e recompensa/log ~17,9 ms. Esses perfis foram coletados antes da propagação final dos tempos do bridge, portanto esta rodada não fornece valores novos de captura/decode.
+- Depois do pedido do usuário para parar por hoje, v19 não foi iniciada e o soak não foi continuado. A parada segura deixou `active_count=0`, `learner.json=CANCELLED`, saves restaurados (`saves_restored=true`, `safe=true`) e `round-00000074.zip` como checkpoint mais recente. O snapshot do painel ainda reportou `last_completion=FAILED` por uma falha de ator da tentativa v17; a rodada v18 foi publicada com os dois atores antes da parada.
+- O componente de farm observado no manifesto foi `farm_component:novelty`, junto de `component_over_60_percent`; não há evidência de que abates tenham sido o componente dominante nesse período. Nenhum peso da UI foi alterado.
+- Validação final após as correções: `ruff check src tests` passou; `mypy src` passou sem problemas em 54 arquivos; pytest completo: 641 passaram, 2 pulados, 3 warnings e 8 subtests.
+- O soak adicional de 2 minutos com captura/decode instrumentados e a confirmação de 15 minutos não foram concluídos porque o usuário pediu para encerrar a sessão. A campanha está parada para retomada posterior a partir da rodada 74.

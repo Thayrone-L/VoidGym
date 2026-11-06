@@ -112,6 +112,15 @@ def run(args: argparse.Namespace) -> int:
             "timeout_seconds": args.timeout,
             "close_timeout_seconds": args.close_timeout,
         }
+        if args.instance_data_root is not None:
+            if args.expected_product_name is None:
+                raise ConfigError("--expected-product-name is required with --instance-data-root")
+            request.update({
+                "instance_data_root": str(args.instance_data_root.resolve(strict=False)),
+                "expected_product_name": args.expected_product_name,
+            })
+        elif args.expected_product_name is not None:
+            raise ConfigError("--expected-product-name requires --instance-data-root")
         if args.mode == "menu":
             if args.capture_output is not None:
                 raise ConfigError("--capture-output is only valid in smoke mode")
@@ -200,6 +209,8 @@ def run(args: argparse.Namespace) -> int:
             result = {
                 "ok": False,
                 "failure": "Session worker did not produce a result",
+                "transaction_stdout": completed.stdout.strip()[-4000:],
+                "transaction_stderr": completed.stderr.strip()[-4000:],
             }
         result["transaction_exit_code"] = completed.returncode
         if completed.returncode != 0:
@@ -220,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--game-profile")
     parser.add_argument("--game-argument", action="append", default=[])
     parser.add_argument("--instance-id", default="isolated-smoke-01")
+    parser.add_argument("--instance-data-root", type=Path)
+    parser.add_argument("--expected-product-name")
     parser.add_argument("--mode", choices=("smoke", "menu", "interactive"), default="smoke")
     parser.add_argument("--capture-output", type=Path)
     parser.add_argument(

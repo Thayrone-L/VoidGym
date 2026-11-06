@@ -1,0 +1,7 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86d-long-2026-10-29-cuda\\universal-009235520",
+  "trained_steps": 9235520,
+  "episodes_per_level": 100,
+  "level7_sets": 30,
+  "perception_frames": 6480000
+}

@@ -1,0 +1,38 @@
+PROMPT 53 — registro robusto de salas no mapa
+Data: 2026-10-18
+
+Diagnóstico de Tutorial_01
+- Captura do jogo: 600×338 px, capturada na janela do agente; histórico de telemetria descreve a janela nominal de 960×540 (fator de escala 0,625). O HUD fica no canto superior esquerdo; a imagem tem bordas escuras/vinheta e partículas/iluminação variável.
+- Arte local: PNG do mapa 72.622×48.128 px. É uma ilustração geral do mapa, não uma captura de gameplay nem a mesma textura da cena renderizada; matching por pixels tem incompatibilidade de domínio.
+- Há três capturas armazenadas de Tutorial_01. Somente uma tem scene_bounds válidos e posição de câmera (camera_x=36,46; camera_y=14,11); as outras duas têm map_view vazio. Nenhuma tem mapZone, portanto não há metadado confiável para restringir a região geográfica.
+- A miniatura lado a lado em tutorial-01-diagnostico.png mostra a captura e a melhor região candidata. O retângulo cai em área escura do mapa sem correspondência visual clara com a cena. Mantive a região como candidata, sem usá-la como posição definitiva.
+
+Alterações
+- Busca multi-escala geométrica de 0,3× a aproximadamente 3,0×, em fator 1,25, com refinamento no mapa em resolução maior.
+- A comparação usa gradiente de bordas, normalizado por captura para reduzir variação de brilho. A máscara exclui o HUD superior esquerdo e margens com vinheta.
+- A confiança agora combina similaridade, distinção do melhor pico frente a alternativas próximas e compatibilidade da energia de bordas. Isso rejeita o falso match em área preta que anteriormente podia aparentar alta similaridade.
+- Matching de sala considera capturas com bounds e câmera válidos; a consistência das posições candidatas em relação ao movimento de câmera reduz a confiança quando há divergência. Menos de quatro vistas válidas limita o fator de consistência a 0,65.
+- A calibração local mantém a caixa candidata em coordenadas numéricas. O painel a desenha tracejada em amarelo e mostra a captura selecionada para orientar uma calibração manual de duas âncoras. O salvamento manual remove a caixa automática anterior.
+- Nenhum candidato é automaticamente posicionado abaixo de confiança 0,75. Dados de mapZone não foram fabricados; não havia esse campo nas capturas disponíveis.
+
+Resultado nas capturas reais disponíveis
+- Tutorial_01: 3 capturas encontradas; 1 elegível para registro robusto (a única com camera e scene_bounds). Confiança final 0,1835498, consistência de captura 0,65 (somente uma vista válida); posicionada=false.
+- Nas três miniaturas comparadas separadamente, os melhores retângulos ficaram em regiões diferentes e escuras do mapa, e as duas capturas sem telemetria válida não serviram como confirmação de câmera. Os melhores candidatos do primeiro estágio não foram tratados como calibrações.
+- A caixa candidata registrada no arquivo de evidência é x=60.105,2, y=21.977,1, width=832,1, height=469,9 em pixels da arte. A inspeção visual não identificou dois marcos correspondentes entre captura e mapa; Tutorial_01 continua sem posicionamento.
+
+Passo a passo para calibração manual de Tutorial_01
+1. No painel local, abra Jornada e a seção “Posicionar uma sala manualmente”.
+2. Selecione Tutorial_01 e a captura do jogo. A caixa tracejada amarela indica apenas a hipótese automática; use zoom/arraste no mapa para encontrar pontos visualmente correspondentes.
+3. Clique num marco visível na captura e depois no mesmo marco na arte do mapa; repita com um segundo marco separado do primeiro.
+4. Confira o alinhamento sugerido e clique “Salvar posicionamento”. Se não for possível reconhecer dois marcos iguais nas duas imagens, não salve: mantenha a sala não posicionada.
+
+Validação
+- .venv\Scripts\ruff.exe check src tests: passou.
+- .venv\Scripts\mypy.exe src: passou (45 arquivos).
+- .venv\Scripts\python.exe -m pytest -q: 564 passed, 2 skipped, 8 subtests passed. Os testes de socket loopback foram executados com permissão de rede local; basetemp curto em %TEMP% evitou limitações de caminho do Windows e o teste de reparse point do OneDrive.
+- node --check src/hk_agent/control_plane_web/app.js: passou.
+- Testes sintéticos novos cobrem busca em escalas amplas, brilho, máscara HUD, falso positivo de imagem uniforme, consistência/outlier entre câmeras e exigência de múltiplas vistas.
+- Imagem comparativa e JSON auxiliar ficam apenas em agent-prompts\relatorios\53_registro\ (ignorado pelo Git). Nenhuma imagem do mapa ou tile foi adicionada ao repositório.
+
+Limitação
+- O matching automático continua sem evidência suficiente para posicionar Tutorial_01. A calibração manual depende de duas correspondências visuais reconhecíveis; a captura atual e a arte do mapa não as tornam óbvias. Não abri jogo nem alterei campanhas.

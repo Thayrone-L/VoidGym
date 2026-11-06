@@ -1,0 +1,21 @@
+Relatório 52a — jornada, explore_v4 e implantação
+Data: 2026-10-18 (America/Sao_Paulo)
+
+Código e validação
+- Commit solicitado: f84af9a — Add run journey telemetry, explore_v4 rewards and schematic journey panel.
+- Correção adicional necessária para testar: 04af932 — Allow explore_v4 in the training CLI; b7de7d7 — Route v3 warm-start to the shared learner. Os três commits estão enviados a origin/codex/parallel-instances-isolation (PR #8).
+- ruff: passou. mypy src: 44 arquivos sem erros. pytest: 553 passed, 2 skipped, 8 subtests passed (63.47 s). Teste focado do encaminhamento learner/actor: 1 passed.
+- Build e testes C# do commit de telemetria: 0 warnings/erros, conforme validação anterior à rodada real; nenhum arquivo C# mudou nesta correção.
+- DLL compilada e implantada nas duas instâncias com SHA-256 idêntico: ae39c5f835d163acd758472773bfde2dc42b430dde6a637ed1bbc40090f45a66.
+
+Rodada real curta
+- ControlPlane de dono único; sem Steam e sem HK pessoal. Campanha explore-v4: explore-v3-short-retry-20261018-v4-9abc, um ator, slot 0, execução isolada.
+- Warm-start confirmado no comando do learner a partir de C:\Users\thayr\Games\HollowKnight-AI\runtime\shared\explore-v3-short-retry-20261018\checkpoints\round-00000002.zip (campanha origem explore-v3-short-retry-20261018). Flags ausentes do comando do ator após a correção.
+- Duração observada: 308.5 s (mais de cinco minutos). Resultado: 256 passos, 2 atualizações do learner, 4 runs registrados, 1 cena distinta; todos os episódios observados ficaram em Tutorial_01 (nome exibido em português no mapa esquemático: Passagem do Rei). Nenhuma morte; nenhum grub, chefe, item ou marco conquistado.
+- Diário/índice gravou quatro episódios e a rota Tutorial_01. Os arquivos de diário existem em runtime/shared/<campanha>/journey/actor-0/. O primeiro relatório do painel mostra o mapa esquemático e o nome Passagem do Rei.
+- Limitação observada: positions e events vieram vazios nos episódios; geo permaneceu nulo. Assim, a rodada confirmou cena/rota e persistência do diário, mas não confirmou coordenadas nem eventos de jogo, capturas de marcos ou taxas de novidade. O painel e os registros consultados não expõem amostras/novidade separadas por grupo de ação (NOOP, mover, atacar); não há taxa válida a relatar nesta execução. O painel mostrou zero marcos.
+- Sem mortes ou mudanças de progresso que demandassem restaurar save diferente; a parada segura registrou final_save_status=captured para o ator e not_applicable para o learner. ControlPlane retornou active_count=0.
+
+Estado final
+- Jogo, atores, learner e ControlPlane deixados parados. As cópias gerenciadas permaneceram separadas dos saves pessoais.
+- Arte de fundo do mapa continua fora do escopo do 52a (separada para 52b); controles de baixar/importar mapa permanecem ocultos até a arte ser exibida.

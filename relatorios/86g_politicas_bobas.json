@@ -1,0 +1,17 @@
+{
+  "rooms_per_level": 200,
+  "max_actions_per_room": 300,
+  "multiroom_max_actions": 600,
+  "policies": ["RIGHT", "RIGHT+JUMP_TAP", "RANDOM_UNIFORM"],
+  "levels": {
+    "2": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 3, "RIGHT+JUMP_TAP": 5, "RANDOM_UNIFORM": 1}, "policy_failure_rates": {"RIGHT": 0.985, "RIGHT+JUMP_TAP": 0.975, "RANDOM_UNIFORM": 0.995}, "all_baselines_fail_at_least_80_percent": true},
+    "3": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 40, "RIGHT+JUMP_TAP": 23, "RANDOM_UNIFORM": 15}, "policy_failure_rates": {"RIGHT": 0.8, "RIGHT+JUMP_TAP": 0.885, "RANDOM_UNIFORM": 0.925}, "all_baselines_fail_at_least_80_percent": true},
+    "4": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 0, "RIGHT+JUMP_TAP": 0, "RANDOM_UNIFORM": 16}, "policy_failure_rates": {"RIGHT": 1.0, "RIGHT+JUMP_TAP": 1.0, "RANDOM_UNIFORM": 0.92}, "all_baselines_fail_at_least_80_percent": true},
+    "5": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 35, "RIGHT+JUMP_TAP": 4, "RANDOM_UNIFORM": 5}, "policy_failure_rates": {"RIGHT": 0.825, "RIGHT+JUMP_TAP": 0.98, "RANDOM_UNIFORM": 0.975}, "all_baselines_fail_at_least_80_percent": true},
+    "6": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 0, "RIGHT+JUMP_TAP": 0, "RANDOM_UNIFORM": 2}, "policy_failure_rates": {"RIGHT": 1.0, "RIGHT+JUMP_TAP": 1.0, "RANDOM_UNIFORM": 0.99}, "all_baselines_fail_at_least_80_percent": true},
+    "7": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 0, "RIGHT+JUMP_TAP": 0, "RANDOM_UNIFORM": 3}, "policy_failure_rates": {"RIGHT": 1.0, "RIGHT+JUMP_TAP": 1.0, "RANDOM_UNIFORM": 0.985}, "all_baselines_fail_at_least_80_percent": true},
+    "8": {"solver_success_rate": 1.0, "policy_successes": {"RIGHT": 0, "RIGHT+JUMP_TAP": 0, "RANDOM_UNIFORM": 0}, "policy_failure_rates": {"RIGHT": 1.0, "RIGHT+JUMP_TAP": 1.0, "RANDOM_UNIFORM": 1.0}, "all_baselines_fail_at_least_80_percent": true}
+  },
+  "level8_door_without_ability": {"solver_successes": 0, "sets": 200, "failure_rate": 1.0},
+  "level6_never_attack_solver": {"successes": 0, "rooms": 200, "failure_rate": 1.0}
+}

@@ -1,0 +1,25 @@
+ETAPA 61 — GERENCIAR AMULETOS NO BANCO
+Data: 2026-10-19
+Workspace: C:\VoidGym
+Estado: AMARELO — validação em jogo pendente de alcance
+
+Implementação
+- Ação OPEN_CHARMS somente sentada no banco, com máscara de menu dedicada e bindings reais do bridge para PAUSE, submit e cancel.
+- Telemetria do bridge inclui menu/cursor, bitmask de 40 amuletos equipados e entalhes usados/total; memória pessoal só equipa amuletos obtidos.
+- Enumerador determinístico limitado a 256 loadouts válidos pela capacidade. Macro de navegação exige banco+menu, valida PNG de referência a cada pulso e sai/aborta com liberação segura dos controles.
+- Diário registra loadout por trecho com frames, geo, dano, inimigos derrotados e mortes observados; painel exibe resultados sem atribuir causalidade nem criar recompensa de troca.
+- Schemas pessoais/contrato atualizados com leitura dos formatos anteriores; docs e painel atualizados.
+
+Validação offline
+- Ruff: passou; mypy src: passou (50 arquivos).
+- Pytest completo: 598 passed, 2 skipped, 8 subtests (113,33 s); testes focados: 84 passed.
+- Bridge Release: 0 warnings/errors; HkAgentBridge.CorrelationTests passou, incluindo bit 40, entalhes e cursor/menu.
+- node --check app.js: passou. Diff check: limpo.
+
+Jogo e implantação
+- DLL Release implantada em hk-ai-1 e hk-ai-2; SHA-256 igual: F56D39337B2FF9B3E331C5FF7C02358C358329985A2DE2E9A1BABB270E16C30C.
+- Smoke isolado por 300 s: bridge carregado, handshake e heartbeat válidos, 15 PNGs 600x338, RELEASE_ALL, client_close, exit code 0, sem erro/crash. Cena inicial Menu_Title.
+- AMARELO porque chegar ao banco de Dirtmouth exigiria avançar o save; para preservar o estado de teste não navegamos em jogo. O fluxo completo de macro/menu foi verificado ponta a ponta com bridge falso e PNGs sintéticos. A captura ao vivo está em artifacts\scripted-validation\61\smoke\.
+- Inventário do save isolado restaurado byte a byte: 176 arquivos, 8.612.594 bytes; saves pessoal/baseline intocados; nenhum processo de jogo/campanha ficou ativo.
+
+Próximo: etapa 62 (LSTM recorrente com máscara).
