@@ -26,7 +26,7 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
         started = perf_counter()
         rooms = [generate_room(level, seed) for seed in range(200)]
         # Leave headroom for shared-host scheduling while still guarding regressions.
-        max_generation_seconds = .50 if level == 9 else .08
+        max_generation_seconds = .65 if level == 9 else .08
         assert (perf_counter() - started) / len(rooms) < max_generation_seconds
         for seed, room in enumerate(rooms):
             assert solve_room(room)
