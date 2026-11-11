@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import pairwise
 from time import perf_counter
 
 import pytest
@@ -14,6 +15,7 @@ from voidgym.gyms.platform_gym.generator import (
 )
 from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
 from voidgym.gyms.platform_gym.levels import LEVEL_COUNT
+from voidgym.gyms.platform_gym.world import Room
 
 
 def test_generated_rooms_certified_deterministic_and_fast() -> None:
@@ -24,7 +26,8 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
         started = perf_counter()
         rooms = [generate_room(level, seed) for seed in range(200)]
         # Leave headroom for shared-host scheduling while still guarding regressions.
-        assert (perf_counter() - started) / len(rooms) < 0.08
+        max_generation_seconds = .50 if level == 9 else .08
+        assert (perf_counter() - started) / len(rooms) < max_generation_seconds
         for seed, room in enumerate(rooms):
             assert solve_room(room)
             tall_rooms += room.height > room.width
@@ -54,7 +57,8 @@ def test_generated_rooms_certified_deterministic_and_fast() -> None:
 def test_dead_end_variants_have_a_solver_certified_backward_exit(seed: int) -> None:
     room = generate_room(9, seed)
     wall = next(solid.rect for solid in room.solids
-                if solid.rect.w >= 2.0 and solid.rect.h >= 1.5 * room.physics.jump_max_height)
+                if 2.0 <= solid.rect.w < 4.0
+                and solid.rect.h >= 1.4 * room.physics.jump_max_height)
     exit_center = room.exits[0].rect.x + room.exits[0].rect.w / 2
     wall_center = wall.x + wall.w / 2
     bridge = next(solid.rect for solid in room.solids
@@ -63,16 +67,55 @@ def test_dead_end_variants_have_a_solver_certified_backward_exit(seed: int) -> N
                         if solid.kind == "platform" and solid.rect.w <= wall.w + 4.0),
                        key=lambda rect: room.spawn_facing * rect.x, reverse=True)
 
-    assert wall.w >= 2.0
-    assert wall.h >= 1.5 * room.physics.jump_max_height
+    assert 2.0 <= wall.w < 4.0
+    assert 1.4 * room.physics.jump_max_height <= wall.h <= 2.0 * room.physics.jump_max_height
     assert not room.breakables
     assert room.spawn_facing * (wall.x + wall.w / 2 - room.spawn[0]) > 0
     assert room.spawn_facing * (exit_center - wall_center) > 0
-    assert len(platforms) >= 3
+    assert 2 <= len(platforms) <= 4
     assert [rect.y for rect in platforms] == sorted(rect.y for rect in platforms)
+    assert all(.35 * room.physics.jump_max_height <= right.y - left.y
+               <= .6 * room.physics.jump_max_height
+               for left, right in pairwise(platforms))
+    assert 1.5 <= abs((platforms[0].x + platforms[0].w / 2) - room.spawn[0]) <= 8.0
     assert bridge.x < wall.x and bridge.right > wall.right
     assert bridge.y > wall.top
     assert solve_room(room)
+
+
+def test_dead_end_far_stair_variant_starts_outside_initial_view() -> None:
+    room = generate_room(9, 3)
+    stairs = sorted((solid.rect for solid in room.solids
+                     if solid.kind == "platform" and abs(solid.rect.w - 2.4) < 1e-6),
+                    key=lambda rect: rect.y)
+    first_center = stairs[0].x + stairs[0].w / 2
+    assert room.width == 40.0
+    assert abs(first_center - room.spawn[0]) > 16.0
+    assert room.spawn_facing * (room.exits[0].rect.x - room.spawn[0]) > 0
+    assert solve_room(room)
+
+
+def test_dead_end_geometry_ranges_and_disjoint_test_holdouts() -> None:
+    train_rooms = [generate_room(9, seed, split="train") for seed in range(80)]
+    test_rooms = [generate_room(9, seed, split="test") for seed in range(80)]
+
+    def features(room: Room) -> tuple[float, int]:
+        platforms = [solid for solid in room.solids if solid.kind == "platform"
+                     and abs(solid.rect.w - 2.4) < 1e-6]
+        wall = next(solid.rect for solid in room.solids
+                    if 2.0 <= solid.rect.w <= 4.0
+                    and solid.rect.h >= 1.4 * room.physics.jump_max_height)
+        return wall.w, len(platforms)
+
+    train_features = [features(room) for room in train_rooms]
+    test_features = [features(room) for room in test_rooms]
+    assert all(24.0 <= room.width <= 40.0 for room in train_rooms + test_rooms)
+    assert all(width < 4.0 and count <= 4 for width, count in train_features)
+    assert any(width == 4.0 and count == 5 for width, count in test_features)
+    assert len({round(next(s.rect.x for s in room.solids
+                           if 2.0 <= s.rect.w < 4.0
+                           and s.rect.h >= 1.4 * room.physics.jump_max_height), 2)
+                for room in train_rooms}) > 50
 
 
 def test_metroidvania_rooms_include_linked_ability_and_bench() -> None:

@@ -52,7 +52,7 @@ class PlatformGymAdapter:
     def __init__(self, *, level: int = 0, seed: int = 0, split: Split = "train") -> None:
         self.level, self.seed, self.split = level, seed, split
         self._rooms = (generate_room_set(seed) if level == MULTI_ROOM_LEVEL
-                       else [generate_room(level, seed)])
+                       else [generate_room(level, seed, split=split)])
         self._room_index = 0
         self.room = self._rooms[0]
         if level != MULTI_ROOM_LEVEL:
@@ -72,7 +72,8 @@ class PlatformGymAdapter:
             self.seed = seed
         self._room_counter = 0
         self._rooms = (generate_room_set(self.seed) if self.level == MULTI_ROOM_LEVEL
-                       else [generate_room(self.level, self.seed + self._room_counter)])
+                       else [generate_room(self.level, self.seed + self._room_counter,
+                                           split=self.split)])
         self._room_index = 0
         self.room = self._rooms[0]
         if self.level != MULTI_ROOM_LEVEL:
@@ -134,7 +135,8 @@ class PlatformGymAdapter:
                 elif self.level in {MULTI_ROOM_LEVEL, DEAD_END_LEVEL}:
                     self._finished = True
                 else:
-                    self.room = generate_room(self.level, self.seed + self._room_counter)
+                    self.room = generate_room(self.level, self.seed + self._room_counter,
+                                              split=self.split)
                     self.room.id = self._room_counter
                     self.player = Player(*self.room.spawn, on_ground=True,
                                          facing=self.room.spawn_facing)

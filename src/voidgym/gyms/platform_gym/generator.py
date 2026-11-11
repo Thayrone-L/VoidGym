@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from voidgym.gyms.platform_gym.levels import DEAD_END_LEVEL, MAX_LEVEL
-from voidgym.gyms.platform_gym.params import PhysicsParams
+from voidgym.gyms.platform_gym.params import PhysicsParams, Split
 from voidgym.gyms.platform_gym.solver import solve_room, solve_room_set
 from voidgym.gyms.platform_gym.world import (
     Breakable,
@@ -99,30 +101,107 @@ def _make(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
     return room
 
 
-def _make_dead_end(seed: int, variant: int) -> Room:
-    """Build a certified lesson where the wall-facing route is a dead end."""
+class _DeadEndLayout(NamedTuple):
+    width: float
+    facing: int
+    wall_width: float
+    step_count: int
+    spacing: float
+    spawn_distance: float
+    spawn_wall_gap: float
+    wall_x: float
+    wall_height: float
+    rise: float
+
+
+def _sample_dead_end_layout(rng: np.random.Generator, physics: PhysicsParams,
+                            variant: int, split: Split) -> _DeadEndLayout:
+    """Sample a room layout while keeping its stair route inside the room."""
+    if variant not in range(4):
+        raise ValueError("dead-end variant must be in [0, 3]")
+    if split not in {"train", "test"}:
+        raise ValueError("split must be train or test")
+    # Variant iv deliberately uses a wide room so its first step lies outside the
+    # initial camera span while remaining inside the floor bounds.
+    width = 40.0 if variant == 3 else float(rng.uniform(24.0, 40.0))
+    facing = (-1 if rng.random() < .5 else 1) if variant == 3 else (-1 if variant == 2 else 1)
+    holdout_room = split == "test" and rng.random() < .25
+    wall_width = (4.0 if holdout_room
+                  else float(rng.uniform(2.0, 4.0 if split == "test" else np.nextafter(4.0, 2.0))))
+    step_count = (5 if holdout_room
+                  else int(rng.integers(2, 5)))
+    if variant == 3:
+        step_count = 2
+    spacing = float(rng.uniform(1.8, 3.2))
+    spawn_distance = float(rng.uniform(17.0, 19.0) if variant == 3 else rng.uniform(1.5, 8.0))
+    spawn_wall_gap = float(rng.uniform(2.0, 6.0) if variant == 3 else rng.uniform(1.5, 8.0))
+    available_extent = width - wall_width - 3.8 - spawn_wall_gap - .6
+    required_extent = spawn_distance + (step_count - 1) * spacing + 1.2
+    if required_extent > available_extent:
+        # Keep each dimension in its requested range and reduce complexity only
+        # when a narrow room cannot physically contain the sampled combination.
+        step_count = 2
+        spacing = 1.8
+        spawn_distance = min(spawn_distance, max(1.5, available_extent - spacing - 1.2))
+        if spawn_distance + spacing + 1.2 > available_extent:
+            spawn_wall_gap = 1.5
+            available_extent = width - wall_width - 3.8 - spawn_wall_gap - .6
+            spawn_distance = max(1.5, available_extent - spacing - 1.2)
+    extent = spawn_distance + (step_count - 1) * spacing + 1.2
+    if facing > 0:
+        wall_min = max(3.8, extent + spawn_wall_gap + .6)
+        wall_max = width - wall_width - 3.8
+    else:
+        wall_min = 3.8
+        wall_max = min(width - wall_width - 3.8,
+                       width - wall_width - spawn_wall_gap - extent - .6)
+    if wall_max < wall_min:
+        # At the narrow-room edge, use the minimum still-valid obstacle spacing.
+        spawn_wall_gap = 1.5
+        step_count = 2
+        spacing = 1.8
+        spawn_distance = 1.5
+        extent = spawn_distance + spacing + 1.2
+        if facing > 0:
+            wall_min = max(3.8, extent + spawn_wall_gap + .6)
+            wall_max = width - wall_width - 3.8
+        else:
+            wall_min = 3.8
+            wall_max = min(width - wall_width - 3.8,
+                           width - wall_width - spawn_wall_gap - extent - .6)
+        if wall_max < wall_min:
+            raise RuntimeError("dead-end room dimensions do not fit sampled stair geometry")
+    wall_x = float(rng.uniform(wall_min, wall_max))
+    wall_height = physics.jump_max_height * float(rng.uniform(1.4, 2.0))
+    minimum_rise_ratio = max(.35, (wall_height / physics.jump_max_height - .82) / step_count)
+    rise = physics.jump_max_height * float(rng.uniform(minimum_rise_ratio, .6))
+    return _DeadEndLayout(width, facing, wall_width, step_count, spacing,
+                          spawn_distance, spawn_wall_gap, wall_x, wall_height, rise)
+
+
+def _make_dead_end(seed: int, variant: int, *, split: Split = "train") -> Room:
+    """Build a varied dead-end lesson; test-only geometry includes 4u/5-step rooms."""
     rng = np.random.default_rng(seed)
     physics = PhysicsParams.sample(rng)
+    layout = _sample_dead_end_layout(rng, physics, variant, split)
     floor = .6
-    width = 30.0
-    wall_width = 2.5
-    facing = -1 if variant == 2 else 1
-    wall_x = width * .67 if facing > 0 else width * .33 - wall_width
-    wall_height = physics.jump_max_height * 1.65
-    spawn_distance = 3.2 if variant != 1 else 8.0
-    spawn_x = wall_x - spawn_distance if facing > 0 else wall_x + wall_width + spawn_distance
+    width, facing = layout.width, layout.facing
+    wall_width, step_count = layout.wall_width, layout.step_count
+    spacing = layout.spacing
+    spawn_distance, spawn_wall_gap = layout.spawn_distance, layout.spawn_wall_gap
+    wall_x, wall_height, rise = layout.wall_x, layout.wall_height, layout.rise
+    spawn_x = wall_x - spawn_wall_gap if facing > 0 else wall_x + wall_width + spawn_wall_gap
     back = -facing
-    step_count = 4
-    rise = physics.jump_max_height * .5
     solids = [Solid(Rect(0.0, 0.0, width, floor)),
               Solid(Rect(wall_x, floor, wall_width, wall_height))]
     centers: list[float] = []
     for index in range(step_count):
-        center = spawn_x + back * (2.7 + index * 2.6)
+        center = spawn_x + back * (spawn_distance + index * spacing)
         centers.append(center)
         solids.append(Solid(Rect(center - 1.2, floor + (index + 1) * rise, 2.4, .22),
                             kind="platform"))
-    exit_y = floor + step_count * rise
+    stair_top = floor + step_count * rise + .22
+    exit_y = max(floor + step_count * rise, floor + wall_height + .25)
     room_height = exit_y + 2.5
     exit_x = width - 2.4 if facing > 0 else .6
     bridge_left = min(exit_x, centers[-1] - 1.2)
@@ -133,7 +212,7 @@ def _make_dead_end(seed: int, variant: int) -> Room:
         DEAD_END_LEVEL, width, room_height, solids, [], [], [], [], [],
         [Exit(Rect(exit_x, exit_y, 1.8, 1.4), DEAD_END_LEVEL + 1)], [],
         (spawn_x, floor), physics, seed, spawn_facing=facing,
-        solver_backtrack_waypoint=(centers[-1], exit_y + .22),
+        solver_backtrack_waypoint=(centers[-1], stair_top),
     )
     return room
 
@@ -282,14 +361,15 @@ def _mirror_room(room: Room) -> Room:
     return room
 
 
-def generate_room(level: int, seed: int, *, allow_vertical: bool = True) -> Room:
+def generate_room(level: int, seed: int, *, allow_vertical: bool = True,
+                  split: Split = "train") -> Room:
     """Generate a seeded level and retain it only when the physics solver completes it."""
     if not 0 <= level <= MAX_LEVEL:
         raise ValueError(f"level must be in [0, {MAX_LEVEL}]")
     if level == DEAD_END_LEVEL:
-        variant = seed % 3
+        variant = seed % 4
         for attempt in range(20):
-            room = _make_dead_end(seed + 1000 * attempt, variant)
+            room = _make_dead_end(seed + 1000 * attempt, variant, split=split)
             if solve_room(room):
                 return room
         raise RuntimeError("could not solve dead-end room within 20 seed attempts")

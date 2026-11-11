@@ -48,18 +48,23 @@ def _rollout(adapter: PlatformGymAdapter, policy: str, seed: int, max_actions: i
 
 
 def evaluate(*, count: int = 200, seed: int = 8600,
-             max_actions: int = 300) -> dict[str, Any]:
+             max_actions: int = 300, split: str = "test",
+             only_level: int | None = None) -> dict[str, Any]:
     if count < 1:
         raise ValueError("count must be positive")
     if max_actions < 1:
         raise ValueError("max_actions must be positive")
+    if split not in {"train", "test"}:
+        raise ValueError("split must be train or test")
+    levels = range(2, LEVEL_COUNT) if only_level is None else (only_level,)
     report: dict[str, Any] = {"rooms_per_level": count, "max_actions_per_room": max_actions,
                               "multiroom_max_actions": max_actions * 2,
+                              "split": split,
                               "policies": list(POLICIES),
                               "dead_end_policies": list(DEAD_END_POLICIES),
                               "levels": {}, "level8_door_without_ability": {},
                               "level6_never_attack_solver": {}}
-    for level in range(2, LEVEL_COUNT):
+    for level in levels:
         policies = DEAD_END_POLICIES if level == DEAD_END_LEVEL else POLICIES
         successes = {policy: 0 for policy in policies}
         solver_passes = 0
@@ -69,7 +74,7 @@ def evaluate(*, count: int = 200, seed: int = 8600,
             # Keep this fixed seed schedule aligned with eval_platform.py and
             # the 86i action-solver set so per-room outcomes can be joined.
             room_seed = seed + level * 10_000 + index * 10
-            adapter = PlatformGymAdapter(level=level, seed=room_seed, split="test")
+            adapter = PlatformGymAdapter(level=level, seed=room_seed, split=split)
             if level == MULTI_ROOM_LEVEL:
                 solver_passes += int(solve_room_set(deepcopy(adapter._rooms)))
                 without_ability = deepcopy(adapter._rooms)
@@ -120,19 +125,27 @@ def main() -> int:
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--seed", type=int, default=8600)
     parser.add_argument("--max-actions", type=int, default=300)
+    parser.add_argument("--split", choices=("test", "train"), default="test")
+    parser.add_argument("--only-level", type=int, choices=range(LEVEL_COUNT))
     parser.add_argument("--output", type=Path,
                         default=PROJECT_ROOT / "relatorios" / "86g_politicas_bobas.json")
     args = parser.parse_args()
-    report = evaluate(count=args.count, seed=args.seed, max_actions=args.max_actions)
+    report = evaluate(count=args.count, seed=args.seed, max_actions=args.max_actions,
+                      split=args.split, only_level=args.only_level)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
                            encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    criteria_met = (all(row["all_baselines_fail_at_least_80_percent"]
-                        and row["solver_success_rate"] == 1.0
-                        for row in report["levels"].values())
-                    and report["level8_door_without_ability"]["failure_rate"] == 1.0)
-    criteria_met &= report["level6_never_attack_solver"]["failure_rate"] >= .8
+    if args.only_level is None:
+        criteria_met = (all(row["all_baselines_fail_at_least_80_percent"]
+                            and row["solver_success_rate"] == 1.0
+                            for row in report["levels"].values())
+                        and report["level8_door_without_ability"]["failure_rate"] == 1.0)
+        criteria_met &= report["level6_never_attack_solver"]["failure_rate"] >= .8
+    else:
+        row = report["levels"][str(args.only_level)]
+        criteria_met = (row["all_baselines_fail_at_least_80_percent"]
+                        and row["solver_success_rate"] == 1.0)
     return 0 if criteria_met else 1
 
 

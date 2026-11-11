@@ -1,0 +1,34 @@
+{
+  "rooms_per_level": 200,
+  "max_actions_per_room": 300,
+  "multiroom_max_actions": 600,
+  "split": "test",
+  "policies": [
+    "RIGHT",
+    "RIGHT+JUMP_TAP",
+    "RANDOM_UNIFORM"
+  ],
+  "dead_end_policies": [
+    "FORWARD",
+    "FORWARD+JUMP_MAX",
+    "FORWARD+ATTACK"
+  ],
+  "levels": {
+    "9": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "FORWARD": 1,
+        "FORWARD+JUMP_MAX": 1,
+        "FORWARD+ATTACK": 1
+      },
+      "policy_failure_rates": {
+        "FORWARD": 0.995,
+        "FORWARD+JUMP_MAX": 0.995,
+        "FORWARD+ATTACK": 0.995
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    }
+  },
+  "level8_door_without_ability": {},
+  "level6_never_attack_solver": {}
+}
