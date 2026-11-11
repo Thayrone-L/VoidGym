@@ -211,3 +211,23 @@ def test_pretrain_commit_guard_accepts_safe_current_and_potential_commit(tmp_pat
     assert pretrain_platform._wait_for_pretrain_commit(
         tmp_path, 321, safe, snapshot_fn=lambda: safe,
     ) == safe
+
+
+def test_pretrain_commit_guard_can_wait_for_planner_headroom(tmp_path: Path) -> None:
+    gib = 2**30
+    snapshots = iter([
+        {"commit_available_bytes": 8 * gib, "potential_commit_available_bytes": 12 * gib},
+        {"commit_available_bytes": 10 * gib, "potential_commit_available_bytes": 12 * gib},
+    ])
+    now = [0.0]
+
+    result = pretrain_platform._wait_for_pretrain_commit(
+        tmp_path, 12_438_528, next(snapshots), snapshot_fn=lambda: next(snapshots),
+        minimum_current_bytes=pretrain_platform._MIN_PRETRAIN_PLAN_COMMIT_BYTES,
+        timeout_seconds=10, poll_seconds=5, monotonic_fn=lambda: now[0],
+        sleep_fn=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert result["commit_available_bytes"] == 10 * gib
+    assert now[0] == 5
+    assert json.loads((tmp_path / "heartbeat.json").read_text())["phase"] == "training"

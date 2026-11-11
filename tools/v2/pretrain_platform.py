@@ -254,6 +254,8 @@ def _memory_telemetry(device: torch.device,
 
 _MIN_PRETRAIN_CURRENT_COMMIT_BYTES = 3 * 2**30 // 2
 _MIN_PRETRAIN_POTENTIAL_COMMIT_BYTES = 3 * 2**30
+# plan_resources reserves 4 GiB for the system and 5.5 GiB for learner growth.
+_MIN_PRETRAIN_PLAN_COMMIT_BYTES = 10 * 2**30
 _PRETRAIN_MEMORY_WAIT_SECONDS = 30 * 60
 
 
@@ -262,6 +264,7 @@ def _wait_for_pretrain_commit(
     snapshot_fn: Callable[[], dict[str, Any]], timeout_seconds: float = _PRETRAIN_MEMORY_WAIT_SECONDS,
     poll_seconds: float = 5.0, monotonic_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], None] = time.sleep,
+    minimum_current_bytes: int = _MIN_PRETRAIN_CURRENT_COMMIT_BYTES,
 ) -> dict[str, Any]:
     """Wait between rounds for current commit to recover, failing on unsafe potential."""
     sample = initial_sample
@@ -275,7 +278,7 @@ def _wait_for_pretrain_commit(
         })
         raise MemoryError(failure)
     current = sample.get("commit_available_bytes")
-    if not isinstance(current, (int, float)) or current >= _MIN_PRETRAIN_CURRENT_COMMIT_BYTES:
+    if not isinstance(current, (int, float)) or current >= minimum_current_bytes:
         return sample
 
     waiting_since = monotonic_fn()
@@ -292,8 +295,7 @@ def _wait_for_pretrain_commit(
                 "reason": failure, "wait_seconds": elapsed, "memory_sample": sample,
             })
             raise MemoryError(failure)
-        if (isinstance(current, (int, float))
-                and current >= _MIN_PRETRAIN_CURRENT_COMMIT_BYTES):
+        if isinstance(current, (int, float)) and current >= minimum_current_bytes:
             heartbeat_path = root / "heartbeat.json"
             try:
                 heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
@@ -310,7 +312,9 @@ def _wait_for_pretrain_commit(
             _atomic_json(heartbeat_path, heartbeat)
             return sample
         if elapsed >= timeout_seconds:
-            failure = (f"commit stayed below 1.5 GiB for {timeout_seconds:.0f} seconds; "
+            minimum_gib = minimum_current_bytes / 2**30
+            failure = (f"commit stayed below {minimum_gib:g} GiB for "
+                       f"{timeout_seconds:.0f} seconds; "
                        "memory guard timed out")
             _atomic_json(root / "memory_guard_failure.json", {
                 "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -401,6 +405,33 @@ def _run_impl(args: argparse.Namespace) -> Path:
         raise SystemExit("CPU training not started; rerun with --allow-cpu to confirm")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but torch.cuda.is_available() is false")
+    initial_device = torch.device(
+        args.device or ("cuda" if (profile.gpu_memory_free_gb or 0.0) >= 6.0 else "cpu")
+    )
+    if args.device == "cuda" and (profile.gpu_memory_free_gb or 0.0) < 6.0:
+        raise SystemExit("CUDA requested but ResourcePlan requires at least 6 GiB of free VRAM")
+    if nvidia_smi and initial_device.type == "cpu" and not args.allow_cpu:
+        _cpu_fallback_warning("ResourcePlan selected CPU despite an NVIDIA GPU being present")
+        raise SystemExit("CPU training not started; rerun with --allow-cpu to confirm")
+    root: Path = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
+    root.mkdir(parents=True, exist_ok=True)
+    global _ACTIVE_RUN_INITIALIZED
+    _ACTIVE_RUN_INITIALIZED = True
+    source_steps = 0
+    if args.resume:
+        try:
+            source_manifest = json.loads((args.resume / "manifest.json").read_text(encoding="utf-8"))
+            source_steps = int(source_manifest.get("trained_steps", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            source_steps = 0
+    if initial_device.type == "cuda":
+        initial_memory = _memory_telemetry(initial_device, [])
+        _wait_for_pretrain_commit(
+            root, source_steps, initial_memory,
+            snapshot_fn=lambda: _memory_telemetry(initial_device, []),
+            minimum_current_bytes=_MIN_PRETRAIN_PLAN_COMMIT_BYTES,
+        )
+    profile = detect_hardware(args.runtime_root)
     free_cores = max(2, (profile.physical_cores or 1) - 5)
     overrides: dict[str, Any] = {}
     if args.device is not None:
@@ -412,13 +443,16 @@ def _run_impl(args: argparse.Namespace) -> Path:
     if (nvidia_smi and plan.train_device == "cpu" and not args.allow_cpu):
         _cpu_fallback_warning("ResourcePlan selected CPU despite an NVIDIA GPU being present")
         raise SystemExit("CPU training not started; rerun with --allow-cpu to confirm")
-    if (args.device == "cuda" and (profile.gpu_memory_free_gb or 0.0) < 6.0):
-        raise SystemExit("CUDA requested but ResourcePlan requires at least 6 GiB of free VRAM")
-    root: Path = Path(args.runtime_root) / "v2" / "pretrain" / str(args.run_name)
-    root.mkdir(parents=True, exist_ok=True)
     _enable_main_faulthandler(root)
     if profile.commit_available_gb is not None:
         worker_private_gb = _measure_worker_private_gb(root, args.seed)
+        planner_memory = _memory_telemetry(torch.device(plan.train_device), [])
+        planner_memory = _wait_for_pretrain_commit(
+            root, source_steps, planner_memory,
+            snapshot_fn=lambda: _memory_telemetry(torch.device(plan.train_device), []),
+            minimum_current_bytes=_MIN_PRETRAIN_PLAN_COMMIT_BYTES,
+        )
+        profile = detect_hardware(args.runtime_root)
         profile = replace(profile, worker_private_gb=worker_private_gb)
         plan = plan_resources(profile, "pretrain_platform", overrides)
         env_count = plan.gym_envs
@@ -430,7 +464,6 @@ def _run_impl(args: argparse.Namespace) -> Path:
     threads = min(free_cores, max(1, plan.torch_threads_learner))
     torch.set_num_threads(threads)
     torch.set_num_interop_threads(1)
-    global _ACTIVE_RUN_INITIALIZED
     _ACTIVE_RUN_INITIALIZED = True
     status_path = root / "status.json"
     if status_path.exists():
