@@ -149,8 +149,8 @@ def test_old_training_log_header_is_extended_without_losing_rows(tmp_path: Path)
 def test_pretrain_commit_guard_waits_for_current_commit_recovery(tmp_path: Path) -> None:
     gib = 2**30
     snapshots = iter([
+        {"commit_available_bytes": gib, "potential_commit_available_bytes": 4 * gib},
         {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 4 * gib},
-        {"commit_available_bytes": 4 * gib, "potential_commit_available_bytes": 4 * gib},
     ])
     now = [0.0]
     heartbeat = tmp_path / "heartbeat.json"
@@ -163,7 +163,7 @@ def test_pretrain_commit_guard_waits_for_current_commit_recovery(tmp_path: Path)
     )
 
     state = json.loads(heartbeat.read_text(encoding="utf-8"))
-    assert result["commit_available_bytes"] == 4 * gib
+    assert result["commit_available_bytes"] == 2 * gib
     assert now[0] == 5
     assert state["steps"] == 1234
     assert state["phase"] == "training"
@@ -174,10 +174,10 @@ def test_pretrain_commit_guard_waits_for_current_commit_recovery(tmp_path: Path)
 
 def test_pretrain_commit_guard_fails_after_wait_timeout(tmp_path: Path) -> None:
     gib = 2**30
-    low = {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 4 * gib}
+    low = {"commit_available_bytes": gib, "potential_commit_available_bytes": 4 * gib}
     now = [0.0]
 
-    with pytest.raises(MemoryError, match="stayed below 3 GiB"):
+    with pytest.raises(MemoryError, match="stayed below 1.5 GiB"):
         pretrain_platform._wait_for_pretrain_commit(
             tmp_path, 987, low, snapshot_fn=lambda: low,
             timeout_seconds=10, poll_seconds=5, monotonic_fn=lambda: now[0],
@@ -192,7 +192,7 @@ def test_pretrain_commit_guard_fails_after_wait_timeout(tmp_path: Path) -> None:
 
 def test_pretrain_commit_guard_fails_when_potential_commit_is_unsafe(tmp_path: Path) -> None:
     gib = 2**30
-    low = {"commit_available_bytes": gib, "potential_commit_available_bytes": 2 * gib}
+    low = {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 2 * gib}
 
     with pytest.raises(MemoryError, match="potential commit fell below 3 GiB"):
         pretrain_platform._wait_for_pretrain_commit(
@@ -202,3 +202,12 @@ def test_pretrain_commit_guard_fails_when_potential_commit_is_unsafe(tmp_path: P
     failure = json.loads((tmp_path / "memory_guard_failure.json").read_text(encoding="utf-8"))
     assert failure["steps"] == 654
     assert failure["wait_seconds"] == 0
+
+
+def test_pretrain_commit_guard_accepts_safe_current_and_potential_commit(tmp_path: Path) -> None:
+    gib = 2**30
+    safe = {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 4 * gib}
+
+    assert pretrain_platform._wait_for_pretrain_commit(
+        tmp_path, 321, safe, snapshot_fn=lambda: safe,
+    ) == safe

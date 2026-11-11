@@ -252,7 +252,8 @@ def _memory_telemetry(device: torch.device,
     return telemetry
 
 
-_MIN_PRETRAIN_COMMIT_BYTES = 3 * 2**30
+_MIN_PRETRAIN_CURRENT_COMMIT_BYTES = 3 * 2**30 // 2
+_MIN_PRETRAIN_POTENTIAL_COMMIT_BYTES = 3 * 2**30
 _PRETRAIN_MEMORY_WAIT_SECONDS = 30 * 60
 
 
@@ -264,18 +265,18 @@ def _wait_for_pretrain_commit(
 ) -> dict[str, Any]:
     """Wait between rounds for current commit to recover, failing on unsafe potential."""
     sample = initial_sample
-    current = sample.get("commit_available_bytes")
-    if not isinstance(current, (int, float)) or current >= _MIN_PRETRAIN_COMMIT_BYTES:
-        return sample
-
     potential = sample.get("potential_commit_available_bytes")
-    if isinstance(potential, (int, float)) and potential < _MIN_PRETRAIN_COMMIT_BYTES:
+    if (isinstance(potential, (int, float))
+            and potential < _MIN_PRETRAIN_POTENTIAL_COMMIT_BYTES):
         failure = "potential commit fell below 3 GiB"
         _atomic_json(root / "memory_guard_failure.json", {
             "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "reason": failure, "wait_seconds": 0.0, "memory_sample": sample,
         })
         raise MemoryError(failure)
+    current = sample.get("commit_available_bytes")
+    if not isinstance(current, (int, float)) or current >= _MIN_PRETRAIN_CURRENT_COMMIT_BYTES:
+        return sample
 
     waiting_since = monotonic_fn()
     waiting_since_wall = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -283,14 +284,16 @@ def _wait_for_pretrain_commit(
         elapsed = max(0.0, monotonic_fn() - waiting_since)
         current = sample.get("commit_available_bytes")
         potential = sample.get("potential_commit_available_bytes")
-        if isinstance(potential, (int, float)) and potential < _MIN_PRETRAIN_COMMIT_BYTES:
+        if (isinstance(potential, (int, float))
+                and potential < _MIN_PRETRAIN_POTENTIAL_COMMIT_BYTES):
             failure = "potential commit fell below 3 GiB while waiting"
             _atomic_json(root / "memory_guard_failure.json", {
                 "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "reason": failure, "wait_seconds": elapsed, "memory_sample": sample,
             })
             raise MemoryError(failure)
-        if isinstance(current, (int, float)) and current >= _MIN_PRETRAIN_COMMIT_BYTES:
+        if (isinstance(current, (int, float))
+                and current >= _MIN_PRETRAIN_CURRENT_COMMIT_BYTES):
             heartbeat_path = root / "heartbeat.json"
             try:
                 heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
@@ -307,7 +310,7 @@ def _wait_for_pretrain_commit(
             _atomic_json(heartbeat_path, heartbeat)
             return sample
         if elapsed >= timeout_seconds:
-            failure = (f"commit stayed below 3 GiB for {timeout_seconds:.0f} seconds; "
+            failure = (f"commit stayed below 1.5 GiB for {timeout_seconds:.0f} seconds; "
                        "memory guard timed out")
             _atomic_json(root / "memory_guard_failure.json", {
                 "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -682,12 +685,10 @@ def _run_impl(args: argparse.Namespace) -> Path:
             for phase_name, phase_value in phase_round.items():
                 phase_totals[phase_name] += phase_value
             memory_sample = _memory_telemetry(device, environments.worker_startup)
-            commit_available = memory_sample.get("commit_available_bytes")
-            if commit_available is not None and commit_available < 3 * 2**30:
-                memory_sample = _wait_for_pretrain_commit(
-                    root, global_step, memory_sample,
-                    snapshot_fn=lambda: _memory_telemetry(device, environments.worker_startup),
-                )
+            memory_sample = _wait_for_pretrain_commit(
+                root, global_step, memory_sample,
+                snapshot_fn=lambda: _memory_telemetry(device, environments.worker_startup),
+            )
             private_worker_bytes = [
                 row.get("private_bytes") for row in memory_sample["processes"]
                 if row.get("role") == "environment_worker" and row.get("private_bytes") is not None
