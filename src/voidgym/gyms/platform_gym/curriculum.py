@@ -59,6 +59,28 @@ class Curriculum:
                 return level
         return None
 
+    def initialize_progress_watch(self, steps: int, *, window: int = 100,
+                                  levels_0_7_target: float = .70,
+                                  level_8_target: float = .30,
+                                  level_9_target: float = .70) -> None:
+        """Start the no-improvement clock at this training run's source step.
+
+        A resumed source checkpoint may carry a stale watch from an earlier
+        campaign. Its rolling rates remain useful as the starting baseline,
+        but its absolute step number must not make a new campaign stop early.
+        """
+        self.best_window_rate.clear()
+        self.last_improvement_step.clear()
+        for level in range(LEVEL_COUNT):
+            rate = self.window_success_rate(level, window)
+            if rate is None:
+                continue
+            target = (level_9_target if level == 9 else
+                      level_8_target if level == 8 else levels_0_7_target)
+            if rate < target:
+                self.best_window_rate[level] = rate
+                self.last_improvement_step[level] = steps
+
     def record(self, success: bool, level: int | None = None) -> None:
         sampled_level = self.level if level is None else int(level)
         if not 0 <= sampled_level <= MAX_LEVEL:

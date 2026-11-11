@@ -41,12 +41,15 @@ O checkpoint de referência está abaixo da meta do beco em ambos os splits, com
 Pronto para iniciar após a CI do commit atual ficar verde:
 
 - Origem: `universal-012438528`, com supervisor e até três retomadas automáticas em 24 h.
-- Limites: 16 h ou 3 milhões de passos sem melhora; avaliações rápidas a cada 1 milhão de passos, 50 episódios por nível.
+- Limites: 16 h ou 3 milhões de passos sem melhora desde o início deste pré-treino; avaliações rápidas a cada 1 milhão de passos, 50 episódios por nível.
+- O marco inicial do observador de estagnação fica salvo em `progress-watch-origin.json` por runtime. Assim, os marcadores antigos carregados do checkpoint-base não encerram uma campanha nova imediatamente, enquanto retomadas do mesmo runtime preservam o mesmo limite acumulado.
 - O guard do pré-treino segue a proteção 87w: aguarda quando o commit atual fica abaixo de 1,5 GiB, publicando `waiting_memory` no heartbeat; retoma quando recuperar. Falha após 30 minutos contínuos abaixo do mínimo ou imediatamente se o commit potencial cair abaixo de 3 GiB.
 - O supervisor grava `memory-history.jsonl` no runtime: top 10 processos por memória privada (nome, PID, memória privada e working set) e métricas de commit, inicialmente e a cada cinco minutos.
 - O ponto de avaliação final será níveis 0–9, split de teste do beco e percepção, comparando com `universal-012438528`; nenhum outro nível pode cair mais de cinco pontos.
-- Primeira tentativa em 11/11/2026: o guard inicial foi implementado por engano com mínimo atual de 3 GiB e encerrou após 30 minutos, embora o commit potencial permanecesse acima de 15 GiB. Não houve update do learner nem checkpoint novo; `trained_steps` continuou em 12.440.576, o mesmo valor do checkpoint de origem.
-- Correção: o mínimo atual passou para 1,5 GiB e o mínimo potencial continua em 3 GiB, alinhados ao guard 87w. O processo encerrou e não será retomado até a CI dessa correção ficar verde.
+- Primeira tentativa em 11/11/2026: o guard inicial foi implementado por engano com mínimo atual de 3 GiB e encerrou após 30 minutos, embora o commit potencial permanecesse acima de 15 GiB. O learner fez uma atualização PPO de 2.048 passos (12.438.528 → 12.440.576) antes do guard; nenhum checkpoint foi salvo além do checkpoint-base.
+- Segunda tentativa, runtime `pretrain-87v-beco-2026-11-11-cuda-r1`: o guard corrigido aguardou a recuperação do commit atual e o learner fez uma atualização (2.048 passos), salvando `universal-012440576`. Encerrou em 11/11/2026 às 14:35:56 por `level 2 had no rolling-success improvement for 3000000 steps`: o checkpoint-base carregava `last_improvement_step=9437376`, mais de 3 milhões abaixo do passo inicial 12.438.528. Esse limite histórico antecedia o 87v; não correspondeu a 3 milhões de passos sem melhora durante esta nova campanha. A retomada r1 foi preservada como evidência e não será usada como origem.
+- Correção antes da nova tentativa: cada runtime 87v registra seu passo-base em `progress-watch-origin.json` e inicializa o limite de estagnação a partir desse marco. Retomadas do mesmo runtime mantêm esse marco e o estado de progresso; o checkpoint-base permanece exatamente `universal-012438528`.
+- Na saída da r1: status `COMPLETED` por limite herdado; duração 6m08s, total 12.440.576, nível de currículo 8, nível 2 em 42% na janela móvel de 100, sem checkpoint íntegro além do `universal-012440576` salvo pela tentativa curta. RAM disponível 2,65 GiB, commit atual disponível 1,57 GiB e potencial 14,53 GiB; não houve erro CUDA. O nível 9 ainda não tinha episódios na janela.
 
 ## Etapa 4 — campanha HK nova
 
@@ -54,8 +57,8 @@ Pendente de autorização textual específica: **“autorizo iniciar a campanha 
 
 ## Validação e commits
 
-- Suíte local após a correção do guard: `923 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
-- Ruff (`ruff check .`), `mypy src` e `git diff --check`: aprovados após o guard.
-- CI do commit `c9b7d02` ficou verde; a CI da correção de limiar do guard está pendente.
-- Commits enviados ao PR #8: `6ef3ac7` (currículo), `e9326e6` (salas e avaliações), `84bf7fa` (telemetria), `2c69203` (tolerância do teste de desempenho), `c9b7d02` (primeira versão do guard); o commit de correção do limiar será acrescentado.
+- Suíte local após a correção do marco de estagnação: `924 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
+- Ruff nos arquivos alterados, `mypy src` e `git diff --check`: aprovados após o ajuste.
+- CI dos commits `c9b7d02` e `15e23f7` ficou verde. A correção atual do marco será commitada e enviada antes de retomar o pré-treino.
+- Commits enviados ao PR #8: `6ef3ac7` (currículo), `e9326e6` (salas e avaliações), `84bf7fa` (telemetria), `2c69203` (tolerância do teste de desempenho), `c9b7d02` (primeira versão do guard) e `15e23f7` (limiar do guard). O commit do marco do watchdog será acrescentado.
 - Resultados do pré-treino e comparação tripla serão acrescentados aqui quando concluídos. A comparação tripla depende de autorização da Etapa 4.

@@ -500,6 +500,19 @@ def _run_impl(args: argparse.Namespace) -> Path:
         manifest = load_universal(args.resume, policy, action_table,
                                   optimizer=trainer.optimizer)
         global_step = int(manifest.get("trained_steps", 0))
+    progress_watch_origin = root / "progress-watch-origin.json"
+    if not progress_watch_origin.is_file():
+        curriculum.initialize_progress_watch(
+            global_step, window=args.goal_window_episodes,
+            levels_0_7_target=args.goal_success_levels_0_7,
+            level_8_target=args.goal_success_level_8,
+            level_9_target=args.goal_success_level_9,
+        )
+        _atomic_json(progress_watch_origin, {
+            "source_steps": global_step,
+            "source_checkpoint": str(args.resume) if args.resume else None,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
     state = actor_policy.initial_state(env_count, actor_device)
     episode_starts = torch.ones(env_count, dtype=torch.bool, device=actor_device)
     episode_had_exit = [False] * env_count

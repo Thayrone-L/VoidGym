@@ -217,3 +217,20 @@ def test_curriculum_progress_watch_round_trips(tmp_path) -> None:
     resumed = Curriculum.load(path)
     assert resumed.best_window_rate == {2: 1 / 3}
     assert resumed.last_improvement_step == {2: 123}
+
+
+def test_curriculum_watch_initializes_at_new_campaign_source_step() -> None:
+    curriculum = Curriculum(seed=5)
+    curriculum.history[2].extend([True, False, False])
+    curriculum.best_window_rate[2] = .69
+    curriculum.last_improvement_step[2] = 9_437_376
+
+    curriculum.initialize_progress_watch(12_438_528, window=3,
+                                         levels_0_7_target=.70)
+
+    assert curriculum.best_window_rate == {2: 1 / 3}
+    assert curriculum.last_improvement_step == {2: 12_438_528}
+    assert curriculum.update_progress_watch(12_438_532, window=3,
+                                            no_improvement_steps=5) is None
+    assert curriculum.update_progress_watch(12_438_533, window=3,
+                                            no_improvement_steps=5) == 2
