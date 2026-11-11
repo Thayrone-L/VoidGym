@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +34,18 @@ _ALLOWED_SAFE_DTYPES = frozenset(_DTYPE_TO_SAFE.values())
 
 class PolicyArtifactError(ValueError):
     """Raised when a portable policy artifact fails closed validation."""
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Retry brief Windows sharing violations while readers load a prior artifact."""
+    for attempt in range(20):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.025)
 
 
 class _Tensor(Protocol):
@@ -313,13 +326,13 @@ def export_policy_artifact(
         }
         manifest = {"manifest_id": hashlib.sha256(_canonical_bytes(body)).hexdigest(), **body}
         validate_policy_manifest(manifest)
-        os.replace(pending, target)
+        _replace_with_retry(pending, target)
         pending_json = sidecar.with_name(
             f".{sidecar.name}.{os.getpid()}.{secrets.token_hex(8)}.pending"
         )
         try:
             pending_json.write_bytes(_canonical_bytes(manifest) + b"\n")
-            os.replace(pending_json, sidecar)
+            _replace_with_retry(pending_json, sidecar)
         finally:
             if pending_json.exists():
                 pending_json.unlink()
@@ -365,6 +378,18 @@ def import_policy_artifact(
         raise PolicyArtifactError("policy artifact or manifest exceeds its size limit")
     try:
         sidecar_bytes = sidecar.read_bytes()
+        if expected_sidecar is not None:
+            # Antivirus/indexing and sync filters on Windows can briefly expose
+            # the previous directory-entry contents immediately after replace.
+            # The pointer is published only after the new manifest is durable;
+            # retry a short bounded interval before treating this as tampering.
+            for attempt in range(20):
+                if hashlib.sha256(sidecar_bytes).hexdigest() == expected_sidecar:
+                    break
+                if attempt == 19:
+                    break
+                time.sleep(0.025)
+                sidecar_bytes = sidecar.read_bytes()
         manifest = validate_policy_manifest(json.loads(sidecar_bytes.decode("utf-8")))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PolicyArtifactError("policy manifest is not readable canonical JSON") from error
@@ -375,11 +400,22 @@ def import_policy_artifact(
         raise PolicyArtifactError("policy manifest ID differs from its frozen identity")
     if manifest["compatibility_fingerprint"] != expected_fingerprint:
         raise PolicyArtifactError("portable policy compatibility fingerprint differs")
-    if manifest["policy_class"] != _policy_class(policy):
+    source_policy_class = manifest["policy_class"]
+    target_policy_class = _policy_class(policy)
+    compatible_masked_pair = {
+        source_policy_class,
+        target_policy_class,
+    } == {
+        "stable_baselines3.common.policies.MultiInputActorCriticPolicy",
+        "sb3_contrib.common.maskable.policies.MaskableMultiInputActorCriticPolicy",
+    }
+    if source_policy_class != target_policy_class and not compatible_masked_pair:
         raise PolicyArtifactError("portable policy class differs")
     _, expected_inventory = _state_inventory(policy)
     if manifest["tensors"] != expected_inventory:
-        raise PolicyArtifactError("portable policy tensor schema differs from the target policy")
+        raise PolicyArtifactError(
+            "portable policy tensor schema differs from the target policy (names or shapes); refusing partial warm-start"
+        )
     safe_open, _ = _safetensors_api()
     loaded: dict[str, Any] = {}
     snapshot = _private_snapshot(

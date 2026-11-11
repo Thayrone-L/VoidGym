@@ -5,7 +5,7 @@ namespace HkAgentBridge;
 
 internal static class MenuActionPolicy
 {
-    public const int ButtonCount = 6;
+    public const int ButtonCount = 7;
     public const int MaximumLeaseMilliseconds = 100;
 
     public static MenuActionSelection Validate(
@@ -67,6 +67,8 @@ internal static class MenuActionPolicy
                 return 1 << 4;
             case "CANCEL":
                 return 1 << 5;
+            case "PAUSE":
+                return 1 << 6;
             default:
                 throw new ArgumentException(
                     $"Unsupported menu button: {button}",

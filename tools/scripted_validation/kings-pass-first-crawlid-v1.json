@@ -1,0 +1,11 @@
+{
+  "route_id": "kings-pass-first-crawlid-v1",
+  "save_source": "isolated-copy-of-development-user1",
+  "steps": [
+    {"buttons": ["RIGHT"], "repeats": 8, "lease_ms": 650},
+    {"buttons": ["RIGHT", "JUMP"], "repeats": 8, "lease_ms": 550},
+    {"buttons": ["ATTACK"], "repeats": 32, "lease_ms": 350, "stop_after_visible_enemy_disappears": true},
+    {"command": "capture", "repeats": 10}
+  ],
+  "evidence": ["PNG after each step", "visible enemy slots", "player-knowledge.json", "route-result.json"]
+}

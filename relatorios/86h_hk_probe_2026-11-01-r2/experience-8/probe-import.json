@@ -1,0 +1,9 @@
+{
+  "probe_root": "C:\\VoidGym\\relatorios\\86h_hk_probe_2026-11-01-r2",
+  "experience_root": "C:\\VoidGym\\relatorios\\86h_hk_probe_2026-11-01-r2\\experience-8",
+  "campaign_id": "86h-policy-probe-r2-8",
+  "source": "test",
+  "sampled_frames": 8,
+  "requested_count": 8,
+  "action_table_matches_checkpoint": true
+}

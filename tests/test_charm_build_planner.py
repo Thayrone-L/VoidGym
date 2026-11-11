@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from hk_agent.charm_build_planner import CharmBuildPlanner, PlannerScope
+from hk_agent.charm_build_planner import CharmBuildPlanner, PlannerScope, enumerate_owned_loadouts
 
 
 def _scope(campaign: str = "campaign-a") -> PlannerScope:
@@ -104,7 +104,7 @@ def test_contract_is_pixel_only_and_declares_non_exhaustive_search() -> None:
     assert contract["information_boundary"] == "pixel_only"
     assert contract["exhaustive_power_set_enumeration"] is False
     assert contract["search"] == "capacity_constrained_bounded_beam"
-    assert contract["menu_integration"] == "planner_only_not_implemented"
+    assert contract["menu_integration"] == "bench_only_reference_frame_guarded_macro"
     assert "PlayerData" in contract["forbidden_inputs"]
     assert "wiki_or_external_charm_database" in contract["forbidden_inputs"]
 
@@ -116,3 +116,15 @@ def test_corrupt_persistence_is_rejected_without_overwriting(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="schema version"):
         _planner(path)
     assert json.loads(path.read_text("utf-8")) == original
+
+
+def test_owned_loadout_enumeration_respects_observed_acquisition_cost_and_capacity() -> None:
+    builds = enumerate_owned_loadouts(
+        {"gotCharm_1": 1, "gotCharm_3": 2, "gotCharm_7": 4}, notch_capacity=3
+    )
+    assert builds == ((), ("gotCharm_1",), ("gotCharm_1", "gotCharm_3"), ("gotCharm_3",))
+    with pytest.raises(ValueError, match="configured bound"):
+        enumerate_owned_loadouts(
+            {f"gotCharm_{i}": 1 for i in range(1, 10)},
+            notch_capacity=9, max_loadouts=10,
+        )

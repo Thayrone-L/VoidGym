@@ -11,6 +11,50 @@ from typing import Any
 CHARM_BUILD_SCHEMA_VERSION = 1
 
 
+def enumerate_owned_loadouts(
+    acquired_notch_costs: Mapping[str, int],
+    *,
+    notch_capacity: int,
+    max_loadouts: int = 256,
+) -> tuple[tuple[str, ...], ...]:
+    """Return bounded legal loadouts from only the currently acquired charms.
+
+    Keys are opaque acquired-charm ids and costs come from the save's observed
+    charmCost fields. Enumeration is deterministic, never includes unknown ids,
+    and refuses a result large enough to create an unbounded policy action set.
+    """
+    if isinstance(notch_capacity, bool) or not isinstance(notch_capacity, int) or not 0 <= notch_capacity <= 12:
+        raise ValueError("notch_capacity must be between 0 and 12")
+    if isinstance(max_loadouts, bool) or not isinstance(max_loadouts, int) or max_loadouts < 1:
+        raise ValueError("max_loadouts must be positive")
+    if len(acquired_notch_costs) > 40:
+        raise ValueError("at most 40 acquired charms are supported")
+    candidates: list[tuple[str, int]] = []
+    for charm_id, cost in acquired_notch_costs.items():
+        if not isinstance(charm_id, str) or not charm_id or len(charm_id) > 128:
+            raise ValueError("charm ids must be non-empty bounded strings")
+        if isinstance(cost, bool) or not isinstance(cost, int) or not 1 <= cost <= 6:
+            raise ValueError("acquired charm costs must be between 1 and 6")
+        if cost <= notch_capacity:
+            candidates.append((charm_id, cost))
+    candidates.sort()
+    loadouts: list[tuple[str, ...]] = [()]
+
+    def extend(start: int, selected: tuple[str, ...], used: int) -> None:
+        for index in range(start, len(candidates)):
+            charm_id, cost = candidates[index]
+            if used + cost > notch_capacity:
+                continue
+            if len(loadouts) >= max_loadouts:
+                raise ValueError("legal loadout count exceeds configured bound")
+            current = (*selected, charm_id)
+            loadouts.append(current)
+            extend(index + 1, current, used + cost)
+
+    extend(0, (), 0)
+    return tuple(loadouts)
+
+
 @dataclass(frozen=True)
 class PlannerScope:
     """Identity boundary that prevents evidence leaking between incompatible runs."""
@@ -85,7 +129,7 @@ class CharmBuildPlanner:
             "uncertainty": "count_based_upper_confidence_exploration",
             "search": "capacity_constrained_bounded_beam",
             "exhaustive_power_set_enumeration": False,
-            "menu_integration": "planner_only_not_implemented",
+            "menu_integration": "bench_only_reference_frame_guarded_macro",
             "information_boundary": "pixel_only",
             "forbidden_inputs": [
                 "PlayerData",
