@@ -6,7 +6,18 @@ import sys
 
 import pytest
 
-from tools.v2.supervise_hk_learner import supervise
+from tools.v2.supervise_hk_learner import _latest_progress, supervise
+
+
+def test_latest_progress_accepts_integral_decimal_shared_round(tmp_path: Path) -> None:
+    (tmp_path / "latest.json").write_text(json.dumps({
+        "trained_steps": 12, "metrics": {"shared_round": 1.0},
+    }), "utf-8")
+    assert _latest_progress(tmp_path)["round"] == 1
+    (tmp_path / "latest.json").write_text(json.dumps({
+        "trained_steps": 12, "metrics": {"shared_round": 1.5},
+    }), "utf-8")
+    assert _latest_progress(tmp_path)["round"] == 0
 
 
 def _checkpoint(path: Path, *, steps: int) -> None:

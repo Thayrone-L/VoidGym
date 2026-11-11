@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 import faulthandler
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -18,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from voidgym.training.runtime_monitor import publish_role_state
+from voidgym.training.memory_history import MemoryHistorySampler
 
 
 def _timestamp(value: str) -> datetime:
@@ -41,6 +43,15 @@ def _checkpoint_files_ok(path: Path) -> bool:
                    for name in required)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
+
+
+def _round_value(value: Any) -> int | None:
+    """Accept nonnegative integral JSON integers and decimal values."""
+    if type(value) is int:
+        return value if value >= 0 else None
+    if type(value) is float and math.isfinite(value) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
 
 
 def latest_checkpoint(root: Path, fallback: Path) -> Path:
@@ -94,8 +105,9 @@ def _latest_progress(root: Path) -> dict[str, Any]:
         row: dict[str, Any] = {"completed_timesteps": steps}
         round_id = payload.get("round", payload.get("metrics", {}).get("shared_round", 0)
                               if isinstance(payload.get("metrics"), dict) else 0)
-        if type(round_id) is int and round_id >= 0:
-            row["round"] = round_id
+        parsed_round = _round_value(round_id)
+        if parsed_round is not None:
+            row["round"] = parsed_round
         relative = payload.get("policy")
         if isinstance(relative, str):
             try:
@@ -124,8 +136,9 @@ def _latest_progress(root: Path) -> dict[str, Any]:
             "metrics": metrics if isinstance(metrics, dict) else {},
         }
         round_id = metrics.get("shared_round", 0) if isinstance(metrics, dict) else 0
-        if type(round_id) is int and round_id >= 0:
-            row["round"] = round_id
+        parsed_round = _round_value(round_id)
+        if parsed_round is not None:
+            row["round"] = parsed_round
         candidates.append(row)
     if not candidates:
         return {}
@@ -278,10 +291,16 @@ def main(argv: list[str] | None = None) -> int:
     command = command_data.get("argv") if isinstance(command_data, dict) else None
     if not isinstance(command, list) or not command or not all(isinstance(item, str) for item in command):
         parser.error("command-json must contain a nonempty argv string list")
-    return supervise(command, shared_root=args.shared_root.resolve(),
-                     stop_file=args.stop_file.resolve(),
-                     fallback_checkpoint=args.fallback_checkpoint.resolve(strict=True),
-                     max_restarts=args.max_restarts)
+    shared_root = args.shared_root.resolve()
+    memory_sampler = MemoryHistorySampler(shared_root)
+    memory_sampler.start()
+    try:
+        return supervise(command, shared_root=shared_root,
+                         stop_file=args.stop_file.resolve(),
+                         fallback_checkpoint=args.fallback_checkpoint.resolve(strict=True),
+                         max_restarts=args.max_restarts)
+    finally:
+        memory_sampler.stop()
 
 
 if __name__ == "__main__":

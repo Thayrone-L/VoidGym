@@ -14,6 +14,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from voidgym.training.memory_history import MemoryHistorySampler
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -137,7 +140,9 @@ def main(argv: list[str] | None = None) -> int:
     run_root = args.runtime_root / "v2" / "pretrain" / args.run_name
     run_root.mkdir(parents=True, exist_ok=True)
     fault_path = run_root / "faulthandler-supervisor.log"
+    memory_sampler = MemoryHistorySampler(run_root)
     with fault_path.open("a", encoding="utf-8") as fault_file:
+        memory_sampler.start()
         faulthandler.enable(file=fault_file, all_threads=True)
 
         def command_builder(resume: Path, _attempt: int) -> Sequence[str]:
@@ -166,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
                              max_restarts=args.max_restarts, window_hours=args.window_hours)
         finally:
             faulthandler.disable()
+            memory_sampler.stop()
 
 
 if __name__ == "__main__":
