@@ -252,6 +252,87 @@ def _memory_telemetry(device: torch.device,
     return telemetry
 
 
+_MIN_PRETRAIN_COMMIT_BYTES = 3 * 2**30
+_PRETRAIN_MEMORY_WAIT_SECONDS = 30 * 60
+
+
+def _wait_for_pretrain_commit(
+    root: Path, completed_steps: int, initial_sample: dict[str, Any], *,
+    snapshot_fn: Callable[[], dict[str, Any]], timeout_seconds: float = _PRETRAIN_MEMORY_WAIT_SECONDS,
+    poll_seconds: float = 5.0, monotonic_fn: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Wait between rounds for current commit to recover, failing on unsafe potential."""
+    sample = initial_sample
+    current = sample.get("commit_available_bytes")
+    if not isinstance(current, (int, float)) or current >= _MIN_PRETRAIN_COMMIT_BYTES:
+        return sample
+
+    potential = sample.get("potential_commit_available_bytes")
+    if isinstance(potential, (int, float)) and potential < _MIN_PRETRAIN_COMMIT_BYTES:
+        failure = "potential commit fell below 3 GiB"
+        _atomic_json(root / "memory_guard_failure.json", {
+            "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "reason": failure, "wait_seconds": 0.0, "memory_sample": sample,
+        })
+        raise MemoryError(failure)
+
+    waiting_since = monotonic_fn()
+    waiting_since_wall = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    while True:
+        elapsed = max(0.0, monotonic_fn() - waiting_since)
+        current = sample.get("commit_available_bytes")
+        potential = sample.get("potential_commit_available_bytes")
+        if isinstance(potential, (int, float)) and potential < _MIN_PRETRAIN_COMMIT_BYTES:
+            failure = "potential commit fell below 3 GiB while waiting"
+            _atomic_json(root / "memory_guard_failure.json", {
+                "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "reason": failure, "wait_seconds": elapsed, "memory_sample": sample,
+            })
+            raise MemoryError(failure)
+        if isinstance(current, (int, float)) and current >= _MIN_PRETRAIN_COMMIT_BYTES:
+            heartbeat_path = root / "heartbeat.json"
+            try:
+                heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+                if not isinstance(heartbeat, dict):
+                    heartbeat = {}
+            except (OSError, json.JSONDecodeError):
+                heartbeat = {}
+            heartbeat.update({
+                "steps": completed_steps, "phase": "training", "waiting_memory": False,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "system_memory": sample,
+            })
+            heartbeat.pop("memory_wait_started_at", None)
+            _atomic_json(heartbeat_path, heartbeat)
+            return sample
+        if elapsed >= timeout_seconds:
+            failure = (f"commit stayed below 3 GiB for {timeout_seconds:.0f} seconds; "
+                       "memory guard timed out")
+            _atomic_json(root / "memory_guard_failure.json", {
+                "steps": completed_steps, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "reason": failure, "wait_seconds": elapsed, "memory_sample": sample,
+            })
+            raise MemoryError(failure)
+
+        heartbeat_path = root / "heartbeat.json"
+        try:
+            heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+            if not isinstance(heartbeat, dict):
+                heartbeat = {}
+        except (OSError, json.JSONDecodeError):
+            heartbeat = {}
+        heartbeat.update({
+            "steps": completed_steps, "phase": "waiting_memory", "waiting_memory": True,
+            "memory_wait_started_at": waiting_since_wall,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "system_memory": sample,
+        })
+        _atomic_json(heartbeat_path, heartbeat)
+        sleep_fn(min(poll_seconds, max(0.0, timeout_seconds - elapsed)))
+        sample = snapshot_fn()
+
+
 def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", default="platform-pretrain")
@@ -603,15 +684,9 @@ def _run_impl(args: argparse.Namespace) -> Path:
             memory_sample = _memory_telemetry(device, environments.worker_startup)
             commit_available = memory_sample.get("commit_available_bytes")
             if commit_available is not None and commit_available < 3 * 2**30:
-                _atomic_json(root / "memory_guard_failure.json", {
-                    "steps": global_step,
-                    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "commit_available_gb": _bytes_to_gib(commit_available),
-                    "memory_sample": memory_sample,
-                })
-                raise RuntimeError(
-                    "commit disponível caiu para "
-                    f"{_bytes_to_gib(commit_available):.2f} GiB; mínimo: 3 GiB"
+                memory_sample = _wait_for_pretrain_commit(
+                    root, global_step, memory_sample,
+                    snapshot_fn=lambda: _memory_telemetry(device, environments.worker_startup),
                 )
             private_worker_bytes = [
                 row.get("private_bytes") for row in memory_sample["processes"]

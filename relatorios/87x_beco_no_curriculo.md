@@ -38,7 +38,14 @@ O checkpoint de referência está abaixo da meta do beco em ambos os splits, com
 
 ## Etapa 3 — pré-treino 87v
 
-Pendente: iniciar de `universal-012438528` com supervisor, retomada, guard de memória, checkpoints e avaliações rápidas; manter `memory-history.jsonl` com os 10 maiores processos a cada cinco minutos. Não iniciar até a suíte completa, Ruff, mypy, `git diff --check` e CI remoto ficarem verdes.
+Pronto para iniciar após a CI do commit atual ficar verde:
+
+- Origem: `universal-012438528`, com supervisor e até três retomadas automáticas em 24 h.
+- Limites: 16 h ou 3 milhões de passos sem melhora; avaliações rápidas a cada 1 milhão de passos, 50 episódios por nível.
+- O guard do pré-treino aguarda a recuperação do commit atual abaixo de 3 GiB, publicando `waiting_memory` no heartbeat. Retoma quando recuperar; falha após 30 minutos contínuos abaixo do mínimo ou imediatamente se o commit potencial cair abaixo de 3 GiB.
+- O supervisor grava `memory-history.jsonl` no runtime: top 10 processos por memória privada (nome, PID, memória privada e working set) e métricas de commit, inicialmente e a cada cinco minutos.
+- O ponto de avaliação final será níveis 0–9, split de teste do beco e percepção, comparando com `universal-012438528`; nenhum outro nível pode cair mais de cinco pontos.
+- Ainda não iniciado; aguardando a CI do commit que contém o guard de espera.
 
 ## Etapa 4 — campanha HK nova
 
@@ -46,7 +53,8 @@ Pendente de autorização textual específica: **“autorizo iniciar a campanha 
 
 ## Validação e commits
 
-- Suíte local: `919 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
-- Ruff (`ruff check .`), `mypy src` e `git diff --check`: aprovados.
-- CI remoto, commits por etapa e push ao PR #8: pendentes.
+- Suíte local após o guard: `922 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
+- Ruff (`ruff check .`), `mypy src` e `git diff --check`: aprovados após o guard.
+- CI do commit `2c69203` ficou verde. A CI do commit que adiciona o guard está pendente.
+- Commits enviados ao PR #8: `6ef3ac7` (currículo), `e9326e6` (salas e avaliações), `84bf7fa` (telemetria), `2c69203` (tolerância do teste de desempenho); o commit do guard será acrescentado.
 - Resultados do pré-treino e comparação tripla serão acrescentados aqui quando concluídos. A comparação tripla depende de autorização da Etapa 4.

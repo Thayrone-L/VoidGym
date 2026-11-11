@@ -144,3 +144,61 @@ def test_old_training_log_header_is_extended_without_losing_rows(tmp_path: Path)
     with path.open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows == [{"steps": "1000", "quick_eval_success": "0.5", "success_rate_level_2": ""}]
+
+
+def test_pretrain_commit_guard_waits_for_current_commit_recovery(tmp_path: Path) -> None:
+    gib = 2**30
+    snapshots = iter([
+        {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 4 * gib},
+        {"commit_available_bytes": 4 * gib, "potential_commit_available_bytes": 4 * gib},
+    ])
+    now = [0.0]
+    heartbeat = tmp_path / "heartbeat.json"
+    heartbeat.write_text(json.dumps({"success_by_level": {"9": 0.5}}), encoding="utf-8")
+
+    result = pretrain_platform._wait_for_pretrain_commit(
+        tmp_path, 1234, next(snapshots), snapshot_fn=lambda: next(snapshots),
+        timeout_seconds=10, poll_seconds=5, monotonic_fn=lambda: now[0],
+        sleep_fn=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    state = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert result["commit_available_bytes"] == 4 * gib
+    assert now[0] == 5
+    assert state["steps"] == 1234
+    assert state["phase"] == "training"
+    assert state["waiting_memory"] is False
+    assert state["success_by_level"] == {"9": 0.5}
+    assert "memory_wait_started_at" not in state
+
+
+def test_pretrain_commit_guard_fails_after_wait_timeout(tmp_path: Path) -> None:
+    gib = 2**30
+    low = {"commit_available_bytes": 2 * gib, "potential_commit_available_bytes": 4 * gib}
+    now = [0.0]
+
+    with pytest.raises(MemoryError, match="stayed below 3 GiB"):
+        pretrain_platform._wait_for_pretrain_commit(
+            tmp_path, 987, low, snapshot_fn=lambda: low,
+            timeout_seconds=10, poll_seconds=5, monotonic_fn=lambda: now[0],
+            sleep_fn=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+    failure = json.loads((tmp_path / "memory_guard_failure.json").read_text(encoding="utf-8"))
+    assert failure["steps"] == 987
+    assert failure["wait_seconds"] == 10
+    assert "timed out" in failure["reason"]
+
+
+def test_pretrain_commit_guard_fails_when_potential_commit_is_unsafe(tmp_path: Path) -> None:
+    gib = 2**30
+    low = {"commit_available_bytes": gib, "potential_commit_available_bytes": 2 * gib}
+
+    with pytest.raises(MemoryError, match="potential commit fell below 3 GiB"):
+        pretrain_platform._wait_for_pretrain_commit(
+            tmp_path, 654, low, snapshot_fn=lambda: low,
+        )
+
+    failure = json.loads((tmp_path / "memory_guard_failure.json").read_text(encoding="utf-8"))
+    assert failure["steps"] == 654
+    assert failure["wait_seconds"] == 0
