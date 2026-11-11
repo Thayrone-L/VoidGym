@@ -29,14 +29,14 @@ class Curriculum:
         return sum(list(values)[-window:]) / window
 
     def training_goal_met(self, *, window: int = 100, levels_0_7_target: float = .70,
-                          level_8_target: float = .70, level_9_target: float = .70) -> bool:
+                          level_8_target: float = .30, level_9_target: float = .70) -> bool:
         return all((rate := self.window_success_rate(level, window)) is not None
                    and rate >= (level_9_target if level == 9 else
                                 level_8_target if level == 8 else levels_0_7_target)
                    for level in range(LEVEL_COUNT))
 
     def update_progress_watch(self, steps: int, *, window: int = 100,
-                              levels_0_7_target: float = .70, level_8_target: float = .70,
+                              levels_0_7_target: float = .70, level_8_target: float = .30,
                               level_9_target: float = .70,
                               no_improvement_steps: int = 3_000_000) -> int | None:
         for level in range(LEVEL_COUNT):
@@ -80,9 +80,12 @@ class Curriculum:
         choice = rng.random()
         if self.level == 0:
             return 1 if choice >= .9 else 0
-        if choice < .6:
+        dead_end_share = self.dead_end_sample_share()
+        current_share = .60 - dead_end_share
+        lower_share_end = .90 - dead_end_share
+        if choice < current_share:
             return self.level
-        if choice < .9:
+        if choice < lower_share_end:
             lower_levels = list(range(self.level))
             weights = np.ones(len(lower_levels), dtype=np.float64)
             for index, level in enumerate(lower_levels):
@@ -90,7 +93,16 @@ class Curriculum:
                 if rate is not None and rate < .70:
                     weights[index] = 3.0
             return int(rng.choice(lower_levels, p=weights / weights.sum()))
+        if choice < .9:
+            return 9
         return self.level if self.level == MAX_LEVEL else self.level + 1
+
+    def dead_end_sample_share(self) -> float:
+        """Reserve part of the current-level share for the dead-end lesson."""
+        if self.level < 3 or self.level >= MAX_LEVEL:
+            return 0.0
+        rate = self.window_success_rate(9, window=100)
+        return .05 if rate is not None and rate >= .70 else .15
 
     def success_rate(self, level: int) -> float:
         values = self.history[level]

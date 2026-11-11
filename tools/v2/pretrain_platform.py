@@ -277,7 +277,7 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--goal-success-levels-0-7", "--goal-success-levels-0-6",
                         dest="goal_success_levels_0_7", type=float, default=.70)
     parser.add_argument("--goal-success-level-8", "--goal-success-level-7",
-                        dest="goal_success_level_8", type=float, default=.70)
+                        dest="goal_success_level_8", type=float, default=.30)
     parser.add_argument("--goal-success-level-9", dest="goal_success_level_9",
                         type=float, default=.70)
     parser.add_argument("--no-improvement-steps", type=int, default=3_000_000)

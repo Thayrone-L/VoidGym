@@ -97,7 +97,7 @@ def test_curriculum_reweights_unlocked_levels_below_seventy_percent() -> None:
 
     lower_samples: list[int] = []
     for seed in range(20_000):
-        if .6 <= np.random.default_rng(seed).random() < .9:
+        if .45 <= np.random.default_rng(seed).random() < .75:
             lower_samples.append(curriculum.sample_level(seed))
     counts = Counter(lower_samples)
 
@@ -120,6 +120,7 @@ def test_curriculum_target_uses_last_100_episodes_per_level() -> None:
         curriculum.history[level].extend(
             [True] * (30 if level == 8 else 70) + [False] * (70 if level == 8 else 30)
         )
+    assert curriculum.training_goal_met()
     assert curriculum.training_goal_met(level_8_target=.30)
     curriculum.history[3].clear()
     curriculum.history[3].extend([True] * 69 + [False] * 31)
@@ -141,6 +142,47 @@ def test_curriculum_advances_at_exact_seventy_percent() -> None:
     for success in [True] * 70 + [False] * 30:
         curriculum.record(success)
     assert curriculum.level == 1
+
+
+def test_dead_end_is_sampled_from_level_three_and_maintenance_share_is_five_percent() -> None:
+    curriculum = Curriculum(seed=11)
+    curriculum.level = 3
+    samples = [curriculum.sample_level(seed) for seed in range(50_000)]
+    assert abs(samples.count(9) / len(samples) - .15) < .01
+    assert abs(samples.count(3) / len(samples) - .45) < .01
+
+    curriculum.history[9].extend([True] * 70 + [False] * 30)
+    samples = [curriculum.sample_level(seed) for seed in range(50_000)]
+    assert abs(samples.count(9) / len(samples) - .05) < .008
+    assert abs(samples.count(3) / len(samples) - .55) < .01
+
+    curriculum.history[9].clear()
+    curriculum.history[9].extend([True] * 69 + [False] * 31)
+    assert curriculum.dead_end_sample_share() == .15
+
+
+def test_curriculum_promotion_zero_through_eight_is_unchanged() -> None:
+    curriculum = Curriculum(seed=5)
+    for expected_level in range(1, 9):
+        for success in [True] * 70 + [False] * 30:
+            curriculum.record(success)
+        assert curriculum.level == expected_level
+
+
+def test_adapter_passes_test_split_to_dead_end_generator_on_reset(monkeypatch) -> None:
+    from voidgym.gyms.platform_gym import adapter as adapter_module
+
+    original = adapter_module.generate_room
+    observed: list[str] = []
+
+    def recording_generate_room(level: int, seed: int, **kwargs):
+        observed.append(kwargs.get("split", "train"))
+        return original(level, seed, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "generate_room", recording_generate_room)
+    gym = adapter_module.PlatformGymAdapter(level=9, seed=11, split="test")
+    gym.reset(seed=15)
+    assert observed == ["test", "test"]
 
 
 def test_curriculum_schema_three_resumes_dead_end_history(tmp_path) -> None:
