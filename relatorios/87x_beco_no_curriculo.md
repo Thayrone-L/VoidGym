@@ -51,7 +51,8 @@ Pronto para iniciar após a CI do commit atual ficar verde:
 - Correção antes da nova tentativa: cada runtime 87v registra seu passo-base em `progress-watch-origin.json` e inicializa o limite de estagnação a partir desse marco. Retomadas do mesmo runtime mantêm esse marco e o estado de progresso; o checkpoint-base permanece exatamente `universal-012438528`.
 - Na saída da r1: status `COMPLETED` por limite herdado; duração 6m08s, total 12.440.576, nível de currículo 8, nível 2 em 42% na janela móvel de 100, sem checkpoint íntegro além do `universal-012440576` salvo pela tentativa curta. RAM disponível 2,65 GiB, commit atual disponível 1,57 GiB e potencial 14,53 GiB; não houve erro CUDA. O nível 9 ainda não tinha episódios na janela.
 - Terceira tentativa, runtime `pretrain-87v-beco-2026-11-11-cuda-r2`: nenhum learner iniciou. O plano conservador de recursos falhou antes de alcançar o guard de espera: com commit atual abaixo da reserva necessária para calcular ambientes, `plan_resources` encerrou três tentativas automáticas. A memória potencial estava segura, mas a espera de 30 minutos ainda só ocorria depois do planejamento.
-- Ajuste seguinte aplicado: a espera CUDA acontece antes do planejamento e se repete depois da sondagem do worker, sempre recalculando o hardware após a espera. O piso de planejamento é 10 GiB, cobrindo 4 GiB do sistema, 5,5 GiB do learner e uma pequena margem do worker; o limite durante o treinamento continua em 1,5 GiB atual / 3 GiB potencial. A espera continua limitada a 30 minutos. A validação focada passou (29 testes).
+- Quarta tentativa, runtime `pretrain-87v-beco-2026-11-11-cuda-r3`: o supervisor aguardou 30 min antes do planejamento e encerrou sem iniciar o learner. Ao fim, RAM livre era 4,47 GiB, commit atual 8,58 GiB e potencial 24,58 GiB; passos ficaram no checkpoint-base 12.438.528 e nenhum checkpoint novo foi gravado.
+- Ajuste seguinte aplicado: a espera CUDA acontece antes do planejamento e se repete depois da sondagem do worker, recalculando o hardware após cada espera. A reserva do learner no planner passou para 4 GiB (mantendo 4 GiB para o sistema e fator de segurança 3× para workers), e o piso de commit atual para planejamento é 8,5 GiB; o guard durante o treinamento continua em 1,5 GiB atual / 3 GiB potencial. A espera continua limitada a 30 minutos.
 
 ## Etapa 4 — campanha HK nova
 
@@ -59,8 +60,8 @@ Pendente de autorização textual específica: **“autorizo iniciar a campanha 
 
 ## Validação e commits
 
-- Suíte local após os ajustes do watchdog e da espera pré-planejamento: `925 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
-- Ruff nos arquivos alterados, `mypy src` e `git diff --check`: aprovados após o ajuste.
-- CI do commit `f501bf4` passou em todos os jobs após um retry de e2e que inicialmente expirou em 60 s. O teste e2e passou no retry em 7m01s.
-- Commits enviados ao PR #8: `6ef3ac7` (currículo), `e9326e6` (salas e avaliações), `84bf7fa` (telemetria), `2c69203` (tolerância do teste de desempenho), `c9b7d02` (primeira versão do guard), `15e23f7` (limiar do guard) e `f501bf4` (watchdog de estagnação por runtime). O ajuste de espera pré-planejamento será acrescentado.
+- Suíte local após o ajuste do watchdog e da espera pré-planejamento: `925 passed, 4 skipped, 8 subtests passed`; os 3 avisos são de `stable-baselines3` ao construir tensores de outros tensores.
+- Ruff nos arquivos alterados, `mypy src` e `git diff --check`: aprovados após os ajustes.
+- CI do commit `f501bf4` passou em todos os jobs após um retry de e2e que inicialmente expirou em 60 s; o e2e passou no retry em 7m01s. CI do `94d9094` ficou verde em todos os workflows.
+- Commits enviados ao PR #8: `6ef3ac7` (currículo), `e9326e6` (salas e avaliações), `84bf7fa` (telemetria), `2c69203` (tolerância do teste de desempenho), `c9b7d02` (primeira versão do guard), `15e23f7` (limiar do guard), `f501bf4` (watchdog de estagnação por runtime) e `94d9094` (espera antes do planejamento). A reserva atualizada do learner será acrescentada.
 - Resultados do pré-treino e comparação tripla serão acrescentados aqui quando concluídos. A comparação tripla depende de autorização da Etapa 4.

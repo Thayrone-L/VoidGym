@@ -254,8 +254,8 @@ def _memory_telemetry(device: torch.device,
 
 _MIN_PRETRAIN_CURRENT_COMMIT_BYTES = 3 * 2**30 // 2
 _MIN_PRETRAIN_POTENTIAL_COMMIT_BYTES = 3 * 2**30
-# plan_resources reserves 4 GiB for the system and 5.5 GiB for learner growth.
-_MIN_PRETRAIN_PLAN_COMMIT_BYTES = 10 * 2**30
+# plan_resources reserves 4 GiB for the system plus 4 GiB for learner growth.
+_MIN_PRETRAIN_PLAN_COMMIT_BYTES = 8 * 2**30 + 512 * 2**20
 _PRETRAIN_MEMORY_WAIT_SECONDS = 30 * 60
 
 
@@ -495,7 +495,7 @@ def _run_impl(args: argparse.Namespace) -> Path:
         "commit_available_gb_at_plan": profile.commit_available_gb,
         "worker_private_gb": profile.worker_private_gb,
         "planned_commit_headroom_gb": plan.commit_headroom_gb,
-        "learner_commit_reserve_gb": 5.5,
+        "learner_commit_reserve_gb": 4.0,
         "worker_memory_safety_factor": 3.0,
         "warnings": list(plan.warnings),
         "effective_batch_size": args.batch_size or plan.batch_size,

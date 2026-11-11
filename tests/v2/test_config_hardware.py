@@ -84,12 +84,12 @@ def test_pretrain_plan_reserves_learner_and_worker_growth() -> None:
         commit_available_gb=12.8, worker_private_gb=.1,
     )
     plan = plan_resources(profile, "pretrain_platform", {"gym_envs": 20})
-    assert plan.gym_envs == 11
+    assert plan.gym_envs == 16
     assert plan.commit_headroom_gb is not None and plan.commit_headroom_gb >= 3
     with pytest.raises(ValueError, match="3 GiB"):
         plan_resources(profile.__class__(
             8, 16, 16, 8, "RTX", 12, 10, "8.6", 100, "Windows",
-            commit_available_gb=8.39, worker_private_gb=.1,
+            commit_available_gb=8.29, worker_private_gb=.1,
         ), "pretrain_platform")
 
 

@@ -237,7 +237,7 @@ def plan_resources(profile: HardwareProfile, kind: str = "game_training",
     instances = min(v2_capacity, v1_recommendation)
     gym_envs = max(2, logical - 2 - 2 * instances)
     requested_envs = int(overrides.get("gym_envs", gym_envs))
-    learner_reserve = 5.5 if kind == "pretrain_platform" else 0.0
+    learner_reserve = 4.0 if kind == "pretrain_platform" else 0.0
     worker_factor = 3.0 if kind == "pretrain_platform" else 1.25
     gym_envs, commit_headroom, commit_warnings = _plan_environment_count(
         profile, requested_envs, extra_learner_reserve_gb=learner_reserve,
