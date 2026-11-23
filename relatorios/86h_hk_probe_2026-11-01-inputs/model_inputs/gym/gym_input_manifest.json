@@ -1,0 +1,32 @@
+{
+  "level": 2,
+  "seed": 8601,
+  "route": [
+    "RIGHT",
+    "RIGHT",
+    "RIGHT",
+    "RIGHT+JUMP_TAP"
+  ],
+  "pixel_shape_chw": [
+    12,
+    108,
+    192
+  ],
+  "pixel_dtype": "uint8",
+  "pixel_min": 4,
+  "pixel_max": 255,
+  "channel_order": "RGB per frame",
+  "frame_sha256": [
+    "11fb54eefb48c87f7285d3958ddc5983f475962c45fd3fcaa74f83c51917f685",
+    "c3101f7bc3d6281b685469c4ba4fca9dc54c2ac8a8eac208d4ffaba9f90a8f87",
+    "bd8f1a1f4e4ee2c69dce2bd3cc59d33e34573bd1a9e0d3dc1bcc08baf0458e75",
+    "6dc3d70ae40fc132386c2cc6588f5756719ee1f5153665d683c4fc31b7af5337"
+  ],
+  "distinct_frames": 4,
+  "action_history": [
+    2,
+    2,
+    7
+  ],
+  "letterbox": "fit_to_universal() produced the 192x108 RGB frames used in this exact stack"
+}

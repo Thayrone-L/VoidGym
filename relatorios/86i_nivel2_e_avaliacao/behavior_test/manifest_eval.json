@@ -1,0 +1,11 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86e-final-resume4-2026-11-03-cuda\\universal-012438528",
+  "trained_steps": 12438528,
+  "episodes_per_level": 200,
+  "level8_sets": 200,
+  "split": "test",
+  "device": "cuda",
+  "perception_frames": null,
+  "perception_output": null,
+  "perception_frames_by_level": null
+}

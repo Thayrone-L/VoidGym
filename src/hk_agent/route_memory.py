@@ -373,7 +373,7 @@ class TopologicalRouteMemory:
         if (
             not isinstance(result["game_profile"], str)
             or not result["game_profile"]
-            or result["save_source"] not in {"existing_save", "new_game"}
+            or result["save_source"] not in {"existing_save", "new_game", "continuous_playthrough"}
             or not isinstance(result["save_slot"], int)
             or not 1 <= result["save_slot"] <= 4
             or not isinstance(result["campaign_id"], str)

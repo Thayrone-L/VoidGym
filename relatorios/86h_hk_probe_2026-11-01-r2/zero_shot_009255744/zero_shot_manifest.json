@@ -1,0 +1,28 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\86h-semantic-skip-smoke-2026-11-01-r2\\universal-009255744",
+  "trained_steps": 9255744,
+  "sampled_frames": 8,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "source": "test",
+  "campaign_id": "86h-policy-probe-r2-8",
+  "frames_per_scene": {
+    "Tutorial_01": 8
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.40598333500652545,
+    "SOLID": 0.013233190271816882,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.0,
+    "ENEMY": 0.0,
+    "PLAYER": 0.11386138613861387,
+    "BREAKABLE": 0.0,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

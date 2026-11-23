@@ -23,7 +23,8 @@ from hk_agent.menu_bootstrap import (
     run_menu_bootstrap,
 )
 from hk_agent.protocol import ProtocolError
-from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer
+from hk_agent.semantic_labels import unpack_u4
+from hk_agent.supervisor import AcceptedBridge, CapturedFrame, SupervisorServer, require_png_frame
 
 _T = TypeVar("_T")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -119,9 +120,15 @@ class SupervisorEnvironmentBackend:
         settle_seconds: float = 0.0,
         menu_bootstrap_plan: MenuBootstrapPlan | None = None,
         menu_bootstrap_plan_provider: MenuBootstrapPlanProvider | None = None,
+        checkpoint_reload_plan_provider: MenuBootstrapPlanProvider | None = None,
+        checkpoint_reload_readiness_verifier: ReadinessVerifier | None = None,
         menu_bootstrap_artifact_root: Path | None = None,
         menu_readiness_verifier: ReadinessVerifier | None = None,
         expected_save_root: Path | None = None,
+        reuse_game_on_reset: bool = False,
+        playthrough_root: Path | None = None,
+        request_semantic_labels: bool = False,
+        request_combat_events: bool = False,
     ) -> None:
         if (
             bridge_timeout_seconds <= 0
@@ -133,8 +140,12 @@ class SupervisorEnvironmentBackend:
             raise ValueError("settle_seconds must be non-negative")
         if menu_bootstrap_plan is not None and menu_bootstrap_plan_provider is not None:
             raise ValueError("provide either a menu bootstrap plan or a provider")
+        if checkpoint_reload_readiness_verifier is not None and checkpoint_reload_plan_provider is None:
+            raise ValueError("checkpoint reload readiness verifier requires a plan provider")
         has_bootstrap = menu_bootstrap_plan is not None or menu_bootstrap_plan_provider is not None
-        if has_bootstrap != (menu_bootstrap_artifact_root is not None):
+        if (has_bootstrap or checkpoint_reload_plan_provider is not None) != (
+            menu_bootstrap_artifact_root is not None
+        ):
             raise ValueError("menu bootstrap plan and artifact root must be provided together")
         if expected_save_root is None and reset_process is not None:
             owner = getattr(reset_process, "__self__", None)
@@ -147,6 +158,14 @@ class SupervisorEnvironmentBackend:
             expected_save_root=expected_save_root,
         )
         self._reset_process = reset_process
+        self._reuse_game_on_reset = reuse_game_on_reset
+        if type(request_semantic_labels) is not bool:
+            raise TypeError("request_semantic_labels must be bool")
+        if type(request_combat_events) is not bool:
+            raise TypeError("request_combat_events must be bool")
+        self._request_semantic_labels = request_semantic_labels
+        self._request_combat_events = request_combat_events
+        self._playthrough_root = playthrough_root.resolve(strict=False) if playthrough_root else None
         self._shutdown_process = shutdown_process
         self._bridge_timeout = bridge_timeout_seconds
         self._command_timeout = command_timeout_seconds
@@ -154,6 +173,8 @@ class SupervisorEnvironmentBackend:
         self._settle_seconds = settle_seconds
         self._menu_bootstrap_plan = menu_bootstrap_plan
         self._menu_bootstrap_plan_provider = menu_bootstrap_plan_provider
+        self._checkpoint_reload_plan_provider = checkpoint_reload_plan_provider
+        self._checkpoint_reload_readiness_verifier = checkpoint_reload_readiness_verifier
         self._menu_bootstrap_artifact_root = menu_bootstrap_artifact_root
         if menu_readiness_verifier is not None and menu_bootstrap_plan is None:
             raise ValueError("menu readiness verifier requires a bootstrap plan")
@@ -173,6 +194,8 @@ class SupervisorEnvironmentBackend:
             raise RuntimeError("supervisor event loop did not start")
         self._bridge: AcceptedBridge | None = None
         self._episode_id: str | None = None
+        self._spawn_candidate_png: bytes | None = None
+        self._last_reset_recovery: dict[str, object] = {"method": "none"}
         self._closed = False
         try:
             self._submit(self._supervisor.start(), timeout=self._command_timeout)
@@ -205,50 +228,88 @@ class SupervisorEnvironmentBackend:
     def reset(
         self, *, seed: int | None, options: Mapping[str, Any] | None
     ) -> ResetResult:
-        del seed, options
+        del seed
         with self._operation_lock:
             self._ensure_open()
             previous_session = self._bridge.session_id if self._bridge is not None else None
             had_bridge = self._bridge is not None
-            if self._bridge is not None:
+            previous_bridge = self._bridge
+            if previous_bridge is not None:
                 self._release_locked(best_effort=True)
-            # A failed reset must never leave the previous episode usable.
-            self._bridge = None
+            reload_checkpoint = bool(options and options.get("reload_checkpoint") is True)
+            reuse_bridge = self._reuse_game_on_reset and previous_bridge is not None and not reload_checkpoint
+            recovered_by_menu = False
+            bridge: AcceptedBridge
+            episode_id = str(uuid.uuid4())
+            if (
+                reload_checkpoint
+                and self._reuse_game_on_reset
+                and previous_bridge is not None
+                and self._checkpoint_reload_plan_provider is not None
+            ):
+                self._episode_id = None
+                self._spawn_candidate_png = None
+                try:
+                    plan = self._checkpoint_reload_plan_provider()
+                    verifier = self._checkpoint_reload_readiness_verifier or build_readiness_verifier(plan)
+                    assert self._menu_bootstrap_artifact_root is not None
+                    self._run_menu_plan(
+                        plan,
+                        bridge=previous_bridge,
+                        episode_id=episode_id,
+                        readiness_verifier=verifier,
+                        artifact_root=self._menu_bootstrap_artifact_root / "checkpoint-reloads",
+                    )
+                    bridge = previous_bridge
+                    recovered_by_menu = True
+                    self._last_reset_recovery = {
+                        "requested": True,
+                        "method": "menu",
+                        "plan_id": plan.plan_id,
+                        "status": "READY",
+                    }
+                except Exception as menu_error:  # noqa: BLE001 - any failed checkpoint navigation uses the safe process-reopen fallback
+                    self._last_reset_recovery = {
+                        "requested": True,
+                        "method": "save-reopen-fallback",
+                        "error": f"{type(menu_error).__name__}: {menu_error}",
+                    }
+                    self._bridge = previous_bridge
+                    self._release_locked(best_effort=True)
+                    self._bridge = None
+                    if self._shutdown_process is not None:
+                        self._invoke_process_callback(
+                            self._shutdown_process,
+                            label="checkpoint_menu_reload_fallback_shutdown",
+                        )
+                else:
+                    # Menu recovery is a real discontinuity for recurrent state,
+                    # even though it keeps the same game process and bridge.
+                    reuse_bridge = False
+            else:
+                self._last_reset_recovery = {
+                    "requested": reload_checkpoint,
+                    "method": "continuous_episode" if not reload_checkpoint and reuse_bridge else "save-reopen-fallback" if reload_checkpoint else "bootstrap",
+                }
+
+            if not recovered_by_menu and not reuse_bridge:
+                self._bridge = None
             self._episode_id = None
 
-            episode_id = str(uuid.uuid4())
-            if self._reset_process is not None:
-                try:
-                    self._invoke_process_callback(
-                        self._reset_process,
-                        self.endpoint,
-                        episode_id,
-                        label="reset_process",
-                        cancellation=ProcessLaunchCancellation(),
+            self._spawn_candidate_png = None
+            if not recovered_by_menu:
+                if reuse_bridge:
+                    assert previous_bridge is not None
+                    bridge = previous_bridge
+                else:
+                    bridge = self._start_new_bridge(
+                        episode_id=episode_id,
+                        previous_session=previous_session,
+                        had_bridge=had_bridge,
                     )
-                except TimeoutError:
-                    # The timed-out daemon thread cannot be forcibly stopped.
-                    # Permanently close this backend so a late process cannot
-                    # connect and be mistaken for a later reset generation.
-                    self._fault_close_listener()
-                    raise
-                bridge = self._submit(
-                    self._supervisor.wait_for_new_bridge(
-                        after_session_id=previous_session,
-                        timeout=self._bridge_timeout,
-                    ),
-                    timeout=self._bridge_timeout + 0.5,
-                )
-            elif not had_bridge:
-                bridge = self._submit(
-                    self._supervisor.wait_for_bridge(self._bridge_timeout),
-                    timeout=self._bridge_timeout + 0.5,
-                )
-            else:
-                raise RuntimeError("a reset_process callback is required for another episode")
 
             try:
-                menu_plan = (
+                menu_plan = None if reuse_bridge or recovered_by_menu else (
                     self._menu_bootstrap_plan_provider()
                     if self._menu_bootstrap_plan_provider is not None
                     else self._menu_bootstrap_plan
@@ -260,18 +321,23 @@ class SupervisorEnvironmentBackend:
                         if self._menu_bootstrap_plan_provider is None
                         else build_readiness_verifier(menu_plan)
                     )
-                    self._submit(
-                        run_menu_bootstrap(
-                            menu_plan,
-                            supervisor=self._supervisor,
-                            bridge=bridge,
-                            episode_id=episode_id,
-                            artifact_root=self._menu_bootstrap_artifact_root,
-                            command_timeout_seconds=self._command_timeout,
-                            readiness_verifier=readiness_verifier,
-                        ),
-                        timeout=menu_plan.timeout_seconds + 0.5,
+                    assert readiness_verifier is not None
+                    bootstrap_report = self._run_menu_plan(
+                        menu_plan,
+                        bridge=bridge,
+                        episode_id=episode_id,
+                        readiness_verifier=readiness_verifier,
+                        artifact_root=self._menu_bootstrap_artifact_root,
                     )
+                    captures = getattr(bootstrap_report, "captures", ())
+                    candidate = next((row for row in captures
+                                      if isinstance(row, dict) and row.get("label") == "ready-candidate"), None)
+                    candidate_path = candidate.get("path") if isinstance(candidate, dict) else None
+                    if isinstance(candidate_path, str):
+                        candidate_file = Path(candidate_path).resolve(strict=True)
+                        artifact_root = self._menu_bootstrap_artifact_root.resolve(strict=True)
+                        candidate_file.relative_to(artifact_root)
+                        self._spawn_candidate_png = candidate_file.read_bytes()
                 self._submit(
                     self._supervisor.begin_episode(
                         episode_id,
@@ -285,12 +351,19 @@ class SupervisorEnvironmentBackend:
                         timeout=self._command_timeout,
                         bridge=bridge,
                         episode_id=episode_id,
+                        encoding="raw_rgb8",
+                        semantic_labels=self._request_semantic_labels,
+                        combat_events=self._request_combat_events,
                     ),
                     timeout=self._command_timeout + 0.5,
                 )
                 if frame.last_applied_action_id is not None:
                     raise ProtocolError("initial FRAME retained a previous action")
                 captured = _to_pixel_frame(frame, episode_id)
+                if not reuse_bridge and self._playthrough_root is not None:
+                    from hk_agent.playthrough import backup_playthrough
+
+                    backup_playthrough(self._playthrough_root, reason="loaded-successfully")
             except Exception as error:
                 self._bridge = bridge
                 self._release_locked(best_effort=True)
@@ -311,6 +384,82 @@ class SupervisorEnvironmentBackend:
             self._episode_id = episode_id
             return ResetResult(episode_id=episode_id, frame=captured)
 
+    def _start_new_bridge(
+        self,
+        *,
+        episode_id: str,
+        previous_session: str | None,
+        had_bridge: bool,
+    ) -> AcceptedBridge:
+        if self._reset_process is not None:
+            try:
+                self._invoke_process_callback(
+                    self._reset_process,
+                    self.endpoint,
+                    episode_id,
+                    label="reset_process",
+                    cancellation=ProcessLaunchCancellation(),
+                )
+            except TimeoutError:
+                self._fault_close_listener()
+                raise
+            return self._submit(
+                self._supervisor.wait_for_new_bridge(
+                    after_session_id=previous_session,
+                    timeout=self._bridge_timeout,
+                ),
+                timeout=self._bridge_timeout + 0.5,
+            )
+        if had_bridge:
+            raise RuntimeError("a reset_process callback is required for another episode")
+        return self._submit(
+            self._supervisor.wait_for_bridge(self._bridge_timeout),
+            timeout=self._bridge_timeout + 0.5,
+        )
+
+    def _run_menu_plan(
+        self,
+        plan: MenuBootstrapPlan,
+        *,
+        bridge: AcceptedBridge,
+        episode_id: str,
+        readiness_verifier: ReadinessVerifier,
+        artifact_root: Path,
+    ) -> object:
+        return self._submit(
+            run_menu_bootstrap(
+                plan,
+                supervisor=self._supervisor,
+                bridge=bridge,
+                episode_id=episode_id,
+                artifact_root=artifact_root,
+                command_timeout_seconds=self._command_timeout,
+                readiness_verifier=readiness_verifier,
+            ),
+            timeout=plan.timeout_seconds + 0.5,
+        )
+
+
+    @property
+    def last_reset_recovery(self) -> dict[str, object]:
+        return dict(self._last_reset_recovery)
+
+
+    def capture_png(self) -> bytes:
+        """Capture an on-demand operator milestone, validating the PNG artifact path."""
+        with self._operation_lock:
+            if self._spawn_candidate_png is not None:
+                payload, self._spawn_candidate_png = self._spawn_candidate_png, None
+                return payload
+            bridge, episode_id = self._require_episode()
+            frame = self._submit(
+                self._supervisor.capture_once(timeout=self._command_timeout, bridge=bridge,
+                                              episode_id=episode_id, encoding="png"),
+                timeout=self._command_timeout + 0.5,
+            )
+            require_png_frame(frame)
+            return frame.data
+
     def step(self, *, action_id: int, buttons: tuple[str, ...], lease_ms: int) -> BackendStep:
         if action_id < 0 or not 1 <= lease_ms <= 2_000:
             raise ValueError("invalid action_id or lease_ms")
@@ -318,8 +467,10 @@ class SupervisorEnvironmentBackend:
             self._ensure_open()
             bridge, episode_id = self._require_episode()
             started = time.monotonic_ns()
+            timings: dict[str, float] = {}
             response = None
             try:
+                apply_started = time.monotonic_ns()
                 response = self._submit(
                     self._supervisor.send_command(
                         "APPLY_ACTION",
@@ -343,23 +494,53 @@ class SupervisorEnvironmentBackend:
                 self._validate_action_ack(
                     response.payload, episode_id, action_id, buttons, lease_ms
                 )
+                timings["apply_rtt"] = (time.monotonic_ns() - apply_started) / 1_000_000
+                sleep_started = time.monotonic_ns()
                 time.sleep((lease_ms / 1000.0) + self._settle_seconds)
+                timings["lease_sleep"] = (time.monotonic_ns() - sleep_started) / 1_000_000
             finally:
+                release_started = time.monotonic_ns()
                 self._release_locked(best_effort=response is None)
+                timings["release_rtt"] = (time.monotonic_ns() - release_started) / 1_000_000
 
+            capture_started = time.monotonic_ns()
             frame = self._capture_locked(expected_action_id=action_id)
+            timings["capture_rtt"] = (time.monotonic_ns() - capture_started) / 1_000_000
+            timings["decode"] = frame.decode_ms
+            for name, value in frame.bridge_timing:
+                timings[f"bridge_{name}"] = value
+            timings["backend"] = (time.monotonic_ns() - started) / 1_000_000
             return BackendStep(
                 frame=frame,
                 applied_action=AppliedAction(action_id, buttons, buttons, lease_ms),
                 terminated=frame.player_dead,
                 termination_reason="player_death" if frame.player_dead else None,
-                timing_ms={"backend": (time.monotonic_ns() - started) / 1_000_000},
+                timing_ms=timings,
             )
 
     def release_all(self) -> None:
         with self._operation_lock:
             self._ensure_open()
             self._release_locked(best_effort=False)
+
+    def set_human_mode(self, enabled: bool) -> dict[str, object]:
+        """Route this isolated game window to physical inputs during operator help."""
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be bool")
+        with self._operation_lock:
+            self._ensure_open()
+            bridge, _episode_id = self._require_episode()
+            self._release_locked(best_effort=False)
+            response = self._submit(
+                self._supervisor.send_command(
+                    "SET_HUMAN_MODE", {"enabled": enabled},
+                    timeout=self._command_timeout, bridge=bridge,
+                ),
+                timeout=self._command_timeout + 0.5,
+            )
+            if response.message_type == "ERROR":
+                raise ProtocolError("SET_HUMAN_MODE failed")
+            return dict(response.payload)
 
     def close(self) -> None:
         with self._operation_lock:
@@ -386,6 +567,9 @@ class SupervisorEnvironmentBackend:
                 timeout=self._command_timeout,
                 bridge=bridge,
                 episode_id=episode_id,
+                encoding="raw_rgb8",
+                semantic_labels=self._request_semantic_labels,
+                combat_events=self._request_combat_events,
             ),
             timeout=self._command_timeout + 0.5,
         )
@@ -509,11 +693,33 @@ class SupervisorEnvironmentBackend:
 def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
     if frame.episode_id != episode_id:
         raise ProtocolError("FRAME belongs to another episode")
-    pixels = decode_rgb8_png(
-        frame.data, expected_width=frame.width, expected_height=frame.height
-    )
+    decode_started = time.monotonic_ns()
+    if frame.encoding == "raw_rgb8":
+        expected_bytes = frame.width * frame.height * 3
+        if (
+            frame.channels != 3
+            or frame.width > 600
+            or frame.height > 338
+            or len(frame.data) != expected_bytes
+        ):
+            raise ProtocolError("raw RGB8 FRAME dimensions or payload are invalid")
+        pixels = np.frombuffer(frame.data, dtype=np.uint8).reshape(
+            frame.height, frame.width, 3
+        ).copy()
+    elif frame.encoding == "png":
+        pixels = decode_rgb8_png(
+            frame.data, expected_width=frame.width, expected_height=frame.height
+        )
+    else:
+        raise ProtocolError(f"unsupported FRAME encoding: {frame.encoding}")
     if pixels.shape != (frame.height, frame.width, 3):
         raise ProtocolError("decoded PNG dimensions differ from FRAME metadata")
+    semantic_labels = None
+    if frame.semantic_labels_u4 is not None:
+        try:
+            semantic_labels = unpack_u4(frame.semantic_labels_u4, width=48, height=27)
+        except ValueError as error:
+            raise ProtocolError("FRAME semantic_labels encoding is invalid") from error
     return PixelFrame(
         episode_id=episode_id,
         frame_id=frame.frame_id,
@@ -531,6 +737,25 @@ def _to_pixel_frame(frame: CapturedFrame, episode_id: str) -> PixelFrame:
         hp_lost_since_last_frame=frame.hp_lost_since_last_frame,
         geo_gained_since_last_frame=frame.geo_gained_since_last_frame,
         geo_spent_since_last_frame=frame.geo_spent_since_last_frame,
+        hp_restored_since_last_frame=frame.hp_restored_since_last_frame,
+        shade_hits_since_last_frame=frame.shade_hits_since_last_frame,
+        shade_distance=frame.shade_distance,
+        scene_name=frame.scene_name,
+        operator_telemetry=frame.operator_telemetry,
+        enemy_events_since_last_frame=frame.enemy_events_since_last_frame,
+        bestiary_events=frame.bestiary_events,
+        combat_events=frame.combat_events,
+        decode_ms=(time.monotonic_ns() - decode_started) / 1_000_000,
+        bridge_timing=frame.bridge_timing,
+        action_availability=frame.action_availability,
+        human_buttons=frame.human_buttons,
+        human_duration_ms=frame.human_duration_ms,
+        human_mode=frame.human_mode,
+        human_input_test=frame.human_input_test,
+        semantic_labels=semantic_labels,
+        hero_motion=frame.hero_motion,
+        interact_prompt=frame.interact_prompt,
+        interact_prompt_valid=frame.interact_prompt_valid,
     )
 
 

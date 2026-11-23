@@ -3,85 +3,119 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Void Lab · HK Training</title>
+  <meta name="color-scheme" content="light dark">
+  <title>Void Lab · Treino</title>
   <link rel="stylesheet" href="/app.css">
+  <script src="/map-transform.js" defer></script>
+  <script src="/app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <p class="eyebrow">LOCAL CONTROL PLANE</p>
-      <h1>Void Lab</h1>
-      <p class="subtitle">Campanhas, sinais e checkpoints — sem sair desta máquina.</p>
-    </div>
-    <div class="live-state"><span id="live-dot"></span><span id="live-label">Conectando</span></div>
+    <div class="brand"><span class="brand-mark">V</span><div><p class="eyebrow">TREINO LOCAL</p><h1>Void Lab</h1></div></div>
+    <div class="topbar-actions"><button id="theme-toggle" class="button quiet theme-toggle" type="button" aria-label="Tema do painel: automático">Tema: Automático</button><div class="connection"><span id="live-dot" class="dot"></span><span id="live-label">Conectando…</span></div></div>
   </header>
-
+  <section id="status-banner" class="status-banner idle" role="status" aria-live="polite" aria-atomic="false">
+    <div class="status-banner-main"><strong id="status-message">Conectando ao painel…</strong><div id="status-alert-list" hidden></div></div>
+    <details id="status-technical" hidden><summary>Detalhes técnicos</summary><pre id="status-technical-detail"></pre></details>
+    <details id="status-events" hidden><summary>Últimos eventos</summary><div id="status-event-list"></div></details>
+    <button id="supervisor-restart" class="button secondary" type="button" hidden>Religar supervisor</button>
+    <button id="retry-status" class="button secondary" type="button" hidden>Tentar de novo</button>
+  </section>
+  <section id="help-alert" class="help-alert" hidden aria-live="polite"><strong id="help-alert-count"></strong></section>
+  <section id="help-top" class="panel help-top" hidden><div class="panel-head"><div><p class="eyebrow">AJUDA AO VIVO</p><h2>Pedido de ajuda</h2></div></div><div id="help-top-list"></div></section>
   <main>
-    <section class="hero-grid">
-      <article class="metric-card"><span>Runs indexadas</span><strong id="run-count">—</strong><small>training + probes</small></article>
-      <article class="metric-card"><span>Gate de cenário</span><strong id="gate-state">—</strong><small id="gate-evidence">Aguardando evidência</small></article>
-      <article class="metric-card"><span>Execução real</span><strong id="execute-state">—</strong><small>controlada ao iniciar o servidor</small></article>
-      <article class="metric-card accent"><span>Processos ativos</span><strong id="active-state">0</strong><small id="active-detail">2 vagas disponíveis</small></article>
-    </section>
+    <section class="welcome"><div><p class="eyebrow">PAINEL DO OPERADOR</p><h2>Deixe a IA explorar Hallownest</h2><p>O treino usa o save experimental que começa na Passagem do Rei. Seu save pessoal fica separado.</p></div><div class="status-badge" id="run-status">Parado</div></section>
 
-    <section class="workspace">
-      <div class="panel runs-panel">
-        <div class="panel-head"><div><p class="eyebrow">TELEMETRIA</p><h2>Histórico de runs</h2></div><button id="refresh" class="ghost">Atualizar</button></div>
-        <div id="runs" class="run-list"><p class="empty">Carregando manifests…</p></div>
-      </div>
-
-      <aside class="panel campaign-panel">
-        <div class="panel-head"><div><p class="eyebrow">ORQUESTRAÇÃO</p><h2>Nova campanha</h2></div></div>
-        <form id="campaign-form">
-          <label>Nome<input name="name" value="Exploração de cenário" maxlength="80" required></label>
-          <label>Tipo<select name="campaign_type" id="campaign-type"><option value="scene_change_probe">Probe de cenário</option><option value="scene_change_training">PPO de cenário</option><option value="visual_motion_training">PPO motor</option></select></label>
-          <fieldset><legend>Origem da campanha</legend><div class="field-grid">
-            <label>Partida<select name="save_source" id="save-source"><option value="existing_save">Usar save existente</option><option value="new_game">Iniciar novo jogo</option></select></label>
-            <label>Slot<select name="save_slot"><option value="1">Slot 1</option><option value="2">Slot 2</option><option value="3">Slot 3</option><option value="4">Slot 4</option></select></label>
-          </div><small id="save-source-help">O slot precisa existir no save experimental.</small></fieldset>
-          <label>Sessão do worker (opcional)<input name="worker_session_id" placeholder="ex.: pc-sala-run-01" pattern="[a-z0-9][a-z0-9-]{0,62}"><small>Para treinos, usa somente a política portátil já congelada pelo preflight; vazio começa do zero.</small></label>
-          <div class="field-grid">
-            <label>Seed<input name="seed" type="number" value="23" min="0" max="2147483647"></label>
-            <label>Lease (ms)<input name="lease_ms" type="number" value="80" min="20" max="5000"></label>
-            <label>Largura da janela<input name="window_width" type="number" value="960" min="320" max="7680"></label>
-            <label>Altura da janela<input name="window_height" type="number" value="540" min="320" max="7680"></label>
-            <label>Duração<select name="duration_mode" id="duration-mode"><option value="limited">Limitada por passos</option><option value="continuous">Contínua até solicitar parada</option></select></label>
-            <label id="timesteps-field">Timesteps<input id="timesteps" name="timesteps" type="number" value="4096" min="1" max="10000000"><small id="duration-help">A campanha termina ao atingir este total.</small></label>
-            <label>Checkpoint<input name="checkpoint_interval" type="number" value="1024" min="1" max="1000000"></label>
-            <label>Checkpoints retidos<input name="max_checkpoints" type="number" value="5" min="2" max="100"><small>Os mais antigos são rotacionados após validar o novo.</small></label>
-            <label>Episódios<input name="episodes" type="number" value="3" min="1" max="10000"></label>
-            <label>Horizonte<input id="horizon" name="horizon" type="number" value="512" min="8" max="100000"><small id="horizon-help">Limite de passos por episódio.</small></label>
-            <label>Action repeat<input name="action_repeat" type="number" value="3" min="1" max="32"></label>
-          </div>
-          <fieldset><legend>Pesos de recompensa</legend><div class="field-grid">
-            <label>Custo temporal<input name="time_cost" type="number" value="-0.002" min="-100" max="0" step="0.001"></label>
-            <label>Sucesso<input name="success_reward" type="number" value="10" min="0.001" max="100" step="any"></label>
-            <label>Inimigo derrotado<input name="enemy_kill_reward" type="number" value="2" min="0" max="100" step="any"><small>Só conta morte confirmada, não apenas um golpe.</small></label>
-            <label>Teto por mortes<input name="enemy_kill_reward_budget" type="number" value="6" min="0" max="100" step="any"><small>Limita farming de inimigos por episódio.</small></label>
-            <label>Recuperar a Sombra<input name="shade_recovery_reward" type="number" value="2" min="0" max="100" step="any"><small>Pago uma vez por episódio após confirmação do bridge.</small></label>
-            <label>Dano / HP perdido<input name="damage_penalty" type="number" value="-0.25" min="-100" max="0" step="any"><small>Aplicado por máscara de vida realmente perdida.</small></label>
-            <label>Geo ganho<input name="geo_gain_reward" type="number" value="0.01" min="0" max="100" step="any"><small>Por Geo coletado fisicamente; recuperar a Shade não conta outra vez.</small></label>
-            <label>Geo gasto<input name="geo_spend_reward" type="number" value="0.02" min="0" max="100" step="any"><small>Compras e pedágios contam; perdas na morte não.</small></label>
-            <label>Morte<input name="death_penalty" type="number" value="-2" min="-100" max="0" step="any"></label>
-            <label>Run falha (perdeu Shade)<input name="run_failed_penalty" type="number" value="-4" min="-100" max="0" step="any"></label>
-            <label id="novelty-field">Novelty budget<input name="novelty_shaping_budget" type="number" value="0" min="0" max="1" step="0.01"></label>
-            <label id="visual-field" hidden>Mudança visual<input name="visual_change_scale" type="number" value="0.1" min="0.001" max="100" step="any"></label>
-          </div></fieldset>
-          <button type="submit" class="primary">Salvar versão</button>
-        </form>
-        <div id="campaign-message" class="message" aria-live="polite"></div>
-        <div class="launch-box">
-          <label>Campanha salva<select id="saved-campaign"></select></label>
-          <label class="toggle"><input id="execute" type="checkbox"><span>Executar no jogo (não dry-run)</span></label>
-          <small id="execute-help">Disponível quando o servidor permite execução real.</small>
-          <div class="button-row"><button id="launch" class="primary">Lançar</button><button id="stop" class="danger" title="Solicita encerramento no próximo ponto seguro">Solicitar parada</button></div>
-          <label>Launch em foco<select id="active-launch"><option value="">Nenhum launch ativo</option></select><small>Define qual processo aparece no log e recebe a solicitação de parada.</small></label>
+    <section class="control-grid">
+      <article class="panel start-panel">
+        <div class="panel-head"><div><p class="eyebrow">CONTROLE</p><h2>Iniciar treino</h2></div></div>
+        <div class="form-grid">
+          <label>Número de instâncias<select id="instance-count"><option value="1">1 instância</option><option value="2">2 instâncias</option><option value="3">3 instâncias</option></select></label>
+          <label>Motor<select id="campaign-engine"><option value="v1">v1 (atual)</option><option value="v2">v2 (universal)</option></select></label>
+          <label>Pedir ajuda depois de N travadas no mesmo lugar<input id="help-stuck-count" type="number" min="1" max="1000" step="1" value="10"></label>
+          <label>Pedir ajuda após X min sem recorde na sala<input id="help-stuck-minutes" type="number" min="5" max="10080" step="1" value="60"></label>
+          <label>Duração<select id="duration-kind"><option value="until_stopped">Até eu parar</option><option value="hours">Por algumas horas</option><option value="until_time">Até um horário</option></select></label>
+          <label id="hours-wrap" hidden>Quantas horas?<input id="duration-hours" type="number" min="0.25" max="72" step="0.25" value="2"></label>
+          <label id="time-wrap" hidden>Parar às<input id="end-time" type="time"></label>
         </div>
-      </aside>
+        <p id="recommendation" class="hint">Calculando recomendação desta máquina…</p>
+        <button id="start-training" class="button secondary large">Começar campanha nova</button>
+        <p class="hint safety-note">Antes de abrir o jogo, feche seu Hollow Knight pessoal.</p>
+        <div class="button-row">
+          <label>Campanha a continuar<select id="resume-campaign"></select></label><button id="continue-training" class="button primary">Continuar de onde parou</button>
+          <button id="repeat-training" class="button secondary">Repetir treino do zero</button>
+        </div>
+        <p class="hint">“Continuar” usa o checkpoint mais recente da campanha selecionada acima.</p>
+        <button id="stop-training" class="button danger large" disabled>Parar com segurança</button>
+        <p id="action-message" class="message" aria-live="polite"></p>
+      </article>
+      <article class="panel live-panel">
+        <div class="panel-head"><div><p class="eyebrow">AGORA</p><h2>Acompanhamento</h2></div><button id="refresh" class="button quiet">Atualizar</button></div>
+        <div class="live-stats">
+          <div><span>Tempo rodando</span><strong id="elapsed">—</strong></div>
+          <div><span>Tempo restante</span><strong id="remaining">Sem limite</strong></div>
+          <div><span>Instâncias</span><strong id="instance-status">—</strong></div>
+          <div><span>CPU</span><strong id="cpu">—</strong></div>
+          <div><span>Memória</span><strong id="memory">—</strong></div>
+          <div><span>Passos por segundo</span><strong id="speed">—</strong></div>
+          <div><span>Ajustes da IA por hora</span><strong id="updates">—</strong></div>
+        </div>
+        <div id="instance-list" class="instance-list"></div>
+        <section class="playthrough-panel"><h3>Desempenho por instância</h3><div id="actor-performance"><p class="empty">A medição detalhada aparece após a próxima coleta.</p></div></section>
+        <section class="playthrough-panel"><h3>Jogada contínua por instância</h3><div id="playthrough-list"><p class="empty">As jogadas aparecem quando a campanha contínua começar.</p></div></section>
+        <section class="playthrough-panel"><h3>Melhores tentativas guardadas</h3><div id="self-imitation"><p class="empty">O banco SIL será preenchido após as próximas atualizações.</p></div></section>
+      </article>
     </section>
 
-    <section class="panel log-panel"><div class="panel-head"><div><p class="eyebrow">PROCESSO</p><h2>Log ao vivo</h2></div></div><pre id="log">Nenhum processo lançado nesta sessão.</pre></section>
+    <section class="metric-grid">
+      <article class="metric-card"><span>Salas distintas por episódio</span><strong id="rooms-episode">—</strong><small>último episódio</small></article>
+      <article class="metric-card"><span>Salas descobertas</span><strong id="rooms-total">0</strong><small>nesta campanha</small></article>
+      <article class="metric-card"><span>Mortes por hora</span><strong id="deaths-hour">—</strong><small>desde o início do treino</small></article>
+      <article class="metric-card"><span>Sombras recuperadas por hora</span><strong id="shade-hour">—</strong><small>desde o início do treino</small></article>
+      <article class="metric-card"><span>Passos para sair da primeira sala</span><strong id="first-room-time">—</strong><small>média dos episódios</small></article>
+      <article class="metric-card"><span>Progresso máximo na sala</span><strong id="max-room-progress">—</strong><small>distância desde o início da sala</small></article>
+    </section>
+
+    <section class="panel journey-panel">
+      <div class="panel-head"><div><p class="eyebrow">JORNADA</p><h2>Mapa da campanha</h2></div><div class="journey-map-actions"><button id="calibration-open" class="button secondary">Calibração do mapa</button><label>Run<select id="journey-run"><option value="">Melhor run</option></select></label></div></div>
+      <div id="journey-map" class="journey-map"><p class="empty">O mapa vai se revelar durante a exploração.</p></div>
+      <div id="journey-records" class="journey-records"></div><h3>Loadouts por trecho</h3><div id="journey-charms"><p class="empty">A IA ainda não registrou conjuntos de amuletos.</p></div><h3>Marcos</h3><div id="journey-milestones"><p class="empty">Ainda sem marcos.</p></div>
+      <div class="map-art-controls"><p id="map-art-attribution">Mapa: The Embraced One — <a href="https://www.hallownest.net/downloads/" target="_blank" rel="noopener">hallownest.net</a> · Hollow Knight © Team Cherry.</p>
+        <div class="map-art-actions"><button id="map-download" class="button secondary">Baixar mapa e gerar tiles</button><button id="map-import" class="button secondary">Importar PNG local</button><input id="map-file" type="file" accept="image/png" hidden><button id="map-view-toggle" class="button quiet" hidden>Arte ⇄ Esquemático</button></div>
+        <progress id="map-progress" max="100" value="0" hidden></progress><p id="map-art-status" class="hint" aria-live="polite">A arte fica no cache local do operador; o mapa esquemático segue disponível.</p>
+      </div><p class="hint">A arte permanece no cache local e não entra em relatórios. Antes de compartilhar o projeto, peça autorização ao autor do mapa.</p>
+    </section>
+
+    <section id="calibration-wizard" class="calibration-wizard" hidden aria-modal="true" role="dialog" aria-labelledby="calibration-title">
+      <header class="wizard-header"><div><p class="eyebrow">MAPA DA CAMPANHA</p><h2 id="calibration-title">Encaixar o mapa do jogo na arte</h2></div><button id="calibration-close" class="button quiet">Fechar</button></header>
+      <div class="wizard-controls"><label>1 · Marco conhecido<select id="calibration-scene"></select></label><fieldset><legend>2 · Onde marcar</legend><label><input type="radio" name="calibration-mode" value="bounds" checked> Pelos limites da sala</label><label><input type="radio" name="calibration-mode" value="captures"> Por capturas</label></fieldset></div>
+      <div id="calibration-warnings" class="wizard-warnings" aria-live="polite"></div><p id="calibration-help" class="hint">Marque 2–3 lugares conhecidos e distantes: Passagem do Rei, poço de Dirtmouth ou Cidade das Lágrimas.</p>
+      <div class="wizard-workspace"><aside class="wizard-side-panel"><div id="calibration-bounds-controls" class="wizard-reference"><p id="calibration-bounds-help" class="hint">Use os limites de mundo desta sala; estes pontos serão convertidos ao espaço do mapa do jogo.</p><button id="calibration-bound-left" class="button secondary">Marcar limite esquerdo</button><button id="calibration-bound-right" class="button secondary">Marcar limite direito</button></div>
+      <div id="calibration-capture-controls" class="wizard-reference" hidden><label>Captura de referência<select id="calibration-capture"></select></label><img id="calibration-capture-image" alt="Captura real da sala" hidden><button id="calibration-add-capture" class="button secondary">Adicionar captura e marcar na arte</button></div></aside>
+      <div id="calibration-map-slot" class="wizard-map-slot"><div class="empty">A arte ainda não foi preparada.<br><button id="calibration-download" class="button secondary">Baixar mapa e gerar tiles</button></div></div></div>
+      <div class="wizard-footer"><span id="calibration-error">Erro estimado: —</span><div><button id="calibration-undo" class="button secondary" disabled>Desfazer ponto</button><button id="calibration-redo" class="button secondary">Refazer</button><details class="map-advanced"><summary>Modo avançado · calibração antiga por sala</summary><button id="calibration-remove" class="button danger" disabled>Remover calibração antiga</button></details><button id="calibration-offset-undo" class="button secondary" disabled>Desfazer ajuste</button><button id="calibration-offset-reset" class="button secondary">Voltar ao automático</button><button id="calibration-save" class="button primary" disabled>Salvar calibração global</button></div></div>
+    </section>
+
+    <section class="charts-grid">
+      <article class="panel"><div class="panel-head"><div><p class="eyebrow">PROGRESSO</p><h2>Salas por episódio</h2></div></div><div id="scene-chart" class="chart"><p class="empty">Ainda sem episódios registrados.</p></div></article>
+      <article class="panel"><div class="panel-head"><div><p class="eyebrow">AVALIAÇÕES</p><h2>Resultado da IA</h2></div></div><div id="evaluation-chart" class="chart"><p class="empty">Provas rápidas alternadas mostram as medidas determinística e estocástica, progresso máximo e tempo até travar.</p></div></article>
+    </section>
+
+    <section class="panel bestiary-panel"><div class="panel-head"><div><p class="eyebrow">EXPERIÊNCIA</p><h2>Bestiário da IA</h2></div></div><div id="bestiary-list"><p class="empty">Inimigos aparecem depois do primeiro encontro.</p></div><h3>Desafios em memória</h3><div id="challenge-list"><p class="empty">Ainda sem desafios registrados.</p></div></section>
+
+    <section class="panel help-history-panel"><div class="panel-head"><div><p class="eyebrow">AJUDA</p><h2>Pedidos e demonstrações</h2></div></div><div id="help-request-list"><p class="empty">Nenhum pedido de ajuda aberto.</p></div><h3>Histórico</h3><div id="help-history-list"><p class="empty">Nenhuma ajuda registrada ainda.</p></div></section>
+
+    <section class="content-grid">
+      <article class="panel"><div class="panel-head"><div><p class="eyebrow">MAPA</p><h2>Salas descobertas</h2></div></div><div id="scene-list" class="scene-list"><p class="empty">Nenhuma sala nova registrada ainda.</p></div></article>
+      <article class="panel alerts-panel"><div class="panel-head"><div><p class="eyebrow">ATENÇÃO</p><h2>Alertas</h2></div></div><div id="alerts"><p class="empty">Nenhum alerta.</p></div></article>
+    </section>
+
+    <section class="panel reports-panel"><div class="panel-head"><div><p class="eyebrow">HISTÓRICO</p><h2>Relatórios dos treinos</h2></div><button id="generate-report" class="button secondary" disabled>Gerar relatório</button></div><div id="reports"><p class="empty">Relatórios aparecem quando um treino termina.</p></div></section>
+
+    <details class="panel advanced"><summary>Avançado para desenvolvedor</summary><div class="advanced-grid"><div><h3>Detalhes do treino</h3><dl id="advanced-info"></dl>
+
+      </div><div><h3>Log bruto</h3><pre id="raw-log">Nenhum processo ativo.</pre></div></div></details>
   </main>
-  <script src="/app.js" defer></script>
+  <footer>Executa somente nesta máquina · servidor local 127.0.0.1</footer>
 </body>
 </html>

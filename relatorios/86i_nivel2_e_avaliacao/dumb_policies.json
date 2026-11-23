@@ -1,0 +1,120 @@
+{
+  "rooms_per_level": 200,
+  "max_actions_per_room": 300,
+  "multiroom_max_actions": 600,
+  "policies": [
+    "RIGHT",
+    "RIGHT+JUMP_TAP",
+    "RANDOM_UNIFORM"
+  ],
+  "levels": {
+    "2": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 3,
+        "RIGHT+JUMP_TAP": 6,
+        "RANDOM_UNIFORM": 5
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.985,
+        "RIGHT+JUMP_TAP": 0.97,
+        "RANDOM_UNIFORM": 0.975
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "3": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 38,
+        "RIGHT+JUMP_TAP": 16,
+        "RANDOM_UNIFORM": 14
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.81,
+        "RIGHT+JUMP_TAP": 0.92,
+        "RANDOM_UNIFORM": 0.9299999999999999
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "4": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 1,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 29
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.995,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 0.855
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "5": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 32,
+        "RIGHT+JUMP_TAP": 7,
+        "RANDOM_UNIFORM": 7
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.84,
+        "RIGHT+JUMP_TAP": 0.965,
+        "RANDOM_UNIFORM": 0.965
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "6": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 0,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 1
+      },
+      "policy_failure_rates": {
+        "RIGHT": 1.0,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 0.995
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "7": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 0,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 2
+      },
+      "policy_failure_rates": {
+        "RIGHT": 1.0,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 0.99
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    },
+    "8": {
+      "solver_success_rate": 1.0,
+      "policy_successes": {
+        "RIGHT": 1,
+        "RIGHT+JUMP_TAP": 0,
+        "RANDOM_UNIFORM": 0
+      },
+      "policy_failure_rates": {
+        "RIGHT": 0.995,
+        "RIGHT+JUMP_TAP": 1.0,
+        "RANDOM_UNIFORM": 1.0
+      },
+      "all_baselines_fail_at_least_80_percent": true
+    }
+  },
+  "level8_door_without_ability": {
+    "solver_successes": 0,
+    "sets": 200,
+    "failure_rate": 1.0
+  },
+  "level6_never_attack_solver": {
+    "successes": 0,
+    "rooms": 200,
+    "failure_rate": 1.0
+  }
+}

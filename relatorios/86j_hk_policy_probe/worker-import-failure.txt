@@ -1,0 +1,5 @@
+86i worker stderr from the isolated diagnostic retry:
+
+C:\VoidGym\.venv-cuda\Scripts\python.exe: Error while finding module specification for 'hk_agent.episode_worker' (ModuleNotFoundError: No module named 'hk_agent')
+
+The parent process had inserted C:\VoidGym\src into its own sys.path. The spawned `python -m hk_agent.episode_worker` process did not inherit that Python path, so it exited before launching Hollow Knight or attempting the bridge handshake.

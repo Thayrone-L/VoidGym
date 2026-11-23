@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "plan_id": "checkpoint-reload-kings-pass-v1",
+  "initial_wait_seconds": 1.0,
+  "final_wait_seconds": 12.0,
+  "timeout_seconds": 90.0,
+  "minimum_distinct_captures": 4,
+  "steps": [
+    {
+      "button": "PAUSE",
+      "lease_ms": 50,
+      "settle_seconds": 1.0,
+      "label": "pause-game",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-pause.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "DOWN",
+      "lease_ms": 50,
+      "settle_seconds": 0.5,
+      "label": "select-options"
+    },
+    {
+      "button": "DOWN",
+      "lease_ms": 50,
+      "settle_seconds": 0.5,
+      "label": "select-save-and-quit",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-quit-to-menu-selected.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "save-and-quit-to-main-menu",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-quit-confirmation-no.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "UP",
+      "lease_ms": 50,
+      "settle_seconds": 0.5,
+      "label": "select-yes-save-and-quit",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-quit-confirmation-yes.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "confirm-save-and-quit"
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "open-continue-profile-selection"
+    },
+    {
+      "button": "CANCEL",
+      "lease_ms": 50,
+      "settle_seconds": 1.0,
+      "label": "return-to-main-menu",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-main-menu.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "reopen-continue-profile-selection",
+      "readiness": {
+        "verifier_id": "reference-rgb-mae-v1",
+        "reference_image": "references/checkpoint-slot-selection.png",
+        "maximum_mean_absolute_error": 24.0
+      }
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "select-playthrough-slot-one"
+    },
+    {
+      "button": "SUBMIT",
+      "lease_ms": 50,
+      "settle_seconds": 2.0,
+      "label": "continue-save-slot-one"
+    }
+  ],
+  "readiness": {
+    "verifier_id": "reference-rgb-mae-v1",
+    "reference_image": "../../artifacts/interactive/kings-pass-1/bootstrap/004-final-wait.png",
+    "maximum_mean_absolute_error": 20.0
+  }
+}

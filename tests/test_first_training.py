@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import runpy
 import shutil
 import sys
 from pathlib import Path
@@ -15,9 +17,11 @@ from hk_agent.training_task import InvalidTrainingTransition
 
 
 class FakeModel:
-    def __init__(self, *_: object, **__: object) -> None:
+    def __init__(self, *_: object, **kwargs: object) -> None:
         self.num_timesteps = 0
         self.policy = object()
+        requested_device = str(kwargs.get("device", "cpu"))
+        self.device = "cpu" if requested_device == "auto" else requested_device
 
     def learn(
         self,
@@ -39,8 +43,8 @@ class FakeModel:
     def load(cls, path: str, *, env: object, device: str) -> FakeModel:
         assert Path(path).is_file()
         assert env is not None
-        assert device == "auto"
-        model = cls()
+        assert device == "cpu"
+        model = cls(device=device)
         model.num_timesteps = 128
         return model
 
@@ -60,6 +64,23 @@ class FakeTask:
             "diagnostic_training": False,
             "claim": "test claim",
         }
+
+
+def fake_torch_module() -> ModuleType:
+    torch = ModuleType("torch")
+    torch.__version__ = "test"  # type: ignore[attr-defined]
+    torch.thread_calls = []  # type: ignore[attr-defined]
+    torch.interop_thread_calls = []  # type: ignore[attr-defined]
+    torch.set_num_threads = lambda value: torch.thread_calls.append(value)  # type: ignore[attr-defined]
+    torch.set_num_interop_threads = (  # type: ignore[attr-defined]
+        lambda value: torch.interop_thread_calls.append(value)
+    )
+    torch.get_num_threads = lambda: torch.thread_calls[-1]  # type: ignore[attr-defined]
+    torch.get_num_interop_threads = (  # type: ignore[attr-defined]
+        lambda: torch.interop_thread_calls[-1]
+    )
+    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    return torch
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +218,162 @@ def test_training_budget_requires_exact_rollouts() -> None:
         raise AssertionError("invalid rollout budget was accepted")
 
 
+def test_training_resource_defaults_and_ranges() -> None:
+    assert FirstTrainingConfig().training_device == "cpu"
+    for config in (
+        FirstTrainingConfig(training_device="metal"),
+        FirstTrainingConfig(torch_threads=0),
+        FirstTrainingConfig(torch_threads=9),
+        FirstTrainingConfig(torch_interop_threads=0),
+        FirstTrainingConfig(torch_interop_threads=5),
+    ):
+        with pytest.raises(ValueError):
+            config.validate()
+
+
+def test_prompt_82_rejects_features_that_are_not_implemented_end_to_end() -> None:
+    for config in (
+        FirstTrainingConfig(game_speed=1.5),
+        FirstTrainingConfig(aux_losses=True),
+        FirstTrainingConfig(asymmetric_critic=True),
+        FirstTrainingConfig(mask_interact_without_prompt=True),
+    ):
+        with pytest.raises(ValueError, match="not implemented end-to-end"):
+            config.validate()
+
+
+def test_training_applies_and_records_effective_resources_without_mutating_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sb3 = ModuleType("stable_baselines3")
+    sb3.__version__ = "test"  # type: ignore[attr-defined]
+    sb3.PPO = FakeModel  # type: ignore[attr-defined]
+    torch = fake_torch_module()
+    monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setenv("OMP_NUM_THREADS", "11")
+    monkeypatch.setenv("MKL_NUM_THREADS", "12")
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "13")
+    environment_before = dict(os.environ)
+
+    result = train_ppo(
+        FakeEnvironment(),  # type: ignore[arg-type]
+        task=FakeTask(),
+        config=FirstTrainingConfig(
+            total_timesteps=128,
+            checkpoint_interval=128,
+            training_device="auto",
+            torch_threads=4,
+            torch_interop_threads=2,
+        ),
+        output_root=tmp_path,
+    )
+
+    assert dict(os.environ) == environment_before
+    assert torch.thread_calls == [4]  # type: ignore[attr-defined]
+    assert torch.interop_thread_calls == [2]  # type: ignore[attr-defined]
+    assert result["runtime_resources"] == {
+        "training_device_requested": "auto",
+        "training_device_effective": "cpu",
+        "torch_threads": 4,
+        "torch_interop_threads": 2,
+        "omp_num_threads": "11",
+        "mkl_num_threads": "12",
+        "openblas_num_threads": "13",
+    }
+
+
+def test_training_fails_clearly_without_torch_thread_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sb3 = ModuleType("stable_baselines3")
+    sb3.__version__ = "test"  # type: ignore[attr-defined]
+    sb3.PPO = FakeModel  # type: ignore[attr-defined]
+    torch = ModuleType("torch")
+    torch.__version__ = "test"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    with pytest.raises(RuntimeError, match="intra-op thread budget"):
+        train_ppo(
+            FakeEnvironment(),  # type: ignore[arg-type]
+            task=FakeTask(),
+            config=FirstTrainingConfig(total_timesteps=128, checkpoint_interval=128),
+            output_root=tmp_path,
+        )
+
+
+def test_training_rejects_unavailable_requested_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sb3 = ModuleType("stable_baselines3")
+    sb3.__version__ = "test"  # type: ignore[attr-defined]
+    sb3.PPO = FakeModel  # type: ignore[attr-defined]
+    torch = fake_torch_module()
+    torch.cuda = ModuleType("torch.cuda")  # type: ignore[attr-defined]
+    torch.cuda.is_available = lambda: False  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    with pytest.raises(RuntimeError, match="CUDA training was requested"):
+        train_ppo(
+            FakeEnvironment(),  # type: ignore[arg-type]
+            task=FakeTask(),
+            config=FirstTrainingConfig(
+                total_timesteps=128,
+                checkpoint_interval=128,
+                training_device="cuda",
+            ),
+            output_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "runner_name", ["run_first_training.py", "run_scene_change_training.py"]
+)
+def test_training_runners_accept_resource_arguments_before_project_imports(
+    runner_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = Path(__file__).resolve().parents[1] / "tools" / runner_name
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(runner),
+            "--training-device",
+            "auto",
+            "--torch-threads",
+            "6",
+            "--torch-interop-threads",
+            "2",
+        ],
+    )
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        monkeypatch.delenv(name, raising=False)
+
+    namespace = runpy.run_path(str(runner))
+    args = namespace["parse_args"]()
+
+    assert args.training_device == "auto"
+    assert args.torch_threads == 6
+    assert args.torch_interop_threads == 2
+    assert os.environ["OMP_NUM_THREADS"] == "6"
+    assert os.environ["MKL_NUM_THREADS"] == "6"
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "6"
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -227,10 +404,12 @@ def test_training_writes_atomic_checkpoints_and_honest_manifest(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = FakeModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     result = train_ppo(
@@ -268,10 +447,12 @@ def test_portable_policy_warm_starts_a_fresh_model_without_loading_zip(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = FreshOnlyModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     artifact = tmp_path / "source" / "policy.safetensors"
     sidecar = tmp_path / "source" / "policy.policy.manifest.json"
@@ -328,10 +509,12 @@ def test_constructor_failure_marks_manifest_failed_and_closes_environment(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = FailingConstructorModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     try:
@@ -359,10 +542,12 @@ def test_training_resumes_only_from_hash_validated_compatible_checkpoint(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = FakeModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     source = tmp_path / "source"
     provenance = {"game_profile": "development", "build": "same"}
@@ -419,10 +604,12 @@ def test_invalid_transition_fails_run_without_checkpoint(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = InvalidTransitionModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
     try:
@@ -453,10 +640,12 @@ def test_stop_request_cancels_with_final_resumable_checkpoint(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = StopDuringRolloutModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
     environment = FakeEnvironment()
 
@@ -484,10 +673,12 @@ def test_continuous_training_runs_until_stop_and_rotates_checkpoints(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = ContinuousStopModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     result = train_ppo(
@@ -523,10 +714,12 @@ def test_environment_run_failed_does_not_abort_continuous_campaign(
     sb3 = ModuleType("stable_baselines3")
     sb3.__version__ = "test"  # type: ignore[attr-defined]
     sb3.PPO = RunFailedModel  # type: ignore[attr-defined]
-    torch = ModuleType("torch")
-    torch.__version__ = "test"  # type: ignore[attr-defined]
-    torch.manual_seed = lambda _: None  # type: ignore[attr-defined]
+    torch = fake_torch_module()
     monkeypatch.setitem(sys.modules, "stable_baselines3", sb3)
+    contrib = ModuleType("sb3_contrib")
+    contrib.__version__ = "test"
+    contrib.MaskablePPO = sb3.PPO
+    monkeypatch.setitem(sys.modules, "sb3_contrib", contrib)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     stop_file = tmp_path / "stop.request"
@@ -541,3 +734,13 @@ def test_environment_run_failed_does_not_abort_continuous_campaign(
     manifest = json.loads((tmp_path / "run" / "manifest.json").read_text("utf-8"))
     assert result["status"] == "CANCELLED"
     assert manifest["gameplay_run_failures"] == 1
+
+
+def test_training_cli_accepts_explore_v4(monkeypatch: Any) -> None:
+    script = Path(__file__).parents[1] / "tools" / "run_first_training.py"
+    monkeypatch.setattr(
+        sys, "argv", [str(script), "--task", "exploration", "--reward-version", "explore_v4"]
+    )
+    namespace = runpy.run_path(str(script), run_name="test_run_first_training_cli")
+    args = namespace["parse_args"]()
+    assert args.reward_version == "explore_v4"

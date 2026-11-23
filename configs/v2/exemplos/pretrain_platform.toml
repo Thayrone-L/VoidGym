@@ -1,0 +1,33 @@
+schema_version = 1
+campaign_id = "platform-pretrain"
+kind = "pretrain_platform"
+game_id = "platform_gym"
+
+[model]
+contract = "2.0"
+hidden_size = 256
+recurrent_layers = 1
+
+[ppo]
+learning_rate = 0.0003
+gamma = 0.99
+batch_size = 512
+sequence_length = 32
+
+[aux]
+c_sem = 0.0
+c_inv = 0.0
+c_mot = 0.0
+augment_random_shift = false
+
+[reward]
+novelty = 0.1
+progress = 1.0
+time_cost = 0.001
+
+[resources]
+storage_budget_gb = 100.0
+
+[storage]
+budget_gb = 100.0
+block_steps = 1024

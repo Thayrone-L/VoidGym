@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import gymnasium as gym
 import numpy as np
@@ -44,8 +44,47 @@ class FirstTrainingConfig:
     warm_start_policy_sha256: str | None = None
     warm_start_policy_manifest_sha256: str | None = None
     warm_start_policy_manifest_id: str | None = None
+    training_device: str = "cpu"
+    torch_threads: int = 3
+    torch_interop_threads: int = 1
+    ent_coef: float | None = None
+    gamma: float | None = None
+    gae_lambda: float | None = None
+    n_epochs: int | None = None
+    target_kl: float | None = None
+    learning_rate: float | None = None
+    clip_range: float | None = None
+    shared_actors: int = 1
+    lstm_hidden_size: int = 256
+    lstm_layers: int = 1
+    game_speed: float = 1.0
+    augment_random_shift: bool = False
+    aux_losses: bool = False
+    asymmetric_critic: bool = False
+    mask_interact_without_prompt: bool = False
 
     def validate(self) -> None:
+        if self.game_speed not in {1.0, 1.5, 2.0}:
+            raise ValueError("game_speed must be 1.0, 1.5 or 2.0")
+        if not all(isinstance(value, bool) for value in (
+            self.augment_random_shift, self.aux_losses, self.asymmetric_critic,
+            self.mask_interact_without_prompt,
+        )):
+            raise TypeError("prompt 82 feature toggles must be booleans")
+        unsupported = []
+        if self.game_speed != 1.0:
+            unsupported.append("game_speed != 1.0")
+        if self.aux_losses:
+            unsupported.append("aux_losses")
+        if self.asymmetric_critic:
+            unsupported.append("asymmetric_critic")
+        if self.mask_interact_without_prompt:
+            unsupported.append("mask_interact_without_prompt")
+        if unsupported:
+            raise ValueError(
+                "prompt 82 options are not implemented end-to-end yet: "
+                + ", ".join(unsupported)
+            )
         if not 1 <= self.total_timesteps <= 10_000_000:
             raise ValueError("total_timesteps is outside the safe range")
         if not 1 <= self.checkpoint_interval <= 1_000_000:
@@ -56,8 +95,12 @@ class FirstTrainingConfig:
             raise ValueError("total_timesteps must be a multiple of rollout_steps")
         if self.checkpoint_interval % self.rollout_steps != 0:
             raise ValueError("checkpoint_interval must be a multiple of rollout_steps")
-        if self.rollout_steps % self.batch_size != 0:
-            raise ValueError("batch_size must divide rollout_steps")
+        if not 32 <= self.lstm_hidden_size <= 1024 or not 1 <= self.lstm_layers <= 4:
+            raise ValueError("recurrent architecture is outside the safe range")
+        if not 1 <= self.shared_actors <= 3:
+            raise ValueError("shared_actors must be in [1, 3]")
+        if self.rollout_steps * self.shared_actors % self.batch_size != 0:
+            raise ValueError("batch_size must divide rollout_steps times actors")
         if not 2 <= self.max_checkpoints <= 100:
             raise ValueError("max_checkpoints must be in [2, 100]")
         if self.resume_checkpoint is not None and self.resume_checkpoint.suffix != ".zip":
@@ -70,8 +113,7 @@ class FirstTrainingConfig:
             self.warm_start_policy_manifest_id,
         )
         if any(value is not None for value in frozen_identity) and (
-            self.warm_start_policy is None
-            or any(value is None for value in frozen_identity)
+            self.warm_start_policy is None or any(value is None for value in frozen_identity)
         ):
             raise ValueError("warm-start frozen identity must be provided as a complete set")
         if any(
@@ -82,16 +124,27 @@ class FirstTrainingConfig:
             raise ValueError("warm-start frozen identity must use lowercase SHA-256")
         if self.resume_checkpoint is not None and self.warm_start_policy is not None:
             raise ValueError("resume checkpoint and warm-start policy are mutually exclusive")
-        if (
-            self.warm_start_policy is not None
-            and self.warm_start_policy.suffix != ".safetensors"
-        ):
+        if self.warm_start_policy is not None and self.warm_start_policy.suffix != ".safetensors":
             raise ValueError("warm_start_policy must be a .safetensors file")
         if (
             self.warm_start_policy_manifest is not None
             and not self.warm_start_policy_manifest.name.endswith(".manifest.json")
         ):
             raise ValueError("warm_start_policy_manifest must be a .manifest.json file")
+        if self.training_device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("training_device must be cpu, cuda, or auto")
+        if not 1 <= self.torch_threads <= 8:
+            raise ValueError("torch_threads must be in [1, 8]")
+        if not 1 <= self.torch_interop_threads <= 4:
+            raise ValueError("torch_interop_threads must be in [1, 4]")
+        for name in ("ent_coef", "gamma", "gae_lambda", "target_kl", "learning_rate", "clip_range"):
+            value = getattr(self, name)
+            if value is not None and (not np.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be positive and finite")
+        if self.gamma is not None and self.gamma > 1 or self.gae_lambda is not None and self.gae_lambda > 1:
+            raise ValueError("gamma and gae_lambda cannot exceed 1")
+        if self.n_epochs is not None and self.n_epochs < 1:
+            raise ValueError("n_epochs must be positive")
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -123,31 +176,33 @@ def _validated_resume_manifest(
         raise ValueError("resume checkpoint has no readable training manifest") from error
     if not isinstance(manifest, dict):
         raise TypeError("resume manifest must be an object")
-    if manifest.get("task_contract") != dict(task_contract):
-        raise ValueError("resume checkpoint task contract differs from this campaign")
+    algorithm = manifest.get("algorithm")
+    source_contract = manifest.get("task_contract")
+    if algorithm == "PPO" and isinstance(source_contract, Mapping):
+        compatible_contract = dict(task_contract)
+        compatible_contract.pop("legal_action_mask", None)
+        if dict(source_contract) != compatible_contract:
+            raise ValueError("legacy PPO resume task contract differs from this campaign")
+    elif algorithm in {"MaskablePPO", "MaskableRecurrentPPO"}:
+        if source_contract != dict(task_contract):
+            raise ValueError("resume checkpoint task contract differs from this campaign")
+    else:
+        raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
     expected_fingerprint = portable_compatibility_fingerprint(task_contract, provenance)
     source_fingerprint = manifest.get("compatibility_fingerprint")
     if not isinstance(source_fingerprint, str):
         source_contract = manifest.get("task_contract")
         source_provenance = manifest.get("provenance")
-        if not isinstance(source_contract, Mapping) or not isinstance(
-            source_provenance, Mapping
-        ):
+        if not isinstance(source_contract, Mapping) or not isinstance(source_provenance, Mapping):
             raise TypeError("resume checkpoint has no compatible provenance")
-        source_fingerprint = portable_compatibility_fingerprint(
-            source_contract, source_provenance
-        )
-    if source_fingerprint != expected_fingerprint:
+        source_fingerprint = portable_compatibility_fingerprint(source_contract, source_provenance)
+    if algorithm != "PPO" and source_fingerprint != expected_fingerprint:
         raise ValueError("resume checkpoint provenance differs from this campaign")
     entries = manifest.get("checkpoints")
     if not isinstance(entries, list):
         raise TypeError("resume manifest has no checkpoint inventory")
     digest = sha256_file(resolved)
-    matched = any(
-        isinstance(entry, Mapping)
-        and entry.get("sha256") == digest
-        for entry in entries
-    )
+    matched = any(isinstance(entry, Mapping) and entry.get("sha256") == digest for entry in entries)
     if not matched:
         raise ValueError("resume checkpoint hash is absent from its manifest")
     return manifest
@@ -168,21 +223,47 @@ def train_ppo(
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "manifest.json"
     task_contract = task.task_contract()
+    if os.environ.get("HK_AGENT_SHARED_ROLE") == "actor":
+        shared_root_value = os.environ.get("HK_AGENT_SHARED_ROOT")
+        if not shared_root_value:
+            raise ValueError("shared actor role requires HK_AGENT_SHARED_ROOT")
+        if config.resume_checkpoint is not None or config.warm_start_policy is not None:
+            raise ValueError("shared actor state comes from learner policy rounds, not local warm-start")
+        from hk_agent.shared_learner import run_shared_actor
+
+        return run_shared_actor(
+            environment,
+            task_contract=task_contract,
+            config=config,
+            output_root=output_root,
+            provenance=dict(provenance or {}),
+            stop_file=stop_file,
+            shared_root=Path(shared_root_value),
+            slot=int(os.environ.get("HK_AGENT_SLOT_ID", "-1")),
+            launch_id=os.environ.get("HK_AGENT_LAUNCH_ID", ""),
+            actors=int(os.environ.get("HK_AGENT_SHARED_ACTORS", "0")),
+        )
     reward_version = str(task_contract.get("reward_version", VISUAL_MOTION_REWARD_VERSION))
     diagnostic_training = bool(task_contract.get("diagnostic_training", True))
     claim = str(
-        task_contract.get(
-            "claim", "motor-signal diagnostic; not game progress or task success"
-        )
+        task_contract.get("claim", "motor-signal diagnostic; not game progress or task success")
     )
+    recurrent_config = task_contract.get("recurrent_policy")
+    recurrent_enabled = isinstance(recurrent_config, Mapping) and recurrent_config.get("name") == "maskable_recurrent_v1"
     manifest: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "RUNNING",
-        "algorithm": "PPO",
+        "algorithm": "MaskableRecurrentPPO" if recurrent_enabled else "MaskablePPO",
         "seed": config.seed,
         "duration_mode": "continuous" if config.continuous else "limited",
         "total_timesteps": None if config.continuous else config.total_timesteps,
         "checkpoint_interval": config.checkpoint_interval,
+        "rollout_steps": config.rollout_steps,
+        "batch_size": config.batch_size,
+        "recurrent_architecture": dict(recurrent_config) if isinstance(recurrent_config, Mapping) else None,
+        "ppo_hyperparameters": {name: getattr(config, name) for name in (
+            "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+        ) if getattr(config, name) is not None},
         "max_checkpoints": config.max_checkpoints,
         "reward_version": reward_version,
         "diagnostic_training": diagnostic_training,
@@ -199,6 +280,8 @@ def train_ppo(
         "gameplay_run_index": 1,
         "gameplay_run_failures": 0,
         "episode_count": 0,
+        "episode_progress": [],
+        "farm_alerts": [],
         "shade_pending": False,
         "started_unix_ns": time.time_ns(),
     }
@@ -208,18 +291,39 @@ def train_ppo(
         try:
             stable_baselines3 = importlib.import_module("stable_baselines3")
             torch = importlib.import_module("torch")
-            PPO = stable_baselines3.PPO
+            sb3_contrib = importlib.import_module("sb3_contrib")
+            MaskablePPO = sb3_contrib.MaskablePPO
+            if recurrent_enabled:
+                from hk_agent.recurrent_sb3 import MaskableRecurrentPPO
         except ImportError as error:
             raise RuntimeError(
                 "training dependencies are absent; install the project training extra"
             ) from error
         random.seed(config.seed)
         np.random.seed(config.seed)
+        try:
+            torch.set_num_threads(config.torch_threads)
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError("Torch intra-op thread budget could not be applied") from error
+        try:
+            torch.set_num_interop_threads(config.torch_interop_threads)
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError(
+                "Torch inter-op threads were initialized before the campaign resource budget"
+            ) from error
+        if (
+            config.training_device == "cuda"
+            and hasattr(torch, "cuda")
+            and not torch.cuda.is_available()
+        ):
+            raise RuntimeError("CUDA training was requested but this Torch build has no CUDA")
         torch.manual_seed(config.seed)
         manifest["versions"] = {
             "python": platform.python_version(),
             "numpy": np.__version__,
             "stable_baselines3": stable_baselines3.__version__,
+            "sb3_contrib": sb3_contrib.__version__,
+            "recurrent_policy": "maskable_recurrent_v1" if recurrent_enabled else "feed_forward",
             "torch": torch.__version__,
         }
         atomic_json(manifest_path, manifest)
@@ -230,7 +334,18 @@ def train_ppo(
                 task_contract=task_contract,
                 provenance=dict(provenance or {}),
             )
-            model = PPO.load(str(resume_path), env=environment, device="auto")
+            algorithm = source_manifest.get("algorithm")
+            if algorithm == "PPO":
+                model = stable_baselines3.PPO.load(str(resume_path), env=environment, device=config.training_device)
+            elif algorithm == "MaskablePPO":
+                model = MaskablePPO.load(str(resume_path), env=environment, device=config.training_device)
+            elif algorithm == "MaskableRecurrentPPO" and recurrent_enabled:
+                model = MaskableRecurrentPPO.load(str(resume_path), env=environment, device=config.training_device)
+            else:
+                raise ValueError(f"unsupported resume algorithm: {algorithm!r}")
+            manifest["algorithm"] = algorithm
+            if hasattr(model.policy, "augment_random_shift"):
+                model.policy.augment_random_shift = config.augment_random_shift
             completed = int(model.num_timesteps)
             manifest["resumed_from"] = {
                 "path": str(resume_path),
@@ -238,44 +353,79 @@ def train_ppo(
                 "completed_timesteps": source_manifest.get("completed_timesteps"),
             }
         else:
-            model = PPO(
-                "MultiInputPolicy",
-                environment,
-                seed=config.seed,
-                n_steps=config.rollout_steps,
-                batch_size=config.batch_size,
-                verbose=1,
-                device="auto",
-            )
+            if recurrent_enabled:
+                policy_cfg = cast(Mapping[str, Any], recurrent_config)
+                if policy_cfg.get("hidden_size") != config.lstm_hidden_size or policy_cfg.get("layers") != config.lstm_layers:
+                    raise ValueError("task recurrent architecture differs from runtime configuration")
+                model = MaskableRecurrentPPO(
+                    "MultiInputLstmPolicy", environment, seed=config.seed,
+                    n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=1,
+                    device=config.training_device,
+                    policy_kwargs={
+                        "lstm_hidden_size": config.lstm_hidden_size,
+                        "n_lstm_layers": config.lstm_layers,
+                        "augment_random_shift": config.augment_random_shift,
+                    },
+                    **{name: getattr(config, name) for name in (
+                        "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+                    ) if getattr(config, name) is not None},
+                )
+            else:
+                model = MaskablePPO(
+                    "MultiInputPolicy", environment, seed=config.seed,
+                    n_steps=config.rollout_steps, batch_size=config.batch_size, verbose=1,
+                    device=config.training_device,
+                    **{name: getattr(config, name) for name in (
+                        "ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range",
+                    ) if getattr(config, name) is not None},
+                )
             if (
                 config.warm_start_policy is not None
                 and config.warm_start_policy_manifest is not None
             ):
                 policy_path = config.warm_start_policy.resolve(strict=True)
                 policy_manifest_path = config.warm_start_policy_manifest.resolve(strict=True)
-                imported = import_policy_artifact(
-                    model.policy,
-                    policy_path,
-                    expected_compatibility_fingerprint=manifest[
-                        "compatibility_fingerprint"
-                    ],
-                    manifest_path=policy_manifest_path,
-                    expected_artifact_sha256=config.warm_start_policy_sha256,
-                    expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
-                    expected_manifest_id=config.warm_start_policy_manifest_id,
-                )
+                if recurrent_enabled:
+                    from hk_agent.maskable_recurrent import import_recurrent_extractor_warm_start
+                    imported = import_recurrent_extractor_warm_start(
+                        model.policy, str(policy_path), str(policy_manifest_path),
+                        expected_fingerprint=manifest["compatibility_fingerprint"],
+                        expected_artifact_sha256=config.warm_start_policy_sha256,
+                        expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
+                        expected_manifest_id=config.warm_start_policy_manifest_id,
+                    )
+                else:
+                    imported = import_policy_artifact(
+                        model.policy, policy_path,
+                        expected_compatibility_fingerprint=manifest["compatibility_fingerprint"],
+                        manifest_path=policy_manifest_path,
+                        expected_artifact_sha256=config.warm_start_policy_sha256,
+                        expected_manifest_sha256=config.warm_start_policy_manifest_sha256,
+                        expected_manifest_id=config.warm_start_policy_manifest_id,
+                    )
                 model.num_timesteps = 0
                 manifest["warm_started_from"] = {
-                    "sha256": imported["artifact"]["sha256"],
-                    "size_bytes": imported["artifact"]["size_bytes"],
+                    "sha256": imported.get("artifact", {}).get("sha256", imported.get("artifact_sha256")),
+                    "size_bytes": imported.get("artifact", {}).get("size_bytes", policy_path.stat().st_size),
                     "format": "safetensors",
                     "manifest_id": imported["manifest_id"],
+                    "copied_tensors": imported.get("copied_tensors"),
+                    "fresh_recurrent_and_heads": imported.get("fresh_recurrent_and_heads", False),
                     "manifest_sha256": sha256_file(policy_manifest_path),
-                    "compatibility_fingerprint": imported[
-                        "compatibility_fingerprint"
-                    ],
+                    "compatibility_fingerprint": imported["compatibility_fingerprint"],
                 }
                 atomic_json(manifest_path, manifest)
+
+        manifest["runtime_resources"] = {
+            "training_device_requested": config.training_device,
+            "training_device_effective": str(model.device),
+            "torch_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
+            "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+            "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
+        }
+        atomic_json(manifest_path, manifest)
 
         run_failures = 0
         episode_count = 0
@@ -298,6 +448,25 @@ def train_ppo(
                         manifest["gameplay_run_failures"] = run_failures
                         changed = True
                     if isinstance(info, Mapping):
+                        progress = info.get("episode_progress")
+                        if isinstance(progress, Mapping) and info.get("evaluation_only") is not True:
+                            entries = manifest.setdefault("episode_progress", [])
+                            if isinstance(entries, list) and not any(
+                                isinstance(item, Mapping) and item.get("episode") == progress.get("episode")
+                                for item in entries
+                            ):
+                                entries.append(dict(progress))
+                                del entries[:-500]
+                                changed = True
+                        alerts = info.get("farm_alerts")
+                        if isinstance(alerts, list) and alerts:
+                            entries = manifest.setdefault("farm_alerts", [])
+                            if isinstance(entries, list):
+                                for alert in alerts:
+                                    if isinstance(alert, str):
+                                        entries.append({"alert": alert, "step": int(model.num_timesteps)})
+                                del entries[:-500]
+                                changed = True
                         supervisor = info.get("supervisor")
                         if isinstance(supervisor, Mapping):
                             for source, target in (
@@ -387,9 +556,7 @@ def train_ppo(
                             }
                         )
                         del pruned[:-1000]
-            retained_steps = {
-                item.get("step") for item in checkpoints if isinstance(item, Mapping)
-            }
+            retained_steps = {item.get("step") for item in checkpoints if isinstance(item, Mapping)}
             expired_policies: list[Path] = []
             retained_policies: list[object] = []
             for item in portable_policies:

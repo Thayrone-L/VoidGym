@@ -1,0 +1,30 @@
+{
+  "campaign_id": "explore-v3-short-retry-20261018",
+  "campaign_version": 1,
+  "duration_seconds": 300,
+  "shared_group": "explore-v3-short-retry-20261018-v0001",
+  "final": {
+    "status": "STOPPED",
+    "active_count": 0,
+    "learner_round": 2,
+    "training_transitions": 256,
+    "evaluations": [
+      {
+        "round": 1,
+        "slot": 0,
+        "deterministic": true,
+        "steps": 120,
+        "return": 0.2459150099894032,
+        "completed": true,
+        "rollout_submitted": false,
+        "distinct_scenes": 1,
+        "termination_reason": "time_limit"
+      }
+    ],
+    "episode_progress": [
+      {"episode": 1, "steps": 120, "distinct_scenes": 1, "scene_names": ["Tutorial_01"], "deaths": 0, "shade_recoveries": 0, "shade_losses": 0, "enemy_kills": 0, "steps_to_first_scene_change": null, "termination_reason": "time_limit", "return": 0.4179700000000004},
+      {"episode": 4, "steps": 120, "distinct_scenes": 1, "scene_names": ["Tutorial_01"], "deaths": 0, "shade_recoveries": 0, "shade_losses": 0, "enemy_kills": 0, "steps_to_first_scene_change": null, "termination_reason": "time_limit", "return": 0.3195900000000004}
+    ],
+    "farm_alerts": []
+  }
+}

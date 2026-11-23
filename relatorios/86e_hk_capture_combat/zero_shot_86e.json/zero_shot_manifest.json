@@ -1,0 +1,28 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86d-long-2026-10-29-cuda\\universal-009235520",
+  "trained_steps": 9235520,
+  "sampled_frames": 61,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "source": "test",
+  "campaign_id": "86e-corrected-partial",
+  "frames_per_scene": {
+    "Tutorial_01": 61
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.3042995194046819,
+    "SOLID": 0.014813567881491458,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.0,
+    "ENEMY": 0.01026560208570963,
+    "PLAYER": 0.04201680672268908,
+    "BREAKABLE": 0.0,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

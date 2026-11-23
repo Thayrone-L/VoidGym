@@ -16,22 +16,27 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _CONTRIBUTION_PATH_RE = re.compile(r"^knowledge/contributions/[0-9a-f]{64}\.json$")
 _WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "torch"})
-_REWARD_VERSIONS = frozenset({"visual_motion_v1", "reach_scene_change_v1"})
+_VERSION_KEYS = frozenset({"python", "numpy", "stable_baselines3", "sb3_contrib", "torch"})
+_REWARD_VERSIONS = frozenset({"visual_motion_v1", "visual_motion_player_knowledge_v1", "reach_scene_change_v1", "explore_v1", "explore_v2", "explore_v3", "explore_v4"})
 _TASK_CONTRACT_KEYS = frozenset(
     {
         "reward_version",
+        "task_contract_schema_version",
+        "observation_version",
         "action_names",
         "raw_action_indices",
         "actions",
         "config",
         "information_boundary",
         "reward_only_signals",
+        "legal_action_mask",
         "detector_inputs",
         "privileged_state",
         "route_memory",
         "diagnostic_training",
         "claim",
+        "ppo_hyperparameters",
+        "recurrent_policy",
     }
 )
 _TASK_CONFIG_KEYS = frozenset(
@@ -74,10 +79,17 @@ _TASK_CONFIG_KEYS = frozenset(
         "novelty_shaping_budget",
         "success_reward",
         "terminate_on_scene_change",
+        "novelty_reward", "novelty_threshold", "novelty_budget", "archive_max",
+        "lifelong_archive_max", "novelty_persistence_steps",
+        "shade_hit_reward", "hp_restored_reward", "stuck_seconds", "evaluation_interval",
+        "hp_restored_budget", "scene_reward_budget", "time_cost_budget", "shade_hit_budget", "shade_approach_budget",
+        "scene_change_reward", "lease_base_ms", "ent_coef", "gamma", "gae_lambda",
+        "n_epochs", "target_kl", "learning_rate", "clip_range",
+        "continuous_playthrough",
     }
 )
-_BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST"})
-_DURATIONS = frozenset({"base", "tap", "hold", "focus", "charge"})
+_BUTTONS = frozenset({"LEFT", "RIGHT", "UP", "DOWN", "JUMP", "ATTACK", "CAST", "DASH", "SUPER_DASH", "DREAM_NAIL", "PAUSE", "MENU_SUBMIT", "MENU_CANCEL"})
+_DURATIONS = frozenset({"base", "tap", "hold", "max_hold", "focus", "charge"})
 _ACTION_NAMES = frozenset(
     {
         "NOOP",
@@ -89,6 +101,9 @@ _ACTION_NAMES = frozenset(
         "LEFT+JUMP_HOLD",
         "RIGHT+JUMP_TAP",
         "RIGHT+JUMP_HOLD",
+        "JUMP_MAX",
+        "LEFT+JUMP_MAX",
+        "RIGHT+JUMP_MAX",
         "ATTACK",
         "LEFT+ATTACK",
         "RIGHT+ATTACK",
@@ -104,8 +119,10 @@ _ACTION_NAMES = frozenset(
         "NAIL_ART_CHARGE",
         "LEFT+NAIL_ART_CHARGE",
         "RIGHT+NAIL_ART_CHARGE",
+        "DASH", "LEFT+DASH", "RIGHT+DASH", "DOWN+DASH", "SUPER_DASH_HOLD", "DREAM_NAIL",
         "UP+NAIL_ART_CHARGE",
         "DOWN+NAIL_ART_CHARGE",
+        "INTERACT", "MENU_UP", "MENU_DOWN", "MENU_LEFT", "MENU_RIGHT", "MENU_SUBMIT", "MENU_CANCEL", "OPEN_CHARMS",
     }
 )
 _INFORMATION_BOUNDARY = frozenset({"pixels", "applied_action_history"})
@@ -116,6 +133,14 @@ _REWARD_ONLY_SIGNALS = frozenset(
         "geo_gained_since_last_frame",
         "geo_spent_since_last_frame",
         "shade_recovered",
+        "hp_restored_since_last_frame",
+        "shade_hits_since_last_frame",
+        "shade_distance",
+        "scene_name",
+        "enemy_type",
+        "enemy_events_since_last_frame",
+        "death",
+        "run_failed",
     }
 )
 _DETECTOR_INPUTS = frozenset({"cropped_rgb_pixels", "temporal_pixel_descriptors"})
@@ -126,6 +151,7 @@ _CLAIMS = frozenset(
             "pixel-only stable visual-regime-change diagnostic; room transition "
             "not yet validated against a holdout corpus"
         ),
+        "pixel-only exploration with bounded reward-only bridge signals",
     }
 )
 _ROUTE_LITERAL_FIELDS = {
@@ -315,7 +341,7 @@ def _public_route_memory(value: object, *, from_manifest: bool) -> dict[str, Any
                     raise KnowledgeValidationError("route memory save_slot must be in [1, 4]")
                 clean_scope[name] = raw
             elif name == "save_source":
-                if raw not in {"new_game", "existing_save"}:
+                if raw not in {"new_game", "existing_save", "continuous_playthrough"}:
                     raise KnowledgeValidationError("route memory save_source is not supported")
                 clean_scope[name] = raw
             elif name == "game_profile":
@@ -339,7 +365,27 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     result: dict[str, Any] = {}
     if contract["reward_version"] not in _REWARD_VERSIONS:
         raise KnowledgeValidationError("task_contract.reward_version is not supported")
+    if "legal_action_mask" in contract:
+        mask = _expect_dict(contract["legal_action_mask"], "task_contract.legal_action_mask")
+        _expect_allowed_keys(mask, {"version", "source"}, "task_contract.legal_action_mask")
+        if mask not in (
+            {"version": "action_availability_v1", "source": "frame_action_availability"},
+            {"version": "action_availability_v2", "source": "frame_action_availability"},
+            {"version": "action_availability_v3", "source": "frame_action_availability"},
+            {"version": "action_availability_v4", "source": "frame_action_availability"},
+        ):
+            raise KnowledgeValidationError("task_contract.legal_action_mask is unsupported")
+        result["legal_action_mask"] = dict(mask)
     result["reward_version"] = contract["reward_version"]
+    schema_version = contract.get("task_contract_schema_version", 1)
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+        raise KnowledgeValidationError("task_contract_schema_version is unsupported")
+    result["task_contract_schema_version"] = schema_version
+    if "observation_version" in contract:
+        observation_version = contract["observation_version"]
+        if not isinstance(observation_version, str) or len(observation_version) > 80:
+            raise KnowledgeValidationError("task_contract.observation_version is invalid")
+        result["observation_version"] = observation_version
     action_names = contract["action_names"]
     if not isinstance(action_names, list) or not all(
         name in _ACTION_NAMES for name in action_names
@@ -349,7 +395,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
     if "raw_action_indices" in contract:
         indices = contract["raw_action_indices"]
         if not isinstance(indices, list) or not all(
-            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 127
+            isinstance(index, int) and not isinstance(index, bool) and 0 <= index <= 1023
             for index in indices
         ):
             raise KnowledgeValidationError("task_contract.raw_action_indices is invalid")
@@ -375,7 +421,7 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
             if (
                 not isinstance(raw_index, int)
                 or isinstance(raw_index, bool)
-                or not 0 <= raw_index <= 127
+                or not 0 <= raw_index <= 1023
             ):
                 raise KnowledgeValidationError("task_contract action index is invalid")
             if (
@@ -427,6 +473,24 @@ def _public_task_contract(value: object, *, from_manifest: bool) -> dict[str, An
         if contract["claim"] not in _CLAIMS:
             raise KnowledgeValidationError("task_contract.claim is not an approved public claim")
         result["claim"] = contract["claim"]
+    if "recurrent_policy" in contract:
+        recurrent = _expect_dict(contract["recurrent_policy"], "task_contract.recurrent_policy")
+        _expect_exact_keys(recurrent, {"name", "hidden_size", "layers", "sequence_length"}, "task_contract.recurrent_policy")
+        if recurrent["name"] != "maskable_recurrent_v1":
+            raise KnowledgeValidationError("task_contract.recurrent_policy.name is unsupported")
+        for key, lower, upper in (("hidden_size", 32, 1024), ("layers", 1, 4), ("sequence_length", 1, 2048)):
+            value = recurrent[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+                raise KnowledgeValidationError(f"task_contract.recurrent_policy.{key} is outside safe bounds")
+        result["recurrent_policy"] = dict(recurrent)
+    if "ppo_hyperparameters" in contract:
+        ppo = _expect_dict(contract["ppo_hyperparameters"], "task_contract.ppo_hyperparameters")
+        allowed_ppo = {"ent_coef", "gamma", "gae_lambda", "n_epochs", "target_kl", "learning_rate", "clip_range"}
+        _expect_allowed_keys(ppo, allowed_ppo, "task_contract.ppo_hyperparameters")
+        result["ppo_hyperparameters"] = {
+            key: _finite_number(value, f"task_contract.ppo_hyperparameters.{key}")
+            for key, value in ppo.items()
+        }
     return result
 
 
@@ -457,7 +521,7 @@ def _portable_origin(provenance: Mapping[str, Any], *, from_manifest: bool) -> d
             raise KnowledgeValidationError("campaign_origin.schema_version must be 1")
         result["schema_version"] = 1
     if "save_source" in raw:
-        if raw["save_source"] not in {"new_game", "existing_save"}:
+        if raw["save_source"] not in {"new_game", "existing_save", "continuous_playthrough"}:
             raise KnowledgeValidationError("campaign_origin.save_source is not supported")
         result["save_source"] = raw["save_source"]
     # Plan identifiers and step labels are local, human-authored strings. Their
@@ -665,7 +729,7 @@ def validate_contribution(value: object) -> dict[str, Any]:
             raise KnowledgeValidationError(f"contribution.{key} must be lowercase SHA-256")
     training = _expect_dict(contribution["training"], "contribution.training")
     _expect_exact_keys(training, _TRAINING_KEYS, "contribution.training")
-    if training["algorithm"] != "PPO":
+    if training["algorithm"] not in {"PPO", "MaskablePPO"}:
         raise KnowledgeValidationError("training.algorithm is not supported")
     if training["reward_version"] not in _REWARD_VERSIONS:
         raise KnowledgeValidationError("training.reward_version is not supported")

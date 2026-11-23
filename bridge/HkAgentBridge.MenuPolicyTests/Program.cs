@@ -8,7 +8,7 @@ AssertRejected(new[] { "UP", "DOWN" }, 50);
 AssertRejected(new[] { "LEFT", "RIGHT" }, 50);
 AssertRejected(new[] { "RIGHT", "SUBMIT" }, 50);
 AssertRejected(new[] { "SUBMIT", "CANCEL" }, 50);
-AssertRejected(new[] { "PAUSE" }, 50);
+AssertAccepted("PAUSE", 50);
 AssertRejected(new[] { "QUIT" }, 50);
 AssertRejected(new[] { "UP" }, 0);
 AssertRejected(new[] { "UP" }, MenuActionPolicy.MaximumLeaseMilliseconds + 1);

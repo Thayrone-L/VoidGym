@@ -1,0 +1,65 @@
+RELATÓRIO — PROMPT 45: EXPLORE_V1 + PPO EXPLÍCITO
+=================================================
+
+Status: IMPLEMENTADO E VALIDADO (sem abrir jogo)
+Reward version: explore_v1
+
+Recompensas e limites
+---------------------
+- Novidade pixel-only: descriptor 9x16xRGB no recorte visual compartilhado com
+  scene_change_task. O arquivo episódico é FIFO, máximo 4096 descritores. Quadros
+  escuros, brancos ou com entropia abaixo de 1 bit são ignorados.
+- Calibração: coletar pelo menos 10 descritores NOOP e 10 ativos. Para cada NOOP,
+  medir a distância mínima ao arquivo NOOP anterior. τ = max(0.02, 2 × p99 dessas
+  distâncias). A mediana das distâncias ativas ao arquivo NOOP precisa superar τ;
+  caso contrário, a calibração falha e o treino não começa. Em learner compartilhado,
+  o primeiro ator grava calibration.json e todos reutilizam a mesma calibração.
+- Novidade paga min(0.05, saldo do orçamento), somente quando a distância mínima ao
+  arquivo >= τ, até 20.0 por episódio.
+- Troca de cena usa a máquina de estados reutilizada de scene_change_task: transição
+  escura confirmada, quadro novo informativo e estável. Paga +5.0 na primeira visita
+  à cena por episódio; a visita é deduplicada por distância do descriptor estável e
+  o evento não encerra o episódio.
+- Combate/recursos: kill +1.0 até 5.0/episódio; dano −0.5 por HP confirmado perdido;
+  morte −5.0 terminal; run_failed −5.0 terminal; Geo ganho +0.01, gasto +0.02 com
+  orçamento combinado de +1.0; recuperação da Shade +1.0 uma vez. O módulo da morte
+  supera a recompensa de Shade.
+- Custo temporal: −0.001 × (lease_ms / 80). Horizonte: 3000 passos.
+- Limite superior conservador dos positivos por episódio: novelty 20 + scene changes
+  até (3000/3) × 5 = 5000 + kills 5 + Geo 1 + Shade 1 = 5027. O termo de cenas usa
+  apenas o mínimo de três frames estáveis para formar um limite superior; a exigência
+  adicional de transição escura torna o máximo atingível menor.
+- Nenhuma recompensa positiva de novidade/cena/combate/Geo/Shade é mantida quando o
+  ambiente base termina ou trunca o passo. Morte e run_failed encerram o episódio.
+  A observação da política contém pixels e histórico de ações; sinais privilegiados
+  do bridge só entram nos componentes de recompensa.
+
+PPO
+---
+ent_coef=0.01; gamma=0.995; gae_lambda=0.95; n_epochs=4; batch_size=256;
+target_kl=0.03; learning_rate=0.00025; clip_range=0.2; rollout_steps=512 por ator.
+Os campos PPO e rollout/batch são configuráveis pela campanha e ficam no contrato e
+manifest. Os parâmetros antigos continuam usando os defaults anteriores; checkpoints
+retomados carregam a configuração salva no modelo.
+
+Validação
+---------
+- Testes de exploração: NOOP estático sem novidade; deslocamento de câmera gera
+  novidade; teto e FIFO; rejeição de quadros pretos/brancos; cena paga uma vez sem
+  terminar episódio; morte suprime positivos e termina; truncamento base suprime
+  positivos; máscara/auditoria; calibração e fingerprint/contrato pixel-only.
+- Learner compartilhado: contrato PPO explore_v1, parâmetros configuráveis e rollouts
+  com observação MultiDiscrete exercitados por testes focados.
+- Execução seca do runner exploration: passou com 4096 timesteps, checkpoint 1024,
+  rollout 512, batch 256 e horizonte 3000; nenhum jogo foi aberto.
+- Ruff: passou.
+- mypy src/hk_agent: passou (42 arquivos).
+- Pytest completo: 495 passed, 2 skipped.
+- Calibração real NOOP/ativa e execução opcional de 3 minutos não foram realizadas;
+  thresholds foram validados com amostras sintéticas. A calibração real é executada
+  automaticamente antes de uma campanha exploration e falha fechada se o movimento
+  ativo não exceder τ.
+
+Arquivos principais: src/hk_agent/exploration_task.py, scene_change_task.py,
+first_training.py, shared_learner.py, control_plane.py, control_plane_server.py,
+distributed_knowledge.py, tools/run_first_training.py e painel ControlPlane.

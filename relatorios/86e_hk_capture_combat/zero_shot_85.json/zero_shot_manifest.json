@@ -1,0 +1,28 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86b-cuda-postopt-smoke\\universal-000697088",
+  "trained_steps": 697088,
+  "sampled_frames": 61,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "source": "test",
+  "campaign_id": "86e-corrected-partial",
+  "frames_per_scene": {
+    "Tutorial_01": 61
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.2907701561090303,
+    "SOLID": 0.07780533783113404,
+    "PLATFORM": 0.0,
+    "HAZARD": null,
+    "ENEMY": 0.0,
+    "PLAYER": 0.041353383458646614,
+    "BREAKABLE": null,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

@@ -1,0 +1,20 @@
+{
+  "instance_data_root": "C:\\Users\\thayr\\AppData\\LocalLow\\Team Cherry\\Hollow Knight AI 1",
+  "before_sha256": {
+    "user1.dat": "a916d37ede9074b2c99294520d80cc3f2f7ac2e2a38f4343b16a0213a0c0c20d",
+    "user1.dat.bak1": "412296a360f3f3ee4d7b26cbe3e74046726041bb49ad9738fc4899cd4ecb57c1",
+    "user1.modded.json": "c107a3525b7276b5f7a0905a87f9be71347b2e39069f45a67289b9a4db2b5452",
+    "user1.modded.json.bak": "c107a3525b7276b5f7a0905a87f9be71347b2e39069f45a67289b9a4db2b5452",
+    "user1_1.5.78.11833.dat": "a916d37ede9074b2c99294520d80cc3f2f7ac2e2a38f4343b16a0213a0c0c20d"
+  },
+  "after_sha256": {
+    "user1.dat": "a916d37ede9074b2c99294520d80cc3f2f7ac2e2a38f4343b16a0213a0c0c20d",
+    "user1.dat.bak1": "412296a360f3f3ee4d7b26cbe3e74046726041bb49ad9738fc4899cd4ecb57c1",
+    "user1.modded.json": "c107a3525b7276b5f7a0905a87f9be71347b2e39069f45a67289b9a4db2b5452",
+    "user1.modded.json.bak": "c107a3525b7276b5f7a0905a87f9be71347b2e39069f45a67289b9a4db2b5452",
+    "user1_1.5.78.11833.dat": "a916d37ede9074b2c99294520d80cc3f2f7ac2e2a38f4343b16a0213a0c0c20d"
+  },
+  "restored": true,
+  "restored_files": [],
+  "removed_generated_save_files": []
+}

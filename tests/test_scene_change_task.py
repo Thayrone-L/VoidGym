@@ -12,6 +12,7 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
+from hk_agent.action_masking import ActionAvailability
 from hk_agent.route_memory import TopologicalRouteMemory
 from hk_agent.scene_change_probe import (
     SceneChangeProbeConfig,
@@ -47,6 +48,25 @@ def test_scene_task_exposes_nail_spell_and_focus_actions() -> None:
     assert actions["DOWN+NAIL_ART_CHARGE"] == (1 << 3) | (1 << 5)
 
 
+def test_scene_task_masks_and_substitutes_unavailable_action() -> None:
+    environment = FakeSceneEnvironment([_frame((220, 220, 220))] * 3)
+    environment.latest_action_availability = ActionAvailability(
+        0, 33, 33, 0, 0, 0, False, False, False, False
+    )
+    task = ReachSceneChangeTask(environment, config=_config())  # type: ignore[arg-type]
+    task.reset()
+    mask = task.action_masks()
+    noop_index = SCENE_CHANGE_ACTION_NAMES.index("NOOP")
+    focus_index = SCENE_CHANGE_ACTION_NAMES.index("FOCUS_HOLD")
+    assert mask[noop_index]
+    assert not mask[focus_index]
+    _, _, _, _, info = task.step(focus_index)
+    assert environment.last_action == (SCENE_CHANGE_ACTIONS[noop_index], 80)
+    assert info["masked_action_substituted"] is True
+    assert info["requested_task_action"] == focus_index
+    assert info["executed_task_action"] == noop_index
+
+
 class FakeSceneEnvironment:
     metadata: ClassVar[dict[str, object]] = {}
 
@@ -67,6 +87,7 @@ class FakeSceneEnvironment:
         self.closed = False
         self.lease_ms = 80
         self.last_action: tuple[int, int] | None = None
+        self.latest_action_availability: ActionAvailability | None = None
         height, width, _ = frames[0].shape
         self.observation_space = gym.spaces.Dict(
             {

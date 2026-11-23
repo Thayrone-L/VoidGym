@@ -1,0 +1,30 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86e-final-resume4-2026-11-03-cuda\\universal-012438528",
+  "trained_steps": 12438528,
+  "capture_dir": "E:\\VoidGymRuntime\\86f-manual-capture\\session-20261101-193731\\frames",
+  "device": "cuda",
+  "capture_frames_available": 727,
+  "menu_frames_excluded_by_order": 21,
+  "almost_black_frames_excluded": 11,
+  "frames_evaluated": 695,
+  "action_history_available": false,
+  "action_history_used": "zero-filled (the manual recapture stores no decisions)",
+  "sample_sha256": "5ae0fc1b928f30bb17700c7bb576b500fb67e6af161ac57a2edd243704816ff0",
+  "iou": {
+    "EMPTY": 0.49458541233707154,
+    "SOLID": 0.08391748399515633,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.007332722273143905,
+    "ENEMY": 0.002672497570456754,
+    "PLAYER": 0.04584752423369138,
+    "BREAKABLE": 0.0,
+    "PICKUP": null,
+    "INTERACTIVE": 0.005515022692020452,
+    "EXIT": 0.0018782549304191924
+  },
+  "solid_support_cells": 384184,
+  "solid_predicted_empty_cells": 325017,
+  "solid_predicted_empty_fraction": 0.8459930658226267,
+  "confusion_csv": "relatorios\\86i_nivel2_e_avaliacao\\hk_recapture\\confusion.csv",
+  "solid_row_csv": "relatorios\\86i_nivel2_e_avaliacao\\hk_recapture\\solid_row.csv"
+}

@@ -1,0 +1,31 @@
+{
+  "checkpoint": "runtime\\v2\\pretrain\\pretrain-resume-2026-10-23\\universal-000697088",
+  "trained_steps": 697088,
+  "requested_frames": 5000,
+  "sampled_frames": 5000,
+  "valid_pixels": 6480000,
+  "frames_per_level": {
+    "0": 625,
+    "1": 625,
+    "2": 625,
+    "3": 625,
+    "4": 625,
+    "5": 625,
+    "6": 625,
+    "7": 625
+  },
+  "split": "test",
+  "mode": "deterministic",
+  "iou": {
+    "EMPTY": 0.8932982602002615,
+    "SOLID": 0.3773145269578565,
+    "PLATFORM": 0.16773784950272097,
+    "HAZARD": 0.0,
+    "ENEMY": 0.0,
+    "PLAYER": 0.29738469982643784,
+    "BREAKABLE": 0.0,
+    "PICKUP": 0.0,
+    "INTERACTIVE": null,
+    "EXIT": 0.06600842775138134
+  }
+}

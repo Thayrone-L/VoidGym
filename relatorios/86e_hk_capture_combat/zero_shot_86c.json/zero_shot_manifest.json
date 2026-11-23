@@ -1,0 +1,28 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86d-resume-verify\\universal-005060096",
+  "trained_steps": 5060096,
+  "sampled_frames": 61,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "source": "test",
+  "campaign_id": "86e-corrected-partial",
+  "frames_per_scene": {
+    "Tutorial_01": 61
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.3045958882503806,
+    "SOLID": 0.080973468515713,
+    "PLATFORM": 0.0,
+    "HAZARD": null,
+    "ENEMY": 0.0,
+    "PLAYER": 0.07338709677419354,
+    "BREAKABLE": null,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

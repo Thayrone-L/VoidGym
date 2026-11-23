@@ -8,7 +8,7 @@ from pathlib import Path
 
 from hk_agent.menu_bootstrap import MenuBootstrapPlan, MenuBootstrapStep
 
-SAVE_SOURCES = frozenset({"existing_save", "new_game"})
+SAVE_SOURCES = frozenset({"existing_save", "new_game", "continuous_playthrough"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +19,7 @@ class CampaignOrigin:
 
     def __post_init__(self) -> None:
         if self.source not in SAVE_SOURCES:
-            raise ValueError("save_source must be existing_save or new_game")
+            raise ValueError("save_source must be existing_save, new_game or continuous_playthrough")
         if isinstance(self.slot, bool) or not isinstance(self.slot, int) or not 1 <= self.slot <= 4:
             raise ValueError("save_slot must be an integer in [1, 4]")
 
@@ -91,12 +91,12 @@ def resolve_campaign_bootstrap(
     origin: CampaignOrigin,
 ) -> ResolvedCampaignBootstrap:
     base_path = (
-        continue_plan_path if origin.source == "existing_save" else new_game_plan_path
+        new_game_plan_path if origin.source == "new_game" else continue_plan_path
     ).resolve(strict=True)
     base = MenuBootstrapPlan.load(base_path)
     if origin.slot == 1:
         plan = base
-    elif origin.source == "existing_save":
+    elif origin.source != "new_game":
         plan = _existing_slot_plan(base, origin.slot)
     else:
         plan = _new_game_slot_plan(base, origin.slot)
@@ -110,7 +110,7 @@ def resolve_campaign_bootstrap(
 def validate_save_precondition(experimental_root: Path, origin: CampaignOrigin) -> Path:
     save_path = experimental_root / origin.save_file_name
     exists = save_path.is_file()
-    if origin.source == "existing_save" and not exists:
+    if origin.source in {"existing_save", "continuous_playthrough"} and not exists:
         raise RuntimeError(f"selected existing save slot is empty: {origin.save_file_name}")
     if origin.source == "new_game" and exists:
         raise RuntimeError(

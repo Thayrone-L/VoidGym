@@ -63,7 +63,13 @@ def main() -> int:
     result = train_ppo(
         environment,
         task=environment,
-        config=FirstTrainingConfig(total_timesteps=128, checkpoint_interval=128),
+        config=FirstTrainingConfig(
+            total_timesteps=128,
+            checkpoint_interval=128,
+            training_device="cpu",
+            torch_threads=3,
+            torch_interop_threads=1,
+        ),
         output_root=args.output,
     )
     return 0 if result["status"] == "COMPLETED" else 1

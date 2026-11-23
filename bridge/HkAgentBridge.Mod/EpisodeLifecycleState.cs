@@ -1,6 +1,43 @@
+using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace HkAgentBridge;
+
+internal readonly struct EnemyKillEvent
+{
+    public EnemyKillEvent(string enemyType, string sceneName, int hitsDealt)
+    {
+        EnemyType = enemyType;
+        SceneName = sceneName;
+        HitsDealt = hitsDealt;
+        BossConfirmed = BossCatalog.TryGet(enemyType, out ConfirmedBoss boss);
+        BossKey = BossConfirmed ? boss.Key : null;
+        BossVersion = BossConfirmed ? boss.Version : null;
+    }
+    public string EnemyType { get; }
+    public string SceneName { get; }
+    public int HitsDealt { get; }
+    public bool BossConfirmed { get; }
+    public string? BossKey { get; }
+    public string? BossVersion { get; }
+}
+
+internal readonly struct CombatLifecycleEvent
+{
+    public CombatLifecycleEvent(string kind, string sceneName, string objectId, int amount)
+    {
+        Kind = kind;
+        SceneName = sceneName;
+        ObjectId = objectId;
+        Amount = amount;
+    }
+
+    public string Kind { get; }
+    public string SceneName { get; }
+    public string ObjectId { get; }
+    public int Amount { get; }
+}
 
 internal readonly struct EpisodeLifecycleSnapshot
 {
@@ -12,7 +49,13 @@ internal readonly struct EpisodeLifecycleSnapshot
         int enemyKillsSinceLastFrame,
         int healthLostSinceLastFrame,
         int geoGainedSinceLastFrame,
-        int geoSpentSinceLastFrame
+        int geoSpentSinceLastFrame,
+        int healthRestoredSinceLastFrame,
+        int shadeHitsSinceLastFrame,
+        string? sceneName,
+        float? shadeDistance,
+        IReadOnlyList<EnemyKillEvent> enemyEvents,
+        IReadOnlyList<CombatLifecycleEvent> combatEvents
     )
     {
         PlayerDead = playerDead;
@@ -23,6 +66,12 @@ internal readonly struct EpisodeLifecycleSnapshot
         HealthLostSinceLastFrame = healthLostSinceLastFrame;
         GeoGainedSinceLastFrame = geoGainedSinceLastFrame;
         GeoSpentSinceLastFrame = geoSpentSinceLastFrame;
+        HealthRestoredSinceLastFrame = healthRestoredSinceLastFrame;
+        ShadeHitsSinceLastFrame = shadeHitsSinceLastFrame;
+        SceneName = sceneName;
+        ShadeDistance = shadeDistance;
+        EnemyEventsSinceLastFrame = enemyEvents;
+        CombatEventsSinceLastFrame = combatEvents;
     }
 
     public bool PlayerDead { get; }
@@ -33,6 +82,12 @@ internal readonly struct EpisodeLifecycleSnapshot
     public int HealthLostSinceLastFrame { get; }
     public int GeoGainedSinceLastFrame { get; }
     public int GeoSpentSinceLastFrame { get; }
+    public int HealthRestoredSinceLastFrame { get; }
+    public int ShadeHitsSinceLastFrame { get; }
+    public string? SceneName { get; }
+    public float? ShadeDistance { get; }
+    public IReadOnlyList<EnemyKillEvent> EnemyEventsSinceLastFrame { get; }
+    public IReadOnlyList<CombatLifecycleEvent> CombatEventsSinceLastFrame { get; }
 }
 
 /// <summary>
@@ -50,8 +105,19 @@ internal sealed class EpisodeLifecycleState
     private int _healthLostSinceLastFrame;
     private int _geoGainedSinceLastFrame;
     private int _geoSpentSinceLastFrame;
+    private int _healthRestoredSinceLastFrame;
+    private int _shadeHitsSinceLastFrame;
+    private int _shadeHitCycleTotal;
+    private readonly object _enemyEventLock = new();
+    private readonly List<EnemyKillEvent> _enemyEventsSinceLastFrame = new();
+    private readonly object _combatEventLock = new();
+    private readonly List<CombatLifecycleEvent> _combatEventsSinceLastFrame = new();
 
-    public EpisodeLifecycleSnapshot Snapshot() =>
+    public bool IsDeathStarted => Volatile.Read(ref _deathStarted) != 0 || Volatile.Read(ref _playerDead) != 0;
+    public bool ShadePending => Volatile.Read(ref _shadePending) != 0;
+
+    public EpisodeLifecycleSnapshot Snapshot(string? sceneName = null, float? shadeDistance = null,
+                                              bool includeCombatEvents = false) =>
         new(
             Volatile.Read(ref _playerDead) != 0,
             Volatile.Read(ref _shadePending) != 0,
@@ -60,7 +126,13 @@ internal sealed class EpisodeLifecycleState
             Interlocked.Exchange(ref _enemyKillsSinceLastFrame, 0),
             Interlocked.Exchange(ref _healthLostSinceLastFrame, 0),
             Interlocked.Exchange(ref _geoGainedSinceLastFrame, 0),
-            Interlocked.Exchange(ref _geoSpentSinceLastFrame, 0)
+            Interlocked.Exchange(ref _geoSpentSinceLastFrame, 0),
+            Interlocked.Exchange(ref _healthRestoredSinceLastFrame, 0),
+            Interlocked.Exchange(ref _shadeHitsSinceLastFrame, 0),
+            sceneName,
+            shadeDistance,
+            DrainEnemyEvents(),
+            includeCombatEvents ? DrainCombatEvents() : Array.Empty<CombatLifecycleEvent>()
         );
 
     public void BeginEpisode(bool? shadePendingFromSave)
@@ -70,9 +142,14 @@ internal sealed class EpisodeLifecycleState
         Interlocked.Exchange(ref _runFailed, 0);
         Interlocked.Exchange(ref _deathStarted, 0);
         Interlocked.Exchange(ref _enemyKillsSinceLastFrame, 0);
+        lock (_enemyEventLock) _enemyEventsSinceLastFrame.Clear();
+        lock (_combatEventLock) _combatEventsSinceLastFrame.Clear();
         Interlocked.Exchange(ref _healthLostSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoGainedSinceLastFrame, 0);
         Interlocked.Exchange(ref _geoSpentSinceLastFrame, 0);
+        Interlocked.Exchange(ref _healthRestoredSinceLastFrame, 0);
+        Interlocked.Exchange(ref _shadeHitsSinceLastFrame, 0);
+        Interlocked.Exchange(ref _shadeHitCycleTotal, 0);
         if (shadePendingFromSave.HasValue)
         {
             Interlocked.Exchange(ref _shadePending, shadePendingFromSave.Value ? 1 : 0);
@@ -87,6 +164,21 @@ internal sealed class EpisodeLifecycleState
         }
     }
 
+    public void RecordCombatEvent(string kind, string sceneName, string objectId, int amount = 0)
+    {
+        if (string.IsNullOrWhiteSpace(kind) || string.IsNullOrWhiteSpace(sceneName) ||
+            string.IsNullOrWhiteSpace(objectId) || amount < 0) return;
+        lock (_combatEventLock)
+        {
+            if (_combatEventsSinceLastFrame.Count < 256)
+            {
+                _combatEventsSinceLastFrame.Add(new CombatLifecycleEvent(
+                    kind, sceneName, objectId, amount
+                ));
+            }
+        }
+    }
+
     public void RecordGeoSpent(int amount)
     {
         if (amount > 0)
@@ -95,9 +187,52 @@ internal sealed class EpisodeLifecycleState
         }
     }
 
-    public void RecordConfirmedEnemyKill()
+    public void RecordConfirmedEnemyKill(string enemyType = "Unknown", string sceneName = "Unknown", int hitsDealt = 0)
     {
         Interlocked.Increment(ref _enemyKillsSinceLastFrame);
+        lock (_enemyEventLock)
+        {
+            if (_enemyEventsSinceLastFrame.Count < 128)
+            {
+                _enemyEventsSinceLastFrame.Add(new EnemyKillEvent(enemyType, sceneName, Math.Max(0, hitsDealt)));
+            }
+        }
+    }
+
+    internal static string NormalizeEnemyType(string name)
+    {
+        string result = name.Trim();
+        const string clone = "(Clone)";
+        if (result.EndsWith(clone, StringComparison.Ordinal)) result = result.Substring(0, result.Length - clone.Length).TrimEnd();
+        int suffix = result.LastIndexOf(" (", StringComparison.Ordinal);
+        if (suffix >= 0 && result.EndsWith(")", StringComparison.Ordinal))
+        {
+            string digits = result.Substring(suffix + 2, result.Length - suffix - 3);
+            bool numeric = digits.Length > 0;
+            foreach (char character in digits) numeric &= character >= '0' && character <= '9';
+            if (numeric) result = result.Substring(0, suffix);
+        }
+        return result;
+    }
+
+    private IReadOnlyList<EnemyKillEvent> DrainEnemyEvents()
+    {
+        lock (_enemyEventLock)
+        {
+            EnemyKillEvent[] events = _enemyEventsSinceLastFrame.ToArray();
+            _enemyEventsSinceLastFrame.Clear();
+            return events;
+        }
+    }
+
+    private IReadOnlyList<CombatLifecycleEvent> DrainCombatEvents()
+    {
+        lock (_combatEventLock)
+        {
+            CombatLifecycleEvent[] events = _combatEventsSinceLastFrame.ToArray();
+            _combatEventsSinceLastFrame.Clear();
+            return events;
+        }
     }
 
     public void RecordHealthLost(int amount)
@@ -107,6 +242,36 @@ internal sealed class EpisodeLifecycleState
             Interlocked.Add(ref _healthLostSinceLastFrame, amount);
         }
     }
+
+    public void RecordHealthRestored(int amount)
+    {
+        if (amount > 0 && Volatile.Read(ref _deathStarted) == 0 && Volatile.Read(ref _playerDead) == 0)
+        {
+            Interlocked.Add(ref _healthRestoredSinceLastFrame, amount);
+        }
+    }
+
+    public void RecordShadeHit()
+    {
+        // A Shade cycle needs at most four registered hits. Cap across the
+        // complete pending cycle so over-reporting cannot create reward.
+        if (Volatile.Read(ref _shadePending) == 0) return;
+        while (true)
+        {
+            int current = Volatile.Read(ref _shadeHitCycleTotal);
+            if (current >= 4) return;
+            if (Interlocked.CompareExchange(ref _shadeHitCycleTotal, current + 1, current) == current)
+            {
+                Interlocked.Increment(ref _shadeHitsSinceLastFrame);
+                return;
+            }
+        }
+    }
+
+    internal static int CountHealthRestored(int previousHealth, int currentHealth, bool episodeActive, bool deathOrReset, bool atBench) =>
+        episodeActive && !deathOrReset && !atBench && previousHealth >= 0
+            ? Math.Max(0, currentHealth - previousHealth)
+            : 0;
 
     public void MarkPlayerDying()
     {
@@ -150,6 +315,7 @@ internal sealed class EpisodeLifecycleState
         if (previous != 0)
         {
             Interlocked.Exchange(ref _shadeRecovered, 1);
+            Interlocked.Exchange(ref _shadeHitCycleTotal, 0);
         }
     }
 }

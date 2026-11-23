@@ -1,0 +1,25 @@
+PROMPT 54 — POSICIONAR SALAS PELAS PASSAGENS
+
+Implementado
+- Telemetria bridge guarda a posição de saída e a primeira posição de entrada estável, além das zonas quando disponíveis. O bridge não fornece nome/id de gate; não foi inventado. As transições sem evidência, com morte/respawn recente ou cenas de sonho/stag/elevador/estação/menu/title não são espaciais.
+- O diário vincula evidências do bridge às mudanças de cena. A construção de arestas agrupa pelo par de cenas e gate conhecido, agrega pela mediana e rejeita outliers. BFS descobre o componente da âncora; mínimos quadrados ajusta ciclos. Salas fora do componente ficam sem calibração.
+- O painel usa dois pontos da run na cena selecionada e os cliques correspondentes na arte para ajustar a transformação manual. Salvar propaga a calibração às cenas alcançáveis.
+- O mapa revela áreas posicionadas, desenha apenas segmentos na mesma sala ou em transição marcada espacial e põe um ícone do Cavaleiro na amostra mais recente mapeada.
+- Refinamento por imagem local não foi habilitado: não havia base local/alta confiança validada para limitar correções com segurança.
+
+Calibrar
+1. Gere/carregue a arte local do mapa.
+2. No painel Avançado, selecione Tutorial_01 (Passagem do Rei) e uma run com pelo menos duas amostras válidas nessa cena.
+3. Confira os pontos inicial e final e clique na arte nos dois locais correspondentes, na mesma ordem.
+4. Salve. A transformação propaga-se pelas transições espaciais observadas; cenas inacessíveis ficam não posicionadas.
+5. Para recalibrar, repita os dois cliques e salve de novo.
+
+Validação
+- pytest: 565 passed, 2 skipped, 8 subtests passed.
+- ruff: passou. mypy: passou (45 módulos). Node --check: passou.
+- Build e execução dos testes de correlação C#: passaram. git diff --check: passou.
+
+Implantação
+Não implante HkAgentBridge.Mod.dll enquanto o treino estiver ativo. Depois que o usuário parar o treino, compile/implante a DLL e confira transições estáveis no diário. Não foi aberta nenhuma instância do jogo nem parada campanha.
+
+Guia visual local: agent-prompts/relatorios/54/guia_calibracao.png

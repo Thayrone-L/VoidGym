@@ -1,0 +1,28 @@
+{
+  "checkpoint": "E:\\VoidGymRuntime\\v2\\pretrain\\pretrain-86d-long-2026-10-29-cuda\\universal-009235520",
+  "trained_steps": 9235520,
+  "sampled_frames": 8,
+  "requested_scenes": [
+    "Tutorial_01"
+  ],
+  "source": "test",
+  "campaign_id": "86h-policy-probe-r2-8",
+  "frames_per_scene": {
+    "Tutorial_01": 8
+  },
+  "action_history_available": false,
+  "iou": {
+    "EMPTY": 0.4111539602491842,
+    "SOLID": 0.009558160504959423,
+    "PLATFORM": 0.0,
+    "HAZARD": 0.0,
+    "ENEMY": 0.0,
+    "PLAYER": 0.11176470588235295,
+    "BREAKABLE": 0.0,
+    "PICKUP": null,
+    "INTERACTIVE": null,
+    "EXIT": 0.0
+  },
+  "confusion": "zero_shot_confusion.csv",
+  "preview": "zero_shot.png"
+}

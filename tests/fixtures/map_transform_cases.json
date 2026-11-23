@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "name": "center of room sprite",
+      "scene": "Tutorial_01",
+      "point": [5, 2.5],
+      "world_bounds": [0, 0, 10, 5],
+      "layout": {"scenes": [{"scene": "Tutorial_01", "has_sprite": true, "rect": {"x": 20, "y": 25, "width": 10, "height": 5}}]},
+      "expected": [25, 27.5]
+    },
+    {
+      "name": "sprite-less scene",
+      "scene": "Town",
+      "point": [1, 1],
+      "world_bounds": [0, 0, 10, 10],
+      "layout": {"scenes": [{"scene": "Town", "has_sprite": false, "rect": null}]},
+      "expected": null
+    },
+    {
+      "name": "degenerate world bounds",
+      "scene": "Tutorial_01",
+      "point": [1, 1],
+      "world_bounds": [0, 0, 0, 5],
+      "layout": {"scenes": [{"scene": "Tutorial_01", "has_sprite": true, "rect": {"x": 20, "y": 25, "width": 10, "height": 5}}]},
+      "expected": null
+    }
+  ]
+}

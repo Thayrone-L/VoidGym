@@ -91,6 +91,7 @@ def test_menu_sequence_orders_capture_action_release_capture(tmp_path: Path) -> 
             events.append("capture")
             return SimpleNamespace(
                 data=b"\x89PNG\r\n\x1a\nframe",
+                encoding="png",
                 frame_id=len(events),
                 capture_monotonic_ns=1,
                 width=1,
