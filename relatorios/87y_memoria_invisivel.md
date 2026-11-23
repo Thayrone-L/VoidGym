@@ -46,7 +46,7 @@ As medições foram feitas sem iniciar a campanha, sem salvar modelo/checkpoint 
 
 O smoke test CUDA separado capturou o alocador do próprio processo: política criada com 15,2 MiB alocados/36 MiB reservados; pico durante a atualização sintética de 86,4 MiB alocados/124 MiB reservados. O `nvidia-smi` marcou 2.536 MiB globais após o teste, mas não separou o uso do processo no modo WDDM. Esse batch de dois passos serve para validar o caminho e medir o custo mínimo, não para prever a memória do batch completo de pré-treino.
 
-Validação do coletor: Ruff passou; mypy estrito passou; sintaxe Python passou; as três funções de teste foram executadas diretamente e passaram. `pytest` não está instalado no `.venv-cuda`, então não foi executado via pytest nem foram instaladas dependências. CI de `fce849d` passou nos workflows VoidGym v2 e Code CI; a correção local de fallback será enviada em commit complementar.
+Validação do coletor: Ruff passou; mypy estrito passou; sintaxe Python passou; as três funções de teste foram executadas diretamente e passaram. `pytest` não está instalado no `.venv-cuda`, então não foi executado via pytest nem foram instaladas dependências. CI de `eb29ba6` passou em Python, Bridge contracts, Portable policy boundary e nos dois jobs v2.
 
 ### Série completa — 13 amostras
 
