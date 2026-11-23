@@ -26,7 +26,7 @@ O registro terminal do guard, mais completo que o histórico periódico, mostra 
 
 `tools/v2/diagnose_memory.py` registra, em JSONL, memória física, commit, contadores PerfOS, todos os processos visíveis por memória privada/working set e leitura do `nvidia-smi`. O Windows fornece `CommittedBytes` e `CommitLimit` pelo CIM quando `GetPerformanceInfo` não está acessível; os campos potencialmente desconhecidos permanecem `null`. O coletor não fecha processos nem muda prioridade, pagefile ou configurações.
 
-Foi iniciado às 19:35:27 um coletor oculto, com 13 amostras espaçadas em 300 s (60 min do primeiro ao último), em `E:\VoidGymRuntime\v2\pretrain\pretrain-87v-beco-2026-11-11-cuda-r6\memory-history-87y-2026-11-23.jsonl`. O relatório final da série fica pendente até a última amostra. A leitura inicial independente indicou 12,76 GiB de commit livre, acima do mínimo de 6 GiB exigido para comandos mais pesados.
+Foi iniciado às 19:35:27 um coletor oculto, com 13 amostras espaçadas em 300 s (60 min do primeiro ao último), em `E:\VoidGymRuntime\v2\pretrain\pretrain-87v-beco-2026-11-11-cuda-r6\memory-history-87y-2026-11-23.jsonl`. A série terminou às 20:35:51 com 13/13 registros e sem erros. A leitura inicial independente indicou 12,76 GiB de commit livre, acima do mínimo de 6 GiB exigido para comandos mais pesados.
 
 ### Fases controladas — 23/11/2026
 
@@ -46,7 +46,13 @@ As medições foram feitas sem iniciar a campanha, sem salvar modelo/checkpoint 
 
 O smoke test CUDA separado capturou o alocador do próprio processo: política criada com 15,2 MiB alocados/36 MiB reservados; pico durante a atualização sintética de 86,4 MiB alocados/124 MiB reservados. O `nvidia-smi` marcou 2.536 MiB globais após o teste, mas não separou o uso do processo no modo WDDM. Esse batch de dois passos serve para validar o caminho e medir o custo mínimo, não para prever a memória do batch completo de pré-treino.
 
-Validação do coletor: Ruff passou; sintaxe Python passou; as três funções de teste foram executadas diretamente e passaram. `pytest` não está instalado no `.venv-cuda`, então não foi executado via pytest nem foram instaladas dependências. A série horária ainda está em andamento.
+Validação do coletor: Ruff passou; mypy estrito passou; sintaxe Python passou; as três funções de teste foram executadas diretamente e passaram. `pytest` não está instalado no `.venv-cuda`, então não foi executado via pytest nem foram instaladas dependências. CI de `fce849d` passou nos workflows VoidGym v2 e Code CI; a correção local de fallback será enviada em commit complementar.
+
+### Série completa — 13 amostras
+
+Nas oito amostras entre 19:35 e 20:10, o commit livre oscilou de 12,30 GiB a 7,67 GiB e a RAM disponível de 4,32 GiB a 2,60 GiB. O ponto mais baixo coincidiu com a execução do ensaio sintético: um processo `python.exe` de diagnóstico chegou a 3,27 GiB de memória privada entre fases. Após o encerramento do teste, a amostra de 19:55 voltou a 11,90 GiB de commit livre e 4,28 GiB de RAM disponível; o processo Python deixou de aparecer entre os maiores consumidores. Isso atribui a queda observada durante o ensaio ao processo de teste, não ao pré-treino.
+
+Na série completa, commit livre variou de 7,67 GiB (19:50, durante o ensaio) a 12,30 GiB no início; RAM disponível variou de 2,60 a 4,32 GiB. Após o ensaio, entre 19:55 e 20:35, commit livre ficou entre 10,79 e 11,90 GiB e RAM entre 3,87 e 4,32 GiB. A soma privada visível variou de 14,88 a 19,33 GiB. A diferença entre commit usado e essa soma ficou em 4,26–5,75 GiB. Pool não paginado ficou em aproximadamente 0,63–0,66 GiB, pool paginado em 0,82–0,91 GiB e cache em 0,25–0,36 GiB. Esses contadores não explicam sozinhos toda a diferença; ela continua sem atribuição exata e não prova vazamento de driver.
 
 ## Interpretação
 

@@ -158,9 +158,11 @@ def collect_snapshot() -> dict[str, Any]:
     windows_system: dict[str, Any] | None = None
     if os.name == "nt":
         processes, windows_system, process_error = _windows_snapshot()
+        windows_error = process_error
         source = "Get-Process"
         if not processes:
-            processes, process_error = _portable_processes()
+            processes, fallback_error = _portable_processes()
+            process_error = windows_error or fallback_error
             source = "psutil fallback"
     else:
         processes, process_error = _portable_processes()
